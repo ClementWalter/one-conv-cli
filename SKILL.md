@@ -25,7 +25,7 @@ one-conv local --help
 - `cloud claude`: Claude web chat, distinct from local Claude Code.
 - `cloud codex`: Codex cloud tasks, distinct from local Codex CLI.
 - `cloud cowork`: remote Cowork sessions and paginated event transcripts.
-- `local`: local Claude Code, Codex CLI, Cursor, Oh My Pi and corpus files.
+- `local`: local Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi and corpus files.
 
 Old top-level commands remain compatibility aliases. Prefer namespaces for new
 invocations so local work cannot implicitly scan cloud accounts. For legacy
@@ -116,7 +116,7 @@ one-conv local skill-usage --json
 conversation, selecting the latest unless `--nth` or `--session` is supplied.
 `search` finds message text; `find` matches conversation titles.
 
-Local `--source` accepts `claude`, `codex`, `cursor`, `omp`, or `corpus`.
+Local `--source` accepts `claude`, `codex`, `cursor`, `cursor-cli`, `omp`, or `corpus`.
 Queries naming the same local project merge matching agent histories.
 `--raw` includes tool details. Reading updates local unread bookkeeping unless
 `--no-mark-read` is supplied. Consult each command's `--help` before less common

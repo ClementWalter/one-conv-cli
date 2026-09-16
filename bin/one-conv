@@ -95,7 +95,7 @@ import time
 import tempfile
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import click
@@ -113,7 +113,7 @@ logging.basicConfig(
 log = logging.getLogger("one-conv")
 
 CLOUD_SOURCES = ("claude-chat", "codex-cloud", "cowork-cloud")
-SOURCES = ("claude", "codex", "cursor", "omp", "chatgpt", "corpus", *CLOUD_SOURCES)
+SOURCES = ("claude", "codex", "cursor", "cursor-cli", "omp", "chatgpt", "corpus", *CLOUD_SOURCES)
 
 # Resolve the checkout behind the launcher symlink for the shared provider package.
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
@@ -924,6 +924,153 @@ def _cursor_composer_ids_matching(needle: str) -> set[str] | None:
         if len(parts) == 3:
             ids.add(parts[1])
     return ids
+
+
+# ---------------------------------------------------------------------------
+# Cursor CLI (cursor-cli) backend
+#
+# `cursor-agent` keeps each chat in its own directory,
+# ~/.cursor/chats/<workspace-hash>/<chat-id>/: a `meta.json` (cwd, title,
+# createdAtMs/updatedAtMs, hasConversation) next to a `store.db` SQLite file
+# whose `blobs` table holds the transcript, one JSON message per row in
+# insertion order (`role` system/user/assistant/tool) between binary rows this
+# reader skips. Subagent runs get a `store.db` without a `meta.json`; they are
+# left out, the way Claude Code sidechains are. A live chat is a WAL database
+# and opens `mode=ro` like the IDE store; an idle one has been checkpointed
+# and lost its `-wal`/`-shm` files, which `mode=ro` cannot recreate, so it
+# falls back to `immutable=1`, only while no `-wal` exists that the fallback
+# would not read. Override the home with $CURSOR_CLI_HOME.
+# ---------------------------------------------------------------------------
+
+CURSOR_CLI_HOME = Path(os.environ.get("CURSOR_CLI_HOME", str(Path.home() / ".cursor")))
+CURSOR_CLI_CHATS_DIR = CURSOR_CLI_HOME / "chats"
+
+_CURSOR_CLI_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.DOTALL)
+_CURSOR_CLI_TIMESTAMP_RE = re.compile(r"<timestamp>(.*?)</timestamp>")
+_CURSOR_CLI_STAMP_RE = re.compile(r"\w+, (\w+ \d+, \d+, \d+:\d+ [AP]M) \(UTC(?:([+-])(\d+)(?::(\d+))?)?\)")
+
+_cursor_cli_project_cache: dict[str, list[tuple[Path, dict]]] | None = None
+
+
+def _cursor_cli_projects_map() -> dict[str, list[tuple[Path, dict]]]:
+    global _cursor_cli_project_cache
+    if _cursor_cli_project_cache is None:
+        by_cwd: dict[str, list[tuple[Path, dict]]] = {}
+        for meta_path in CURSOR_CLI_CHATS_DIR.glob("*/*/meta.json"):
+            try:
+                meta = json.loads(meta_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            if meta.get("cwd") and meta.get("hasConversation") and (meta_path.parent / "store.db").is_file():
+                by_cwd.setdefault(meta["cwd"], []).append((meta_path.parent, meta))
+        _cursor_cli_project_cache = by_cwd
+    return _cursor_cli_project_cache
+
+
+def _cursor_cli_iter_projects():
+    for cwd in _cursor_cli_projects_map():
+        yield ProjectHandle(source="cursor-cli", cwd=cwd, key=cwd)
+
+
+def _cursor_cli_project_sessions(project: ProjectHandle) -> list[SessionHandle]:
+    return [
+        SessionHandle(
+            source="cursor-cli",
+            uuid=chat_dir.name,
+            project_cwd=project.cwd,
+            path=chat_dir / "store.db",
+            mtime=(meta.get("updatedAtMs") or meta.get("createdAtMs") or 0) / 1000.0,
+            title_hint=meta.get("title") or None,
+        )
+        for chat_dir, meta in _cursor_cli_projects_map().get(project.cwd, [])
+    ]
+
+
+def _cursor_cli_rows(db: Path) -> list[bytes]:
+    queries = ["mode=ro"]
+    if not db.with_name(db.name + "-wal").exists():
+        queries.append("mode=ro&immutable=1")  # Never create a missing store during fallback.
+    for query in queries:
+        try:
+            # Escape path delimiters so URI options always enforce read-only access.
+            conn = sqlite3.connect(f"{db.resolve().as_uri()}?{query}", uri=True)
+        except sqlite3.OperationalError:
+            continue
+        try:
+            return [row[0] for row in conn.execute("SELECT data FROM blobs ORDER BY rowid")]
+        except sqlite3.OperationalError as exc:
+            log.debug("Cursor CLI store %s not readable with %s: %s", db, query, exc)
+        finally:
+            conn.close()
+    return []
+
+
+def _cursor_cli_iso(stamp: str) -> str:
+    """`Tuesday, Sep 15, 2026, 2:49 PM (UTC+2)` → ISO 8601 with that offset."""
+    m = _CURSOR_CLI_STAMP_RE.fullmatch(stamp.strip())
+    if not m:
+        return ""
+    try:
+        offset = timedelta(hours=int(m.group(3) or 0), minutes=int(m.group(4) or 0))
+        if m.group(2) == "-":
+            offset = -offset
+        return datetime.strptime(m.group(1), "%b %d, %Y, %I:%M %p").replace(tzinfo=timezone(offset)).isoformat()
+    except (ValueError, OverflowError):
+        # Invalid stored dates must not prevent reading the conversation.
+        return ""
+
+
+def _cursor_cli_iter_turns(db: Path) -> list[Turn]:
+    """Normalize Cursor CLI messages into Turn/blocks.
+
+    A typed prompt is a user message whose text parts carry a `<timestamp>`
+    and the prompt inside `<user_query>`; the string-bodied environment
+    preamble that opens every chat and the other injected parts (attached
+    skills, workspace context) are not turns. Assistant and tool messages
+    store no timestamp, so they carry the preceding prompt's.
+    """
+    turns: list[Turn] = []
+    ts = ""
+    for data in _cursor_cli_rows(db):
+        try:
+            message = json.loads(data)
+        except ValueError:
+            continue  # binary row
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        parts = [p for p in content if isinstance(p, dict)] if isinstance(content, list) else []
+        blocks: list[dict] = []
+        if role == "user":
+            text = "\n".join(p.get("text") or "" for p in parts)
+            stamp = _CURSOR_CLI_TIMESTAMP_RE.search(text)
+            if stamp:
+                ts = _cursor_cli_iso(stamp.group(1))
+            query = _CURSOR_CLI_QUERY_RE.search(text)
+            if query:
+                blocks.append({"type": "text", "text": query.group(1)})
+        elif role == "assistant":
+            for p in parts:
+                pt = p.get("type")
+                if pt == "text" and p.get("text"):
+                    blocks.append({"type": "text", "text": p["text"]})
+                elif pt == "reasoning" and p.get("text"):
+                    blocks.append({"type": "thinking", "thinking": p["text"]})
+                elif pt == "tool-call":
+                    blocks.append({"type": "tool_use", "name": p.get("toolName", "?"), "input": p.get("args") or {}})
+        elif role == "tool":
+            for p in parts:
+                if p.get("type") == "tool-result":
+                    result = p.get("result")
+                    body = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                    blocks.append({"type": "tool_result", "content": body})
+            role = "user"
+        if blocks:
+            turns.append(Turn(ts=ts, role=role, blocks=blocks))
+    return turns
 
 
 # ---------------------------------------------------------------------------
@@ -1916,6 +2063,8 @@ def _iter_all_projects(sources: tuple[str, ...]):
         yield from _codex_iter_projects()
     if "cursor" in sources:
         yield from _cursor_iter_projects()
+    if "cursor-cli" in sources:
+        yield from _cursor_cli_iter_projects()
     if "omp" in sources:
         yield from _omp_iter_projects()
     if "chatgpt" in sources:
@@ -1968,6 +2117,8 @@ def _project_sessions(project: ProjectHandle) -> list[SessionHandle]:
         return _codex_project_sessions(project)
     if project.source == "cursor":
         return _cursor_project_sessions(project)
+    if project.source == "cursor-cli":
+        return _cursor_cli_project_sessions(project)
     if project.source == "omp":
         return _omp_project_sessions(project)
     if project.source == "chatgpt":
@@ -1993,6 +2144,8 @@ def _handle_iter_turns(handle: SessionHandle, include_subagents: bool) -> list[T
         return list(_codex_iter_turns(handle.path))
     if handle.source == "cursor":
         return _cursor_iter_turns(handle.composer_id)
+    if handle.source == "cursor-cli":
+        return _cursor_cli_iter_turns(handle.path)
     if handle.source == "omp":
         return list(_omp_iter_turns(handle.path))
     if handle.source == "chatgpt":
@@ -2022,7 +2175,7 @@ def _handle_drop_noise(handle: SessionHandle, turns: list[Turn]) -> list[Turn]:
         return _drop_tool_injected_followups(turns)
     if handle.source == "codex":
         return _codex_drop_noise(turns)
-    return turns  # cursor: bubbles are already clean user/assistant, no known noise pattern
+    return turns  # cursor, cursor-cli: turns are already clean user/assistant, no known noise pattern
 
 
 def _handle_rendered_turns(handle: SessionHandle, raw: bool, include_subagents: bool, limit: int) -> list[dict]:
@@ -2325,7 +2478,7 @@ _SOURCE_OPTION = click.option(
     "--source",
     "source_filter",
     type=click.Choice(SOURCES),
-    help="Restrict to one source (default: claude + codex + cursor + omp + chatgpt, all at once).",
+    help="Restrict to one source (default: claude + codex + cursor + cursor-cli + omp + chatgpt, all at once).",
 )
 
 
@@ -2730,8 +2883,8 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
 def unread(source_filter: str | None, project_query: str | None, limit: int, mark_all_read: bool, as_json: bool) -> None:
     """List threads with activity you haven't seen yet, across every source.
 
-    Claude Code, Codex, and Oh My Pi have no concept of read/unread, so those
-    three are tracked via local bookkeeping (~/.config/one-conv-cli/read-state.json,
+    Claude Code, Codex, Oh My Pi and the Cursor CLI have no concept of read/unread,
+    so those are tracked via local bookkeeping (~/.config/one-conv-cli/read-state.json,
     override with $AGENT_CONV_STATE_DIR): a thread counts as unread until you
     view its full content via `thread` or `read --expand` (or catch up in
     bulk with --mark-all-read), same as a message you've never opened, and
@@ -2778,7 +2931,7 @@ def find(text: str, source_filter: str | None, limit: int, as_json: bool) -> Non
     """Find a thread by name — i.e. by its derived title — across every
     project and source.
 
-    Cursor and Oh My Pi store a real thread title; Claude Code/Codex don't,
+    Cursor (IDE and CLI) and Oh My Pi store a real thread title; Claude Code/Codex don't,
     so "name" there is the first substantive thing you said in it (same text
     `chats`/`read` derive titles from). Unlike `search`, which matches
     anywhere in a transcript and returns one row per matching turn, this

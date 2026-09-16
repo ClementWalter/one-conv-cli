@@ -28,6 +28,12 @@ agents by reading each one's local storage directly, read-only:
   (each bubble's text). Opened read-only (`mode=ro`) — no snapshot-copy
   needed (the db is often 1GB+; SQLite's own WAL readers already get a
   consistent view without one).
+- **Cursor CLI** — one directory per chat,
+  `~/.cursor/chats/<workspace-hash>/<chat-id>/` (override with `$CURSOR_CLI_HOME`):
+  `meta.json` carries the cwd, stored title and last-activity time, `store.db`
+  holds the transcript as one JSON message per `blobs` row. Subagent runs have
+  no `meta.json` and are skipped. Unread is local bookkeeping, same as Claude
+  Code/Codex.
 - **Oh My Pi** — `~/.omp/agent/sessions/<cwd-encoded>/<timestamp>_<uuid>.jsonl`
   (override with `$OMP_HOME`). cwd/id/title live on the `session` event;
   this CLI groups by that recorded cwd. Unread is local bookkeeping, same
@@ -71,7 +77,7 @@ exactly, across all five sources at once:
 | *(no equivalent)* | `find <text>` — locate a thread by its title across every project |
 | *(no equivalent)* | `fork` / `send` — continue a Claude Code thread, live or headless |
 | *(no equivalent)* | `unread` — read/unread tracking, native for Cursor, local bookkeeping for Claude Code/Codex |
-| *(no equivalent)* | `--source claude\|codex\|cursor\|omp\|chatgpt` — scope any command to one backend |
+| *(no equivalent)* | `--source claude\|codex\|cursor\|cursor-cli\|omp\|chatgpt` — scope any command to one backend |
 | *(no equivalent)* | `chatgpt sync` — pull chatgpt.com web chats into the local cache |
 
 Unlike Slack, there's no "loose message outside any thread" case — every turn

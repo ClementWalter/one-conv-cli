@@ -6,7 +6,7 @@ into a local history, or read sessions already saved by your coding tools.
 | Namespace | Sources |
 | --- | --- |
 | `cloud` | ChatGPT, Claude Chat, Codex cloud, Cowork cloud |
-| `local` | Claude Code, Codex CLI, Cursor, Oh My Pi, shared corpus files |
+| `local` | Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi, shared corpus files |
 
 Cloud conversations are addressed by ID or title. Local sessions are grouped
 by the project where the agent ran.
@@ -165,7 +165,7 @@ one-conv local search TEXT
 Replace `PROJECT` with a name from the listing. `local read` lists its sessions;
 `local thread` reads the newest one. Choose another with `--session ID` or
 `--nth 2`, or use `local read PROJECT --expand` to read all of them.
-`--source claude|codex|cursor|omp|corpus` narrows the source. Local readers never
+`--source claude|codex|cursor|cursor-cli|omp|corpus` narrows the source. Local readers never
 discover cloud accounts.
 
 For agent workflows, `local fork` starts a new Claude Code thread from an

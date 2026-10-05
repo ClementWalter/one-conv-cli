@@ -116,6 +116,16 @@ one-conv local skill-usage --json
 conversation, selecting the latest unless `--nth` or `--session` is supplied.
 `search` finds message text; `find` matches conversation titles.
 
+`--json` shapes (top level is a list unless noted):
+
+- `chats`: `{source, cwd, threads, unread, last_active, last_active_epoch}`
+- `read`, `find`, `unread`: `{uuid, source, cwd, start, end, turns, tokens, title, unread}`;
+  `turns` is a count here. `start`/`end` are ISO strings that can be `""`
+  (seen on cursor and corpus rows), so guard before parsing them.
+- `thread`: one object `{source, session, cwd, title, tokens, turns}`, where
+  `turns` is the message list `[{ts, role, text}]` (there is no `messages` key).
+- `search`: `{ts, source, cwd, session, role, text}`
+
 Local `--source` accepts `claude`, `codex`, `cursor`, `cursor-cli`, `omp`, or `corpus`.
 Queries naming the same local project merge matching agent histories.
 `--raw` includes tool details. Reading updates local unread bookkeeping unless

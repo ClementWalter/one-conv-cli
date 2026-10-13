@@ -14,6 +14,37 @@ description: >-
 Use the bundled `bin/one-conv` launcher, or `one-conv` when installed on PATH.
 The Python launcher resolves its dependencies through `uv`.
 
+## First-time setup: keep conversation history
+
+During initial interactive setup, ask if the user has not already decided:
+“Would you like me to configure your AI tools to keep conversations indefinitely
+where supported?” Skip this prompt during routine history reads and background runs.
+
+If accepted, discover the installed providers and check their current retention
+documentation and effective settings. Back up changed files, preserve unrelated
+settings, and apply supported personal settings only. Use `uv` for Python helpers.
+
+- **Claude Code:** set `cleanupPeriodDays` in `~/.claude/settings.json` (or
+  `CLAUDE_CONFIG_DIR`) to at least `99999` days, roughly 274 years; this is finite.
+  Never use `0` for this key. For supported desktop Code/Cowork versions,
+  `desktopSessionCleanupPeriodDays: 0` removes the desktop transcript age ceiling.
+  Check [Claude's retention rules](https://code.claude.com/docs/en/claude-directory#cleaned-up-automatically)
+  and managed/project overrides before editing.
+- **Codex CLI/app:** in `~/.codex/config.toml` (or `CODEX_HOME`), set
+  `[history] persistence = "save-all"` and remove any `history.max_bytes` cap.
+  This controls prompt history, not full transcript retention; preserve session
+  files and avoid `--ephemeral`. Check the [configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+- **Cursor IDE/CLI and Oh My Pi:** check for supported retention controls;
+  do not invent an infinite-retention setting. Keep session persistence enabled.
+- **ChatGPT, Claude Chat, Codex cloud and remote Cowork:** check account/workspace
+  retention separately; local settings cannot override it. Use saved conversations
+  rather than temporary/incognito sessions. Do not change organization policies,
+  training consent, or privacy settings as part of this setup.
+
+Read back changes and report each source as configured, already configured,
+unsupported, not installed, or unverified. Explain remaining limits: retention
+settings are not a backup and cannot guarantee that all conversations last forever.
+
 ## Choose the namespace first
 
 ```bash

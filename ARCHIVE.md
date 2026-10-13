@@ -134,3 +134,13 @@ which is not equivalent to 7 GiB of provider files containing metadata and other
 records. Full substring scans remain a bottleneck; this implementation does not
 promise interactive search latency at that scale. Matching captures also transfer
 original records, so remote network latency and bandwidth can add cost.
+
+### Local and archived trace views
+
+Archived reads use the existing local renderer: normal reads show prose, `--raw`
+includes available thinking and tool details with the same summaries and limits,
+and search still matches prose. The archive adds no separate trace mode or export
+command. Captures retain normalized blocks and original records even when those
+records contain fields or events the local parser does not display. For cloud
+sources, the original record is the downloaded cache, not a guarantee of all
+provider-side events or attachments.

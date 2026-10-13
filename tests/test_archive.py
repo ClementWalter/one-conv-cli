@@ -317,3 +317,52 @@ def test_existing_full_captures_survive_chunked_updates(tmp_path, archive):
     assert run(env, "scripts/archive-sync.py", "--source", "claude")["uploaded"] == 1
     assert client.read_conversation(row["key"], row["revision"]) == old
     assert client.read_conversation(row["key"])["turns"][-1]["blocks"][0]["text"] == "An additional message"
+
+
+@pytest.mark.parametrize("source", ["claude", "codex"])
+def test_archived_trace_uses_existing_local_views(tmp_path, archive, source):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    result_text = "tool-result-marker " + "x" * 1000 + " original-tail"
+    if source == "claude":
+        path = write_claude(env)
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        events.append({"type": "user", "cwd": "/example/ancestry", "timestamp": "2026-01-01T10:02:00Z",
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call-one", "content": result_text}]}})
+        native_root = "CLAUDE_CONFIG_DIR"
+        thinking = "private reasoning"
+        tool = "example"
+    else:
+        path = Path(env["CODEX_HOME"]) / "sessions" / "rollout-trace.jsonl"
+        path.parent.mkdir(parents=True)
+        events = [{"type": "session_meta", "payload": {"id": "trace-fixture", "cwd": "/example/ancestry"}},
+            {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Inspect the file"}]}},
+            {"type": "response_item", "payload": {"type": "reasoning", "summary": [{"text": "reasoning summary marker"}]}},
+            {"type": "response_item", "payload": {"type": "function_call", "name": "read_file", "call_id": "call-one", "arguments": '{"path":"example.txt"}'}},
+            {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "call-one", "output": result_text}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Inspection complete"}]}}]
+        native_root = "CODEX_HOME"
+        thinking = "reasoning summary marker"
+        tool = "read_file"
+    # This event is deliberately outside the normalized reader's message schema.
+    events.append({"type": "provider_metadata", "opaque": {"retained": "unparsed-event-marker"}})
+    path.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+    commands = [("thread", "ancestry", "--no-mark-read"),
+                ("thread", "ancestry", "--raw", "--no-mark-read"),
+                ("search", "tool-result-marker")]
+    baseline = [run(env, "bin/one-conv", "local", *args, "--source", source, "--json") for args in commands]
+    compact = "\n".join(turn["text"] for turn in baseline[0]["turns"])
+    raw = "\n".join(turn["text"] for turn in baseline[1]["turns"])
+    assert thinking not in compact and "tool-result-marker" not in compact
+    assert thinking in raw and tool in raw and "tool-result-marker" in raw
+    assert "original-tail" not in raw  # Existing local rendering remains summarized.
+    assert baseline[2] == []  # Search keeps its existing prose-only contract.
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", source)
+    row = list(client.list_conversations())[0]
+    captured = client.read_conversation(row["key"])
+    assert base64.b64decode(captured["originals"][str(path)]) == path.read_bytes()
+    assert any(block.get("content") == result_text for turn in captured["turns"] for block in turn["blocks"])
+    env[native_root] = str(tmp_path / "empty")
+    for args, expected in zip(commands, baseline):
+        assert run(env, "bin/one-conv", "local", *args, "--source", source, "--json") == expected

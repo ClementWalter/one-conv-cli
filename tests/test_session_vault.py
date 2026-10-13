@@ -153,7 +153,8 @@ def test_jar_without_rotation_is_unchanged(app):
 
 
 class RefreshFailedSession:
-    headers = {}
+    def __init__(self):
+        self.headers = {}
 
     def get(self, url, **kwargs):
         response = FakeResponse({})

@@ -16,7 +16,7 @@ from .dataset import write_dataset
 from .label import (
     LABELS,
     PROVIDERS,
-    decision_classifier,
+    build_classifier,
     label_moments,
     load_labels,
     moments,
@@ -115,7 +115,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
     @click.option("--max-chars", default=12_000, show_default=True,
                   help="Characters per example, history included (~4 per token). Keep under train --max-seq-length.")
     @click.option("--include-system", is_flag=True, help="Keep heartbeat and worker sessions.")
-    @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="subq", show_default=True,
+    @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="classifier", show_default=True,
                   help="Decision model that labeled (or labels) the moments.")
     @click.option("--labels/--keywords", "use_labels", default=False,
                   help="Use classifier labels from `tune label` instead of the keyword heuristic.")
@@ -157,10 +157,10 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             click.echo(f"  rule {rule}: {manifest['rule_rewritten_targets']} target(s) rewritten")
 
     @tune.command(context_settings=HELP)
-    @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="subq", show_default=True,
+    @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="classifier", show_default=True,
                   help="Decision model that labeled (or labels) the moments.")
     @click.option("--limit", default=0, show_default=True, help="Label at most this many new moments (0 = all).")
-    @click.option("--workers", default=8, show_default=True, help="Concurrent classifier requests.")
+    @click.option("--workers", default=4, show_default=True, help="Concurrent classifier requests.")
     @click.option("--dry-run", is_flag=True, help="Count pending moments and estimate cost without calling the API.")
     def label(provider, limit, workers, dry_run):
         """Classify your reaction to every assistant reply with a decision model.
@@ -168,14 +168,15 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         Each moment (your request, the reply, your next message) gets one
         label: accepted, correction_preference, correction_new_info,
         new_task, question or unclear, with calibrated probabilities. Labels
-        are cached by content, so reruns only classify new moments. Needs
-        SUBQ_API_KEY for SubQ Snap, or TYPESAFE_API_KEY for Jev.
+        are cached by content, so reruns only classify new moments.
+        classifier.dev needs no key and is asked not to keep the text; SubQ
+        Snap needs SUBQ_API_KEY and Jev needs TYPESAFE_API_KEY.
 
         \b
         Examples:
           one-conv tune label --dry-run
           one-conv tune label --limit 50
-          one-conv tune label --provider jev
+          one-conv tune label --provider subq
           one-conv tune review
         """
         home = tune_home()
@@ -197,17 +198,17 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         click.echo(f"{len(done)} labeled, {len(pending)} to label, ~{tokens / 1e6:.1f}M tokens (~${cost:.2f} on {provider})")
         if dry_run or not pending:
             return
-        api_key = os.environ.get(spec.key_env)
-        if not api_key:
+        api_key = os.environ.get(spec.key_env) if spec.key_env else None
+        if spec.key_env and not api_key:
             raise click.ClickException(f"Set {spec.key_env} ({spec.console}).")
         try:
-            count = label_moments(pending, decision_classifier(spec, api_key), out, workers)
+            count = label_moments(pending, build_classifier(spec, api_key), out, workers, spec.batch_size)
         except RuntimeError as error:
             raise click.ClickException(f"{error}. Labels written so far are kept; rerun to resume.") from None
         click.echo(f"Labeled {count} moment(s) into {out}")
 
     @tune.command(context_settings=HELP)
-    @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="subq", show_default=True,
+    @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="classifier", show_default=True,
                   help="Decision model that labeled (or labels) the moments.")
     @click.option("-n", "count", default=20, show_default=True, help="Moments to show.")
     @click.option("--label", "only", type=click.Choice(LABELS), default=None, help="Only this label.")

@@ -101,7 +101,7 @@ def test_label_requires_api_key(home, tmp_path, monkeypatch):
         "source": "codex", "session": "s2", "cwd": "/repo", "author": "human", "mtime": 1.0,
         "turns": [{"role": "user", "text": "a"}, {"role": "assistant", "text": "b"}, {"role": "user", "text": "c"}]}))
     tune = build_tune_group(snapshot=lambda out: (0, 0), corpus_roots=lambda: [root])
-    result = CliRunner().invoke(tune, ["label"])
+    result = CliRunner().invoke(tune, ["label", "--provider", "subq"])
     assert "SUBQ_API_KEY" in result.output
 
 

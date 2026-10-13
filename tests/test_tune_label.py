@@ -9,6 +9,7 @@ from one_conv.tune.dataset import session_examples
 from one_conv.tune.label import (
     PROVIDERS,
     _clip,
+    classifier_dev_classifier,
     decision_classifier,
     label_moments,
     load_labels,
@@ -114,30 +115,30 @@ def _post(responses, calls):
 
 def test_classifier_returns_label():
     classify = decision_classifier(PROVIDERS["jev"], "k", post=_post([StubResponse(200, ANSWER)], []))
-    assert classify({"x": 1})["label"] == "accepted"
+    assert classify([{"x": 1}])[0]["label"] == "accepted"
 
 
 def test_classifier_sends_bearer_key():
     calls = []
-    decision_classifier(PROVIDERS["jev"], "secret", post=_post([StubResponse(200, ANSWER)], calls))({"x": 1})
+    decision_classifier(PROVIDERS["jev"], "secret", post=_post([StubResponse(200, ANSWER)], calls))([{"x": 1}])
     assert calls[0]["headers"]["Authorization"] == "Bearer secret"
 
 
 def test_classifier_retries_rate_limit(monkeypatch):
     monkeypatch.setattr("one_conv.tune.label.time.sleep", lambda seconds: None)
     responses = [StubResponse(429, {}, {"retry-after": "0"}), StubResponse(200, ANSWER)]
-    assert decision_classifier(PROVIDERS["jev"], "k", post=_post(responses, []))({"x": 1})["model"] == "jev-1.13.0"
+    assert decision_classifier(PROVIDERS["jev"], "k", post=_post(responses, []))([{"x": 1}])[0]["model"] == "jev-1.13.0"
 
 
 def test_classifier_reports_billing_error():
     billing = StubResponse(402, {"detail": {"error_type": "billing_error"}})
     with pytest.raises(RuntimeError, match="402"):
-        decision_classifier(PROVIDERS["jev"], "k", post=_post([billing], []))({"x": 1})
+        decision_classifier(PROVIDERS["jev"], "k", post=_post([billing], []))([{"x": 1}])
 
 
 def test_label_moments_appends_rows(tmp_path, corrected):
     out = tmp_path / "labels.jsonl"
-    label_moments(list(moments(corrected)), lambda state: {"label": "accepted", "probabilities": {"accepted": 1.0}}, out)
+    label_moments(list(moments(corrected)), lambda states: [{"label": "accepted", "probabilities": {"accepted": 1.0}} for _ in states], out)
     assert len(load_labels(out)) == 2
 
 
@@ -145,7 +146,7 @@ def test_labels_resume_from_partial_file(tmp_path, corrected):
     out = tmp_path / "labels.jsonl"
     first = next(moments(corrected))
     out.write_text(json.dumps({"key": first.key, "label": "accepted", "probabilities": {}}) + "\n")
-    label_moments([list(moments(corrected))[1]], lambda state: {"label": "question", "probabilities": {}}, out)
+    label_moments([list(moments(corrected))[1]], lambda states: [{"label": "question", "probabilities": {}} for _ in states], out)
     assert sorted(row["label"] for row in load_labels(out).values()) == ["accepted", "question"]
 
 
@@ -153,11 +154,53 @@ def test_subq_uses_its_own_endpoint():
     calls = []
     post = _post([StubResponse(200, ANSWER)], calls)
     urls = []
-    decision_classifier(PROVIDERS["subq"], "k", post=lambda url, **kw: urls.append(url) or post(url, **kw))({"x": 1})
+    decision_classifier(PROVIDERS["subq"], "k", post=lambda url, **kw: urls.append(url) or post(url, **kw))([{"x": 1}])
     assert urls == ["https://api.subq.ai/v1/systemone"]
 
 
 def test_subq_sends_snap_model():
     calls = []
-    decision_classifier(PROVIDERS["subq"], "k", post=_post([StubResponse(200, ANSWER)], calls))({"x": 1})
+    decision_classifier(PROVIDERS["subq"], "k", post=_post([StubResponse(200, ANSWER)], calls))([{"x": 1}])
     assert calls[0]["json"]["model"] == "subq-snap-preview"
+
+
+CDEV = {"results": [{"label": "correction the assistant could have anticipated", "confidence": 0.98,
+                     "scores": {"correction the assistant could have anticipated": 0.98, "accepted the reply": 0.02},
+                     "model": "jev-1.13.0"}]}
+STATE = {"user_request": "a", "assistant_reply": "b", "user_next_message": "c"}
+
+
+def test_classifier_dev_maps_worded_label_back():
+    classify = classifier_dev_classifier(post=_post([StubResponse(200, CDEV)], []))
+    assert classify([STATE])[0]["label"] == "correction_preference"
+
+
+def test_classifier_dev_maps_scores_back():
+    classify = classifier_dev_classifier(post=_post([StubResponse(200, CDEV)], []))
+    assert classify([STATE])[0]["probabilities"] == {"correction_preference": 0.98, "accepted": 0.02}
+
+
+def test_classifier_dev_opts_out_of_training_in_body():
+    calls = []
+    classifier_dev_classifier(post=_post([StubResponse(200, CDEV)], calls))([STATE])
+    assert calls[0]["json"]["share_data"] is False
+
+
+def test_classifier_dev_opts_out_of_training_in_header():
+    calls = []
+    classifier_dev_classifier(post=_post([StubResponse(200, CDEV)], calls))([STATE])
+    assert calls[0]["headers"]["X-Classifier-Share-Data"] == "false"
+
+
+def test_classifier_dev_sends_whole_batch_in_one_call():
+    calls = []
+    two = {"results": CDEV["results"] * 2}
+    classifier_dev_classifier(post=_post([StubResponse(200, two)], calls))([STATE, STATE])
+    assert len(calls[0]["json"]["inputs"]) == 2
+
+
+def test_batched_labeling_writes_every_moment(tmp_path, corrected):
+    out = tmp_path / "labels.jsonl"
+    label_moments(list(moments(corrected)), lambda states: [{"label": "accepted", "probabilities": {}} for _ in states],
+                  out, batch_size=40)
+    assert len(load_labels(out)) == 2

@@ -87,7 +87,7 @@ def create_server() -> MCPServer:
     @server.tool(annotations=readonly, structured_output=True)
     def search_conversations(query: str, namespace: Namespace = "cloud",
                              source: str | None = None, limit: int = 30) -> dict[str, Any]:
-        """Search saved message text without network requests."""
+        """Search saved message text, including configured archives."""
         return read_cli(namespace, "search", query=query, source=source, limit=limit)
 
     @server.tool(annotations=readonly, structured_output=True)

@@ -173,6 +173,12 @@ These agents can modify files or use tools, so preserve the user's action scope.
 `local export` writes normalized history into a corpus checkout. `local append`
 writes one turn to the shared corpus log. These are writes, not history reads.
 
+## Optional archive
+
+When the user wants to sync history to their own searchable storage, follow
+[ARCHIVE.md](ARCHIVE.md). Start with a bounded copy and verify existing commands
+against the archive. Use `uv` for Python. Never delete native history as part of sync.
+
 ## Verification
 
 Distinguish current provider access, cached history and parser tests. A browser

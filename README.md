@@ -243,6 +243,36 @@ The server exposes history access and explicit refresh, with no message sending
 or arbitrary command execution. This repository contains the CLI, agent skill,
 and local MCP server. The hosted OneConv application is developed separately.
 
+## Fine-tune on your history
+
+`one-conv tune` turns saved sessions into LoRA training data for a local
+model, trains with [mlx-lm](https://github.com/ml-explore/mlx-lm) on Apple
+Silicon, and ranks runs on held-out sessions. MLX is installed on demand
+through `uv`; the launcher itself does not depend on it.
+
+```bash
+one-conv tune snapshot                      # export every local and cached cloud session
+one-conv tune dataset --name base           # SFT examples + DPO correction pairs
+one-conv tune train --dataset base --run first
+one-conv tune eval --run first              # perplexity and preference accuracy, base vs adapter
+one-conv tune probe --run first --rule no-comments
+one-conv tune runs                          # rank runs by a metric
+```
+
+The dataset is built from the export format: user and assistant text, with
+tool calls summarized, tool output dropped, and secrets redacted. Sessions
+written by heartbeats and workers are skipped. An assistant turn followed by
+a correction ("no", "revert", "pas ça", ...) becomes the rejected side of a
+preference pair, and the next assistant turn becomes the chosen side. Every
+other assistant turn is an SFT target. Splits are assigned per session, so
+evaluation never sees a training conversation.
+
+`probe` measures how often a rule is broken as real history accumulates in
+the context. It compares the base model, the base model with the rule as a
+system prompt, and the adapter trained on rule-rewritten answers
+(`tune dataset --rule no-comments`). Files live under
+`~/.cache/one-conv-cli/tune`, or `ONE_CONV_TUNE_DIR`.
+
 ## Command reference
 
 Start with `one-conv --help`, `one-conv cloud --help`, or `one-conv local --help`.

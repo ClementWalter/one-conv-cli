@@ -2737,6 +2737,21 @@ def _export_session(handle: SessionHandle, machine: str, out_root: Path) -> Path
     return target
 
 
+def _export_all(out_root: Path, machine: str, sources: tuple[str, ...], cutoff: float = 0.0) -> tuple[list[str], int]:
+    """Export every session in scope; return written relative paths and the already-current count."""
+    written, skipped = [], 0
+    for project in _iter_all_projects(sources):
+        for handle in _project_sessions(project):
+            if handle.mtime < cutoff:
+                continue
+            path = _export_session(handle, machine, out_root)
+            if path is None:
+                skipped += 1
+            else:
+                written.append(str(path.relative_to(out_root)))
+    return written, skipped
+
+
 @cli.command()
 @click.option("--out", "out_dir", required=True, help="Root of the corpus checkout, e.g. ~/Documents/corpus.")
 @click.option("--machine", default=None, help="Folder name for this machine (default: hostname).")
@@ -2756,16 +2771,7 @@ def export(out_dir: str, machine: str | None, source_filter: str | None, since: 
     machine = machine or socket.gethostname().split(".")[0]
     sources = selected_sources(source_filter, SOURCES)
     cutoff = datetime.fromisoformat(since).timestamp() if since else 0.0
-    written, skipped = [], 0
-    for project in _iter_all_projects(sources):
-        for handle in _project_sessions(project):
-            if handle.mtime < cutoff:
-                continue
-            path = _export_session(handle, machine, out_root)
-            if path is None:
-                skipped += 1
-            else:
-                written.append(str(path.relative_to(out_root)))
+    written, skipped = _export_all(out_root, machine, sources, cutoff)
     if as_json:
         click.echo(json.dumps({"machine": machine, "written": written, "skipped": skipped}))
         return
@@ -3602,6 +3608,18 @@ def cloud_command(context):
 
 
 install_namespaces(cli, lambda: _chatgpt_accounts(), lambda: _claude_accounts())
+
+
+def _tune_snapshot(out_root: Path) -> tuple[int, int]:
+    # The corpus source re-reads exports, so excluding it avoids training on duplicates.
+    sources = tuple(source for source in SOURCES if source != "corpus")
+    written, skipped = _export_all(out_root, _THIS_MACHINE, sources)
+    return len(written), skipped
+
+
+from one_conv.tune.cli import build_tune_group  # noqa: E402
+
+cli.add_command(build_tune_group(_tune_snapshot, _corpus_roots))
 
 
 @cli.command("mcp")

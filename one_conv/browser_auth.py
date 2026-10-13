@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import logging
 import hashlib
+import logging
 
 from .providers.anthropic import FINGERPRINT
 from .providers.base import AuthenticationRequired, JsonTransport, SchemaChanged

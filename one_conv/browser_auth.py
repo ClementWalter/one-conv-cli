@@ -25,13 +25,14 @@ def _claude_session(cookies):
     return session
 
 
-def claude_accounts(cookie_jars, *, session_factory=None, on_verified=None):
+def claude_accounts(cookie_jars, *, session_factory=None, on_verified=None, on_expired=None):
     """Yield verified organization-scoped sessions from the launcher's cookie reader.
 
     Profile and organization both scope history because different users can
     belong to the same organization. Missing user email remains unknown.
     `on_verified(profile, cookies, organizations)` runs once per session whose
     organizations validated, so callers can keep it beyond the browser's login.
+    `on_expired(profile, cookies)` replaces the generic warning for a revoked session.
     """
     factory = session_factory or _claude_session
     seen = set()
@@ -47,7 +48,10 @@ def claude_accounts(cookie_jars, *, session_factory=None, on_verified=None):
         try:
             organizations = transport.get("/api/organizations")
         except AuthenticationRequired:
-            log.warning("A Claude browser session requires renewed authorization")
+            if on_expired is not None:
+                on_expired(profile, cookies)
+            else:
+                log.warning("A Claude browser session requires renewed authorization")
             continue
         if not isinstance(organizations, list):
             raise SchemaChanged("Claude organization response must be an array")

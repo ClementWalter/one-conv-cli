@@ -39,10 +39,12 @@ one-conv cloud claude connect --login --browser chrome
 Finish signing in in the browser. Opening the page does not verify the login.
 
 Every session one-conv verifies is saved in a private session vault
-(`~/.config/one-conv-cli/sessions`, files readable only by you). To add a
+(`sessions/` in the one-conv state folder under `~/.config`, files readable only by you). To add a
 second account, sign in to it in the same browser and run `accounts` again:
 the first account stays available from the vault until its session expires,
-even though the browser now shows the other one.
+even though the browser now shows the other one. Signing out on claude.ai
+revokes that session for good, so add a second Claude account from another
+browser or browser profile instead of signing out of the first.
 
 Authorize one-conv to read that browser's session, then verify account access:
 

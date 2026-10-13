@@ -1444,10 +1444,23 @@ def _claude_accounts():
     def identity(profile, organizations):
         return profile + ":" + ",".join(sorted(org["uuid"] for org in organizations))
 
+    saved: dict[str, object] = {}
+
     def remember(profile, cookies, organizations):
         key = identity(profile, organizations)
         verified.add(key)
-        vault.save("claude", key, profile, cookies)
+        names = ", ".join(org.get("name") or org["uuid"] for org in organizations)
+        vault.save("claude", key, profile, cookies, description=names)
+
+    def expired(profile, cookies):
+        entry = saved.get(cookies.get("sessionKey"))
+        if entry is None:
+            log.warning("The Claude login in %s is signed out; sign in again on claude.ai", profile)
+            return
+        # Signing out on claude.ai revokes the session server-side, so the saved copy is dead too.
+        vault.remove("claude", entry.identity)
+        log.warning("Removed the saved Claude session for %s: it was signed out on claude.ai. "
+                    "Sign in to it again to re-add it.", entry.description or entry.identity)
 
     def jars():
         live = list(_chatgpt_cookie_jars("claude.ai", "sessionKey"))
@@ -1456,9 +1469,10 @@ def _claude_accounts():
         # Lazy: live logins are verified first, so an older saved copy never overwrites them.
         for entry in vault.entries("claude"):
             if entry.cookies.get("sessionKey") not in live_keys and entry.identity not in verified:
+                saved[entry.cookies.get("sessionKey")] = entry
                 yield entry.label, entry.cookies
 
-    yield from claude_accounts(jars, on_verified=remember)
+    yield from claude_accounts(jars, on_verified=remember, on_expired=expired)
 
 
 def _chatgpt_client(jar: dict[str, str]):

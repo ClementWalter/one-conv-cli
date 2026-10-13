@@ -30,6 +30,7 @@ class VaultEntry:
     label: str
     cookies: dict[str, str]
     saved_at: float
+    description: str = ""
 
 
 def _private(metadata: os.stat_result) -> bool:
@@ -51,14 +52,15 @@ class SessionVault:
         digest = hashlib.sha256(identity.encode()).hexdigest()[:24]
         return self.root / f"{provider}-{digest}.json"
 
-    def save(self, provider: str, identity: str, label: str, cookies: dict[str, str]) -> None:
+    def save(self, provider: str, identity: str, label: str, cookies: dict[str, str],
+             description: str = "") -> None:
         if provider not in PROVIDERS:
             raise ValueError("Unsupported vault provider")
         directory = self._directory()
         target = self._path(provider, identity)
         temporary = directory / f".{target.name}.{os.getpid()}.tmp"
         payload = json.dumps({"provider": provider, "identity": identity, "label": label,
-                              "cookies": cookies, "saved_at": time.time()})
+                              "description": description, "cookies": cookies, "saved_at": time.time()})
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             with os.fdopen(descriptor, "w") as stream:
@@ -85,7 +87,10 @@ class SessionVault:
                                                             for k, v in cookies.items()):
                     continue
                 found.append(VaultEntry(provider, str(doc["identity"]), str(doc["label"]), cookies,
-                                        float(doc["saved_at"])))
+                                        float(doc["saved_at"]), str(doc.get("description") or "")))
             except (OSError, ValueError, KeyError, TypeError):
                 continue
         return sorted(found, key=lambda entry: entry.saved_at, reverse=True)
+
+    def remove(self, provider: str, identity: str) -> None:
+        self._path(provider, identity).unlink(missing_ok=True)

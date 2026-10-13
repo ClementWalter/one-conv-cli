@@ -165,3 +165,22 @@ class RefreshFailedSession:
 def test_refresh_error_counts_as_signed_out(app, monkeypatch):
     monkeypatch.setattr(app, "_chatgpt_client", lambda jar: RefreshFailedSession())
     assert app._chatgpt_authenticate({"__Secure-next-auth.session-token": "stale"}) is None
+
+
+def test_revoked_saved_login_is_removed(app, monkeypatch):
+    app._session_vault().save("claude", "chrome/Default:old-org", "chrome/Default", {"sessionKey": "gone"})
+    monkeypatch.setattr(app, "_chatgpt_cookie_jars", lambda *a: [("chrome/Default", {"sessionKey": "perso-key"})])
+    _organizations(app)
+    assert [entry.identity for entry in app._session_vault().entries("claude")] == ["chrome/Default:perso-org"]
+
+
+def test_saved_login_records_organization_names(app, monkeypatch):
+    monkeypatch.setattr(app, "_chatgpt_cookie_jars", lambda *a: [("chrome/Default", {"sessionKey": "zama-key"})])
+    _organizations(app)
+    assert app._session_vault().entries("claude")[0].description == "Zama"
+
+
+def test_remove_deletes_entry(vault):
+    vault.save("claude", "id-1", "chrome/Default", {"sessionKey": "k1"})
+    vault.remove("claude", "id-1")
+    assert vault.entries("claude") == []

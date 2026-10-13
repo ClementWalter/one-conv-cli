@@ -2085,12 +2085,7 @@ def _archive_state(query=None):
             client = configured_client()
             rows = list(client.list_conversations(query=query)) if client else []
             projects = {}
-            identities = {}
             for row in rows:
-                identity = row["source"], row["cwd"], row["session"]
-                if identity in identities and identities[identity] != row["origin"]:
-                    raise ArchiveError("Archive contains conflicting origins for the same source/project/session identity.")
-                identities[identity] = row["origin"]
                 projects.setdefault((row["source"], row["cwd"]), []).append(row)
             context.meta["archive"] = ({"client": client, "rows": rows, "projects": projects, "documents": {}}
                                        if client else None)
@@ -2184,8 +2179,12 @@ def _project_sessions(project: ProjectHandle) -> list[SessionHandle]:
     native = _native_project_sessions(project)
     by_id = {(h.source, h.project_cwd, h.uuid): h for h in native}
     archive = _archive_state()
+    origins = {}
     for row in archive["projects"].get((project.source, project.cwd), ()) if archive else ():
         identity = row["source"], row["cwd"], row["session"]
+        if identity in origins and origins[identity] != row["origin"]:
+            raise click.ClickException("Archive contains conflicting origins for the same source/project/session identity.")
+        origins[identity] = row["origin"]
         existing = by_id.get(identity)
         if existing and existing.mtime >= row["mtime"]:
             continue

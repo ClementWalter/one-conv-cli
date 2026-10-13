@@ -1,10 +1,12 @@
 """Conversation storage contract and SQLite implementation using SQLAlchemy Core."""
 
+import hashlib
 import json
 from typing import Protocol
 
-from sqlalchemy import Column, Float, MetaData, String, Table, Text, create_engine, select
+from sqlalchemy import Column, Float, LargeBinary, MetaData, String, Table, Text, create_engine, select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.sqlite import insert
 
 from one_conv.archive import conversation_key, encode, revision
 
@@ -17,6 +19,10 @@ class ConversationStore(Protocol):
     def list_conversations(self, after: str, query: str | None, limit: int) -> dict: ...
     def read_conversation(self, key: str, revision: str | None = None) -> dict | None: ...
     def put(self, document: dict, expected: str | None) -> dict: ...
+
+
+CHUNK_BYTES = 64 * 1024
+CAPTURE_FIELDS = ("turns", "turns_with_subagents", "search_text")
 
 
 class SQLiteStore:
@@ -34,6 +40,8 @@ class SQLiteStore:
         self.revisions = Table("revisions_v1", schema,
             Column("key", String, primary_key=True), Column("revision", String, primary_key=True),
             Column("document", Text, nullable=False))
+        self.chunks = Table("chunks_v1", schema,
+            Column("digest", String, primary_key=True), Column("data", LargeBinary, nullable=False))
         schema.create_all(self.engine)
 
     def list_conversations(self, after="", query=None, limit=100):
@@ -53,7 +61,43 @@ class SQLiteStore:
             statement = (select(r.c.document).where((r.c.key == key) & (r.c.revision == revision)) if revision else
                          select(r.c.document).join(h, (h.c.key == r.c.key) & (h.c.revision == r.c.revision)).where(h.c.key == key))
             row = conn.execute(statement).first()
-        return json.loads(row[0]) if row else None
+            return self._unpack(conn, json.loads(row[0])) if row else None
+
+    def _pack(self, conn, document):
+        pending = {}
+        def chunks(value):
+            payload = encode(value)
+            digests = []
+            for start in range(0, len(payload), CHUNK_BYTES):
+                data = payload[start:start + CHUNK_BYTES]
+                digest = hashlib.sha256(data).hexdigest()
+                pending[digest] = data
+                digests.append(digest)
+            return digests
+
+        # Chunk fields separately so appended turns do not shift original-record chunks.
+        manifest = {k: v for k, v in document.items() if k not in (*CAPTURE_FIELDS, "originals")}
+        manifest["_chunks"] = {field: chunks(document[field]) for field in CAPTURE_FIELDS}
+        manifest["_original_chunks"] = {path: chunks(value) for path, value in document["originals"].items()}
+        conn.execute(insert(self.chunks).on_conflict_do_nothing(),
+            [{"digest": digest, "data": data} for digest, data in pending.items()])
+        return manifest
+
+    def _unpack(self, conn, document):
+        if "_chunks" not in document:
+            return document  # Captures written before chunk storage remain readable.
+        fields = document.pop("_chunks")
+        originals = document.pop("_original_chunks")
+        digests = list({digest for parts in (*fields.values(), *originals.values()) for digest in parts})
+        data = {}
+        for start in range(0, len(digests), 500):
+            data.update(conn.execute(select(self.chunks.c.digest, self.chunks.c.data).where(
+                self.chunks.c.digest.in_(digests[start:start + 500]))).all())
+        def restore(parts):
+            return json.loads(b"".join(data[digest] for digest in parts))
+        document.update({field: restore(parts) for field, parts in fields.items()})
+        document["originals"] = {path: restore(parts) for path, parts in originals.items()}
+        return document
 
     def put(self, document, expected):
         key = conversation_key(document["origin"], document["source"], document["cwd"], document["session"])
@@ -70,8 +114,8 @@ class SQLiteStore:
                 if (current.revision if current else None) != expected or (current and current.mtime > document["mtime"]):
                     raise Conflict("Conversation changed; resync from its current source.")
                 if current:
-                    previous = json.loads(conn.execute(select(r.c.document).where(
-                        (r.c.key == key) & (r.c.revision == current.revision))).scalar_one())
+                    previous = self._unpack(conn, json.loads(conn.execute(select(r.c.document).where(
+                        (r.c.key == key) & (r.c.revision == current.revision))).scalar_one()))
                     for field in ("turns", "turns_with_subagents"):
                         old = previous[field] if previous[field] is not None else previous["turns"]
                         new = document[field] if document[field] is not None else document["turns"]
@@ -83,7 +127,7 @@ class SQLiteStore:
                 else:
                     conn.execute(h.insert().values(key=key, **values))
                 if not conn.execute(select(r.c.key).where((r.c.key == key) & (r.c.revision == digest))).first():
-                    conn.execute(r.insert().values(key=key, revision=digest, document=encode(document).decode()))
+                    conn.execute(r.insert().values(key=key, revision=digest, document=encode(self._pack(conn, document)).decode()))
         except IntegrityError as error:
             raise Conflict("Concurrent sync; retry.") from error
         return {"key": key, "revision": digest}

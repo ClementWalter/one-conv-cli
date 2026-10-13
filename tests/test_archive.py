@@ -232,3 +232,88 @@ def test_unavailable_archive_is_not_an_empty_result(tmp_path):
         result = run(env, "bin/one-conv", "local", "search", "Quartz", "--source", "claude", "--json", success=False)
         assert result.returncode != 0 and "unavailable" in result.stderr
         assert result.stdout == ""
+
+
+def test_failed_capture_does_not_starve_older_history(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    older = path.with_name("older-unarchived.jsonl")
+    older.write_bytes(path.read_bytes())
+    os.utime(older, (path.stat().st_mtime - 20,) * 2)
+    path.write_text(path.read_text().replace("forty-two", "rewritten"))
+    before = {p: p.read_bytes() for p in (older, path)}
+    result = run(env, "scripts/archive-sync.py", "--source", "claude", success=False)
+    assert result.returncode == 1
+    assert {row["session"] for row in client.list_conversations()} == {"session-one", "older-unarchived"}
+    assert "claude/session-one" in result.stderr and "409" in result.stderr
+    assert json.loads(result.stdout) == {"uploaded": 1, "unchanged": 0, "failed": 1}
+    assert {p: p.read_bytes() for p in before} == before
+
+
+def test_collision_does_not_break_other_sources_or_projects(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    row = list(client.list_conversations())[0]
+    document = client.read_conversation(row["key"])
+    document["origin"] = "second-machine"
+    client.put(document, None)
+    assert run(env, "bin/one-conv", "local", "chats", "--source", "codex", "--json") == []
+    document["cwd"] = document["summary"]["cwd"] = "/example/independent"
+    client.put(document, None)
+    assert len(list(client.list_conversations())) == 3  # Both conflicting captures still exist.
+    results = run(env, "bin/one-conv", "local", "search", "Quartz", "--project", "independent", "--source", "claude", "--json")
+    assert len(results) == 1 and results[0]["cwd"] == "/example/independent"
+
+
+def test_revisions_share_unchanged_payload_and_restore_exactly(tmp_path, archive):
+    import copy
+    import random
+    store, client, url = archive
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    row = list(client.list_conversations())[0]
+    document = client.read_conversation(row["key"])
+    # Incompressible records prevent compression from disguising repeated full copies.
+    native = random.Random(42).randbytes(1024 * 1024)
+    document["originals"] = {"record": base64.b64encode(native).decode()}
+    expected = row["revision"]
+    captures = []
+    for i in range(10):
+        document["mtime"] += 1
+        text = f"Appended message {i}"
+        document["turns"].append({"ts": "", "role": "user", "blocks": [{"type": "text", "text": text}]})
+        document["search_text"].append(text)
+        native += text.encode()
+        document["originals"]["record"] = base64.b64encode(native).decode()
+        expected = client.put(document, expected)["revision"]
+        captures.append((expected, copy.deepcopy(document)))
+    for digest, capture in captures:
+        assert client.read_conversation(row["key"], digest) == capture
+    # Ten growing captures should cost near one payload, not ten payloads.
+    assert Path(store.engine.url.database).stat().st_size < 3 * 1024 * 1024
+
+
+def test_existing_full_captures_survive_chunked_updates(tmp_path, archive):
+    from one_conv.archive import encode
+    store, client, url = archive
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    row = list(client.list_conversations())[0]
+    old = client.read_conversation(row["key"])
+    # Recreate the full-document row written by the previous archive version.
+    with store.engine.begin() as conn:
+        conn.execute(store.revisions.update().where(store.revisions.c.key == row["key"]).values(document=encode(old).decode()))
+    write_claude(env, extra=True)
+    assert run(env, "scripts/archive-sync.py", "--source", "claude")["uploaded"] == 1
+    assert client.read_conversation(row["key"], row["revision"]) == old
+    assert client.read_conversation(row["key"])["turns"][-1]["blocks"][0]["text"] == "An additional message"

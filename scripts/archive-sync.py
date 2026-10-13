@@ -121,25 +121,33 @@ def main():
     existing = {row["key"]: row["revision"] for row in client.list_conversations()}
     projects = [p for p in reader._native_projects(tuple(args.source)) if not args.project or args.project.lower() in p.cwd.lower()]
     handles = sorted((h for p in projects for h in reader._native_project_sessions(p)), key=lambda h: h.mtime, reverse=True)
-    uploaded = unchanged = 0
+    uploaded = unchanged = failed = 0
     for handle in handles[:args.limit] if args.limit else handles:
-        document = capture(reader, handle, origin)
-        key = conversation_key(origin, handle.source, handle.project_cwd, handle.uuid)
-        digest = revision(document)
-        if existing.get(key) == digest:
-            unchanged += 1
-            continue
-        receipt = client.put(document, existing.get(key))
-        if receipt != {"key": key, "revision": digest}:
-            raise ArchiveError("Archive acknowledgement does not match the uploaded capture")
-        existing[key] = digest
-        uploaded += 1
-    print(json.dumps({"uploaded": uploaded, "unchanged": unchanged}))
+        try:
+            document = capture(reader, handle, origin)
+            key = conversation_key(origin, handle.source, handle.project_cwd, handle.uuid)
+            digest = revision(document)
+            if existing.get(key) == digest:
+                unchanged += 1
+                continue
+            receipt = client.put(document, existing.get(key))
+            if receipt != {"key": key, "revision": digest}:
+                raise ArchiveError("Archive acknowledgement does not match the uploaded capture")
+            existing[key] = digest
+            uploaded += 1
+        except (ArchiveError, OSError, ValueError, sqlite3.Error) as error:
+            failed += 1
+            print(f"{handle.source}/{handle.uuid}: {error}", file=sys.stderr)
+    result = {"uploaded": uploaded, "unchanged": unchanged}
+    if failed:
+        result["failed"] = failed
+    print(json.dumps(result))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except (ArchiveError, OSError, ValueError, sqlite3.Error) as error:
         print(str(error), file=sys.stderr)
         sys.exit(1)

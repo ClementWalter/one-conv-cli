@@ -25,11 +25,13 @@ def _claude_session(cookies):
     return session
 
 
-def claude_accounts(cookie_jars, *, session_factory=None):
+def claude_accounts(cookie_jars, *, session_factory=None, on_verified=None):
     """Yield verified organization-scoped sessions from the launcher's cookie reader.
 
     Profile and organization both scope history because different users can
     belong to the same organization. Missing user email remains unknown.
+    `on_verified(profile, cookies, organizations)` runs once per session whose
+    organizations validated, so callers can keep it beyond the browser's login.
     """
     factory = session_factory or _claude_session
     seen = set()
@@ -49,6 +51,7 @@ def claude_accounts(cookie_jars, *, session_factory=None):
             continue
         if not isinstance(organizations, list):
             raise SchemaChanged("Claude organization response must be an array")
+        accounts = []
         for organization in organizations:
             if not isinstance(organization, dict):
                 raise SchemaChanged("Claude returned an invalid organization")
@@ -60,11 +63,14 @@ def claude_accounts(cookie_jars, *, session_factory=None):
             if scoped_id in seen:
                 continue
             seen.add(scoped_id)
-            yield {
+            accounts.append({
                 "session": session,
                 "account_id": scoped_id,
                 "email": None,
                 "organization_id": identifier,
                 "organization_label": label,
                 "profile": profile,
-            }
+            })
+        if on_verified is not None and organizations:
+            on_verified(profile, cookies, organizations)
+        yield from accounts

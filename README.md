@@ -36,9 +36,13 @@ open Claude's sign-in page with:
 one-conv cloud claude connect --login --browser chrome
 ```
 
-Finish signing in in the browser. If it already has your personal account
-signed in, switch to your work account there, or use separate browser profiles
-to keep both accounts available. Opening the page does not verify the login.
+Finish signing in in the browser. Opening the page does not verify the login.
+
+Every session one-conv verifies is saved in a private session vault
+(`~/.config/one-conv-cli/sessions`, files readable only by you). To add a
+second account, sign in to it in the same browser and run `accounts` again:
+the first account stays available from the vault until its session expires,
+even though the browser now shows the other one.
 
 Authorize one-conv to read that browser's session, then verify account access:
 

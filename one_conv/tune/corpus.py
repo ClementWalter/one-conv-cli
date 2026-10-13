@@ -74,3 +74,14 @@ def load_sessions(roots: list[Path], sources: tuple[str, ...] = AGENT_SOURCES,
             if current is None or session.mtime > current.mtime:
                 newest[session.key] = session
     return sorted(newest.values(), key=lambda s: s.mtime)
+
+
+def merge_runs(messages: tuple[Message, ...]) -> list[Message]:
+    """Join consecutive same-role messages; exports split one agent turn per tool call."""
+    merged: list[Message] = []
+    for message in messages:
+        if merged and merged[-1].role == message.role:
+            merged[-1] = Message(message.role, merged[-1].text + "\n\n" + message.text)
+        else:
+            merged.append(message)
+    return merged

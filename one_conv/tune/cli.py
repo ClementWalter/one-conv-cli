@@ -1,8 +1,11 @@
 """`one-conv tune`: snapshot history, build datasets, train LoRA adapters and rank runs."""
 
 import json
+import os
+import random
 import shlex
 import subprocess
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
@@ -10,6 +13,7 @@ import click
 
 from .corpus import AGENT_SOURCES, load_sessions
 from .dataset import write_dataset
+from .label import LABELS, jev_classifier, label_moments, load_labels, moments
 from .metrics import drift_table, rank_runs
 from .rules import RULES
 from .runs import (
@@ -51,6 +55,13 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
                      corpus_roots: Callable[[], list[Path]]) -> click.Group:
     """`snapshot` exports this machine's sources; `corpus_roots` lists shared exports from other machines."""
 
+    def _sessions(home, extra_roots=(), sources=(), include_system=False):
+        roots = [home / "snapshot", *corpus_roots(), *extra_roots]
+        roots = [root for root in roots if root.expanduser().is_dir()]
+        if not roots:
+            raise click.ClickException("No exported sessions found. Run: one-conv tune snapshot")
+        return load_sessions(roots, tuple(sources) or AGENT_SOURCES, include_system)
+
     @click.group("tune", context_settings=HELP)
     def tune():
         """Fine-tune a local model on your own agent history.
@@ -58,7 +69,8 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         \b
         Pipeline:
           one-conv tune snapshot
-          one-conv tune dataset --name base
+          one-conv tune label
+          one-conv tune dataset --name base --labels
           one-conv tune train --dataset base --run first
           one-conv tune eval --run first
           one-conv tune probe --run first --rule no-comments
@@ -96,8 +108,13 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
     @click.option("--max-chars", default=12_000, show_default=True,
                   help="Characters per example, history included (~4 per token). Keep under train --max-seq-length.")
     @click.option("--include-system", is_flag=True, help="Keep heartbeat and worker sessions.")
+    @click.option("--labels/--keywords", "use_labels", default=False,
+                  help="Use classifier labels from `tune label` instead of the keyword heuristic.")
+    @click.option("--min-probability", default=0.6, show_default=True,
+                  help="With --labels, ignore moments whose label probability is below this.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the manifest as JSON.")
-    def dataset(name, extra_roots, sources, rule, valid, test, max_context_messages, max_chars, include_system, as_json):
+    def dataset(name, extra_roots, sources, rule, valid, test, max_context_messages, max_chars, include_system,
+                use_labels, min_probability, as_json):
         """Build SFT examples and DPO pairs from exported sessions.
 
         Accepted assistant turns become SFT targets. A turn followed by a
@@ -111,14 +128,15 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
           one-conv tune dataset --name no-comments --rule no-comments
         """
         home = tune_home()
-        roots = [home / "snapshot", *corpus_roots(), *extra_roots]
-        roots = [root for root in roots if root.expanduser().is_dir()]
-        if not roots:
-            raise click.ClickException("No exported sessions found. Run: one-conv tune snapshot")
-        sessions = load_sessions(roots, tuple(sources) or AGENT_SOURCES, include_system)
+        sessions = _sessions(home, extra_roots, sources, include_system)
+        labels = None
+        if use_labels:
+            labels = load_labels(home / "labels" / "jev.jsonl")
+            if not labels:
+                raise click.ClickException("No labels yet. Run: one-conv tune label")
         out = home / "datasets" / name
         manifest = write_dataset(sessions, out, valid, test, RULES[rule] if rule else None,
-                                 max_context_messages, max_chars)
+                                 max_context_messages, max_chars, labels, min_probability)
         if as_json:
             click.echo(json.dumps({"dataset": str(out), **manifest}))
             return
@@ -128,6 +146,78 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             click.echo(f"  {kind}: " + ", ".join(f"{split} {n}" for split, n in counts[kind].items()))
         if rule:
             click.echo(f"  rule {rule}: {manifest['rule_rewritten_targets']} target(s) rewritten")
+
+    @tune.command(context_settings=HELP)
+    @click.option("--limit", default=0, show_default=True, help="Label at most this many new moments (0 = all).")
+    @click.option("--workers", default=8, show_default=True, help="Concurrent classifier requests.")
+    @click.option("--dry-run", is_flag=True, help="Count pending moments and estimate cost without calling the API.")
+    def label(limit, workers, dry_run):
+        """Classify your reaction to every assistant reply with Jev.
+
+        Each moment (your request, the reply, your next message) gets one
+        label: accepted, correction_preference, correction_new_info,
+        new_task, question or unclear, with calibrated probabilities. Labels
+        are cached by content, so reruns only classify new moments. Needs
+        TYPESAFE_API_KEY.
+
+        \b
+        Examples:
+          one-conv tune label --dry-run
+          one-conv tune label --limit 50
+          one-conv tune review
+        """
+        home = tune_home()
+        out = home / "labels" / "jev.jsonl"
+        done = load_labels(out)
+        pending, queued = [], set()
+        for session in _sessions(home):
+            for moment in moments(session):
+                if moment.key not in done and moment.key not in queued:
+                    queued.add(moment.key)
+                    pending.append(moment)
+        if limit:
+            pending = pending[:limit]
+        chars = sum(len(json.dumps(m.state)) for m in pending)
+        # ~4 characters per token, plus the question; Jev bills input tokens at $0.042 per million.
+        tokens = chars // 4 + 400 * len(pending)
+        click.echo(f"{len(done)} labeled, {len(pending)} to label, ~{tokens / 1e6:.1f}M tokens (~${tokens * 0.042 / 1e6:.2f})")
+        if dry_run or not pending:
+            return
+        api_key = os.environ.get("TYPESAFE_API_KEY")
+        if not api_key:
+            raise click.ClickException("Set TYPESAFE_API_KEY (console.typesafe.ai/settings/keys).")
+        try:
+            count = label_moments(pending, jev_classifier(api_key), out, workers)
+        except RuntimeError as error:
+            raise click.ClickException(f"{error}. Labels written so far are kept; rerun to resume.") from None
+        click.echo(f"Labeled {count} moment(s) into {out}")
+
+    @tune.command(context_settings=HELP)
+    @click.option("-n", "count", default=20, show_default=True, help="Moments to show.")
+    @click.option("--label", "only", type=click.Choice(LABELS), default=None, help="Only this label.")
+    @click.option("--seed", default=0, show_default=True)
+    def review(count, only, seed):
+        """Show label counts and a random sample to check the classifier against your own judgment.
+
+        \b
+        Examples:
+          one-conv tune review
+          one-conv tune review --label correction_preference -n 30
+        """
+        home = tune_home()
+        labels = load_labels(home / "labels" / "jev.jsonl")
+        if not labels:
+            raise click.ClickException("No labels yet. Run: one-conv tune label")
+        totals = Counter(row["label"] for row in labels.values())
+        click.echo("  ".join(f"{name}={totals.get(name, 0)}" for name in LABELS))
+        states = {m.key: m.state for session in _sessions(home) for m in moments(session)}
+        rows = [row for row in labels.values() if row["key"] in states and (only is None or row["label"] == only)]
+        for row in random.Random(seed).sample(rows, min(count, len(rows))):
+            state = states[row["key"]]
+            probability = row["probabilities"][row["label"]]
+            click.echo(f"\n[{row['label']} {probability:.2f}]")
+            click.echo("  reply: " + state["assistant_reply"][:200].replace("\n", " "))
+            click.echo("  you:   " + state["user_next_message"][:300].replace("\n", " "))
 
     @tune.command(context_settings=HELP)
     @click.option("--dataset", "dataset_name", default="base", show_default=True)

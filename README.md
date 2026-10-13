@@ -258,7 +258,9 @@ through `uv`; the launcher itself does not depend on it.
 
 ```bash
 one-conv tune snapshot                      # export every local and cached cloud session
-one-conv tune dataset --name base           # SFT examples + DPO correction pairs
+one-conv tune label                         # classify every reaction with Jev (needs TYPESAFE_API_KEY)
+one-conv tune review                        # spot-check labels against your own judgment
+one-conv tune dataset --name base --labels  # SFT examples + DPO correction pairs from the labels
 one-conv tune train --dataset base --run first
 one-conv tune eval --run first              # perplexity and preference accuracy, base vs adapter
 one-conv tune probe --run first --rule no-comments
@@ -267,10 +269,14 @@ one-conv tune runs                          # rank runs by a metric
 
 The dataset is built from the export format: user and assistant text, with
 tool calls summarized, tool output dropped, and secrets redacted. Sessions
-written by heartbeats and workers are skipped. An assistant turn followed by
-a correction ("no", "revert", "pas ça", ...) becomes the rejected side of a
-preference pair, and the next assistant turn becomes the chosen side. Every
-other assistant turn is an SFT target. Splits are assigned per session, so
+written by heartbeats and workers are skipped. `tune label` asks
+[Jev](https://docs.typesafe.ai) how you reacted to each assistant reply:
+accepted, a correction you could have been spared (preference), a correction
+based on facts the agent could not know (new information), a new task, a
+question, or unclear. With `--labels`, confidently accepted replies become
+SFT targets, and corrected ones become the rejected side of a preference pair
+whose chosen side is the next reply. Without it, a keyword heuristic ("no",
+"revert", "pas ça", ...) stands in for the classifier. Splits are assigned per session, so
 evaluation never sees a training conversation.
 
 `probe` measures how often a rule is broken as real history accumulates in

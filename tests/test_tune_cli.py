@@ -86,3 +86,25 @@ def test_probe_metrics_reads_longest_context():
     rows = [{"variant": "prefix", "context_tokens": 0, "violated": False},
             {"variant": "prefix", "context_tokens": 16000, "violated": True}]
     assert probe_metrics({"rows": rows}) == {"prefix_violation@16000": 1.0}
+
+
+def test_label_dry_run_counts_pending(home, tune):
+    result = CliRunner().invoke(tune, ["label", "--dry-run"])
+    assert result.output.startswith("0 labeled, 0 to label")
+
+
+def test_label_requires_api_key(home, tmp_path, monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    root = tmp_path / "answered"
+    root.mkdir()
+    (root / "s.json").write_text(json.dumps({
+        "source": "codex", "session": "s2", "cwd": "/repo", "author": "human", "mtime": 1.0,
+        "turns": [{"role": "user", "text": "a"}, {"role": "assistant", "text": "b"}, {"role": "user", "text": "c"}]}))
+    tune = build_tune_group(snapshot=lambda out: (0, 0), corpus_roots=lambda: [root])
+    result = CliRunner().invoke(tune, ["label"])
+    assert "TYPESAFE_API_KEY" in result.output
+
+
+def test_dataset_with_labels_requires_labels(home, tune):
+    result = CliRunner().invoke(tune, ["dataset", "--labels"])
+    assert "one-conv tune label" in result.output

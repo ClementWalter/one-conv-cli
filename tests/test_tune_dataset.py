@@ -45,7 +45,7 @@ def test_merge_joins_same_role_runs():
 def test_correction_yields_preference_pair(corrected):
     _, pairs = session_examples(corrected)
     assert pairs == [PreferencePair((Message("user", "Add caching"),), chosen="Added one dict",
-                                    rejected="Added three abstraction layers")]
+                                    rejected="Added three abstraction layers", correction="No, keep it simple")]
 
 
 def test_corrected_turn_is_not_an_sft_target(corrected):

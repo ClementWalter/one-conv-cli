@@ -13,7 +13,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .corpus import Message, Session
+from .corpus import Message, Session, merge_runs
+from .label import CORRECTIONS, moment_key, moment_state
 from .rules import Rule
 
 log = logging.getLogger(__name__)
@@ -33,17 +34,6 @@ def is_correction(text: str) -> bool:
     return bool(_CORRECTION_RE.match(text))
 
 
-def merge_runs(messages: tuple[Message, ...]) -> list[Message]:
-    """Join consecutive same-role messages; exports split one agent turn per tool call."""
-    merged: list[Message] = []
-    for message in messages:
-        if merged and merged[-1].role == message.role:
-            merged[-1] = Message(message.role, merged[-1].text + "\n\n" + message.text)
-        else:
-            merged.append(message)
-    return merged
-
-
 @dataclass(frozen=True)
 class SFTExample:
     messages: tuple[Message, ...]
@@ -54,6 +44,8 @@ class PreferencePair:
     prompt: tuple[Message, ...]
     chosen: str
     rejected: str
+    kind: str = "correction"
+    correction: str = ""
 
 
 def _context(messages: list[Message], end: int, max_messages: int, budget: int) -> tuple[Message, ...]:
@@ -68,8 +60,10 @@ def _context(messages: list[Message], end: int, max_messages: int, budget: int) 
     return tuple(window)
 
 
-def session_examples(session: Session, max_context_messages: int = 16,
-                     max_chars: int = 12_000) -> tuple[list[SFTExample], list[PreferencePair]]:
+def session_examples(session: Session, max_context_messages: int = 16, max_chars: int = 12_000,
+                     labels: dict[str, dict] | None = None,
+                     min_probability: float = 0.6) -> tuple[list[SFTExample], list[PreferencePair]]:
+    """Without `labels`, a keyword heuristic spots corrections; with them, only confident labels count."""
     messages = merge_runs(session.messages)
     sft: list[SFTExample] = []
     pairs: list[PreferencePair] = []
@@ -77,14 +71,27 @@ def session_examples(session: Session, max_context_messages: int = 16,
         if message.role != "assistant":
             continue
         follow = messages[index + 1] if index + 1 < len(messages) else None
-        if follow is not None and is_correction(follow.text):
+        if labels is None:
+            verdict = "correction" if follow is not None and is_correction(follow.text) else "accepted"
+        elif follow is None or follow.role != "user" or index == 0:
+            # A reply nobody answered carries no acceptance signal.
+            continue
+        else:
+            row = labels.get(moment_key(moment_state(messages, index)))
+            if row is None or row["probabilities"].get(row["label"], 0.0) < min_probability:
+                continue
+            verdict = row["label"]
+        if verdict == "correction" or verdict in CORRECTIONS:
             retry = messages[index + 2] if index + 2 < len(messages) else None
             if retry is None or retry.role != "assistant":
                 continue
             budget = max_chars - max(len(retry.text), len(message.text))
             context = _context(messages, index, max_context_messages, budget)
             if context:
-                pairs.append(PreferencePair(context, chosen=retry.text, rejected=message.text))
+                pairs.append(PreferencePair(context, chosen=retry.text, rejected=message.text,
+                                            kind=verdict, correction=follow.text))
+            continue
+        if verdict != "accepted":
             continue
         context = _context(messages, index, max_context_messages, max_chars - len(message.text))
         if context:
@@ -120,7 +127,8 @@ def _first_time(line: str, seen: set[str]) -> bool:
 
 
 def write_dataset(sessions: list[Session], out_dir: Path, valid: float = 0.05, test: float = 0.05,
-                  rule: Rule | None = None, max_context_messages: int = 16, max_chars: int = 12_000) -> dict:
+                  rule: Rule | None = None, max_context_messages: int = 16, max_chars: int = 12_000,
+                  labels: dict[str, dict] | None = None, min_probability: float = 0.6) -> dict:
     """Write mlx-lm chat JSONL under sft/ and preference JSONL under dpo/; return the manifest."""
     counts = {kind: {split: 0 for split in SPLITS} for kind in ("sft", "dpo")}
     rewritten = duplicates = 0
@@ -134,7 +142,7 @@ def write_dataset(sessions: list[Session], out_dir: Path, valid: float = 0.05, t
     try:
         for session in sessions:
             split = split_of(session.key, valid, test)
-            sft, pairs = session_examples(session, max_context_messages, max_chars)
+            sft, pairs = session_examples(session, max_context_messages, max_chars, labels, min_probability)
             for example in sft:
                 if rule is not None:
                     transformed = apply_rule(example, rule)
@@ -148,7 +156,8 @@ def write_dataset(sessions: list[Session], out_dir: Path, valid: float = 0.05, t
                     duplicates += 1
             for pair in pairs:
                 line = json.dumps({"prompt": _chat(pair.prompt), "chosen": pair.chosen,
-                                   "rejected": pair.rejected}, ensure_ascii=False)
+                                   "rejected": pair.rejected, "kind": pair.kind,
+                                   "correction": pair.correction}, ensure_ascii=False)
                 if _first_time(line, seen):
                     handles["dpo", split].write(line + "\n")
                     counts["dpo"][split] += 1
@@ -159,7 +168,8 @@ def write_dataset(sessions: list[Session], out_dir: Path, valid: float = 0.05, t
             handle.close()
     manifest = {"sessions": len(sessions), "counts": counts, "rule": rule.name if rule else None,
                 "rule_rewritten_targets": rewritten, "duplicates_skipped": duplicates, "valid": valid, "test": test,
-                "max_context_messages": max_context_messages, "max_chars": max_chars}
+                "max_context_messages": max_context_messages, "max_chars": max_chars,
+                "labeled": labels is not None, "min_probability": min_probability if labels is not None else None}
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     log.info("Wrote dataset to %s: %s", out_dir, counts)
     return manifest

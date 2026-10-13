@@ -1,4 +1,4 @@
-"""Classify how the user reacted to each assistant reply, with a calibrated decision model.
+"""Classify how the user reacted to each assistant reply, with a calibrated decision model (Jev or SubQ Snap).
 
 Every (assistant reply, next user message) moment gets one label. The labels
 replace keyword heuristics when building datasets: only clearly accepted
@@ -20,12 +20,29 @@ from .corpus import Message, Session, merge_runs
 
 log = logging.getLogger(__name__)
 
-JEV_URL = "https://api.typesafe.ai/v1/systemone"
-JEV_MODEL = "jev-latest"
+
+
+@dataclass(frozen=True)
+class Provider:
+    name: str
+    url: str
+    model: str
+    key_env: str
+    usd_per_million: float
+    console: str
+
+
+# Both serve the same System One decisions contract; only endpoint, model and key differ.
+PROVIDERS = {
+    "jev": Provider("jev", "https://api.typesafe.ai/v1/systemone", "jev-latest", "TYPESAFE_API_KEY",
+                    0.042, "console.typesafe.ai/settings/keys"),
+    "subq": Provider("subq", "https://api.subq.ai/v1/systemone", "subq-snap-preview", "SUBQ_API_KEY",
+                     0.05, "console.subq.ai"),
+}
 LABELS = ("accepted", "correction_preference", "correction_new_info", "new_task", "question", "unclear")
 CORRECTIONS = ("correction_preference", "correction_new_info")
 
-# Jev reads at most 32k tokens of state; these caps keep each moment well inside it.
+# Jev reads at most 32k tokens of state; these caps keep each moment inside it for every provider.
 _MAX_REQUEST_CHARS = 4_000
 _MAX_REPLY_CHARS = 12_000
 _MAX_NEXT_CHARS = 4_000
@@ -101,16 +118,17 @@ def load_labels(path: Path) -> dict[str, dict]:
 Classifier = Callable[[dict], dict]
 
 
-def jev_classifier(api_key: str, post: Callable | None = None, max_attempts: int = 6) -> Classifier:
-    """Return a function mapping a moment's state to Jev's reaction answer."""
+def decision_classifier(provider: Provider, api_key: str, post: Callable | None = None,
+                        max_attempts: int = 6) -> Classifier:
+    """Return a function mapping a moment's state to the provider's reaction answer."""
     if post is None:
         from curl_cffi import requests
         post = requests.post
 
     def classify(state: dict) -> dict:
-        body = {"model": JEV_MODEL, "state": state, "questions": {"reaction": REACTION_QUESTION}}
+        body = {"model": provider.model, "state": state, "questions": {"reaction": REACTION_QUESTION}}
         for attempt in range(max_attempts):
-            response = post(JEV_URL, json=body, timeout=60, headers={"Authorization": f"Bearer {api_key}"})
+            response = post(provider.url, json=body, timeout=60, headers={"Authorization": f"Bearer {api_key}"})
             if response.status_code in (429, 529) and attempt + 1 < max_attempts:
                 retry_after = response.headers.get("retry-after")
                 delay = float(retry_after) if retry_after else 2 ** attempt
@@ -118,13 +136,13 @@ def jev_classifier(api_key: str, post: Callable | None = None, max_attempts: int
                 continue
             if response.status_code != 200:
                 detail = response.json().get("detail") if "json" in response.headers.get("content-type", "") else None
-                raise RuntimeError(f"Jev returned HTTP {response.status_code}: {detail}")
+                raise RuntimeError(f"{provider.name} returned HTTP {response.status_code}: {detail}")
             payload = response.json()
             answer = payload["answers"]["reaction"]
             return {"label": answer["choice"], "probabilities": answer["probabilities"],
                     "confidence": answer["confidence"], "model": payload["model"],
                     "input_tokens": payload["usage"]["input_tokens"]}
-        raise RuntimeError("Jev stayed rate-limited")
+        raise RuntimeError(f"{provider.name} stayed rate-limited")
     return classify
 
 

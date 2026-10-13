@@ -258,7 +258,7 @@ through `uv`; the launcher itself does not depend on it.
 
 ```bash
 one-conv tune snapshot                      # export every local and cached cloud session
-one-conv tune label                         # classify every reaction with Jev (needs TYPESAFE_API_KEY)
+one-conv tune label                         # classify every reaction with SubQ Snap (SUBQ_API_KEY) or --provider jev
 one-conv tune review                        # spot-check labels against your own judgment
 one-conv tune dataset --name base --labels  # SFT examples + DPO correction pairs from the labels
 one-conv tune train --dataset base --run first
@@ -269,8 +269,8 @@ one-conv tune runs                          # rank runs by a metric
 
 The dataset is built from the export format: user and assistant text, with
 tool calls summarized, tool output dropped, and secrets redacted. Sessions
-written by heartbeats and workers are skipped. `tune label` asks
-[Jev](https://docs.typesafe.ai) how you reacted to each assistant reply:
+written by heartbeats and workers are skipped. `tune label` asks a decision model,
+[SubQ Snap](https://docs.subq.ai) or [Jev](https://docs.typesafe.ai), how you reacted to each assistant reply:
 accepted, a correction you could have been spared (preference), a correction
 based on facts the agent could not know (new information), a new task, a
 question, or unclear. With `--labels`, confidently accepted replies become

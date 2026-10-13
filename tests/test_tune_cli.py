@@ -94,7 +94,7 @@ def test_label_dry_run_counts_pending(home, tune):
 
 
 def test_label_requires_api_key(home, tmp_path, monkeypatch):
-    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.delenv("SUBQ_API_KEY", raising=False)
     root = tmp_path / "answered"
     root.mkdir()
     (root / "s.json").write_text(json.dumps({
@@ -102,7 +102,7 @@ def test_label_requires_api_key(home, tmp_path, monkeypatch):
         "turns": [{"role": "user", "text": "a"}, {"role": "assistant", "text": "b"}, {"role": "user", "text": "c"}]}))
     tune = build_tune_group(snapshot=lambda out: (0, 0), corpus_roots=lambda: [root])
     result = CliRunner().invoke(tune, ["label"])
-    assert "TYPESAFE_API_KEY" in result.output
+    assert "SUBQ_API_KEY" in result.output
 
 
 def test_dataset_with_labels_requires_labels(home, tune):

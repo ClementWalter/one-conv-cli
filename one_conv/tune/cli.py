@@ -13,7 +13,14 @@ import click
 
 from .corpus import AGENT_SOURCES, load_sessions
 from .dataset import write_dataset
-from .label import LABELS, jev_classifier, label_moments, load_labels, moments
+from .label import (
+    LABELS,
+    PROVIDERS,
+    decision_classifier,
+    label_moments,
+    load_labels,
+    moments,
+)
 from .metrics import drift_table, rank_runs
 from .rules import RULES
 from .runs import (
@@ -108,13 +115,15 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
     @click.option("--max-chars", default=12_000, show_default=True,
                   help="Characters per example, history included (~4 per token). Keep under train --max-seq-length.")
     @click.option("--include-system", is_flag=True, help="Keep heartbeat and worker sessions.")
+    @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="subq", show_default=True,
+                  help="Decision model that labeled (or labels) the moments.")
     @click.option("--labels/--keywords", "use_labels", default=False,
                   help="Use classifier labels from `tune label` instead of the keyword heuristic.")
     @click.option("--min-probability", default=0.6, show_default=True,
                   help="With --labels, ignore moments whose label probability is below this.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the manifest as JSON.")
     def dataset(name, extra_roots, sources, rule, valid, test, max_context_messages, max_chars, include_system,
-                use_labels, min_probability, as_json):
+                provider, use_labels, min_probability, as_json):
         """Build SFT examples and DPO pairs from exported sessions.
 
         Accepted assistant turns become SFT targets. A turn followed by a
@@ -131,9 +140,9 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         sessions = _sessions(home, extra_roots, sources, include_system)
         labels = None
         if use_labels:
-            labels = load_labels(home / "labels" / "jev.jsonl")
+            labels = load_labels(home / "labels" / f"{provider}.jsonl")
             if not labels:
-                raise click.ClickException("No labels yet. Run: one-conv tune label")
+                raise click.ClickException(f"No labels yet. Run: one-conv tune label --provider {provider}")
         out = home / "datasets" / name
         manifest = write_dataset(sessions, out, valid, test, RULES[rule] if rule else None,
                                  max_context_messages, max_chars, labels, min_probability)
@@ -148,26 +157,30 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             click.echo(f"  rule {rule}: {manifest['rule_rewritten_targets']} target(s) rewritten")
 
     @tune.command(context_settings=HELP)
+    @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="subq", show_default=True,
+                  help="Decision model that labeled (or labels) the moments.")
     @click.option("--limit", default=0, show_default=True, help="Label at most this many new moments (0 = all).")
     @click.option("--workers", default=8, show_default=True, help="Concurrent classifier requests.")
     @click.option("--dry-run", is_flag=True, help="Count pending moments and estimate cost without calling the API.")
-    def label(limit, workers, dry_run):
-        """Classify your reaction to every assistant reply with Jev.
+    def label(provider, limit, workers, dry_run):
+        """Classify your reaction to every assistant reply with a decision model.
 
         Each moment (your request, the reply, your next message) gets one
         label: accepted, correction_preference, correction_new_info,
         new_task, question or unclear, with calibrated probabilities. Labels
         are cached by content, so reruns only classify new moments. Needs
-        TYPESAFE_API_KEY.
+        SUBQ_API_KEY for SubQ Snap, or TYPESAFE_API_KEY for Jev.
 
         \b
         Examples:
           one-conv tune label --dry-run
           one-conv tune label --limit 50
+          one-conv tune label --provider jev
           one-conv tune review
         """
         home = tune_home()
-        out = home / "labels" / "jev.jsonl"
+        spec = PROVIDERS[provider]
+        out = home / "labels" / f"{provider}.jsonl"
         done = load_labels(out)
         pending, queued = [], set()
         for session in _sessions(home):
@@ -178,25 +191,28 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         if limit:
             pending = pending[:limit]
         chars = sum(len(json.dumps(m.state)) for m in pending)
-        # ~4 characters per token, plus the question; Jev bills input tokens at $0.042 per million.
+        # ~4 characters per token, plus the question; both providers bill input tokens only.
         tokens = chars // 4 + 400 * len(pending)
-        click.echo(f"{len(done)} labeled, {len(pending)} to label, ~{tokens / 1e6:.1f}M tokens (~${tokens * 0.042 / 1e6:.2f})")
+        cost = tokens * spec.usd_per_million / 1e6
+        click.echo(f"{len(done)} labeled, {len(pending)} to label, ~{tokens / 1e6:.1f}M tokens (~${cost:.2f} on {provider})")
         if dry_run or not pending:
             return
-        api_key = os.environ.get("TYPESAFE_API_KEY")
+        api_key = os.environ.get(spec.key_env)
         if not api_key:
-            raise click.ClickException("Set TYPESAFE_API_KEY (console.typesafe.ai/settings/keys).")
+            raise click.ClickException(f"Set {spec.key_env} ({spec.console}).")
         try:
-            count = label_moments(pending, jev_classifier(api_key), out, workers)
+            count = label_moments(pending, decision_classifier(spec, api_key), out, workers)
         except RuntimeError as error:
             raise click.ClickException(f"{error}. Labels written so far are kept; rerun to resume.") from None
         click.echo(f"Labeled {count} moment(s) into {out}")
 
     @tune.command(context_settings=HELP)
+    @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="subq", show_default=True,
+                  help="Decision model that labeled (or labels) the moments.")
     @click.option("-n", "count", default=20, show_default=True, help="Moments to show.")
     @click.option("--label", "only", type=click.Choice(LABELS), default=None, help="Only this label.")
     @click.option("--seed", default=0, show_default=True)
-    def review(count, only, seed):
+    def review(provider, count, only, seed):
         """Show label counts and a random sample to check the classifier against your own judgment.
 
         \b
@@ -205,9 +221,9 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
           one-conv tune review --label correction_preference -n 30
         """
         home = tune_home()
-        labels = load_labels(home / "labels" / "jev.jsonl")
+        labels = load_labels(home / "labels" / f"{provider}.jsonl")
         if not labels:
-            raise click.ClickException("No labels yet. Run: one-conv tune label")
+            raise click.ClickException(f"No labels yet. Run: one-conv tune label --provider {provider}")
         totals = Counter(row["label"] for row in labels.values())
         click.echo("  ".join(f"{name}={totals.get(name, 0)}" for name in LABELS))
         states = {m.key: m.state for session in _sessions(home) for m in moments(session)}

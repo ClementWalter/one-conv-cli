@@ -1,10 +1,12 @@
 """List live sessions across harnesses, identify the sender, resolve a target and deliver."""
 
+import fcntl
 import json
 import logging
 import os
 import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from . import claude, codex, cursor, omp
@@ -85,7 +87,7 @@ def resolve(target: str, sessions: list[LiveSession] | None = None,
             exclude: LiveSession | None = None) -> LiveSession:
     """Match an address, id prefix, then title/cwd substring; `exclude` drops the sender first."""
     harness, query = parse_address(target)
-    if exclude is not None and harness in (None, exclude.harness) and exclude.id.startswith(query):
+    if exclude is not None and target in (exclude.address, exclude.id):
         raise LiveError(f"{exclude.address} is the sending session itself.")
     pool = [s for s in (list_all(harness) if sessions is None else sessions)
             if harness in (None, s.harness) and (exclude is None or s.address != exclude.address)]
@@ -108,20 +110,24 @@ def resolve(target: str, sessions: list[LiveSession] | None = None,
     raise LiveError(f"No live session matches {target!r}. Run `one-conv live ls`.{hint}")
 
 
-def _check_rate(sender: str, target: str) -> None:
-    """Refuse a pair that already exchanged RATE_LIMIT messages within the window, then log this one."""
+@contextmanager
+def _rate_slot(sender: str, target: str):
+    """Hold the send log locked, refuse a pair over RATE_LIMIT, and record the send only if delivery succeeds."""
     log = live_home() / "sent.jsonl"
-    now = time.time()
-    try:
-        rows = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
-    except FileNotFoundError:
-        rows = []
-    recent = [r for r in rows if now - r["at"] < RATE_WINDOW_SECONDS]
-    if sum(1 for r in recent if r["from"] == sender and r["to"] == target) >= RATE_LIMIT:
-        raise LiveError(f"{sender} already sent {RATE_LIMIT} messages to {target} in the last "
-                        f"{RATE_WINDOW_SECONDS // 60} minutes; refusing so two agents cannot relay forever.")
     log.parent.mkdir(parents=True, exist_ok=True)
-    log.write_text("".join(json.dumps(r) + "\n" for r in [*recent, {"from": sender, "to": target, "at": now}]))
+    with (live_home() / "sent.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        now = time.time()
+        try:
+            rows = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
+        except FileNotFoundError:
+            rows = []
+        recent = [r for r in rows if now - r["at"] < RATE_WINDOW_SECONDS]
+        if sum(1 for r in recent if r["from"] == sender and r["to"] == target) >= RATE_LIMIT:
+            raise LiveError(f"{sender} already sent {RATE_LIMIT} messages to {target} in the last "
+                            f"{RATE_WINDOW_SECONDS // 60} minutes; refusing so two agents cannot relay forever.")
+        yield
+        log.write_text("".join(json.dumps(r) + "\n" for r in [*recent, {"from": sender, "to": target, "at": now}]))
 
 
 def send(target: str, text: str, sender: LiveSession | None, origin: str = "unknown") -> dict:
@@ -129,8 +135,8 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
     if sender is not None and session.address == sender.address:
         raise LiveError(f"{session.address} is the sending session itself.")
     sender_label = sender.address if sender else origin
-    _check_rate(sender_label, session.address)
-    status = ADAPTERS[session.harness].deliver(session, envelope(text, sender, origin))
+    with _rate_slot(sender_label, session.address):
+        status = ADAPTERS[session.harness].deliver(session, envelope(text, sender, origin))
     return {"to": session.address, "title": session.title, "cwd": session.cwd,
             "delivery": session.delivery, "status": status,
             "from": sender_label}

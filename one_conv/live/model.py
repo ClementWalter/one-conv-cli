@@ -1,6 +1,8 @@
 """Shared session record, addresses, state directory and the delivered message envelope."""
 
+import html
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -54,20 +56,29 @@ def pid_alive(pid: int | None) -> bool:
     return True
 
 
+# A body may not open or close an envelope, or it could forge a second block from another sender.
+_ENVELOPE_TAG = re.compile(r"<(\s*/?\s*one-conv-message)", re.IGNORECASE)
+
+
+def _attr(value: str) -> str:
+    return html.escape(value, quote=True)
+
+
 def envelope(text: str, sender: LiveSession | None, origin: str = "unknown") -> str:
     """Wrap a message so the receiver knows who sent it and how to answer.
 
     `origin` labels a sender that is not an agent session: "user" only for an
     interactive terminal, "unknown" for anything else (a detached or scripted process).
     """
+    text = _ENVELOPE_TAG.sub(r"&lt;\1", text)
     if sender is None:
-        return f'<one-conv-message from="{origin}">\n{text}\n</one-conv-message>'
-    attrs = f'from="{sender.address}"'
+        return f'<one-conv-message from="{_attr(origin)}">\n{text}\n</one-conv-message>'
+    attrs = f'from="{_attr(sender.address)}"'
     if sender.title:
-        attrs += f' from-name="{sender.title.replace(chr(34), chr(39))}"'
+        attrs += f' from-name="{_attr(sender.title)}"'
     if sender.cwd:
-        attrs += f' from-cwd="{sender.cwd}"'
+        attrs += f' from-cwd="{_attr(sender.cwd)}"'
     reply = ""
     if not sender.id.startswith("?"):
-        reply = f'\nTo reply, call the one-conv send_message tool with to="{sender.address}".'
+        reply = f'\nTo reply, call the one-conv send_message tool with to="{_attr(sender.address)}".'
     return f"<one-conv-message {attrs}>\n{text}\n</one-conv-message>{reply}"

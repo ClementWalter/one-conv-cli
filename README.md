@@ -264,7 +264,12 @@ These labels are self-reported, not proof of identity or of your approval:
 them. Message bodies cannot open or close an envelope of their own. A
 sender may send at most 10 messages to one target per 5 minutes; this throttles
 two agents that keep replying to each other but does not end the exchange. Live state lives in
-`~/.config/agent-conv-cli/live` (override with `ONE_CONV_LIVE_DIR`).
+`~/.config/agent-conv-cli/live` (override with `ONE_CONV_LIVE_DIR`). After a
+delivery between two identified sessions, `peers.json` there records the pair
+(both addresses sorted, joined by a space) with the time of its last exchange;
+if that record cannot be written, the send still reports delivered with a warning.
+The record only chooses what `local feed` follows by default; it grants no
+permission and is not evidence of anyone's approval.
 
 ### Keeping multi-agent exchanges readable
 

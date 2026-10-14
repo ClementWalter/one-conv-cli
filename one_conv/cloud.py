@@ -60,6 +60,18 @@ def _active_messages(conversation):
     return tuple(row for row in reversed(selected) if row.role != "structure")
 
 
+def _unchanged(destination: Path, updated_at) -> bool:
+    """A complete cached copy with the listing's update time needs no new read."""
+    stamp = _timestamp(updated_at)
+    if not stamp or not destination.exists():
+        return False
+    try:
+        cached = json.loads(destination.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(cached, dict) and cached.get("complete", True) is not False and cached.get("last") == stamp
+
+
 def synchronize(provider, product: str, *, root: Path | None = None, limit: int = 100) -> dict:
     """Bound each discovery run and retain cached content when a provider drifts."""
     if not 1 <= limit <= 10000:
@@ -67,7 +79,7 @@ def synchronize(provider, product: str, *, root: Path | None = None, limit: int 
     account = provider.validate_connection()
     directory = (root or cache_root()) / _key(product, account.id)
     report = {"product": product, "account_id": account.id, "fetched": 0,
-              "incomplete_conversations": 0, "retained_complete_snapshots": 0,
+              "incomplete_conversations": 0, "retained_complete_snapshots": 0, "unchanged": 0,
               "state": "syncing", "capabilities": account.capabilities,
               "observed_at": datetime.now(timezone.utc).isoformat()}
     cursor = None
@@ -85,6 +97,13 @@ def synchronize(provider, product: str, *, root: Path | None = None, limit: int 
                 if item.id in seen:
                     raise SchemaChanged("Repeated conversation identity in provider listing")
                 seen.add(item.id)
+                # Rate-limited providers throttle per-conversation reads, so reruns only read what changed.
+                if _unchanged(directory / f"{_key(product, account.id, item.id)}.json", item.updated_at):
+                    report["unchanged"] += 1
+                    report["fetched"] += 1
+                    if report["fetched"] >= limit:
+                        break
+                    continue
                 conversation = provider.read_conversation(item.id)
                 if conversation.id != item.id:
                     raise SchemaChanged("Conversation identity differs from requested identity")

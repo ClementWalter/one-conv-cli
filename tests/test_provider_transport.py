@@ -278,3 +278,10 @@ def test_readonly_search_post_retries_same_query_body():
     JsonTransport(session, "https://chatgpt.com", "fixture", sleep=lambda _: None).post_search(
         "/backend-api/global/search", {"query_id": "fixed", "query": "query"})
     assert [call["json"] for call in session.requests] == [{"query_id": "fixed", "query": "query"}] * 2
+
+
+def test_patient_transport_waits_out_long_rate_limit():
+    delays = []
+    JsonTransport(StubSession([429, 200], headers={"Retry-After": "120"}), "https://example.com",
+                  "fixture", sleep=delays.append, max_retry_delay=600).get("/read")
+    assert delays == [120.0]

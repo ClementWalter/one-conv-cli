@@ -233,3 +233,35 @@ def test_malformed_cache_does_not_break_default_search(cli_module, tmp_path, con
     (directory / "broken.json").write_text(payload if isinstance(payload, str) else json.dumps(payload))
     result = CliRunner().invoke(cli_module.cli, ["search", "durable-cloud-test", "--offline", "--json"])
     assert json.loads(result.output)[0]["source"] == "claude-chat"
+
+
+class CountingStub(ProviderStub):
+    def __init__(self, conversation):
+        super().__init__(conversation)
+        self.reads = 0
+
+    def read_conversation(self, conversation_id):
+        self.reads += 1
+        return super().read_conversation(conversation_id)
+
+
+def test_unchanged_conversation_is_not_read_again(tmp_path, conversation):
+    provider = CountingStub(conversation)
+    synchronize(provider, "chatgpt", root=tmp_path)
+    synchronize(provider, "chatgpt", root=tmp_path)
+    assert provider.reads == 1
+
+
+def test_unchanged_conversation_is_reported(tmp_path, conversation):
+    provider = CountingStub(conversation)
+    synchronize(provider, "chatgpt", root=tmp_path)
+    assert synchronize(provider, "chatgpt", root=tmp_path)["unchanged"] == 1
+
+
+def test_updated_conversation_is_read_again(tmp_path, conversation):
+    provider = CountingStub(conversation)
+    synchronize(provider, "chatgpt", root=tmp_path)
+    provider.pages = {None: ConversationPage((ConversationSummary(
+        conversation.id, conversation.title, 1700000999, "https://claude.ai/chat/thread-1"),))}
+    synchronize(provider, "chatgpt", root=tmp_path)
+    assert provider.reads == 2

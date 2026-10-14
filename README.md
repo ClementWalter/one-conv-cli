@@ -266,6 +266,33 @@ sender may send at most 10 messages to one target per 5 minutes; this throttles
 two agents that keep replying to each other but does not end the exchange. Live state lives in
 `~/.config/agent-conv-cli/live` (override with `ONE_CONV_LIVE_DIR`).
 
+### Keeping multi-agent exchanges readable
+
+Any agent can read another agent's thread with `one-conv local thread`, so an
+exchange can be reconstructed from the transcripts. A relayed message lands as
+a user turn in the **receiver's** thread. In the sender's thread it exists only
+as a tool call, which `local thread` hides unless `--raw` is given, so a
+reference must point at the receiver's thread.
+
+- Start each message with a header line such as
+  `to: codex:01a1  cc: claude:6c51  re: migration order`, so either side of the
+  exchange can be rebuilt.
+- Reference instead of copying when the content is long, when a recipient may
+  not need it, or when several agents follow the same exchange. Make the pointer
+  precise: the receiver's address, the send time, and a quoted phrase to search
+  for, for example `replied to claude:6c51 at 23:19Z, find it with
+  one-conv local search "Round 2 review" --source claude`. `local thread` selects
+  only the last N turns, so "see its latest turn" goes stale as soon as the
+  receiver takes another turn.
+- Copy instead when the content is short, when the recipient must act on the
+  exact wording (a decision, an approval scope, a command), or when the
+  recipient cannot read the thread (another machine, a cloud session, a Cursor
+  IDE chat).
+- A reference is not delivery: if someone must act, send them a message.
+
+Delivery order is not guaranteed across harnesses: a `codex queue` message can
+arrive after one sent later through another route.
+
 ## Local MCP server
 
 Run `one-conv mcp --config` to generate the JSON configuration for your MCP

@@ -147,7 +147,7 @@ def install(root, browser_accounts, claude_accounts):
                         help="Read local agent history and run local agent tools.",
                         epilog="\b\nExamples:\n  one-conv local chats\n  one-conv local search QUERY",
                         context_settings=HELP_SETTINGS)
-    for name in (*READ_COMMANDS, "export", "fork", "port", "send", "skill-usage", "append"):
+    for name in (*READ_COMMANDS, "export", "fork", "port", "send", "skill-usage", "append", "feed"):
         local.add_command(_reader(root.commands[name], LOCAL_SOURCES, "one-conv local"))
     root.add_command(local)
 

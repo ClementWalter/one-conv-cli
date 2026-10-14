@@ -3676,6 +3676,78 @@ def cloud_command(context):
                     obj={"browser_accounts": _chatgpt_accounts})
 
 
+_FEED_SOURCES = ("claude", "codex", "cursor", "cursor-cli", "omp")
+
+
+def _feed_stamp(handle: SessionHandle) -> str:
+    """size:mtime_ns:inode of a file transcript; empty for SQLite-backed Cursor, which is always parsed."""
+    if handle.path is None:
+        return ""
+    try:
+        stat = handle.path.stat()
+    except OSError:
+        return ""
+    return f"{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ino}"
+
+
+def _feed_find_threads(addresses: list[str]):
+    """Resolve `source:id` addresses (id or unique prefix) to feed threads over local transcripts.
+
+    A `cursor:` address may name an IDE chat or a cursor-agent chat; it must match exactly one.
+    """
+    from one_conv.feed import Thread
+    wanted: dict[str, list[tuple[str, str]]] = {}
+    for address in addresses:
+        source, _, ident = address.partition(":")
+        if source in _FEED_SOURCES and ident:
+            for candidate in (("cursor", "cursor-cli") if source == "cursor" else (source,)):
+                wanted.setdefault(candidate, []).append((address, ident))
+    matches: dict[str, list[SessionHandle]] = {address: [] for address in addresses}
+    for source, queries in wanted.items():
+        for project in _iter_all_projects((source,)):
+            for handle in _project_sessions(project):
+                for address, ident in queries:
+                    if handle.uuid == ident or handle.uuid.startswith(ident):
+                        matches[address].append(handle)
+    found, missing = {}, []
+    for address in addresses:
+        handles = matches[address]
+        if len(handles) != 1:
+            missing.append(address)
+            continue
+        handle = handles[0]
+        key = f"{handle.source}:{handle.uuid}"
+        found[key] = Thread(
+            address=key, title=handle.title_hint or Path(handle.project_cwd).name, cwd=handle.project_cwd,
+            stamp=_feed_stamp(handle),
+            load=lambda h=handle: _handle_iter_turns(h, include_subagents=False),
+            visible=lambda turns, h=handle: _handle_drop_noise(h, turns),
+            render=lambda turn: _render_turn(turn, raw=False))
+    return found, missing
+
+
+def _feed_whoami() -> str | None:
+    from one_conv.live import router
+    me = router.whoami()
+    return me.address if me and not me.id.startswith("?") else None
+
+
+def _feed_root() -> Path:
+    from one_conv.live.model import live_home
+    return live_home()
+
+
+def _feed_live_addresses() -> list[str]:
+    from one_conv.live import router
+    return [session.address for session in router.list_all()]
+
+
+from one_conv.feed import build_feed_command  # noqa: E402
+
+_feed_command = build_feed_command(_feed_find_threads, _feed_whoami, _feed_root, _feed_live_addresses)
+_feed_command.hidden = True
+cli.add_command(_feed_command)
+
 install_namespaces(cli, lambda: _chatgpt_accounts(), lambda: _claude_accounts())
 
 

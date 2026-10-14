@@ -86,7 +86,7 @@ class SQLiteStore:
                 current = conn.execute(select(h.c.revision, h.c.mtime).where(h.c.key == key)).first()
                 if current and current.revision == revision:
                     return {"key": key, "revision": revision}
-                if (current.revision if current else None) != expected or (current and current.mtime > metadata["mtime"]):
+                if (current.revision if current else None) != expected:
                     raise Conflict("Conversation changed; resync from its current source.")
                 if current:
                     result = conn.execute(h.update().where((h.c.key == key) & (h.c.revision == expected)).values(**values))

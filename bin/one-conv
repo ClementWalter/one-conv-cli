@@ -2181,20 +2181,34 @@ def _native_project_sessions(project: ProjectHandle) -> list[SessionHandle]:
     return []
 
 
+def _record_locator(handle: SessionHandle) -> str:
+    """Which of a session's native records a handle reads; Codex subagent rollouts share their
+    parent's session ID. File names stay the same across machines and when Codex archives a session."""
+    if handle.archive:
+        return handle.archive["locator"]
+    return handle.path.name if handle.path else handle.uuid
+
+
+def _record_identity(handle: SessionHandle) -> tuple[str, str, str, str]:
+    return handle.source, handle.project_cwd, handle.uuid, _record_locator(handle)
+
+
 def _project_sessions(project: ProjectHandle) -> list[SessionHandle]:
     native = _native_project_sessions(project)
-    by_id = {(h.source, h.project_cwd, h.uuid): h for h in native}
     archive = _archive_state()
-    # Machines or reset state directories can upload one conversation under several origins.
-    for row in archive["projects"].get((project.source, project.cwd), ()) if archive else ():
-        identity = row["source"], row["cwd"], row["session"]
-        existing = by_id.get(identity)
-        if existing and existing.mtime >= row["mtime"]:
-            continue
-        by_id[identity] = SessionHandle(source=row["source"], uuid=row["session"],
+    rows = archive["projects"].get((project.source, project.cwd), ()) if archive else ()
+    if not rows:
+        return native
+    # Machines or reset state directories can upload one record under several origins; show its newest copy.
+    by_record = {_record_identity(h): h for h in native}
+    for row in rows:
+        handle = SessionHandle(source=row["source"], uuid=row["session"],
             project_cwd=row["cwd"], mtime=row["mtime"], title_hint=row["summary"]["title"],
             unread_native=row["unread_native"], archive=row)
-    return sorted(by_id.values(), key=lambda h: h.mtime, reverse=True)
+        existing = by_record.get(_record_identity(handle))
+        if not existing or existing.mtime < handle.mtime:
+            by_record[_record_identity(handle)] = handle
+    return sorted(by_record.values(), key=lambda h: h.mtime, reverse=True)
 
 
 def _handle_iter_turns(handle: SessionHandle, include_subagents: bool) -> list[Turn]:
@@ -2374,10 +2388,10 @@ def _resolve_projects(query: str, match: int, sources: tuple[str, ...]) -> list[
 
 def _all_sessions_for(projects: list[ProjectHandle]) -> list[SessionHandle]:
     # Two project directories can resolve to one cwd; each merges that cwd's archived copies.
-    newest: dict[tuple[str, str, str], SessionHandle] = {}
+    newest: dict[tuple[str, str, str, str], SessionHandle] = {}
     for p in projects:
         for h in _project_sessions(p):
-            identity = h.source, h.project_cwd, h.uuid
+            identity = _record_identity(h)
             if identity not in newest or h.mtime > newest[identity].mtime:
                 newest[identity] = h
     return sorted(newest.values(), key=lambda h: h.mtime, reverse=True)

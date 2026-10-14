@@ -42,8 +42,8 @@ def revision(manifest):
     return digest(encode(manifest, sort_keys=True))
 
 
-def conversation_key(origin, source, cwd, session):
-    return revision([origin, source, cwd, session])
+def conversation_key(origin, source, cwd, session, locator):
+    return revision([origin, source, cwd, session, locator])
 
 
 def pack(capture):

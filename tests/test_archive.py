@@ -11,6 +11,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import zlib
 from urllib.parse import urlsplit
 
@@ -68,6 +69,16 @@ def write_claude(env, extra=False):
     if extra:
         rows.append({"type": "user", "cwd": "/example/ancestry", "timestamp": "2026-01-01T10:02:00Z", "message": {"role": "user", "content": "An additional message"}})
     path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    return path
+
+
+def write_codex(env):
+    path = Path(env["CODEX_HOME"]) / "sessions" / "rollout-fixture.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    events = [{"type": "session_meta", "payload": {"id": "codex-fixture", "cwd": "/example/codex-fixture"}},
+              {"type": "response_item", "timestamp": "2026-01-01T10:00:00Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Quartz question"}]}},
+              {"type": "response_item", "timestamp": "2026-01-01T10:01:00Z", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Quartz answer"}]}}]
+    path.write_text("\n".join(json.dumps(row) for row in events))
     return path
 
 
@@ -170,12 +181,7 @@ def test_other_sources_keep_native_thread_shape(tmp_path, archive, source):
         native_root = "OMP_HOME"
     elif source == "codex":
         project, text, native_root = "/example/codex-fixture", "Quartz", "CODEX_HOME"
-        path = Path(env[native_root]) / "sessions" / "rollout-fixture.jsonl"
-        path.parent.mkdir(parents=True)
-        events = [{"type": "session_meta", "payload": {"id": "codex-fixture", "cwd": project}},
-                  {"type": "response_item", "timestamp": "2026-01-01T10:00:00Z", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Quartz question"}]}},
-                  {"type": "response_item", "timestamp": "2026-01-01T10:01:00Z", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Quartz answer"}]}}]
-        path.write_text("\n".join(json.dumps(row) for row in events))
+        write_codex(env)
     else:
         namespace = "cloud"
         project, text, native_root = "claude-chat:account", "Quartz", "ONE_CONV_CLOUD_CACHE"
@@ -282,20 +288,63 @@ def test_failed_capture_does_not_starve_older_history(tmp_path, archive):
     env = fixture_env(tmp_path)
     path = write_claude(env)
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
-    run(env, "scripts/archive-sync.py", "--source", "claude")
-    archived = path.stat().st_mtime
     older = path.with_name("older-unarchived.jsonl")
     older.write_bytes(path.read_bytes())
-    os.utime(older, (archived - 20,) * 2)
-    path.write_text(path.read_text().replace("forty-two", "rewritten"))
-    os.utime(path, (archived - 10,) * 2)  # Older than the archived capture: stale.
-    before = {p: p.read_bytes() for p in (older, path)}
-    result = run(env, "scripts/archive-sync.py", "--source", "claude", success=False)
+    os.utime(older, (path.stat().st_mtime - 20,) * 2)
+    unreadable = path.with_suffix("") / "tool-results" / "output.txt"  # The newest conversation cannot be captured.
+    unreadable.parent.mkdir(parents=True)
+    unreadable.write_text("complete tool output")
+    unreadable.chmod(0)
+    try:
+        result = run(env, "scripts/archive-sync.py", "--source", "claude", success=False)
+    finally:
+        unreadable.chmod(0o600)
     assert result.returncode == 1
-    assert {row["session"] for row in client.list_conversations()} == {"session-one", "older-unarchived"}
-    assert "claude/session-one" in result.stderr and "409" in result.stderr and "Conversation changed" in result.stderr
+    assert {row["session"] for row in client.list_conversations()} == {"older-unarchived"}
+    assert "claude/session-one" in result.stderr and "PermissionError" in result.stderr
     assert json.loads(result.stdout) == {"uploaded": 1, "unchanged": 0, "failed": 1}
-    assert {p: p.read_bytes() for p in before} == before
+
+
+def test_an_older_local_copy_becomes_current(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    first = list(client.list_conversations())[0]
+    path.write_text(path.read_text().replace("forty-two", "restored from a backup"))
+    os.utime(path, (first["mtime"] - 10,) * 2)
+    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 1, "unchanged": 0}
+    remote = {**env, "CLAUDE_CONFIG_DIR": str(tmp_path / "empty")}
+    thread = run(remote, "bin/one-conv", "local", "thread", "ancestry", "--source", "claude", "--no-mark-read", "--json")
+    assert thread["turns"][-1]["text"] == "The answer is restored from a backup."
+    assert "forty-two" in json.dumps(client.read_capture(first["key"], first["revision"])["turns"])
+
+
+def test_codex_rollouts_sharing_a_session_id_are_archived_separately(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    parent = write_codex(env)
+    events = [json.loads(line) for line in parent.read_text().splitlines()]
+    events[0]["payload"]["session_id"] = "shared-session"
+    parent.write_text("\n".join(json.dumps(event) for event in events))
+    subagent = parent.with_name("rollout-subagent.jsonl")
+    events[1]["payload"]["content"][0]["text"] = "Subagent question"
+    subagent.write_text("\n".join(json.dumps(event) for event in events))
+    os.utime(parent, (time.time() - 60,) * 2)
+    commands = [("chats",), ("thread", "codex-fixture", "--session", "shared", "--no-mark-read"),
+                ("thread", "codex-fixture", "--nth", "2", "--no-mark-read"), ("search", "question")]
+    baseline = [run(env, "bin/one-conv", "local", *args, "--source", "codex", "--json") for args in commands]
+    assert baseline[1]["turns"][0]["text"] == "Subagent question"  # The newest rollout, as without an archive.
+    assert baseline[2]["turns"][0]["text"] == "Quartz question"
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    assert run(env, "scripts/archive-sync.py", "--source", "codex") == {"uploaded": 2, "unchanged": 0}
+    assert run(env, "scripts/archive-sync.py", "--source", "codex") == {"uploaded": 0, "unchanged": 2}
+    for args, expected in zip(commands, baseline):
+        assert run(env, "bin/one-conv", "local", *args, "--source", "codex", "--json") == expected
+    remote = {**env, "CODEX_HOME": str(tmp_path / "empty")}
+    for args, expected in zip(commands, baseline):
+        assert run(remote, "bin/one-conv", "local", *args, "--source", "codex", "--json") == expected
 
 
 def test_collision_does_not_break_other_sources_or_projects(tmp_path, archive):
@@ -349,7 +398,7 @@ def test_capture_larger_than_one_request_round_trips(tmp_path):
     bound = 2 * CHUNK_BYTES
     url, stop = serve(create_app(store, "test-secret", max_request_bytes=bound))
     try:
-        capture = {"origin": "large", "source": "claude", "cwd": "/example/large", "session": "large", "mtime": 1.0, "capture_version": "test", "account_label": None,
+        capture = {"origin": "large", "source": "claude", "cwd": "/example/large", "session": "large", "locator": "large.jsonl", "mtime": 1.0, "capture_version": "test", "account_label": None,
             "summary": {"uuid": "large", "source": "claude", "cwd": "/example/large", "start": "", "end": "",
                         "turns": 0, "tokens": None, "title": "Large"},
             "unread_native": None, "turns": [], "turns_with_subagents": None, "search_text": ["large session"],

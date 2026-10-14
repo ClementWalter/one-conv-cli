@@ -40,9 +40,12 @@ token, commands warn on stderr and show native history only.
   directory), readers show the newest copy.
 - A conversation is re-read only when its main source file's modification time
   differs from the archived capture.
-- Each upload names the revision it replaces, so stale and concurrent captures are
-  rejected. A capture that rewrites earlier turns (provider edit or regeneration, a
-  parser upgrade) becomes current; earlier revisions stay readable by revision.
+- Each native record is archived separately, even when records share a session ID
+  (Codex subagent rollouts share their parent's).
+- Each upload names the revision it replaces, so concurrent captures are rejected.
+  An installation's current native record always becomes current, including a
+  rewrite of earlier turns (provider edit or regeneration, a parser upgrade) or a
+  file restored from an older backup; earlier revisions stay readable by revision.
 - A failed conversation is reported on stderr; sync continues and exits nonzero with
   uploaded, unchanged and failed counts. Retry a changing source when it is idle.
 - There is no scheduler, deletion propagation, local eviction or provider resume.

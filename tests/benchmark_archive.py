@@ -34,7 +34,7 @@ def test_search_scale(tmp_path, archive):
             rare_sessions.add(session)
         turn = {"ts": "2026-01-01T10:00:00Z", "role": "user", "blocks": [{"type": "text", "text": text}]}
         document = {"origin": "synthetic-benchmark", "source": "claude", "cwd": "/benchmark",
-            "session": session, "mtime": i, "unread_native": None,
+            "session": session, "locator": session + ".jsonl", "mtime": i, "unread_native": None,
             "capture_version": "benchmark", "account_label": None,
             "summary": {"uuid": session, "source": "claude", "cwd": "/benchmark", "start": turn["ts"],
                 "end": turn["ts"], "turns": 1, "tokens": None, "title": "Benchmark conversation"},

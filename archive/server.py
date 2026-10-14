@@ -29,6 +29,7 @@ class Manifest(Strict):
     source: str = Field(min_length=1)
     cwd: str
     session: str = Field(min_length=1)
+    locator: str = Field(min_length=1)
     mtime: float
     capture_version: str = Field(min_length=1)
     account_label: str | None
@@ -107,7 +108,7 @@ def create_app(store: ConversationStore, token, max_request_bytes=MAX_REQUEST_BY
         parts = manifest["fields"]["search_text"]
         search_text = "\n".join(json.loads(b"".join(decompress(store.read_chunk(d), d) for d in parts))).lower()
         metadata = {name: value for name, value in manifest.items() if name not in ("fields", "originals")}
-        key = conversation_key(manifest["origin"], manifest["source"], manifest["cwd"], manifest["session"])
+        key = conversation_key(manifest["origin"], manifest["source"], manifest["cwd"], manifest["session"], manifest["locator"])
         return store.put(key, revision(manifest), metadata, search_text, manifest, validated.expected)
 
     @endpoint

@@ -108,7 +108,7 @@ def capture(reader, handle, origin):
     summary = reader._handle_summary(handle, {})
     summary.pop("unread", None)
     document = {"origin": origin, "source": handle.source, "cwd": handle.project_cwd,
-        "session": handle.uuid, "mtime": handle.mtime, "capture_version": CAPTURE_VERSION,
+        "session": handle.uuid, "locator": reader._record_locator(handle), "mtime": handle.mtime, "capture_version": CAPTURE_VERSION,
         "account_label": account_label, "summary": summary,
         "unread_native": handle.unread_native, "turns": [asdict(turn) for turn in turns],
         "turns_with_subagents": [asdict(turn) for turn in expanded] if expanded != turns and expanded is not None else None,
@@ -139,7 +139,7 @@ def main():
     uploaded = unchanged = failed = 0
     for handle in handles[:args.limit] if args.limit else handles:
         try:
-            key = conversation_key(origin, handle.source, handle.project_cwd, handle.uuid)
+            key = conversation_key(origin, handle.source, handle.project_cwd, handle.uuid, reader._record_locator(handle))
             archived = existing.get(key)
             if archived and archived["mtime"] == handle.mtime and archived["capture_version"] == CAPTURE_VERSION:
                 unchanged += 1  # Avoid re-reading and re-encoding unchanged history.

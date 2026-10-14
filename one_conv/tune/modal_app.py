@@ -280,46 +280,6 @@ def benchmark(run: str) -> dict:
     return {v: f"{r['passed']}/{r['total']}" for v, r in result.items()}
 
 
-@app.function(**GPU, timeout=3600)
-def diagnose(dataset: str, micro_batches: int = 64, batch_size: int = 4, max_length: int = 4096) -> list[dict]:
-    """Replay training's first micro-batches one example at a time; report examples with non-finite loss or grads."""
-    import torch
-    from datasets import Dataset
-    from peft import LoraConfig
-    from trl import SFTConfig, SFTTrainer
-
-    rows = _read_jsonl(VOL / "datasets" / dataset / "sft" / "train.jsonl")
-    config = SFTConfig(output_dir="/tmp/diag", per_device_train_batch_size=batch_size, max_length=max_length,
-                       bf16=True, report_to=[], completion_only_loss=True, gradient_checkpointing=True,
-                       model_init_kwargs={"dtype": "bfloat16"})
-    trainer = SFTTrainer(model=MODEL, args=config, train_dataset=Dataset.from_list(_prompt_completion(rows)),
-                         peft_config=LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", task_type="CAUSAL_LM"))
-    model = trainer.model
-    model.train()
-    found = []
-    for b, batch in enumerate(trainer.get_train_dataloader()):
-        if b >= micro_batches:
-            break
-        for i in range(batch["input_ids"].shape[0]):
-            one = {k: v[i:i + 1].to(model.device) for k, v in batch.items() if hasattr(v, "shape")}
-            labels = one["input_ids"].clone()
-            if "completion_mask" in one:
-                labels[one["completion_mask"] == 0] = -100
-            if "attention_mask" in one:
-                labels[one["attention_mask"] == 0] = -100
-            out = model(input_ids=one["input_ids"], attention_mask=one.get("attention_mask"), labels=labels)
-            out.loss.backward()
-            bad_grad = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in model.parameters())
-            model.zero_grad(set_to_none=True)
-            if bad_grad or not torch.isfinite(out.loss):
-                ids = one["input_ids"][0][one["attention_mask"][0].bool()] if "attention_mask" in one else one["input_ids"][0]
-                found.append({"micro_batch": b, "row": i, "loss": float(out.loss), "tokens": int(ids.numel()),
-                              "completion_tokens": int((labels != -100).sum()),
-                              "tail": trainer.processing_class.decode(ids[-200:])})
-    _write_json(VOL / "diagnose.json", {"micro_batches": micro_batches, "found": found})
-    volume.commit()
-    return found
-
 
 def _merged_base(base_adapter: str | None, attn: str = "eager"):
     """Qwen with an earlier run's adapter merged in, so a new adapter trains or scores on top of it."""
@@ -393,46 +353,3 @@ def train_dpo(dataset: str, run: str, base_adapter: str, epochs: float = 2.0, le
     _write_json(run_dir / "train_metrics.json", curves)
     volume.commit()
     return settings
-
-
-@app.function(**GPU, timeout=1800)
-def token_view(run: str, session_path: str = "token_view/session.json") -> dict:
-    """Per-token probabilities of each assistant reply in one conversation, base vs adapter, with each model's top guess."""
-    import torch
-    from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    doc = json.loads((VOL / session_path).read_text())
-    messages = doc["messages"]
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    base = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, device_map="cuda")
-    model = PeftModel.from_pretrained(base, str(VOL / "runs" / run / "adapter"))
-    model.eval()
-
-    def scores(ids, start):
-        with torch.no_grad():
-            logp = torch.log_softmax(model(ids[:, :-1]).logits.float(), dim=-1)[0, start - 1:]
-        targets = ids[0, start:]
-        actual = logp.gather(-1, targets[:, None]).squeeze(-1)
-        top = logp.max(dim=-1)
-        return actual.tolist(), top.indices.tolist(), top.values.tolist()
-
-    replies = []
-    for i, message in enumerate(messages):
-        if message["role"] != "assistant":
-            continue
-        prompt = _token_ids(tokenizer, messages[:i], add_generation_prompt=True)
-        full = _token_ids(tokenizer, messages[:i + 1])
-        ids = torch.tensor([full], device=model.device)
-        with model.disable_adapter():
-            lp_b, top_b, top_lp_b = scores(ids, len(prompt))
-        lp_a, top_a, top_lp_a = scores(ids, len(prompt))
-        tokens = full[len(prompt):]
-        replies.append({"index": i, "tokens": [
-            {"t": tokenizer.decode([tok]), "b": round(b, 4), "a": round(a, 4),
-             "bt": tokenizer.decode([tb]), "bp": round(pb, 4), "at": tokenizer.decode([ta]), "ap": round(pa, 4)}
-            for tok, b, a, tb, pb, ta, pa in zip(tokens, lp_b, lp_a, top_b, top_lp_b, top_a, top_lp_a)]})
-    out = {"run": run, "key": doc["key"], "cwd": doc["cwd"], "messages": messages, "replies": replies}
-    _write_json(VOL / "token_view" / "result.json", out)
-    volume.commit()
-    return {"replies": len(replies)}

@@ -2824,8 +2824,9 @@ def _export_all(out_root: Path, machine: str, sources: tuple[str, ...], cutoff: 
 def export(out_dir: str, machine: str | None, source_filter: str | None, since: str | None, as_json: bool) -> None:
     """Export every session as text to OUT/<machine>/<source>/<cwd>/<uuid>.json.
 
-    Only user and assistant text is kept, with tool calls summarized and
-    tool output dropped, and token-shaped strings are redacted. A session
+    Only user and assistant text blocks are kept: tool calls, tool output,
+    thinking and sub-agent turns are dropped, and token-shaped strings are
+    redacted. A session
     whose stored copy is already as recent as the source is skipped, so the
     command is cheap to run hourly. Each file carries `author`: "human" for
     sessions a person drove, "system" for heartbeat/worker prompts.

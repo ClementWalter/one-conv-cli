@@ -140,6 +140,29 @@ def _rate_slot(sender: str, target: str):
         log.write_text("".join(json.dumps(r) + "\n" for r in [*recent, {"from": sender, "to": target, "at": now}]))
 
 
+def peer_key(first: str, second: str) -> str:
+    """`peers.json` key for an exchange: both addresses sorted, joined by one space."""
+    return " ".join(sorted((first, second)))
+
+
+def _record_peers(sender: str, target: str) -> None:
+    """Note that two sessions exchanged a message; `local feed` follows recent partners from this."""
+    path = live_home() / "peers.json"
+    with (live_home() / "sent.lock").open("a") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            peers = json.loads(path.read_text())
+        except FileNotFoundError:
+            peers = {}
+        if not isinstance(peers, dict):
+            peers = {}
+        peers[peer_key(sender, target)] = time.time()
+        partial = path.with_name(f".peers.{os.getpid()}.tmp")
+        partial.write_text(json.dumps(peers, indent=1, sort_keys=True))
+        os.replace(partial, path)
+
+
 def send(target: str, text: str, sender: LiveSession | None, origin: str = "unknown") -> dict:
     session = resolve(target, exclude=sender)
     if sender is not None and session.address == sender.address:
@@ -147,6 +170,14 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
     sender_label = sender.address if sender else origin
     with _rate_slot(sender_label, session.address):
         status = ADAPTERS[session.harness].deliver(session, envelope(text, sender, origin))
-    return {"to": session.address, "title": session.title, "cwd": session.cwd,
-            "delivery": session.delivery, "status": status,
-            "from": sender_label}
+    receipt = {"to": session.address, "title": session.title, "cwd": session.cwd,
+               "delivery": session.delivery, "status": status, "from": sender_label}
+    # Only two identified sessions form a pair; "user", "unknown" and "?unknown" ids do not.
+    if sender is not None and not sender.id.startswith("?"):
+        try:
+            _record_peers(sender.address, session.address)
+        except (OSError, ValueError) as error:
+            # The message is already delivered; a retry would duplicate it, so warn instead of failing.
+            logger.warning("delivered, but could not record the peer pair: %s", error)
+            receipt["warning"] = f"peer pair not recorded: {error}"
+    return receipt

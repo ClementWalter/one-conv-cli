@@ -66,6 +66,8 @@ def build_live_group(launcher: list[str]) -> click.Group:
         except (router.LiveError, RuntimeError, OSError) as error:
             raise click.ClickException(str(error)) from None
         click.echo(json.dumps(receipt) if as_json else f"{receipt['status']}: {receipt['to']}")
+        if receipt.get("warning") and not as_json:
+            click.echo(f"warning: {receipt['warning']}", err=True)
 
     @live.command("whoami", context_settings=HELP)
     def whoami_command():

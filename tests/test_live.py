@@ -322,6 +322,52 @@ def test_failed_delivery_does_not_use_a_rate_slot(homes, monkeypatch):
     assert not (homes / "live" / "sent.jsonl").exists()
 
 
+def test_send_records_peer_pair_with_sorted_key(homes):
+    _omp_record(homes, os.getpid())
+    router.send("omp:o1", "hi", LiveSession("claude", "c1"))
+    assert list(json.loads((homes / "live" / "peers.json").read_text())) == ["claude:c1 omp:o1"]
+
+
+def test_send_from_terminal_records_no_pair(homes):
+    _omp_record(homes, os.getpid())
+    router.send("omp:o1", "hi", None, "user")
+    assert not (homes / "live" / "peers.json").exists()
+
+
+def test_send_from_unidentified_session_records_no_pair(homes):
+    _omp_record(homes, os.getpid())
+    router.send("omp:o1", "hi", LiveSession("cursor", "?unknown"))
+    assert not (homes / "live" / "peers.json").exists()
+
+
+def test_peer_record_failure_still_reports_delivery(homes, monkeypatch):
+    _omp_record(homes, os.getpid())
+
+    def broken(sender, target):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(router, "_record_peers", broken)
+    assert router.send("omp:o1", "hi", LiveSession("claude", "c1"))["status"] == "delivered"
+
+
+def test_peer_record_failure_is_reported_as_warning(homes, monkeypatch):
+    _omp_record(homes, os.getpid())
+
+    def broken(sender, target):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(router, "_record_peers", broken)
+    assert "read-only" in router.send("omp:o1", "hi", LiveSession("claude", "c1"))["warning"]
+
+
+def test_peer_record_keeps_other_pairs(homes):
+    _omp_record(homes, os.getpid())
+    (homes / "live").mkdir(exist_ok=True)
+    (homes / "live" / "peers.json").write_text(json.dumps({"codex:x omp:o1": 1.0}))
+    router.send("omp:o1", "hi", LiveSession("claude", "c1"))
+    assert sorted(json.loads((homes / "live" / "peers.json").read_text())) == ["claude:c1 omp:o1", "codex:x omp:o1"]
+
+
 def test_send_stops_a_runaway_pair(homes):
     _omp_record(homes, os.getpid())
     for _ in range(router.RATE_LIMIT):

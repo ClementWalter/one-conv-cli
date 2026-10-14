@@ -188,10 +188,18 @@ def restore(reader, client, session):
     matches = {(row["source"], row["session"]) for row in rows}
     if len(matches) != 1:
         raise ArchiveError(f"{len(matches)} archived conversations match {session!r}; give the full session ID")
-    row = max(rows, key=lambda row: row["mtime"])
-    manifest = client.read_conversation(row["key"], row["revision"])
-    roots = history_roots(reader, row["source"])
-    contents = {restore_target(roots, name): client.read_chunks(parts) for name, parts in manifest["originals"].items()}
+    # Another machine's newer copy may name paths that do not exist here; take the newest this machine can hold.
+    for row in sorted(rows, key=lambda row: row["mtime"], reverse=True):
+        manifest = client.read_conversation(row["key"], row["revision"])
+        try:
+            targets = {restore_target(history_roots(reader, row["source"]), name): parts
+                       for name, parts in manifest["originals"].items()}
+            break
+        except ArchiveError as error:
+            refused = error
+    else:
+        raise refused
+    contents = {path: client.read_chunks(parts) for path, parts in targets.items()}
     for path, data in contents.items():
         if path.exists() and path.read_bytes() != data:
             raise ArchiveError(f"{path} exists with different content; move it away to restore")

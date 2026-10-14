@@ -53,10 +53,7 @@ def fixture_env(tmp_path):
         "CODEX_HOME": str(tmp_path / "codex"), "CURSOR_USER_DIR": str(tmp_path / "cursor"),
         "CURSOR_CLI_HOME": str(tmp_path / "cursor-cli"), "OMP_HOME": str(tmp_path / "omp"),
         "ONE_CONV_CORPUS": str(tmp_path / "corpus"), "ONE_CONV_CLOUD_CACHE": str(tmp_path / "cloud"),
-        "ONE_CONV_STATE_DIR": str(tmp_path / "state"), "AGENT_CONV_STATE_DIR": str(tmp_path / "state"),
-        "ONE_CONV_ARCHIVE_SYNC_MINUTES": "0"}
-    env.pop("ONE_CONV_ARCHIVE_URL", None)
-    env.pop("ONE_CONV_ARCHIVE_TOKEN", None)
+        "ONE_CONV_STATE_DIR": str(tmp_path / "state"), "AGENT_CONV_STATE_DIR": str(tmp_path / "state")}
     return env
 
 
@@ -696,6 +693,21 @@ def test_restore_writes_only_inside_native_history(tmp_path, archive, escape):
     result = run(env, "scripts/archive-sync.py", "--restore", "session-one", success=False)
     assert result.returncode == 1 and "nothing was restored" in result.stderr
     assert not path.exists() and not any(outside.iterdir())
+
+
+def test_restore_skips_newer_copies_this_machine_cannot_hold(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    original = path.read_bytes()
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    manifest = client.read_conversation(list(client.list_conversations())[0]["key"])
+    elsewhere = {"/another/home/.claude/projects/fixture/" + Path(name).name: parts for name, parts in manifest["originals"].items()}
+    client.put({**manifest, "origin": "another-machine", "mtime": manifest["mtime"] + 60, "originals": elsewhere}, {}, None)
+    path.unlink()
+    assert run(env, "scripts/archive-sync.py", "--restore", "session-one") == {"restored": 1}
+    assert path.read_bytes() == original
 
 
 def test_damaged_state_files_and_settings_do_not_break_commands(tmp_path, archive):

@@ -30,6 +30,7 @@ from .mood import intensity, mood_classifier, session_heat
 from .rules import RULES
 from .runs import (
     DEFAULT_MODEL,
+    PACKAGE_ROOT,
     eval_metrics,
     load_runs,
     lora_command,
@@ -325,6 +326,116 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         click.echo(f"{count} sessions → {out}")
         if not no_open:
             click.launch(str(out))
+
+    @tune.group("cloud", context_settings=HELP)
+    def cloud():
+        """Run synthesis, training, evaluation and probes on a Modal H100.
+
+        Data goes to the `one-conv-tune` Modal volume and results come back to
+        the local workspace, so `tune runs` and the report work unchanged.
+
+        \b
+        Pipeline:
+          one-conv tune cloud push --dataset adjudicated
+          one-conv tune cloud synth --rule no-comments
+          one-conv tune cloud train --dataset adjudicated --run cloud-1
+          one-conv tune cloud eval --run cloud-1 --dataset adjudicated
+          one-conv tune cloud probe --run cloud-1 --dataset adjudicated --rule no-comments
+          one-conv tune cloud pull --run cloud-1
+          one-conv tune cloud clean --yes
+        """
+
+    def _modal(*args: str) -> None:
+        command = ["modal", *args]
+        click.echo(shlex.join(command), err=True)
+        # Run from the checkout so the app's local `one_conv` source is found and shipped.
+        if subprocess.run(command, cwd=PACKAGE_ROOT, check=False).returncode != 0:
+            raise click.ClickException(f"modal {args[0]} failed.")
+
+    def _ensure_volume() -> None:
+        # Creating an existing volume fails harmlessly, so this runs before every upload.
+        subprocess.run(["modal", "volume", "create", "one-conv-tune"], cwd=PACKAGE_ROOT, check=False,
+                       capture_output=True)
+
+    def _remote(fn: str, **options) -> None:
+        flags = [part for key, value in options.items() if value is not None
+                 for part in (f"--{key.replace('_', '-')}", str(value))]
+        _modal("run", f"one_conv/tune/modal_app.py::{fn}", *flags)
+
+    @cloud.command("push", context_settings=HELP)
+    @click.option("--dataset", "dataset_name", required=True)
+    def cloud_push(dataset_name):
+        """Upload a local dataset to the Modal volume."""
+        local = tune_home() / "datasets" / dataset_name
+        if not (local / "manifest.json").exists():
+            raise click.ClickException(f"No dataset {dataset_name!r}.")
+        _ensure_volume()
+        _modal("volume", "put", "--force", "one-conv-tune", str(local), f"/datasets/{dataset_name}")
+
+    @cloud.command("synth", context_settings=HELP)
+    @click.option("--rule", type=click.Choice(sorted(RULES)), required=True)
+    @click.option("--limit", default=2000, show_default=True)
+    @click.option("--max-new-tokens", default=512, show_default=True)
+    def cloud_synth(rule, limit, max_new_tokens):
+        """Generate rule-following answers with vLLM on the GPU, then download them."""
+        home = tune_home()
+        folder = home / "synth" / rule
+        folder.mkdir(parents=True, exist_ok=True)
+        prompts = coding_prompts(_sessions(home), 0.05, 0.05)
+        (folder / "prompts.jsonl").write_text("".join(json.dumps(p, ensure_ascii=False) + "\n" for p in prompts))
+        _ensure_volume()
+        _modal("volume", "put", "--force", "one-conv-tune", str(folder / "prompts.jsonl"), f"/synth/{rule}/prompts.jsonl")
+        _remote("synthesize", rule=rule, limit=limit, max_new_tokens=max_new_tokens)
+        _modal("volume", "get", "--force", "one-conv-tune", f"/synth/{rule}/answers.jsonl", str(folder / "answers.jsonl"))
+
+    @cloud.command("train", context_settings=HELP)
+    @click.option("--dataset", "dataset_name", required=True)
+    @click.option("--run", "run", required=True)
+    @click.option("--epochs", default=1.0, show_default=True)
+    @click.option("--learning-rate", default=1e-4, show_default=True)
+    @click.option("--rank", default=16, show_default=True)
+    @click.option("--max-steps", default=-1, show_default=True, help="Stop early, for smoke tests.")
+    def cloud_train(dataset_name, run, epochs, learning_rate, rank, max_steps):
+        """Train a LoRA adapter with TRL on the GPU (loss on the final reply only)."""
+        _remote("train", dataset=dataset_name, run=run, epochs=epochs, learning_rate=learning_rate,
+                rank=rank, max_steps=max_steps)
+
+    @cloud.command("eval", context_settings=HELP)
+    @click.option("--run", "run", required=True)
+    @click.option("--dataset", "dataset_name", required=True)
+    def cloud_eval(run, dataset_name):
+        """Score base vs adapter on the held-out split, on the GPU."""
+        _remote("evaluate", run=run, dataset=dataset_name)
+
+    @cloud.command("probe", context_settings=HELP)
+    @click.option("--run", "run", required=True)
+    @click.option("--dataset", "dataset_name", required=True)
+    @click.option("--rule", type=click.Choice(sorted(RULES)), required=True)
+    @click.option("--samples", default=4, show_default=True, help="Sampled answers per task and length.")
+    @click.option("--lengths", default="0,2000,8000,16000", show_default=True)
+    def cloud_probe(run, dataset_name, rule, samples, lengths):
+        """Run the drift probe with several samples per task, on the GPU."""
+        _remote("probe", run=run, dataset=dataset_name, rule=rule, samples=samples, lengths=lengths)
+
+    @cloud.command("pull", context_settings=HELP)
+    @click.option("--run", "run", required=True)
+    def cloud_pull(run):
+        """Download a run's results (adapter, metrics, eval, probe) into the local workspace."""
+        local = tune_home() / "runs" / run
+        local.mkdir(parents=True, exist_ok=True)
+        for name in ("train.json", "train_metrics.json", "eval.json", "probe.json", "adapter"):
+            # Missing files only mean that step has not run yet.
+            subprocess.run(["modal", "volume", "get", "--force", "one-conv-tune", f"/runs/{run}/{name}", str(local)],
+                           cwd=PACKAGE_ROOT, check=False)
+        click.echo(f"Pulled into {local}")
+
+    @cloud.command("clean", context_settings=HELP)
+    @click.option("--yes", is_flag=True, help="Confirm deleting the volume and everything uploaded to it.")
+    def cloud_clean(yes):
+        """Delete the Modal volume, including uploaded sessions and the model cache."""
+        if not yes:
+            raise click.ClickException("This deletes every file in the one-conv-tune volume. Rerun with --yes.")
+        _modal("volume", "delete", "--yes", "one-conv-tune")
 
     @tune.command(context_settings=HELP)
     @click.argument("reference")

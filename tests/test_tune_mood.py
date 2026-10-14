@@ -65,8 +65,8 @@ def labeled(session):
             {key: {"label": "angry", "probabilities": {"angry": 1.0}}})
 
 
-def test_record_marks_reaction_on_reply(session, labeled):
-    assert session_record(session, *labeled)["messages"][1]["reaction"] == ["correction_preference", 0.93]
+def test_record_marks_reaction_on_user_answer(session, labeled):
+    assert session_record(session, *labeled)["messages"][2]["reaction"] == ["correction_preference", 0.93]
 
 
 def test_record_marks_tone_on_user_message(session, labeled):

@@ -31,8 +31,9 @@ def session_record(session: Session, reactions: dict[str, dict], moods: dict[str
         if messages[index].role != "assistant" or messages[index + 1].role != "user":
             continue
         key = moment_key(moment_state(messages, index))
+        # The label describes the user's next message, so it is shown there.
         if key in reactions:
-            rendered[index]["reaction"] = [reactions[key]["label"], _probability(reactions[key])]
+            rendered[index + 1]["reaction"] = [reactions[key]["label"], _probability(reactions[key])]
         if key in moods:
             level = round(intensity(moods[key]), 2)
             rendered[index + 1]["mood"] = level

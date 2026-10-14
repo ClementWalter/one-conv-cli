@@ -69,8 +69,9 @@ main { overflow-y: auto; min-width: 0; }
 <script>
 const S = JSON.parse(document.getElementById("data").textContent);
 const MOOD = (v) => v >= 2.5 ? "angry" : v >= 1.5 ? "frustrated" : v >= 0.75 ? "impatient" : "calm";
-const LABEL = { accepted: "accepted", new_task: "moved on", correction_preference: "correction: preference",
-  correction_new_info: "correction: new info", question: "question", unclear: "unclear" };
+const LABEL = { accepted: "accepted the reply above", new_task: "moved on to something else",
+  correction_preference: "corrected it: avoidable (approach, style, scope)", correction_new_info: "corrected it: gave new facts",
+  question: "asked about it", unclear: "unclear" };
 const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 for (const src of [...new Set(S.map((s) => s.source))].sort()) {
   document.getElementById("source").insertAdjacentHTML("beforeend", `<option>${esc(src)}</option>`);
@@ -109,8 +110,8 @@ function show(id) {
       let text = esc(m.text);
       if (q) text = text.replace(new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), (x) => `<mark>${x}</mark>`);
       return `<div class="msg ${m.role} ${cls}"><div class="who">${m.role === "user" ? "You" : "Agent"}
-        ${m.reaction ? `<span class="chip ${m.reaction[0]}">next reaction: ${LABEL[m.reaction[0]]} ${m.reaction[1]}</span>` : ""}
-        ${mood ? `<span class="chip">tone: ${mood} ${m.mood}</span>` : ""}</div><div class="text">${text}</div></div>`;
+        ${m.reaction ? `<span class="chip ${m.reaction[0]}" title="Classifier probability ${m.reaction[1]}">${LABEL[m.reaction[0]]} · ${Math.round(m.reaction[1] * 100)}%</span>` : ""}
+        ${mood ? `<span class="chip" title="Tone level ${m.mood} on a 0 (calm) to 3 (angry) scale">tone: ${mood}</span>` : ""}</div><div class="text">${text}</div></div>`;
     }).join("")}`;
   document.querySelector("main").scrollTop = 0;
   renderList();

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -21,6 +22,10 @@ SYNC_STATE = "archive-sync.json"
 SYNC_LOCK = "archive-sync.lock"
 SYNC_LOG = "archive-sync.log"
 LISTING_CACHE = "archive-listing.json"
+FREED = "archive-freed.json"
+# A running sync refreshes its lock after every conversation; one conversation's upload
+# can take minutes on a slow link, so only a much older lock belongs to a stopped sync.
+SYNC_STALE_SECONDS = 3600
 # Python's socket timeout bounds a whole send, so upload deadlines grow with the body,
 # assuming at least 1 Mbit/s of upstream bandwidth.
 MIN_UPLOAD_BYTES_PER_SECOND = 128 * 1024
@@ -28,6 +33,28 @@ MIN_UPLOAD_BYTES_PER_SECOND = 128 * 1024
 
 class ArchiveError(RuntimeError):
     pass
+
+
+def read_json(path):
+    """A state file's content; a missing or damaged file reads as empty so it is rewritten, not fatal."""
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def write_json(path, value):
+    """Replace a state file atomically; concurrent writers never share a temporary file. Readable by the owner only."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(value, stream)
+        os.replace(temporary, path)
+    except BaseException:
+        os.unlink(temporary)
+        raise
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -173,6 +200,10 @@ class ArchiveClient:
         return self.request("conversations", {"manifest": manifest, "expected": expected})
 
 
+def configured_url():
+    return os.environ.get("ONE_CONV_ARCHIVE_URL")
+
+
 def configured_client():
-    url = os.environ.get("ONE_CONV_ARCHIVE_URL")
+    url = configured_url()
     return ArchiveClient(url, os.environ.get("ONE_CONV_ARCHIVE_TOKEN", "")) if url else None

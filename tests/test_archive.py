@@ -20,7 +20,7 @@ import uvicorn
 
 from archive.server import create_app
 from archive.store import SQLiteStore
-from one_conv.archive import CHUNK_BYTES, ArchiveClient, ArchiveError, pack
+from one_conv.archive import CHUNK_BYTES, SYNC_STALE_SECONDS, ArchiveClient, ArchiveError, pack
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -574,7 +574,8 @@ def test_using_one_conv_syncs_in_the_background(tmp_path, archive):
     env = fixture_env(tmp_path)
     write_claude(env)
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret", ONE_CONV_ARCHIVE_SYNC_MINUTES="15")
-    assert run(env, "bin/one-conv", "local", "chats", "--source", "claude", "--json")  # Returns without waiting.
+    # Any command starts it, including one that never reads the archive, and returns without waiting.
+    assert run(env, "bin/one-conv", "cloud", "providers", success=False).returncode == 0
     deadline = time.time() + 60
     while not list(client.list_conversations()) and time.time() < deadline:
         time.sleep(0.5)
@@ -601,39 +602,140 @@ def test_failing_or_missing_syncs_are_reported_on_every_command(tmp_path, archiv
     state = Path(env["ONE_CONV_STATE_DIR"]) / "archive-sync.json"
     state.write_text(json.dumps({"requested": time.time() - 2 * 86400, "started": time.time() - 2 * 86400}))
     result = run(env, "bin/one-conv", "local", "chats", "--source", "claude", "--json", success=False)
+    assert "has not completed in the last day" not in result.stderr  # Automatic sync is off.
+    env["ONE_CONV_ARCHIVE_SYNC_MINUTES"] = str(3 * 24 * 60)  # On, but not yet due again: nothing starts.
+    result = run(env, "bin/one-conv", "local", "chats", "--source", "claude", "--json", success=False)
     assert "has not completed in the last day" in result.stderr
 
 
-def test_freeing_deletes_only_verified_files_and_restore_brings_them_back(tmp_path, archive):
+@pytest.mark.parametrize("source", ["claude", "codex"])
+def test_freeing_deletes_only_verified_files_and_restore_brings_them_back(tmp_path, archive, source):
     _, _, url = archive
     env = fixture_env(tmp_path)
-    path = write_claude(env)
-    folder = path.with_suffix("")
-    (folder / "tool-results").mkdir(parents=True)
-    (folder / "tool-results" / "output.txt").write_text("complete tool output")
     old = time.time() - 100 * 86400
-    for item in (path, folder / "tool-results" / "output.txt"):
+    if source == "claude":
+        path, session, project = write_claude(env), "session", "ancestry"
+        folder = path.with_suffix("")
+        (folder / "tool-results").mkdir(parents=True)
+        (folder / "tool-results" / "output.txt").write_text("complete tool output")
+        files = [path, folder / "tool-results" / "output.txt"]
+        unsynced, unsynced_text = folder / "tool-results" / "later.txt", "a file the archive has not captured"
+    else:
+        path, session, project = write_codex(env), "rollout-fixture", "codex-fixture"
+        files = [path]
+        unsynced, unsynced_text = path, path.read_text() + "\n" + json.dumps({"type": "event_msg", "payload": {"type": "unsynced"}})
+    for item in files:
         os.utime(item, (old, old))
-    originals = {item: item.read_bytes() for item in (path, folder / "tool-results" / "output.txt")}
-    commands = [("thread", "ancestry", "--raw", "--no-mark-read"), ("search", "Quartz"), ("chats",)]
-    baseline = [run(env, "bin/one-conv", "local", *args, "--source", "claude", "--json") for args in commands]
+    originals = {item: item.read_bytes() for item in files}
+    commands = [("thread", project, "--raw", "--no-mark-read"), ("search", "Quartz"), ("chats",)]
+    baseline = [run(env, "bin/one-conv", "local", *args, "--source", source, "--json") for args in commands]
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
-    run(env, "scripts/archive-sync.py", "--source", "claude")
-    # A file the archive has not captured blocks freeing the whole conversation.
-    unsynced = folder / "tool-results" / "later.txt"
-    unsynced.write_text("written after the last capture")
-    assert run(env, "scripts/archive-sync.py", "--source", "claude", "--free-older-than", "30")["freed"] == 0
-    assert path.exists() and unsynced.exists()
-    unsynced.unlink()
-    result = run(env, "scripts/archive-sync.py", "--source", "claude", "--free-older-than", "30")
+    run(env, "scripts/archive-sync.py", "--source", source)
+    unsynced.write_text(unsynced_text)
+    os.utime(unsynced, (old, old))  # Unchanged modification time: the sync skips it, so the archive lacks these bytes.
+    result = run(env, "scripts/archive-sync.py", "--source", source, "--free-older-than", "30", success=False)
+    assert result.returncode == 0 and json.loads(result.stdout)["kept"] == 1 and "differ from the archived capture" in result.stderr
+    assert all(item.exists() for item in files)
+    if source == "claude":
+        unsynced.unlink()
+    else:
+        path.write_bytes(originals[path])
+        os.utime(path, (old, old))
+    result = run(env, "scripts/archive-sync.py", "--source", source, "--free-older-than", "30")
     assert result["freed"] == 1 and result["freed_bytes"] == sum(map(len, originals.values()))
-    assert not path.exists() and not folder.exists()
+    assert not any(item.exists() for item in files) and not path.with_suffix("").exists()
     for args, expected in zip(commands, baseline):
-        assert run(env, "bin/one-conv", "local", *args, "--source", "claude", "--json") == expected
-    assert run(env, "scripts/archive-sync.py", "--restore", "session") == {"restored": 2}
+        assert run(env, "bin/one-conv", "local", *args, "--source", source, "--json") == expected
+    (Path(env["ONE_CONV_STATE_DIR"]) / "archive-origin").unlink()  # Restore works after the installation ID is lost.
+    assert run(env, "scripts/archive-sync.py", "--restore", session) == {"restored": len(files)}
     assert {item: item.read_bytes() for item in originals} == originals and path.stat().st_mtime == old
     for args, expected in zip(commands, baseline):
-        assert run(env, "bin/one-conv", "local", *args, "--source", "claude", "--json") == expected
+        assert run(env, "bin/one-conv", "local", *args, "--source", source, "--json") == expected
+
+
+def test_a_freed_conversation_written_again_does_not_replace_its_archive(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    old = time.time() - 100 * 86400
+    os.utime(path, (old, old))
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    assert run(env, "scripts/archive-sync.py", "--source", "claude", "--free-older-than", "30")["freed"] == 1
+    archived = list(client.list_conversations())
+    path.write_text(json.dumps({"type": "user", "cwd": "/example/ancestry", "timestamp": "2026-01-02T10:00:00Z",
+                                "message": {"role": "user", "content": "Continued after freeing"}}) + "\n")
+    result = run(env, "scripts/archive-sync.py", "--source", "claude", success=False)
+    assert result.returncode == 1 and "freed here and written again" in result.stderr
+    assert list(client.list_conversations()) == archived
+    result = run(env, "scripts/archive-sync.py", "--restore", "session-one", success=False)
+    assert result.returncode == 1 and "exists with different content" in result.stderr
+    path.unlink()
+    assert run(env, "scripts/archive-sync.py", "--restore", "session-one") == {"restored": 1}
+    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 0, "unchanged": 1}
+
+
+@pytest.mark.parametrize("escape", ["outside history", "through a symbolic link"])
+def test_restore_writes_only_inside_native_history(tmp_path, archive, escape):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if escape == "outside history":
+        planted = outside / "planted.jsonl"
+    else:
+        (path.parent.parent / "linked").symlink_to(outside)
+        planted = path.parent.parent / "linked" / "planted.jsonl"
+    row = list(client.list_conversations())[0]
+    manifest = client.read_conversation(row["key"])
+    manifest["originals"][str(planted)] = manifest["originals"][str(path)]
+    client.put(manifest, {}, row["revision"])
+    path.unlink()
+    result = run(env, "scripts/archive-sync.py", "--restore", "session-one", success=False)
+    assert result.returncode == 1 and "nothing was restored" in result.stderr
+    assert not path.exists() and not any(outside.iterdir())
+
+
+def test_damaged_state_files_and_settings_do_not_break_commands(tmp_path, archive):
+    _, _, url = archive
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    state = Path(env["ONE_CONV_STATE_DIR"])
+    state.mkdir()
+    damaged = ("archive-sync.json", "archive-listing.json", "archive-freed.json")
+    for name in damaged:
+        (state / name).write_text('{"truncated')
+    native = run(env, "bin/one-conv", "local", "chats", "--source", "claude", "--json")
+    unreachable = {**env, "ONE_CONV_ARCHIVE_URL": "http://127.0.0.1:1", "ONE_CONV_ARCHIVE_TOKEN": "test-secret"}
+    result = run(unreachable, "bin/one-conv", "local", "chats", "--source", "claude", "--json", success=False)
+    assert result.returncode == 0 and json.loads(result.stdout) == native and "Showing native history only" in result.stderr
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret", ONE_CONV_ARCHIVE_SYNC_MINUTES="soon")
+    result = run(env, "bin/one-conv", "local", "chats", "--source", "claude", "--json", success=False)
+    assert result.returncode == 0 and json.loads(result.stdout) == native and "Ignoring ONE_CONV_ARCHIVE_SYNC_MINUTES" in result.stderr
+    deadline = time.time() + 60  # The invalid interval falls back to the default, so a sync starts and repairs the state.
+    while "succeeded" not in (state / "archive-sync.json").read_text() and time.time() < deadline:
+        time.sleep(0.5)
+    assert json.loads((state / "archive-sync.json").read_text())["uploaded"] == 1
+    if os.name == "posix":
+        for name in ("archive-sync.json", "archive-listing.json", "archive-sync.log", "archive-sync.lock", "archive-origin"):
+            assert not (state / name).exists() or (state / name).stat().st_mode & 0o777 == 0o600, name
+
+
+def test_only_one_sync_runs_and_a_stopped_sync_does_not_block_later_ones(tmp_path, archive):
+    _, _, url = archive
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    lock = Path(env["ONE_CONV_STATE_DIR"]) / "archive-sync.lock"
+    lock.parent.mkdir()
+    lock.touch()
+    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"skipped": "another sync is running"}
+    stopped = time.time() - SYNC_STALE_SECONDS - 60
+    os.utime(lock, (stopped, stopped))
+    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 1, "unchanged": 0}
+    assert not lock.exists()
 
 
 def test_offline_archive_keeps_archived_conversations_listed(tmp_path):

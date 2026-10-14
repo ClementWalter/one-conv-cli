@@ -58,20 +58,28 @@ is installed on the machine: sync runs only while one-conv is used.
 Automatic sync covers every source except the shared corpus.
 
 Each sync records its result in one-conv's state directory and appends to
-`archive-sync.log` there. While the last sync has failures, or none has completed for
-a day, every command prints a warning on stderr. Only one sync runs at a time.
+`archive-sync.log` there; these files are readable only by their owner. While the
+last sync has failures, or automatic sync is on and none has completed for a day,
+every command prints a warning on stderr. Only one sync runs at a time; a sync that
+stopped without finishing blocks others for at most an hour.
 
 ## Freeing local space
 
-`uv run scripts/archive-sync.py --source claude --source codex --free-older-than 90`
+`uv run scripts/archive-sync.py --source claude --source codex --source omp --free-older-than 90`
 syncs, then deletes Claude Code, Codex and Oh My Pi conversations unchanged for 90
 days whose every file the archive holds byte for byte. A conversation with any file
-the archive lacks, or that changes during the check, is kept. Cursor conversations
-live in shared databases and are never deleted. Freed conversations still appear in
-every one-conv command, read from the archive.
+the archive lacks, or that changes during the check, is kept, and the reason is
+printed. Cursor conversations live in shared databases and are never deleted. Freed
+conversations still appear in every one-conv command, read from the archive.
 
-`uv run scripts/archive-sync.py --restore SESSION` writes a freed conversation's
-files back, for example to resume it in its own tool.
+`uv run scripts/archive-sync.py --restore SESSION` writes the newest archived copy
+of a freed conversation's files back, for example to resume it in its own tool. It
+writes only inside this machine's Claude Code, Codex and Oh My Pi history folders,
+never over a different file, and works after the state directory is reset.
+
+If a tool writes to a conversation after it was freed here, sync reports it and
+does not upload the new, partial file over the archived conversation. Move the new
+file away and restore the conversation.
 
 If the archive is unreachable, commands list archived conversations from the last
 successful listing and warn; opening one that exists only in the archive fails

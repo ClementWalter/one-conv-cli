@@ -21,8 +21,8 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from one_conv.archive import (SYNC_LOCK, SYNC_STATE, ArchiveError, configured_client, conversation_key, digest, encode,
-                              pack, revision, split)
+from one_conv.archive import (FREED, SYNC_LOCK, SYNC_STALE_SECONDS, SYNC_STATE, ArchiveError, configured_client,
+                              conversation_key, digest, encode, pack, read_json, revision, split, write_json)
 
 # Captures re-run when the reader or this capture code changes, even if sources did not.
 CAPTURE_VERSION = digest((ROOT / "bin/one-conv").read_bytes() + Path(__file__).read_bytes())
@@ -123,36 +123,40 @@ def capture(reader, handle, origin):
     return document
 
 
-LOCK_STALE_SECONDS = 600  # A running sync refreshes its lock after every conversation.
 FREEABLE_SOURCES = ("claude", "codex", "omp")  # One file or folder per conversation; never a shared database.
 
 
+def history_roots(reader, source):
+    return {"claude": [reader.PROJECTS_DIR], "codex": reader.CODEX_SESSION_DIRS, "omp": [reader.OMP_SESSIONS_DIR]}[source]
+
+
 def acquire_lock(path):
-    try:
-        path.open("x").close()
-        return True
-    except FileExistsError:
-        if time.time() - path.stat().st_mtime < LOCK_STALE_SECONDS:
-            return False
-        path.touch()  # Stale: the previous sync stopped without releasing it.
-        return True
+    for _ in range(2):
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            return True
+        except FileExistsError:
+            try:
+                if time.time() - path.stat().st_mtime < SYNC_STALE_SECONDS:
+                    return False
+                path.unlink()  # The previous sync stopped without releasing it.
+            except FileNotFoundError:
+                pass
+    return False
 
 
-def write_state(reader, state):
-    path = reader.STATE_DIR / SYNC_STATE
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(state))
-    temporary.replace(path)
-
-
-def free(client, handle, archived, paths):
-    """Delete a conversation's native files only if the archive holds exactly these bytes."""
+def free(reader, client, handle, archived):
+    """Delete a conversation's native files only if the archive holds exactly these bytes; return the bytes freed."""
+    paths = source_paths(reader, handle)
     before = fingerprint(paths)
     originals = client.read_conversation(archived["key"], archived["revision"])["originals"]
-    if any(originals.get(str(path)) != [name for name, _ in split(path.read_bytes())] for path in paths):
-        return 0
-    if fingerprint(paths) != before:
-        return 0
+    parts = {path: [name for name, _ in split(path.read_bytes())] for path in paths}
+    if any(originals.get(str(path)) != names for path, names in parts.items()):
+        raise ArchiveError("its files differ from the archived capture")
+    if client.request("chunks/missing", {"digests": [name for names in parts.values() for name in names]})["missing"]:
+        raise ArchiveError("the archive is missing some of its content")
+    if source_paths(reader, handle) != paths or fingerprint(paths) != before:
+        raise ArchiveError("it changed while being verified")
     size = sum(path.stat().st_size for path in paths)
     for path in paths:
         path.unlink()
@@ -163,26 +167,47 @@ def free(client, handle, archived, paths):
     return size
 
 
-def restore(client, origin, session):
-    rows = [row for row in client.list_conversations() if row["origin"] == origin and row["session"].startswith(session)]
-    if len(rows) != 1:
-        raise ArchiveError(f"{len(rows)} conversations from this installation match {session!r}; give a longer session ID")
-    manifest = client.read_conversation(rows[0]["key"])
+def restore_target(roots, name):
+    """The local path of an archived original, refused unless it lies inside this machine's native history."""
+    path = Path(name)
+    root = next((root for root in roots if path.is_absolute() and ".." not in path.parts and path.is_relative_to(root)
+                 and path != root), None)
+    if root is None:
+        raise ArchiveError(f"{name} is outside this machine's history folders; nothing was restored")
+    current = root
+    for part in path.relative_to(root).parts:
+        current = current / part
+        if current.is_symlink():
+            raise ArchiveError(f"{current} is a symbolic link; nothing was restored")
+    return path
+
+
+def restore(reader, client, session):
+    """Write the newest archived copy of a conversation back; every target is checked before anything is written."""
+    rows = [row for row in client.list_conversations() if row["source"] in FREEABLE_SOURCES and row["session"].startswith(session)]
+    matches = {(row["source"], row["session"]) for row in rows}
+    if len(matches) != 1:
+        raise ArchiveError(f"{len(matches)} archived conversations match {session!r}; give the full session ID")
+    row = max(rows, key=lambda row: row["mtime"])
+    manifest = client.read_conversation(row["key"], row["revision"])
+    roots = history_roots(reader, row["source"])
+    contents = {restore_target(roots, name): client.read_chunks(parts) for name, parts in manifest["originals"].items()}
+    for path, data in contents.items():
+        if path.exists() and path.read_bytes() != data:
+            raise ArchiveError(f"{path} exists with different content; move it away to restore")
     restored = 0
-    for name, parts in manifest["originals"].items():
-        path = Path(name)
-        if not path.is_absolute():
-            raise ArchiveError("Cursor IDE rows live in Cursor's shared database and cannot be restored")
-        data = client.read_chunks(parts)
-        if path.exists():
-            if path.read_bytes() != data:
-                raise ArchiveError(f"{path} exists with different content; move it away to restore")
-            continue
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-        restored += 1
-    main_file = Path(next(iter(manifest["originals"])))
+    for path, data in contents.items():
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("xb") as stream:
+                stream.write(data)
+            restored += 1
+    main_file = next(iter(contents))  # Captures list the conversation's main file first.
     os.utime(main_file, (manifest["mtime"], manifest["mtime"]))  # Native and archived copies compare equal.
+    freed_path = reader.STATE_DIR / FREED
+    freed = read_json(freed_path)
+    write_json(freed_path, {key: entry for key, entry in freed.items()
+                            if (entry.get("source"), entry.get("session")) != (row["source"], row["session"])})
     return {"restored": restored}
 
 
@@ -204,43 +229,52 @@ def main():
     client = configured_client()
     if client is None:
         parser.error("Set ONE_CONV_ARCHIVE_URL and ONE_CONV_ARCHIVE_TOKEN")
-    origin = origin_id(reader)
     if args.restore:
-        print(json.dumps(restore(client, origin, args.restore)))
+        print(json.dumps(restore(reader, client, args.restore)))
         return 0
+    origin = origin_id(reader)
     lock = reader.STATE_DIR / SYNC_LOCK
     if not acquire_lock(lock):
         print(json.dumps({"skipped": "another sync is running"}))
         return 0
-    state = {"started": time.time(), "failures": [], "failed": 0, "error": None}
+    state_path, started = reader.STATE_DIR / SYNC_STATE, time.time()
+    result, failures, error = {}, [], None
     try:
-        result = sync(reader, client, origin, args, lock, state)
-        state.update(finished=time.time(), **result)
-        if not result.get("failed"):
-            state["succeeded"] = state["finished"]
-    except Exception as error:
-        state.update(finished=time.time(), error=f"{type(error).__name__}: {error}")
+        result, failures = sync(reader, client, origin, args, lock)
+    except Exception as exception:
+        error = f"{type(exception).__name__}: {exception}"
         raise
     finally:
-        previous = json.loads((reader.STATE_DIR / SYNC_STATE).read_text()) if (reader.STATE_DIR / SYNC_STATE).exists() else {}
-        write_state(reader, {"requested": state["started"], **previous, **state})
-        lock.unlink(missing_ok=True)
+        try:
+            finished = time.time()
+            state = {"requested": started, **read_json(state_path), **result, "started": started, "finished": finished,
+                     "error": error, "failed": len(failures), "failures": failures[:5]}
+            if not error and not failures:
+                state["succeeded"] = finished
+            write_json(state_path, state)
+        finally:
+            lock.unlink(missing_ok=True)
     print(json.dumps(result))
-    return 1 if result.get("failed") else 0
+    return 1 if failures else 0
 
 
-def sync(reader, client, origin, args, lock, state):
+def sync(reader, client, origin, args, lock):
     existing = {row["key"]: row for row in client.list_conversations()}
+    freed = read_json(reader.STATE_DIR / FREED)
     projects = [p for p in reader._native_projects(tuple(args.source)) if not args.project or args.project.lower() in p.cwd.lower()]
     handles = sorted((h for p in projects for h in reader._native_project_sessions(p)), key=lambda h: h.mtime, reverse=True)
     handles = handles[:args.limit] if args.limit else handles
+    keyed = [(conversation_key(origin, h.source, h.project_cwd, h.uuid, reader._record_locator(h)), h) for h in handles]
     print(f"{datetime.now():%Y-%m-%d %H:%M:%S} sync of {len(handles)} conversations", file=sys.stderr)
     result = {"uploaded": 0, "unchanged": 0}
-    failed = []
-    for handle in handles:
+    failures = []
+    for key, handle in keyed:
         lock.touch()
         try:
-            key = conversation_key(origin, handle.source, handle.project_cwd, handle.uuid, reader._record_locator(handle))
+            if key in freed:
+                # Its new files hold only what was written after freeing; uploading them would hide the rest.
+                raise ArchiveError(f"freed here and written again since; move its new files away and run "
+                                   f"archive-sync.py --restore {handle.uuid}")
             archived = existing.get(key)
             if archived and archived["mtime"] == handle.mtime and archived["capture_version"] == CAPTURE_VERSION:
                 result["unchanged"] += 1  # Avoid re-reading and re-encoding unchanged history.
@@ -256,29 +290,31 @@ def sync(reader, client, origin, args, lock, state):
             existing[key] = {"key": key, "revision": head, "mtime": handle.mtime}
             result["uploaded"] += 1
         except Exception as error:  # One unreadable conversation must not stop the others.
-            failed.append(f"{handle.source}/{handle.uuid}: {type(error).__name__}: {error}")
-            print(failed[-1], file=sys.stderr)
+            failures.append(f"{handle.source}/{handle.uuid}: {type(error).__name__}: {error}")
+            print(failures[-1], file=sys.stderr)
     if args.free_older_than:
-        cutoff = time.time() - args.free_older_than * 86400
-        freed, freed_bytes = 0, 0
-        for handle in handles:
-            key = conversation_key(origin, handle.source, handle.project_cwd, handle.uuid, reader._record_locator(handle))
-            archived = existing.get(key)
-            if handle.source not in FREEABLE_SOURCES or handle.mtime >= cutoff or not archived or archived["mtime"] != handle.mtime:
-                continue
-            lock.touch()
-            try:
-                size = free(client, handle, archived, source_paths(reader, handle))
-            except Exception as error:
-                failed.append(f"{handle.source}/{handle.uuid}: not freed: {type(error).__name__}: {error}")
-                print(failed[-1], file=sys.stderr)
-                continue
-            freed += bool(size)
-            freed_bytes += size
-        result.update(freed=freed, freed_bytes=freed_bytes)
-    if failed:
-        result["failed"] = len(failed)
-        state["failures"] = failed[:5]
+        result.update(free_older(reader, client, keyed, existing, freed, time.time() - args.free_older_than * 86400, lock))
+    if failures:
+        result["failed"] = len(failures)
+    return result, failures
+
+
+def free_older(reader, client, keyed, existing, freed, cutoff, lock):
+    result = {"freed": 0, "freed_bytes": 0, "kept": 0}
+    for key, handle in keyed:
+        archived = existing.get(key)
+        if handle.source not in FREEABLE_SOURCES or handle.mtime >= cutoff or not archived or archived["mtime"] != handle.mtime:
+            continue
+        lock.touch()
+        try:
+            result["freed_bytes"] += free(reader, client, handle, archived)
+        except Exception as error:  # Keeping a conversation is safe; report why and continue.
+            result["kept"] += 1
+            print(f"{handle.source}/{handle.uuid}: kept: {error}", file=sys.stderr)
+            continue
+        result["freed"] += 1
+        freed[key] = {"source": handle.source, "session": handle.uuid, "freed": time.time()}
+        write_json(reader.STATE_DIR / FREED, freed)
     return result
 
 

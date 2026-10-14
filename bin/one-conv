@@ -83,6 +83,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -2059,7 +2060,8 @@ def _append_log_turn(mouth: str, role: str, text: str, machine: str | None = Non
 
 def _native_projects(sources: tuple[str, ...]):
     # A machine reading only archived Claude history has no projects directory; that is not an error then.
-    if "claude" in sources and (PROJECTS_DIR.is_dir() or not os.environ.get("ONE_CONV_ARCHIVE_URL")):
+    from one_conv.archive import configured_url
+    if "claude" in sources and (PROJECTS_DIR.is_dir() or not configured_url()):
         yield from _claude_iter_projects()
     if "codex" in sources:
         yield from _codex_iter_projects()
@@ -2085,24 +2087,25 @@ def _archive_state():
     When the archive is unreachable, its last listing keeps archived conversations visible;
     opening one then fails with a clear error.
     """
-    from one_conv.archive import LISTING_CACHE, ArchiveError, configured_client
+    from one_conv.archive import LISTING_CACHE, ArchiveError, configured_client, configured_url, read_json, write_json
     context = click.get_current_context(silent=True)
     if context is None:
         return None
     if "archive" not in context.meta:
-        url, cache = os.environ.get("ONE_CONV_ARCHIVE_URL"), STATE_DIR / LISTING_CACHE
+        url, cache = configured_url(), STATE_DIR / LISTING_CACHE
         client, rows, offline = None, None, None
         try:
             client = configured_client()
             if client:
                 rows = list(client.list_conversations())
-                STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-                cache.with_suffix(".tmp").write_text(json.dumps({"url": url, "listed": time.time(), "rows": rows}))
-                cache.with_suffix(".tmp").replace(cache)
+                try:
+                    write_json(cache, {"url": url, "listed": time.time(), "rows": rows})
+                except OSError as error:
+                    log.warning("Could not save the archive listing for offline use: %s", error)
         except ArchiveError as error:
             offline = str(error)
-            cached = json.loads(cache.read_text()) if cache.exists() else {}
-            rows = cached["rows"] if cached.get("url") == url else None
+            cached = read_json(cache)
+            rows = cached.get("rows") if cached.get("url") == url and "listed" in cached else None
             listed = (f" and the archive's listing from {datetime.fromtimestamp(cached['listed']):%Y-%m-%d %H:%M}"
                       if rows is not None else "")
             log.warning("%s Showing native history%s only.", error, listed)
@@ -2113,38 +2116,63 @@ def _archive_state():
                 projects.setdefault((row["source"], row["cwd"]), []).append(row)
             context.meta["archive"] = {"client": client, "offline": offline, "rows": rows, "projects": projects,
                                        "manifests": {}, "fields": {}}
-        if url:
-            _archive_sync_in_background()
     return context.meta["archive"]
 
 
-def _archive_sync_in_background():
-    """Start a sync when one is due, without waiting, and report a failing one on stderr."""
-    from one_conv.archive import SYNC_LOCK, SYNC_LOG, SYNC_STATE
-    minutes = float(os.environ.get("ONE_CONV_ARCHIVE_SYNC_MINUTES", "15"))
-    state_path = STATE_DIR / SYNC_STATE
-    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+ARCHIVE_SYNC_MINUTES = 15
+
+
+def _archive_sync_minutes():
+    value = os.environ.get("ONE_CONV_ARCHIVE_SYNC_MINUTES", str(ARCHIVE_SYNC_MINUTES))
+    try:
+        minutes = float(value)
+    except ValueError:
+        minutes = float("nan")
+    if not math.isfinite(minutes):
+        log.warning("Ignoring ONE_CONV_ARCHIVE_SYNC_MINUTES=%r; syncing every %d minutes.", value, ARCHIVE_SYNC_MINUTES)
+        return ARCHIVE_SYNC_MINUTES
+    return minutes
+
+
+def _archive_sync_health(state, minutes):
+    """Report a failing sync, or one that has not completed for a day while automatic sync is on."""
+    from one_conv.archive import SYNC_LOG
     if state.get("error") or state.get("failed"):
         detail = state.get("error") or "; ".join(state.get("failures", []))
-        log.warning("Archive sync at %s failed: %s (log: %s)",
-                    datetime.fromtimestamp(state["finished"]).strftime("%Y-%m-%d %H:%M"), detail, STATE_DIR / SYNC_LOG)
-    elif state and time.time() - (state.get("succeeded") or state["requested"]) > 86400:
+        finished = datetime.fromtimestamp(state.get("finished", 0)).strftime("%Y-%m-%d %H:%M")
+        log.warning("Archive sync at %s failed: %s (log: %s)", finished, detail, STATE_DIR / SYNC_LOG)
+    elif minutes > 0 and state and time.time() - (state.get("succeeded") or state.get("requested", 0)) > 86400:
         log.warning("Archive sync has not completed in the last day (log: %s)", STATE_DIR / SYNC_LOG)
-    lock = STATE_DIR / SYNC_LOCK
-    if minutes <= 0 or time.time() - state.get("started", 0) < minutes * 60 or (lock.exists() and time.time() - lock.stat().st_mtime < 600):
+
+
+def _archive_sync_in_background():
+    """Start a sync when one is due, without waiting; the sync script itself skips if another is running."""
+    from one_conv.archive import SYNC_LOG, SYNC_STATE, configured_url, read_json, write_json
+    if not configured_url():
+        return
+    minutes, state_path = _archive_sync_minutes(), STATE_DIR / SYNC_STATE
+    state = read_json(state_path)
+    _archive_sync_health(state, minutes)
+    if minutes <= 0 or time.time() - state.get("started", 0) < minutes * 60:
         return
     script = Path(__file__).resolve().parents[1] / "scripts" / "archive-sync.py"
+    if not script.is_file():
+        log.warning("Could not start archive sync: %s is missing", script)
+        return
     sources = [argument for source in ARCHIVE_SYNC_SOURCES for argument in ("--source", source)]
     detached = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
                 else {"start_new_session": True})
-    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # Recorded before starting, so a sync that never runs is reported too.
-    state.update(started=time.time(), requested=state.get("requested", time.time()))
-    state_path.with_suffix(".tmp").write_text(json.dumps(state))
-    state_path.with_suffix(".tmp").replace(state_path)
-    with (STATE_DIR / SYNC_LOG).open("a") as output:
-        subprocess.Popen([sys.executable, str(script), *sources], stdin=subprocess.DEVNULL, stdout=output,
-                         stderr=subprocess.STDOUT, **detached)
+    try:
+        # Recorded before starting, so a sync that never runs is reported too.
+        write_json(state_path, {**state, "started": time.time(), "requested": state.get("requested", time.time())})
+        output = os.open(STATE_DIR / SYNC_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            subprocess.Popen([sys.executable, str(script), *sources], stdin=subprocess.DEVNULL, stdout=output,
+                             stderr=subprocess.STDOUT, **detached)
+        finally:
+            os.close(output)
+    except OSError as error:
+        log.warning("Could not start archive sync: %s", error)
 
 
 def _archive_field(handle, field):
@@ -2622,6 +2650,7 @@ from one_conv.namespaces import NamespaceRoot, install as install_namespaces, se
              epilog="\b\nExamples:\n  one-conv cloud --help\n  one-conv local --help\n\nLegacy top-level commands remain available as compatibility aliases.")
 def cli() -> None:
     """Read conversation history from cloud products or local agent tools."""
+    _archive_sync_in_background()
 
 
 _SOURCE_OPTION = click.option(

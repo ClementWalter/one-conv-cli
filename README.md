@@ -36,9 +36,15 @@ open Claude's sign-in page with:
 one-conv cloud claude connect --login --browser chrome
 ```
 
-Finish signing in in the browser. If it already has your personal account
-signed in, switch to your work account there, or use separate browser profiles
-to keep both accounts available. Opening the page does not verify the login.
+Finish signing in in the browser. Opening the page does not verify the login.
+
+Every session one-conv verifies is saved in a private session vault
+(`sessions/` in the one-conv state folder under `~/.config`, files readable only by you). To add a
+second account, sign in to it in the same browser and run `accounts` again:
+the first account stays available from the vault until its session expires,
+even though the browser now shows the other one. Signing out on claude.ai
+revokes that session for good, so add a second Claude account from another
+browser or browser profile instead of signing out of the first.
 
 Authorize one-conv to read that browser's session, then verify account access:
 
@@ -122,7 +128,11 @@ pulls, and exits with an error before displaying results. It does not silently
 substitute old results for a failed refresh.
 
 Use a product's `pull --limit` to request a larger batch, up to 10,000
-conversations. The sync report distinguishes `ready`, `partial`, and `error`.
+conversations. Pulls are resumable: conversations whose cached copy is complete
+and current are not read again, and a conversation listed twice while paging
+is read once. Pulls run from the CLI wait out provider throttling (ChatGPT
+spaces out conversation reads) instead of failing; MCP refreshes keep short
+timeouts. The sync report distinguishes `ready`, `partial`, and `error`.
 `partial` can mean the batch limit was reached or a transcript was incomplete.
 A complete Cowork event snapshot does not mean the task itself has finished.
 
@@ -242,6 +252,77 @@ stale data as fresh. Searches always use saved history.
 The server exposes history access and explicit refresh, with no message sending
 or arbitrary command execution. This repository contains the CLI, agent skill,
 and local MCP server. The hosted OneConv application is developed separately.
+
+## Fine-tune on your history
+
+`one-conv tune` asks whether your own agent history can teach a coding model
+how you work. It turns saved sessions into fine-tuning data, trains a LoRA
+adapter on Qwen2.5-Coder-7B, and measures it against the base model on
+sessions it never saw. Everything stays in `~/.cache/one-conv-cli/tune`
+(`ONE_CONV_TUNE_DIR`) unless you use the Modal commands.
+
+**Data.** `snapshot` exports every human-driven session through the export
+format above: user and assistant text only, secrets redacted. The dataset
+drops machine-written "user" turns (relay preambles, harness warnings, other
+sessions' messages), keeps ChatGPT voice turns as their transcription, merges
+copies of the same conversation, and takes training rows only from agentic
+coding tools (`--targets` overrides). Each training row is the conversation
+up to an agent reply plus that reply; the loss covers the reply only. The
+newest sessions are held out for testing (`--split time`).
+
+**Labels.** Every moment where you answered an agent reply is classified:
+accepted, moved on, correction you could have been spared, correction that
+brought new facts, question, or unclear. `label` uses classifier.dev (free,
+keyless, asked not to keep the text) by default, SubQ Snap or Jev with a key,
+or an LLM judge on Boundless for the uncertain ones (`--provider boundless
+--uncertain-from classifier`). Accepted and moved-on replies become SFT
+targets; avoidable corrections become DPO pairs (rejected reply vs the reply
+that followed); new-fact corrections are kept for evaluation only. `annotate`
+lets you label uncertain moments yourself, and `compare` scores each labeler
+against your labels.
+
+**Looking at the data.** `review` samples labels, `mood` rates the tone of
+every reaction from calm to angry and lists the most heated sessions, and
+`view` writes a local HTML viewer of all conversations with their labels.
+
+```bash
+one-conv tune snapshot && one-conv tune label && one-conv tune mood
+one-conv tune view                                    # local viewer, never published
+one-conv tune dataset --name base --labels            # SFT rows, DPO pairs, new-fact pairs
+one-conv tune synth --rule no-comments                # optional rule data, see below
+one-conv tune train --dataset base --run first        # MLX on Apple Silicon
+one-conv tune eval --run first
+one-conv tune probe --run first --rule no-comments
+one-conv tune runs                                    # compare runs
+```
+
+**On a GPU.** `tune cloud` runs the same steps on a Modal H100 (about 20
+minutes and a few dollars per run), with vLLM for generation and TRL for
+training: `push`, `synth`, `train`, `dpo` (preference training on top of an
+SFT run), `eval`, `benchmark` (HumanEval, to catch lost general coding
+ability), `probe`, `pull`, and `nightly` to refresh everything and retrain.
+`clean --yes` deletes the Modal volume, including the uploaded sessions.
+
+**Measures.** `eval` reports perplexity on your held-out accepted replies
+(how expected they are, not what the model writes) and preference shift: how
+often training moved probability toward the reply you accepted rather than the
+one you corrected, relative to the starting model, so reply length cancels
+out. `probe` asks a rule's coding tasks after growing amounts of real
+conversation and counts violations for the base model, the base model with the
+rule in its system prompt, and the adapter, which was never told the rule.
+`synth` provides that rule's training data by regenerating replies to your own
+coding requests with the rule as a system prompt and rewriting them to obey
+it; `dataset --synth RULE` trains on them without the prompt.
+
+**What a first experiment found** (about 2,000 human sessions, Qwen2.5-Coder-7B):
+training on accepted replies cut held-out perplexity from 9.2 to 7.4 with no
+loss on HumanEval, almost all of it from the raw sessions; DPO on about 860
+avoidable corrections moved probability toward the accepted reply on 81% of
+held-out pairs; and a no-comments rule learned from synthetic data held at
+about 50% violations across 2k to 16k tokens of history, while the same rule
+in the system prompt went from 15% with no history to 80-100%. These reading
+metrics show the model's probabilities moved; they do not yet show that its
+own replies would be accepted more often.
 
 ## Command reference
 

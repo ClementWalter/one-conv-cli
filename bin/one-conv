@@ -1430,10 +1430,49 @@ def _chatgpt_cookie_jars(domain="chatgpt.com", required_cookie="__Secure-next-au
                 yield f"{label}/{Path(store).parent.name}", jar
 
 
+def _session_vault():
+    from one_conv.session_vault import SessionVault
+    return SessionVault(Path(os.environ.get("ONE_CONV_SESSION_VAULT", str(STATE_DIR / "sessions"))))
+
+
 def _claude_accounts():
-    """Reuse provider-scoped browser session discovery for Claude organization access."""
+    """Claude organizations from live browser logins plus saved sessions of other logins."""
     from one_conv.browser_auth import claude_accounts
-    yield from claude_accounts(lambda: _chatgpt_cookie_jars("claude.ai", "sessionKey"))
+    vault = _session_vault()
+    verified: set[str] = set()
+
+    def identity(profile, organizations):
+        return profile + ":" + ",".join(sorted(org["uuid"] for org in organizations))
+
+    saved: dict[str, object] = {}
+
+    def remember(profile, cookies, organizations):
+        key = identity(profile, organizations)
+        verified.add(key)
+        names = ", ".join(org.get("name") or org["uuid"] for org in organizations)
+        vault.save("claude", key, profile, cookies, description=names)
+
+    def expired(profile, cookies):
+        entry = saved.get(cookies.get("sessionKey"))
+        if entry is None:
+            log.warning("The Claude login in %s is signed out; sign in again on claude.ai", profile)
+            return
+        # Signing out on claude.ai revokes the session server-side, so the saved copy is dead too.
+        vault.remove("claude", entry.identity)
+        log.warning("Removed the saved Claude session for %s: it was signed out on claude.ai. "
+                    "Sign in to it again to re-add it.", entry.description or entry.identity)
+
+    def jars():
+        live = list(_chatgpt_cookie_jars("claude.ai", "sessionKey"))
+        live_keys = {cookies.get("sessionKey") for _, cookies in live}
+        yield from live
+        # Lazy: live logins are verified first, so an older saved copy never overwrites them.
+        for entry in vault.entries("claude"):
+            if entry.cookies.get("sessionKey") not in live_keys and entry.identity not in verified:
+                saved[entry.cookies.get("sessionKey")] = entry
+                yield entry.label, entry.cookies
+
+    yield from claude_accounts(jars, on_verified=remember, on_expired=expired)
 
 
 def _chatgpt_client(jar: dict[str, str]):
@@ -1461,11 +1500,16 @@ def _chatgpt_authenticate(jar: dict[str, str]) -> dict | None:
     Returns None when that profile is signed out."""
     session = _chatgpt_client(jar)
     try:
-        payload = session.get(f"{CHATGPT_HOST}/api/auth/session", timeout=30).json()
+        response = session.get(f"{CHATGPT_HOST}/api/auth/session", timeout=30)
+        payload = response.json()
     except Exception:
         return None
     token = payload.get("accessToken")
     if not token:
+        return None
+    if payload.get("error"):
+        # A stale token comes back with RefreshAccessTokenError and is refused by every API route.
+        log.warning("A ChatGPT session has expired; sign in again with: one-conv cloud chatgpt connect --login")
         return None
     account = payload.get("account") or {}
     session.headers["Authorization"] = f"Bearer {token}"
@@ -1474,6 +1518,7 @@ def _chatgpt_authenticate(jar: dict[str, str]) -> dict | None:
         session.headers["ChatGPT-Account-ID"] = account_id
     return {
         "session": session,
+        "jar": _chatgpt_rotated_jar(jar, response),
         "account_id": account_id,
         "email": (payload.get("user") or {}).get("email") or "",
         "plan": account.get("planType") or "",
@@ -1481,15 +1526,33 @@ def _chatgpt_authenticate(jar: dict[str, str]) -> dict | None:
     }
 
 
+def _chatgpt_rotated_jar(jar: dict[str, str], response) -> dict[str, str]:
+    """Fold a refreshed session cookie into the jar so the saved copy stays current."""
+    token = "__Secure-next-auth.session-token"
+    issued = {name: value for name, value in response.cookies.items() if name.startswith(token) and value}
+    if not issued:
+        return dict(jar)
+    chunks = sorted(name for name in issued if name != token)
+    fresh = "".join(issued[name] for name in chunks) if chunks else issued[token]
+    return {**jar, token: fresh}
+
+
 def _chatgpt_accounts():
-    """Every signed-in ChatGPT account reachable from a local browser profile."""
+    """Every ChatGPT account from live browser logins plus saved sessions of other logins."""
+    token = "__Secure-next-auth.session-token"
+    vault = _session_vault()
     seen: set[str] = set()
-    for label, jar in _chatgpt_cookie_jars():
+    live = list(_chatgpt_cookie_jars())
+    live_tokens = {jar.get(token) for _, jar in live}
+    saved = [(entry.label, entry.cookies) for entry in vault.entries("chatgpt")
+             if entry.cookies.get(token) not in live_tokens]
+    for label, jar in live + saved:
         auth = _chatgpt_authenticate(jar)
         if not auth or not auth["account_id"] or auth["account_id"] in seen:
             continue
         seen.add(auth["account_id"])
         auth["profile"] = label
+        vault.save("chatgpt", auth["account_id"], label, auth.pop("jar"))
         yield auth
 
 
@@ -2737,25 +2800,8 @@ def _export_session(handle: SessionHandle, machine: str, out_root: Path) -> Path
     return target
 
 
-@cli.command()
-@click.option("--out", "out_dir", required=True, help="Root of the corpus checkout, e.g. ~/Documents/corpus.")
-@click.option("--machine", default=None, help="Folder name for this machine (default: hostname).")
-@click.option("--source", "source_filter", type=click.Choice(SOURCES), default=None, help="Only this backend.")
-@click.option("--since", default=None, help="Only sessions active at/after this ISO date (default: all).")
-@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
-def export(out_dir: str, machine: str | None, source_filter: str | None, since: str | None, as_json: bool) -> None:
-    """Export every session as text to OUT/<machine>/<source>/<cwd>/<uuid>.json.
-
-    Only user and assistant text is kept, with tool calls summarized and
-    tool output dropped, and token-shaped strings are redacted. A session
-    whose stored copy is already as recent as the source is skipped, so the
-    command is cheap to run hourly. Each file carries `author`: "human" for
-    sessions a person drove, "system" for heartbeat/worker prompts.
-    """
-    out_root = Path(out_dir).expanduser()
-    machine = machine or socket.gethostname().split(".")[0]
-    sources = selected_sources(source_filter, SOURCES)
-    cutoff = datetime.fromisoformat(since).timestamp() if since else 0.0
+def _export_all(out_root: Path, machine: str, sources: tuple[str, ...], cutoff: float = 0.0) -> tuple[list[str], int]:
+    """Export every session in scope; return written relative paths and the already-current count."""
     written, skipped = [], 0
     for project in _iter_all_projects(sources):
         for handle in _project_sessions(project):
@@ -2766,6 +2812,30 @@ def export(out_dir: str, machine: str | None, source_filter: str | None, since: 
                 skipped += 1
             else:
                 written.append(str(path.relative_to(out_root)))
+    return written, skipped
+
+
+@cli.command()
+@click.option("--out", "out_dir", required=True, help="Root of the corpus checkout, e.g. ~/Documents/corpus.")
+@click.option("--machine", default=None, help="Folder name for this machine (default: hostname).")
+@click.option("--source", "source_filter", type=click.Choice(SOURCES), default=None, help="Only this backend.")
+@click.option("--since", default=None, help="Only sessions active at/after this ISO date (default: all).")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+def export(out_dir: str, machine: str | None, source_filter: str | None, since: str | None, as_json: bool) -> None:
+    """Export every session as text to OUT/<machine>/<source>/<cwd>/<uuid>.json.
+
+    Only user and assistant text blocks are kept: tool calls, tool output,
+    thinking and sub-agent turns are dropped, and token-shaped strings are
+    redacted. A session
+    whose stored copy is already as recent as the source is skipped, so the
+    command is cheap to run hourly. Each file carries `author`: "human" for
+    sessions a person drove, "system" for heartbeat/worker prompts.
+    """
+    out_root = Path(out_dir).expanduser()
+    machine = machine or socket.gethostname().split(".")[0]
+    sources = selected_sources(source_filter, SOURCES)
+    cutoff = datetime.fromisoformat(since).timestamp() if since else 0.0
+    written, skipped = _export_all(out_root, machine, sources, cutoff)
     if as_json:
         click.echo(json.dumps({"machine": machine, "written": written, "skipped": skipped}))
         return
@@ -3602,6 +3672,18 @@ def cloud_command(context):
 
 
 install_namespaces(cli, lambda: _chatgpt_accounts(), lambda: _claude_accounts())
+
+
+def _tune_snapshot(out_root: Path) -> tuple[int, int]:
+    # The corpus source re-reads exports, so excluding it avoids training on duplicates.
+    sources = tuple(source for source in SOURCES if source != "corpus")
+    written, skipped = _export_all(out_root, _THIS_MACHINE, sources)
+    return len(written), skipped
+
+
+from one_conv.tune.cli import build_tune_group  # noqa: E402
+
+cli.add_command(build_tune_group(_tune_snapshot, _corpus_roots))
 
 
 @cli.command("mcp")

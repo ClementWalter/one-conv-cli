@@ -189,8 +189,8 @@ the user asked to send. `one-conv live install` lists the per-harness setup and
 Keep exchanges reconstructable. Open each message with
 `to: <address>  cc: <addresses>  re: <topic>`. A relayed message is a user turn
 in the receiver's thread and only a tool call in the sender's, so point
-references at the receiver: its address, the send time and a quoted phrase for
-`one-conv local search`. Reference long or optional content; copy short content
+references at the receiver: its address, the send time and a distinctive quoted phrase
+for `one-conv local search`. Reference long or optional content; copy short content
 and anything the recipient must act on verbatim (decisions, approval scope,
 commands), or when the recipient cannot read local threads. A reference is not
 delivery: message anyone who must act.

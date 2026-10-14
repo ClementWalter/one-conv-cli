@@ -281,7 +281,8 @@ reference must point at the receiver's thread.
   not need it, or when several agents follow the same exchange. Make the pointer
   precise: the receiver's address, the send time, and a quoted phrase to search
   for, for example `replied to claude:6c51 at 23:19Z, find it with
-  one-conv local search "Round 2 review" --source claude`. `local thread` selects
+  one-conv local search "Round 2 review" --source claude`. Choose a phrase
+  distinctive enough that later messages quoting it are unlikely. `local thread` selects
   only the last N turns, so "see its latest turn" goes stale as soon as the
   receiver takes another turn.
 - Copy instead when the content is short, when the recipient must act on the

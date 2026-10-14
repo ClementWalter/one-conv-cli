@@ -15,7 +15,7 @@ from click.testing import CliRunner
 
 from one_conv.live import claude, codex, cursor, install, omp, router
 from one_conv.live.cli import build_live_group
-from one_conv.live.model import LiveSession, envelope, parse_address
+from one_conv.live.model import LiveSession, envelope, is_session_id, parse_address
 
 THREAD = "01a13c8f-049a-71b1-b4e6-e0798600ccaa"
 CLI = Path(__file__).resolve().parents[1] / "bin" / "one-conv"
@@ -96,6 +96,14 @@ def inbox_socket():
 ])
 def test_parse_address(text, expected):
     assert parse_address(text) == expected
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (THREAD, True), ("b1bf197e-7306", True), ("/tmp/outside", False), ("../up", False),
+    ("a/b", False), (".hidden", False), ("", False),
+])
+def test_is_session_id(value, expected):
+    assert is_session_id(value) is expected
 
 
 def test_envelope_without_sender_is_unknown_by_default():
@@ -242,6 +250,29 @@ def test_cursor_stop_hook_registers_chat(homes):
     assert [(s.address, s.cwd) for s in cursor.list_sessions()] == [("cursor:k1", "/work/ui")]
 
 
+def _inbox_with_bad_file(homes):
+    directory = cursor.inbox("k1")
+    directory.mkdir(parents=True)
+    (directory / "001-good.json").write_text(json.dumps({"text": "valid"}))
+    (directory / "002-bad.json").write_text("{")
+    return directory
+
+
+def test_cursor_stop_hook_keeps_valid_message_beside_malformed_one(homes):
+    _inbox_with_bad_file(homes)
+    assert _hook() == {"followup_message": "valid"}
+
+
+def test_cursor_stop_hook_drops_malformed_file(homes):
+    directory = _inbox_with_bad_file(homes)
+    _hook()
+    assert list(directory.iterdir()) == []
+
+
+def test_cursor_stop_hook_ignores_path_like_conversation_id(homes):
+    assert cursor.run_stop_hook({"conversation_id": "../../escape"}) == {}
+
+
 def test_cursor_stop_hook_without_conversation_does_nothing(homes):
     assert cursor.run_stop_hook({}) == {}
 
@@ -297,6 +328,21 @@ def test_send_stops_a_runaway_pair(homes):
         router.send("omp:o1", "ping", LiveSession("claude", "c1"))
     with pytest.raises(router.LiveError, match="relay forever"):
         router.send("omp:o1", "ping", LiveSession("claude", "c1"))
+
+
+def test_resolve_rejects_path_as_cursor_id(homes, tmp_path):
+    with pytest.raises(router.LiveError):
+        router.resolve(f"cursor:{tmp_path / 'outside'}", sessions=[])
+
+
+def test_router_imports_without_fcntl():
+    """Windows has no fcntl; the CLI imports the live package on every invocation."""
+    script = ("import sys\nclass Block:\n    def find_spec(self, name, *a):\n"
+              "        if name == 'fcntl': raise ImportError(name)\n"
+              "sys.meta_path.insert(0, Block())\nimport one_conv.live.router")
+    result = subprocess.run([sys.executable, "-c", script], check=False, capture_output=True, text=True,
+                            cwd=CLI.parents[1])
+    assert result.returncode == 0, result.stderr
 
 
 def test_resolve_closed_claude_session_points_to_local_send(homes):

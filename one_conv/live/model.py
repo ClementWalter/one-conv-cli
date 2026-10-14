@@ -40,6 +40,14 @@ def parse_address(text: str) -> tuple[str | None, str]:
     return None, text
 
 
+# Session ids become file and directory names under live_home(); anything else could escape it.
+_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def is_session_id(value: str) -> bool:
+    return bool(_SESSION_ID.fullmatch(value)) and ".." not in value
+
+
 def live_home() -> Path:
     return Path(os.environ.get("ONE_CONV_LIVE_DIR", str(Path.home() / ".config" / "agent-conv-cli" / "live")))
 

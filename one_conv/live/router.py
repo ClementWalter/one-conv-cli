@@ -1,6 +1,5 @@
 """List live sessions across harnesses, identify the sender, resolve a target and deliver."""
 
-import fcntl
 import json
 import logging
 import os
@@ -10,7 +9,12 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from . import claude, codex, cursor, omp
-from .model import LiveSession, envelope, live_home, parse_address
+from .model import LiveSession, envelope, is_session_id, live_home, parse_address
+
+try:
+    import fcntl
+except ImportError:  # Windows has no flock; the rate log is then updated unlocked.
+    fcntl = None
 
 logger = logging.getLogger(__name__)
 ADAPTERS = {"claude": claude, "codex": codex, "omp": omp, "cursor": cursor}
@@ -99,11 +103,13 @@ def resolve(target: str, sessions: list[LiveSession] | None = None,
         if len(matches) > 1:
             listing = "\n".join(f"  {s.address}  {s.title or s.cwd}" for s in matches)
             raise LiveError(f"{target!r} matches several live sessions:\n{listing}")
-    if harness == "codex":
+    if harness == "codex" and is_session_id(query):
         stored = codex.stored_session(query)
         if stored:
             return stored
     if harness == "cursor":
+        if not is_session_id(query):
+            raise LiveError(f"{query!r} is not a Cursor conversation id.")
         return LiveSession("cursor", query, status="not seen recently", delivery="stop hook",
                            endpoint=str(cursor.inbox(query)))
     hint = " A closed Claude Code session can be continued with `one-conv local send`." if harness == "claude" else ""
@@ -116,7 +122,8 @@ def _rate_slot(sender: str, target: str):
     log = live_home() / "sent.jsonl"
     log.parent.mkdir(parents=True, exist_ok=True)
     with (live_home() / "sent.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
         now = time.time()
         try:
             rows = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]

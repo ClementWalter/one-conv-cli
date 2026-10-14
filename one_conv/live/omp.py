@@ -9,7 +9,7 @@ import os
 import uuid
 from pathlib import Path
 
-from .model import LiveSession, live_home, pid_alive
+from .model import LiveSession, is_session_id, live_home, pid_alive
 
 
 def omp_home() -> Path:
@@ -25,6 +25,8 @@ def _registry() -> Path:
 
 
 def inbox(session_id: str) -> Path:
+    if not is_session_id(session_id):
+        raise ValueError(f"not an omp session id: {session_id!r}")
     return live_home() / "inbox" / "omp" / session_id
 
 
@@ -41,7 +43,7 @@ def _records() -> list[dict]:
             data = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-        if isinstance(data, dict) and data.get("sessionId"):
+        if isinstance(data, dict) and is_session_id(str(data.get("sessionId") or "")):
             rows.append(data)
     return rows
 

@@ -257,8 +257,11 @@ messages carry `from="cursor:?unknown"` and cannot be answered.
 messages as user turns, including sessions that skip permission prompts; without
 it, those sessions hold each message for approval. A sender that is not an agent
 session is labelled `user` from an interactive terminal and `unknown` otherwise.
-A sender may send at most 10 messages to one target per 5 minutes, which stops
-two agents from relaying replies forever. Live state lives in
+These labels are not authenticated: any local process running as you can name
+any sender with `--from`, so treat relayed messages as coming from trusted local
+processes. Message bodies cannot open or close an envelope of their own. A
+sender may send at most 10 messages to one target per 5 minutes; this throttles
+two agents that keep replying to each other but does not end the exchange. Live state lives in
 `~/.config/agent-conv-cli/live` (override with `ONE_CONV_LIVE_DIR`).
 
 ## Local MCP server

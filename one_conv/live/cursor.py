@@ -12,7 +12,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .model import LiveSession, live_home
+from .model import LiveSession, is_session_id, live_home
 
 # Chats whose last turn ended longer ago than this are treated as closed.
 RECENT_SECONDS = 12 * 3600
@@ -27,6 +27,8 @@ def _registry() -> Path:
 
 
 def inbox(conversation_id: str) -> Path:
+    if not is_session_id(conversation_id):
+        raise ValueError(f"not a Cursor conversation id: {conversation_id!r}")
     return live_home() / "inbox" / "cursor" / conversation_id
 
 
@@ -98,7 +100,7 @@ def chat_for_pid(pid: int) -> str | None:
 def run_stop_hook(payload: dict) -> dict:
     """Record the chat as live and return its queued messages as one follow-up turn."""
     conversation_id = payload.get("conversation_id")
-    if not conversation_id:
+    if not isinstance(conversation_id, str) or not is_session_id(conversation_id):
         return {}
     roots = payload.get("workspace_roots") or []
     _registry().mkdir(parents=True, exist_ok=True)
@@ -114,6 +116,12 @@ def run_stop_hook(payload: dict) -> dict:
             path.rename(claimed)
         except OSError:
             continue
-        texts.append(json.loads(claimed.read_text())["text"])
-        claimed.unlink()
+        try:
+            text = json.loads(claimed.read_text()).get("text")
+        except (OSError, ValueError, AttributeError):
+            text = None
+        # A malformed file is dropped so it cannot block or lose the messages around it.
+        claimed.unlink(missing_ok=True)
+        if isinstance(text, str) and text:
+            texts.append(text)
     return {"followup_message": "\n\n".join(texts)} if texts else {}

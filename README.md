@@ -261,6 +261,7 @@ one-conv tune snapshot                      # export every local and cached clou
 one-conv tune label                         # classify every reaction with SubQ Snap (SUBQ_API_KEY) or --provider jev
 one-conv tune review                        # spot-check labels against your own judgment
 one-conv tune dataset --name base --labels  # SFT examples + DPO correction pairs from the labels
+one-conv tune synth --rule no-comments        # optional: rule-following answers by context distillation
 one-conv tune train --dataset base --run first
 one-conv tune eval --run first              # perplexity and preference accuracy, base vs adapter
 one-conv tune probe --run first --rule no-comments
@@ -278,6 +279,11 @@ SFT targets, and corrected ones become the rejected side of a preference pair
 whose chosen side is the next reply. Without it, a keyword heuristic ("no",
 "revert", "pas ça", ...) stands in for the classifier. Splits are assigned per session, so
 evaluation never sees a training conversation.
+
+`synth` regenerates replies to your real coding requests, in their original
+conversation context, with a rule in the system prompt, then rewrites them to
+obey it; `tune dataset --synth RULE` adds them to the training split without
+the system prompt, so the rule has to come from the weights.
 
 `probe` measures how often a rule is broken as real history accumulates in
 the context. It compares the base model, the base model with the rule as a

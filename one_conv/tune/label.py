@@ -126,7 +126,7 @@ def load_labels(path: Path) -> dict[str, dict]:
     if not path.exists():
         return {}
     labels = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8").split("\n"):
         if line.strip():
             row = json.loads(line)
             labels[row["key"]] = row

@@ -113,15 +113,38 @@ def probe(job: dict) -> dict:
     return {"rule": rule.name, "rows": rows}
 
 
+def synthesize(job: dict) -> dict:
+    """Answer prompts with the rule in the system prompt, appending raw answers so runs resume."""
+    from mlx_lm import batch_generate
+    rule = RULES[job["rule"]]
+    out = Path(job["out"])
+    done = {json.loads(line)["key"] for line in out.read_text().split("\n") if line.strip()} if out.exists() else set()
+    pending = [row for row in _read_jsonl(Path(job["prompts"]), 10**9) if row["key"] not in done][:job["limit"]]
+    model, tokenizer = _load(job["model"], None)
+    written = 0
+    with out.open("a", encoding="utf-8") as stream:
+        for start in range(0, len(pending), job["batch_size"]):
+            batch = pending[start:start + job["batch_size"]]
+            prompts = [tokenizer.apply_chat_template([{"role": "system", "content": rule.instruction}, *row["messages"]],
+                                                     add_generation_prompt=True) for row in batch]
+            texts = batch_generate(model, tokenizer, prompts, max_tokens=job["max_new_tokens"]).texts
+            for row, text in zip(batch, texts):
+                stream.write(json.dumps({**row, "answer": text}, ensure_ascii=False) + "\n")
+            stream.flush()
+            written += len(batch)
+            log.info("Synthesized %d/%d answers", written, len(pending))
+    return {"written": written, "pending_before": len(pending)}
+
+
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", stream=sys.stderr)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("evaluate", "probe"))
+    parser.add_argument("mode", choices=("evaluate", "probe", "synthesize"))
     parser.add_argument("--job", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args(argv)
     job = json.loads(args.job.read_text())
-    result = evaluate(job) if args.mode == "evaluate" else probe(job)
+    result = {"evaluate": evaluate, "probe": probe, "synthesize": synthesize}[args.mode](job)
     args.out.write_text(json.dumps(result, indent=1, ensure_ascii=False) + "\n")
 
 

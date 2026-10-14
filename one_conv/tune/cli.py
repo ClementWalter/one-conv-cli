@@ -5,6 +5,7 @@ import os
 import random
 import shlex
 import subprocess
+import sys
 from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
@@ -29,20 +30,32 @@ from .runs import (
     load_runs,
     lora_command,
     mlx_env,
+    mlx_python,
     score_command,
     tune_home,
 )
+from .synth import coding_prompts, load_answers, synthetic_examples
 
 HELP = {"help_option_names": ["-h", "--help"]}
 
 
-def _execute(command: list[str], dry_run: bool) -> None:
+def _execute(command: list[str], dry_run: bool, log_path: Path | None = None) -> None:
+    """Run an MLX command, mirroring its output into `log_path` so curves can be charted later."""
     click.echo(shlex.join(command), err=True)
     if dry_run:
         return
-    completed = subprocess.run(command, env=mlx_env(), check=False)
-    if completed.returncode != 0:
-        raise click.ClickException(f"Command failed with exit code {completed.returncode}.")
+    if log_path is None:
+        returncode = subprocess.run(command, env=mlx_env(), check=False).returncode
+    else:
+        with log_path.open("w", encoding="utf-8") as log, subprocess.Popen(
+                command, env=mlx_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as process:
+            for line in process.stdout:
+                sys.stderr.write(line)
+                log.write(line)
+                log.flush()
+        returncode = process.returncode
+    if returncode != 0:
+        raise click.ClickException(f"Command failed with exit code {returncode}.")
 
 
 def _job(run_dir: Path, name: str, job: dict) -> Path:
@@ -121,9 +134,13 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
                   help="Use classifier labels from `tune label` instead of the keyword heuristic.")
     @click.option("--min-probability", default=0.6, show_default=True,
                   help="With --labels, ignore moments whose label probability is below this.")
+    @click.option("--synth", "synth_rule", type=click.Choice(sorted(RULES)), default=None,
+                  help="Add synthetic rule-following examples from `tune synth` to the training split.")
+    @click.option("--synth-ratio", default=1.0, show_default=True,
+                  help="Synthetic rows per real SFT training row.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the manifest as JSON.")
     def dataset(name, extra_roots, sources, rule, valid, test, max_context_messages, max_chars, include_system,
-                provider, use_labels, min_probability, as_json):
+                provider, use_labels, min_probability, synth_rule, synth_ratio, as_json):
         """Build SFT examples and DPO pairs from exported sessions.
 
         Accepted assistant turns become SFT targets. A turn followed by a
@@ -144,8 +161,17 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             if not labels:
                 raise click.ClickException(f"No labels yet. Run: one-conv tune label --provider {provider}")
         out = home / "datasets" / name
-        manifest = write_dataset(sessions, out, valid, test, RULES[rule] if rule else None,
+        synthetic = None
+        if synth_rule:
+            answers = load_answers(home / "synth" / synth_rule / "answers.jsonl")
+            if not answers:
+                raise click.ClickException(f"No synthetic answers yet. Run: one-conv tune synth --rule {synth_rule}")
+            # Sized against the real training rows: build once without them to count, then mix.
+            real = write_dataset(sessions, out, valid, test, RULES[rule] if rule else None,
                                  max_context_messages, max_chars, labels, min_probability)
+            synthetic = synthetic_examples(answers, RULES[synth_rule], int(real["counts"]["sft"]["train"] * synth_ratio))
+        manifest = write_dataset(sessions, out, valid, test, RULES[rule] if rule else None,
+                                 max_context_messages, max_chars, labels, min_probability, synthetic)
         if as_json:
             click.echo(json.dumps({"dataset": str(out), **manifest}))
             return
@@ -155,6 +181,8 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             click.echo(f"  {kind}: " + ", ".join(f"{split} {n}" for split, n in counts[kind].items()))
         if rule:
             click.echo(f"  rule {rule}: {manifest['rule_rewritten_targets']} target(s) rewritten")
+        if synth_rule:
+            click.echo(f"  synthetic {synth_rule}: {manifest['synthetic_train_rows']} training row(s) added")
 
     @tune.command(context_settings=HELP)
     @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="classifier", show_default=True,
@@ -237,6 +265,42 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             click.echo("  you:   " + state["user_next_message"][:300].replace("\n", " "))
 
     @tune.command(context_settings=HELP)
+    @click.option("--rule", type=click.Choice(sorted(RULES)), required=True)
+    @click.option("--model", default=DEFAULT_MODEL, show_default=True, help="Generator; the base model keeps its style.")
+    @click.option("--limit", default=2000, show_default=True, help="New answers to generate in this run.")
+    @click.option("--batch-size", default=8, show_default=True, help="Prompts generated together.")
+    @click.option("--max-new-tokens", default=512, show_default=True)
+    @click.option("--valid", default=0.05, show_default=True, help="Must match the dataset's split shares.")
+    @click.option("--test", default=0.05, show_default=True, help="Must match the dataset's split shares.")
+    @click.option("--dry-run", is_flag=True, help="Write the prompt list and print the command without generating.")
+    def synth(rule, model, limit, batch_size, max_new_tokens, valid, test, dry_run):
+        """Generate rule-following coding answers by context distillation.
+
+        Real coding requests from your training-split sessions are answered
+        with the rule as a system prompt, then rewritten to obey it. Answers
+        are appended, so reruns continue where the last one stopped. Add them
+        to a dataset with `tune dataset --synth RULE`.
+
+        \b
+        Examples:
+          one-conv tune synth --rule no-comments --dry-run
+          one-conv tune synth --rule no-comments --limit 2000
+          one-conv tune dataset --name nocom --labels --rule no-comments --synth no-comments
+        """
+        home = tune_home()
+        folder = home / "synth" / rule
+        folder.mkdir(parents=True, exist_ok=True)
+        prompts = coding_prompts(_sessions(home), valid, test)
+        (folder / "prompts.jsonl").write_text("".join(json.dumps(p, ensure_ascii=False) + "\n" for p in prompts))
+        done = len(load_answers(folder / "answers.jsonl"))
+        click.echo(f"{len(prompts)} coding prompts, {done} already answered")
+        job = _job(folder, "synth", {"model": model, "rule": rule, "prompts": str(folder / "prompts.jsonl"),
+                                     "out": str(folder / "answers.jsonl"), "limit": limit,
+                                     "batch_size": batch_size, "max_new_tokens": max_new_tokens})
+        _execute(mlx_python("one_conv.tune.score", "synthesize", "--job", str(job), "--out", str(folder / "synth.result.json")),
+                 dry_run)
+
+    @tune.command(context_settings=HELP)
     @click.option("--dataset", "dataset_name", default="base", show_default=True)
     @click.option("--run", "run", required=True, help="Run name; adapters land in runs/<run>/adapters.")
     @click.option("--model", default=DEFAULT_MODEL, show_default=True, help="MLX model repo or path.")
@@ -270,7 +334,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
                 "dataset": dataset_name, "model": model, "iters": iters, "batch_size": batch_size,
                 "num_layers": num_layers, "learning_rate": learning_rate, "max_seq_length": max_seq_length,
             }, indent=1) + "\n")
-        _execute(command, dry_run)
+        _execute(command, dry_run, None if dry_run else run_dir / "train.log")
 
     @tune.command("eval", context_settings=HELP)
     @click.option("--run", "run", required=True)

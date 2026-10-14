@@ -132,7 +132,8 @@ def _first_time(line: str, seen: set[str]) -> bool:
 
 def write_dataset(sessions: list[Session], out_dir: Path, valid: float = 0.05, test: float = 0.05,
                   rule: Rule | None = None, max_context_messages: int = 16, max_chars: int = 12_000,
-                  labels: dict[str, dict] | None = None, min_probability: float = 0.6) -> dict:
+                  labels: dict[str, dict] | None = None, min_probability: float = 0.6,
+                  synthetic: list[dict] | None = None) -> dict:
     """Write mlx-lm chat JSONL under sft/, preference pairs under dpo/, and return the manifest.
 
     Corrections that supplied facts the assistant could not know go to new_info/: the
@@ -174,11 +175,15 @@ def write_dataset(sessions: list[Session], out_dir: Path, valid: float = 0.05, t
                     counts[folder][split] += 1
                 else:
                     duplicates += 1
+        # Synthetic rows only ever join training, so evaluation stays on real sessions.
+        for row in synthetic or []:
+            handles["sft", "train"].write(json.dumps(row, ensure_ascii=False) + "\n")
     finally:
         for handle in handles.values():
             handle.close()
     manifest = {"sessions": len(sessions), "counts": counts, "rule": rule.name if rule else None,
-                "rule_rewritten_targets": rewritten, "duplicates_skipped": duplicates, "valid": valid, "test": test,
+                "rule_rewritten_targets": rewritten, "duplicates_skipped": duplicates,
+                "synthetic_train_rows": len(synthetic or []), "valid": valid, "test": test,
                 "max_context_messages": max_context_messages, "max_chars": max_chars,
                 "labeled": labels is not None, "min_probability": min_probability if labels is not None else None}
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")

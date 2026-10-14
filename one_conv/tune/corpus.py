@@ -117,7 +117,13 @@ def load_sessions(roots: list[Path], sources: tuple[str, ...] = AGENT_SOURCES,
             current = newest.get(session.key)
             if current is None or session.mtime > current.mtime:
                 newest[session.key] = session
-    return sorted(newest.values(), key=lambda s: s.mtime)
+    # The same conversation can also be stored under two ids (old and new caches, another machine's export).
+    by_content: dict[int, Session] = {}
+    for session in newest.values():
+        content = hash(session.messages)
+        if content not in by_content or session.mtime > by_content[content].mtime:
+            by_content[content] = session
+    return sorted(by_content.values(), key=lambda s: s.mtime)
 
 
 def merge_runs(messages: tuple[Message, ...]) -> list[Message]:

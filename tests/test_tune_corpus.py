@@ -93,3 +93,10 @@ def test_voice_turn_keeps_transcription():
 
 def test_plain_text_is_not_parsed_as_voice():
     assert parse_session(_doc(turns=[{"role": "user", "text": "[1, 2]"}])).messages == (Message("user", "[1, 2]"),)
+
+
+def test_load_merges_same_conversation_under_two_ids(corpus):
+    root, write = corpus
+    write("a.json", _doc(session="old-id", mtime=1.0))
+    write("b.json", _doc(session="new-id", mtime=2.0))
+    assert [s.session for s in load_sessions([root])] == ["new-id"]

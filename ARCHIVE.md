@@ -72,14 +72,18 @@ the archive lacks, or that changes during the check, is kept, and the reason is
 printed. Cursor conversations live in shared databases and are never deleted. Freed
 conversations still appear in every one-conv command, read from the archive.
 
-`uv run scripts/archive-sync.py --restore SESSION` writes the newest archived copy
-of a freed conversation's files back, for example to resume it in its own tool. It
-writes only inside this machine's Claude Code, Codex and Oh My Pi history folders,
-never over a different file, and works after the state directory is reset.
+Before deleting, freeing marks the archived capture as freed from this machine.
+`uv run scripts/archive-sync.py --restore SESSION` writes back each of the
+conversation's records that was freed or is missing here (a Codex session also has
+one per subagent), from the newest copy this machine can hold, then clears the
+mark. It writes only inside this machine's Claude Code, Codex and Oh My Pi history
+folders and never over a different file.
 
-If a tool writes to a conversation after it was freed here, sync reports it and
-does not upload the new, partial file over the archived conversation. Move the new
-file away and restore the conversation.
+If a tool writes to a conversation after it was freed here, the new file holds only
+what was written since. Sync does not upload it over the archived conversation, even
+after the state directory is reset; it reports the file and the steps to recover:
+move the file away, restore the conversation, then add back what the moved file
+holds.
 
 If the archive is unreachable, commands list archived conversations from the last
 successful listing and warn; opening one that exists only in the archive fails

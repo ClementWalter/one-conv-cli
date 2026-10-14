@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import random
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -588,11 +589,14 @@ def test_failing_or_missing_syncs_are_reported_on_every_command(tmp_path, archiv
     env = fixture_env(tmp_path)
     path = write_claude(env)
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
-    run(env, "scripts/archive-sync.py", "--source", "claude")
-    archived = path.stat().st_mtime
-    path.write_text(path.read_text().replace("forty-two", "rewritten"))
-    os.utime(path, (archived - 10,) * 2)  # Older than the archive: rejected as stale.
-    run(env, "scripts/archive-sync.py", "--source", "claude", success=False)
+    unreadable = path.with_suffix("") / "tool-results" / "output.txt"
+    unreadable.parent.mkdir(parents=True)
+    unreadable.write_text("complete tool output")
+    unreadable.chmod(0)
+    try:
+        run(env, "scripts/archive-sync.py", "--source", "claude", success=False)
+    finally:
+        unreadable.chmod(0o600)
     for _ in range(2):
         result = run(env, "bin/one-conv", "local", "chats", "--source", "claude", "--json", success=False)
         assert result.returncode == 0 and "Archive sync at" in result.stderr and "claude/session-one" in result.stderr
@@ -658,17 +662,18 @@ def test_a_freed_conversation_written_again_does_not_replace_its_archive(tmp_pat
     os.utime(path, (old, old))
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
     assert run(env, "scripts/archive-sync.py", "--source", "claude", "--free-older-than", "30")["freed"] == 1
+    shutil.rmtree(env["ONE_CONV_STATE_DIR"])  # The archive, not local state, remembers what was freed here.
     archived = list(client.list_conversations())
     path.write_text(json.dumps({"type": "user", "cwd": "/example/ancestry", "timestamp": "2026-01-02T10:00:00Z",
                                 "message": {"role": "user", "content": "Continued after freeing"}}) + "\n")
     result = run(env, "scripts/archive-sync.py", "--source", "claude", success=False)
-    assert result.returncode == 1 and "freed here and written again" in result.stderr
+    assert result.returncode == 1 and f"{path} was freed on" in result.stderr and "--restore session-one" in result.stderr
     assert list(client.list_conversations()) == archived
     result = run(env, "scripts/archive-sync.py", "--restore", "session-one", success=False)
     assert result.returncode == 1 and "exists with different content" in result.stderr
     path.unlink()
     assert run(env, "scripts/archive-sync.py", "--restore", "session-one") == {"restored": 1}
-    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 0, "unchanged": 1}
+    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 1, "unchanged": 0}  # A new installation.
 
 
 @pytest.mark.parametrize("escape", ["outside history", "through a symbolic link"])

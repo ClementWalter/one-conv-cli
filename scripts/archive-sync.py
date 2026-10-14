@@ -21,7 +21,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from one_conv.archive import (FREED, SYNC_LOCK, SYNC_STALE_SECONDS, SYNC_STATE, ArchiveError, configured_client,
+from one_conv.archive import (SYNC_LOCK, SYNC_STALE_SECONDS, SYNC_STATE, ArchiveError, configured_client,
                               conversation_key, digest, encode, pack, read_json, revision, split, write_json)
 
 # Captures re-run when the reader or this capture code changes, even if sources did not.
@@ -149,7 +149,8 @@ def free(reader, client, handle, archived):
     """Delete a conversation's native files only if the archive holds exactly these bytes; return the bytes freed."""
     paths = source_paths(reader, handle)
     before = fingerprint(paths)
-    originals = client.read_conversation(archived["key"], archived["revision"])["originals"]
+    manifest = client.read_conversation(archived["key"], archived["revision"])
+    originals = manifest["originals"]
     parts = {path: [name for name, _ in split(path.read_bytes())] for path in paths}
     if any(originals.get(str(path)) != names for path, names in parts.items()):
         raise ArchiveError("its files differ from the archived capture")
@@ -157,6 +158,8 @@ def free(reader, client, handle, archived):
         raise ArchiveError("the archive is missing some of its content")
     if source_paths(reader, handle) != paths or fingerprint(paths) != before:
         raise ArchiveError("it changed while being verified")
+    # Marked in the archive first, so sync refuses a partial file that reappears here, even after a state reset.
+    client.put({**manifest, "freed": time.time()}, {}, archived["revision"])
     size = sum(path.stat().st_size for path in paths)
     for path in paths:
         path.unlink()
@@ -183,39 +186,45 @@ def restore_target(roots, name):
 
 
 def restore(reader, client, session):
-    """Write the newest archived copy of a conversation back; every target is checked before anything is written."""
+    """Write back each record of a conversation that was freed or is missing here, from its newest copy this
+    machine can hold; every target is checked before anything is written."""
     rows = [row for row in client.list_conversations() if row["source"] in FREEABLE_SOURCES and row["session"].startswith(session)]
     matches = {(row["source"], row["session"]) for row in rows}
     if len(matches) != 1:
         raise ArchiveError(f"{len(matches)} archived conversations match {session!r}; give the full session ID")
-    # Another machine's newer copy may name paths that do not exist here; take the newest this machine can hold.
+    records, refused = {}, None
     for row in sorted(rows, key=lambda row: row["mtime"], reverse=True):
         manifest = client.read_conversation(row["key"], row["revision"])
-        try:
+        try:  # Another machine's copy may name paths that do not exist here.
             targets = {restore_target(history_roots(reader, row["source"]), name): parts
                        for name, parts in manifest["originals"].items()}
-            break
         except ArchiveError as error:
             refused = error
-    else:
+            continue
+        records.setdefault(row["locator"], []).append((row, manifest, targets))
+    plans = [copies for copies in records.values()
+             if any(row.get("freed") for row, _, _ in copies) or not all(path.exists() for path in copies[0][2])]
+    if not plans and refused:
         raise refused
-    contents = {path: client.read_chunks(parts) for path, parts in targets.items()}
-    for path, data in contents.items():
-        if path.exists() and path.read_bytes() != data:
-            raise ArchiveError(f"{path} exists with different content; move it away to restore")
+    contents = [(copies[0][1], {path: client.read_chunks(parts) for path, parts in copies[0][2].items()}) for copies in plans]
+    for _, files in contents:
+        for path, data in files.items():
+            if path.exists() and path.read_bytes() != data:
+                raise ArchiveError(f"{path} exists with different content; move it away to restore")
     restored = 0
-    for path, data in contents.items():
-        if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("xb") as stream:
-                stream.write(data)
-            restored += 1
-    main_file = next(iter(contents))  # Captures list the conversation's main file first.
-    os.utime(main_file, (manifest["mtime"], manifest["mtime"]))  # Native and archived copies compare equal.
-    freed_path = reader.STATE_DIR / FREED
-    freed = read_json(freed_path)
-    write_json(freed_path, {key: entry for key, entry in freed.items()
-                            if (entry.get("source"), entry.get("session")) != (row["source"], row["session"])})
+    for manifest, files in contents:
+        for path, data in files.items():
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("xb") as stream:
+                    stream.write(data)
+                restored += 1
+        main_file = next(iter(files))  # Captures list the conversation's main file first.
+        os.utime(main_file, (manifest["mtime"], manifest["mtime"]))  # Native and archived copies compare equal.
+    for copies in plans:
+        for row, manifest, _ in copies:
+            if row.get("freed"):
+                client.put({name: value for name, value in manifest.items() if name != "freed"}, {}, row["revision"])
     return {"restored": restored}
 
 
@@ -268,7 +277,10 @@ def main():
 
 def sync(reader, client, origin, args, lock):
     existing = {row["key"]: row for row in client.list_conversations()}
-    freed = read_json(reader.STATE_DIR / FREED)
+    freed = {}
+    for row in existing.values():
+        if row.get("freed"):
+            freed.setdefault((row["source"], row["cwd"], row["session"], row["locator"]), []).append(row)
     projects = [p for p in reader._native_projects(tuple(args.source)) if not args.project or args.project.lower() in p.cwd.lower()]
     handles = sorted((h for p in projects for h in reader._native_project_sessions(p)), key=lambda h: h.mtime, reverse=True)
     handles = handles[:args.limit] if args.limit else handles
@@ -279,10 +291,12 @@ def sync(reader, client, origin, args, lock):
     for key, handle in keyed:
         lock.touch()
         try:
-            if key in freed:
-                # Its new files hold only what was written after freeing; uploading them would hide the rest.
-                raise ArchiveError(f"freed here and written again since; move its new files away and run "
-                                   f"archive-sync.py --restore {handle.uuid}")
+            for row in freed.get(reader._record_identity(handle), ()):
+                if str(handle.path) in client.read_conversation(row["key"], row["revision"])["originals"]:
+                    # Its file holds only what was written after freeing; uploading it would hide the rest.
+                    raise ArchiveError(f"{handle.path} was freed on {datetime.fromtimestamp(row['freed']):%Y-%m-%d} and "
+                                       f"written again since. Move it away, run `uv run scripts/archive-sync.py --restore "
+                                       f"{handle.uuid}`, then add back what the moved file holds.")
             archived = existing.get(key)
             if archived and archived["mtime"] == handle.mtime and archived["capture_version"] == CAPTURE_VERSION:
                 result["unchanged"] += 1  # Avoid re-reading and re-encoding unchanged history.
@@ -301,13 +315,13 @@ def sync(reader, client, origin, args, lock):
             failures.append(f"{handle.source}/{handle.uuid}: {type(error).__name__}: {error}")
             print(failures[-1], file=sys.stderr)
     if args.free_older_than:
-        result.update(free_older(reader, client, keyed, existing, freed, time.time() - args.free_older_than * 86400, lock))
+        result.update(free_older(reader, client, keyed, existing, time.time() - args.free_older_than * 86400, lock))
     if failures:
         result["failed"] = len(failures)
     return result, failures
 
 
-def free_older(reader, client, keyed, existing, freed, cutoff, lock):
+def free_older(reader, client, keyed, existing, cutoff, lock):
     result = {"freed": 0, "freed_bytes": 0, "kept": 0}
     for key, handle in keyed:
         archived = existing.get(key)
@@ -321,8 +335,6 @@ def free_older(reader, client, keyed, existing, freed, cutoff, lock):
             print(f"{handle.source}/{handle.uuid}: kept: {error}", file=sys.stderr)
             continue
         result["freed"] += 1
-        freed[key] = {"source": handle.source, "session": handle.uuid, "freed": time.time()}
-        write_json(reader.STATE_DIR / FREED, freed)
     return result
 
 

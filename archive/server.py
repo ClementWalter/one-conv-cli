@@ -35,6 +35,7 @@ class Manifest(Strict):
     account_label: str | None
     summary: dict
     unread_native: bool | None
+    freed: float | None = None  # When this machine deleted its native files, which only this capture now holds.
     fields: dict[str, list[str]]
     originals: dict[str, list[str]]
 

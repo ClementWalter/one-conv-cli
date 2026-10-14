@@ -265,3 +265,11 @@ def test_updated_conversation_is_read_again(tmp_path, conversation):
         conversation.id, conversation.title, 1700000999, "https://claude.ai/chat/thread-1"),))}
     synchronize(provider, "chatgpt", root=tmp_path)
     assert provider.reads == 2
+
+
+def test_conversation_listed_twice_is_read_once(tmp_path, conversation):
+    summary = ConversationSummary(conversation.id, conversation.title, 1700000000, "https://claude.ai/chat/thread-1")
+    provider = CountingStub(conversation)
+    provider.pages = {None: ConversationPage((summary,), "next"), "next": ConversationPage((summary,))}
+    synchronize(provider, "chatgpt", root=tmp_path)
+    assert provider.reads == 1

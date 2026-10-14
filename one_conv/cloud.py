@@ -94,8 +94,10 @@ def synchronize(provider, product: str, *, root: Path | None = None, limit: int 
             page = provider.list_conversations(cursor=cursor, limit=min(50, limit - report["fetched"]))
             truncated = len(page.items) > limit - report["fetched"]
             for item in page.items:
+                # Listings ordered by update time shift while paging, so a conversation can appear twice.
                 if item.id in seen:
-                    raise SchemaChanged("Repeated conversation identity in provider listing")
+                    report["repeated_in_listing"] = report.get("repeated_in_listing", 0) + 1
+                    continue
                 seen.add(item.id)
                 # Rate-limited providers throttle per-conversation reads, so reruns only read what changed.
                 if _unchanged(directory / f"{_key(product, account.id, item.id)}.json", item.updated_at):

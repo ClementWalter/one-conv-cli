@@ -112,7 +112,9 @@ def plan(launcher: list[str]) -> list[Step]:
              lambda: _registered(["claude", "mcp", "get", "one-conv"], mcp),
              lambda: _replace(["claude", "mcp", "remove", "--scope", "user", "one-conv"],
                               ["claude", "mcp", "add", "--scope", "user", "one-conv", "--", *mcp])),
-        Step("claude", f'set "crossSessionInbound": "accept" in {settings}', inbound_done, inbound_apply),
+        Step("claude", f'set "crossSessionInbound": "accept" in {settings}; any local process running as '
+             "you can then inject user turns into every Claude Code session, including bypass ones",
+             inbound_done, inbound_apply),
         Step("codex", "register the one-conv MCP server",
              lambda: _registered(["codex", "mcp", "get", "one-conv"], mcp),
              lambda: _replace(["codex", "mcp", "remove", "one-conv"],

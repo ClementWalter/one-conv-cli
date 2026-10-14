@@ -60,7 +60,10 @@ def whoami(explicit: str | None = None, meta: dict | None = None, pid: int | Non
         if not harness:
             raise LiveError(f"--from must be an address like claude:<id>, got {explicit!r}")
         known = next((s for s in list_all(harness) if s.id == ident), None)
-        return known or LiveSession(harness, ident)
+        if known is None:
+            # Labels are self-reported; refusing addresses that are not running narrows invented senders.
+            raise LiveError(f"--from {explicit} is not a running session (see `one-conv live ls`).")
+        return known
     thread_id = (meta or {}).get("threadId")
     if thread_id:
         return next((s for s in codex.list_sessions() if s.id == thread_id), LiveSession("codex", thread_id))

@@ -368,8 +368,14 @@ def test_send_wraps_message_with_sender(homes):
     assert 'from="claude:c1"' in json.loads(message.read_text())["text"]
 
 
-def test_whoami_explicit_address(homes):
+def test_whoami_explicit_running_address(homes):
+    _omp_record(homes, os.getpid(), "o9")
     assert router.whoami("omp:o9").address == "omp:o9"
+
+
+def test_whoami_refuses_explicit_address_that_is_not_running(homes):
+    with pytest.raises(router.LiveError, match="not a running session"):
+        router.whoami("claude:invented-session")
 
 
 def test_whoami_rejects_malformed_explicit_address(homes):

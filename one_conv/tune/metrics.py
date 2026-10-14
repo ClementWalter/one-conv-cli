@@ -5,11 +5,15 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 
 
-def preference_accuracy(margins: Sequence[float]) -> float:
-    """Share of held-out pairs where the model scores your accepted answer above the rejected one."""
-    if not margins:
-        raise ValueError("No preference pairs to score")
-    return sum(1 for margin in margins if margin > 0) / len(margins)
+def preference_shift(base_margins: Sequence[float], adapter_margins: Sequence[float]) -> float:
+    """Share of pairs where training moved probability toward the accepted reply, relative to the start model.
+
+    Raw margins compare summed log-probabilities, which mostly reward the shorter reply; the change
+    in margin cancels length, like DPO's implicit-reward accuracy.
+    """
+    if not base_margins or len(base_margins) != len(adapter_margins):
+        raise ValueError("Preference shift needs the same scored pairs for both models")
+    return sum(1 for b, a in zip(base_margins, adapter_margins) if a - b > 0) / len(base_margins)
 
 
 def perplexity(mean_nll: float) -> float:

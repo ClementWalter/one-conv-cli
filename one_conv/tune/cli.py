@@ -409,6 +409,18 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         _remote("train", dataset=dataset_name, run=run, epochs=epochs, learning_rate=learning_rate,
                 rank=rank, max_steps=max_steps, batch_size=batch_size, grad_accum=grad_accum)
 
+    @cloud.command("dpo", context_settings=HELP)
+    @click.option("--dataset", "dataset_name", required=True)
+    @click.option("--run", "run", required=True)
+    @click.option("--on", "base_adapter", required=True, help="SFT run to start from; it is also the DPO reference.")
+    @click.option("--epochs", default=2.0, show_default=True)
+    @click.option("--learning-rate", default=2e-5, show_default=True)
+    @click.option("--beta", default=0.1, show_default=True)
+    def cloud_dpo(dataset_name, run, base_adapter, epochs, learning_rate, beta):
+        """Train on the dataset's preference pairs (DPO) on top of an SFT run."""
+        _remote("train_dpo", dataset=dataset_name, run=run, base_adapter=base_adapter, epochs=epochs,
+                learning_rate=learning_rate, beta=beta)
+
     @cloud.command("eval", context_settings=HELP)
     @click.option("--run", "run", required=True)
     @click.option("--dataset", "dataset_name", required=True)
@@ -680,8 +692,8 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         """Score base vs adapter on held-out sessions.
 
         Reports test perplexity on your accepted answers (lower is better)
-        and preference accuracy on correction pairs: how often the model
-        ranks the answer you accepted above the one you corrected.
+        and preference shift on correction pairs: how often training moved
+        probability toward the answer you accepted, relative to the base.
 
         \b
         Examples:
@@ -733,7 +745,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
                 click.echo(f"{variant:8} " + "  ".join(f"@{length}: {rate:.0%}" for length, rate in rates.items()))
 
     @tune.command(context_settings=HELP)
-    @click.option("--sort", "metric", default="adapter_pref_acc", show_default=True, help="Metric to rank by.")
+    @click.option("--sort", "metric", default="pref_shift", show_default=True, help="Metric to rank by.")
     @click.option("--lower-is-better", is_flag=True, help="Rank ascending, e.g. for perplexity or violation rates.")
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
     def runs(metric, lower_is_better, as_json):

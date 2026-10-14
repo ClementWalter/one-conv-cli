@@ -154,7 +154,11 @@ def evaluate(run: str, dataset: str, limit: int = 400, max_tokens: int = 4096) -
 
     data = VOL / "datasets" / dataset
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    base = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, device_map="cuda")
+    # A run stacked on an earlier one (DPO on SFT) is scored against that earlier model as "base".
+    settings_path = VOL / "runs" / run / "train.json"
+    stacked_on = json.loads(settings_path.read_text()).get("base_adapter") if settings_path.exists() else None
+    base = _merged_base(stacked_on, attn="sdpa") if stacked_on else AutoModelForCausalLM.from_pretrained(
+        MODEL, dtype=torch.bfloat16, device_map="cuda")
     model = PeftModel.from_pretrained(base, str(VOL / "runs" / run / "adapter"))
     sft = _read_jsonl(data / "sft" / "test.jsonl")[:limit]
     pairs = _read_jsonl(data / "dpo" / "test.jsonl")[:limit]
@@ -180,9 +184,10 @@ def evaluate(run: str, dataset: str, limit: int = 400, max_tokens: int = 4096) -
                            "preference_margins": margins}
     _write_json(VOL / "runs" / run / "eval.json", result)
     volume.commit()
-    return {v: {"ppl": math.exp(r["test_mean_nll"]) if r["test_mean_nll"] else None,
-                "pref_acc": sum(m > 0 for m in r["preference_margins"]) / max(1, len(r["preference_margins"]))}
-            for v, r in result.items()}
+    base, adapter = result["base"]["preference_margins"], result["adapter"]["preference_margins"]
+    return {"base_ppl": math.exp(result["base"]["test_mean_nll"]) if result["base"]["test_mean_nll"] else None,
+            "adapter_ppl": math.exp(result["adapter"]["test_mean_nll"]) if result["adapter"]["test_mean_nll"] else None,
+            "pref_shift": sum(a - b > 0 for a, b in zip(adapter, base)) / max(1, len(base))}
 
 
 @app.function(**GPU, timeout=2 * 3600)
@@ -314,3 +319,77 @@ def diagnose(dataset: str, micro_batches: int = 64, batch_size: int = 4, max_len
     _write_json(VOL / "diagnose.json", {"micro_batches": micro_batches, "found": found})
     volume.commit()
     return found
+
+
+def _merged_base(base_adapter: str | None, attn: str = "eager"):
+    """Qwen with an earlier run's adapter merged in, so a new adapter trains or scores on top of it."""
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, device_map="cuda", attn_implementation=attn)
+    if base_adapter:
+        model = PeftModel.from_pretrained(model, str(VOL / "runs" / base_adapter / "adapter")).merge_and_unload()
+    return model
+
+
+@app.function(**GPU, timeout=4 * 3600)
+def train_dpo(dataset: str, run: str, base_adapter: str, epochs: float = 2.0, learning_rate: float = 2e-5,
+              beta: float = 0.1, rank: int = 16, max_length: int = 4096, grad_accum: int = 16) -> dict:
+    """DPO on the dataset's preference pairs, on top of an SFT run, with that SFT model as reference."""
+    from datasets import Dataset
+    from peft import LoraConfig
+    from transformers import AutoTokenizer, TrainerCallback
+    from trl import DPOConfig, DPOTrainer
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    run_dir = VOL / "runs" / run
+    curves = {"train": [], "val": [], "reward_accuracy": []}
+
+    def pairs(split):
+        rows = []
+        for r in _read_jsonl(VOL / "datasets" / dataset / "dpo" / f"{split}.jsonl"):
+            longest = max(r["chosen"], r["rejected"], key=len)
+            # Over-long pairs would be truncated at the end, cutting the replies being compared.
+            if len(_token_ids(tokenizer, r["prompt"] + [{"role": "assistant", "content": longest}])) <= max_length:
+                rows.append({"prompt": r["prompt"], "chosen": [{"role": "assistant", "content": r["chosen"]}],
+                             "rejected": [{"role": "assistant", "content": r["rejected"]}]})
+        return rows
+
+    class Curves(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            logs = logs or {}
+            if "loss" in logs:
+                curves["train"].append([state.global_step, logs["loss"]])
+            if "eval_loss" in logs:
+                curves["val"].append([state.global_step, logs["eval_loss"]])
+            if "eval_rewards/accuracies" in logs:
+                curves["reward_accuracy"].append([state.global_step, logs["eval_rewards/accuracies"]])
+
+    train_rows, valid_rows = pairs("train"), pairs("valid")
+    # Eager attention: chosen and rejected share a padded batch, which made fused bf16 attention emit NaN.
+    config = DPOConfig(
+        output_dir=str(run_dir / "checkpoints"), num_train_epochs=epochs, learning_rate=learning_rate, beta=beta,
+        per_device_train_batch_size=1, per_device_eval_batch_size=1, gradient_accumulation_steps=grad_accum,
+        max_length=max_length, bf16=True, logging_steps=5, eval_strategy="steps", eval_steps=20, save_strategy="no",
+        report_to=[], lr_scheduler_type="cosine", warmup_steps=0.05, gradient_checkpointing=True,
+    )
+    trainer = DPOTrainer(
+        model=_merged_base(base_adapter), args=config, processing_class=tokenizer,
+        train_dataset=Dataset.from_list(train_rows), eval_dataset=Dataset.from_list(valid_rows),
+        peft_config=LoraConfig(r=rank, lora_alpha=2 * rank, lora_dropout=0.05, target_modules="all-linear",
+                               task_type="CAUSAL_LM"),
+        callbacks=[Curves()],
+    )
+    started = time.time()
+    trainer.train()
+    trainer.evaluate()
+    curves["val"] = sorted({s: v for s, v in curves["val"]}.items())
+    trainer.model.save_pretrained(str(run_dir / "adapter"))
+    settings = {"dataset": dataset, "model": MODEL, "backend": "modal-h100", "kind": "dpo", "base_adapter": base_adapter,
+                "epochs": epochs, "learning_rate": learning_rate, "beta": beta, "rank": rank, "max_length": max_length,
+                "batch_size": grad_accum, "steps": trainer.state.global_step, "train_rows": len(train_rows),
+                "seconds": round(time.time() - started)}
+    _write_json(run_dir / "train.json", settings)
+    _write_json(run_dir / "train_metrics.json", curves)
+    volume.commit()
+    return settings

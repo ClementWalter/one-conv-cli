@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 
-from .metrics import drift_table, perplexity, preference_accuracy
+from .metrics import drift_table, perplexity, preference_shift
 
 # Pinned so a run is reproducible; MLX stays out of the launcher's own dependencies.
 MLX_LM = "mlx-lm==0.32.0"
@@ -53,9 +53,10 @@ def eval_metrics(result: dict) -> dict:
     for variant, scores in result.items():
         if scores.get("test_mean_nll") is not None:
             metrics[f"{variant}_test_ppl"] = perplexity(scores["test_mean_nll"])
-        if scores.get("preference_margins"):
-            metrics[f"{variant}_pref_acc"] = preference_accuracy(scores["preference_margins"])
-            metrics["pref_pairs"] = len(scores["preference_margins"])
+    base, adapter = (result.get(v, {}).get("preference_margins") for v in ("base", "adapter"))
+    if base and adapter and len(base) == len(adapter):
+        metrics["pref_shift"] = preference_shift(base, adapter)
+        metrics["pref_pairs"] = len(base)
     return metrics
 
 

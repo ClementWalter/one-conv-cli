@@ -7,19 +7,24 @@ import pytest
 from one_conv.tune.metrics import (
     drift_table,
     perplexity,
-    preference_accuracy,
+    preference_shift,
     rank_runs,
     violation_rate,
 )
 
 
-def test_preference_accuracy_counts_positive_margins():
-    assert preference_accuracy([1.0, -0.5, 2.0, 0.0]) == 0.5
+def test_preference_shift_counts_margins_that_grew():
+    assert preference_shift([5.0, 5.0, -3.0, 0.0], [6.0, 4.0, -1.0, 0.0]) == 0.5
 
 
-def test_preference_accuracy_rejects_empty():
+def test_preference_shift_ignores_length_bias():
+    # Both models prefer the shorter reply everywhere; only the change in margin counts.
+    assert preference_shift([100.0, 100.0], [90.0, 90.0]) == 0.0
+
+
+def test_preference_shift_needs_matching_pairs():
     with pytest.raises(ValueError):
-        preference_accuracy([])
+        preference_shift([1.0], [1.0, 2.0])
 
 
 def test_perplexity_is_exp_of_nll():

@@ -69,7 +69,9 @@ def test_runs_ranks_by_metric(home, tune):
     for name, accuracy in (("low", 0.4), ("high", 0.8)):
         run = home / "runs" / name
         run.mkdir(parents=True)
-        (run / "eval.json").write_text(json.dumps({"adapter": {"preference_margins": [1.0] * int(accuracy * 10) + [-1.0] * (10 - int(accuracy * 10))}}))
+        shifted = [1.0] * int(accuracy * 10) + [-1.0] * (10 - int(accuracy * 10))
+        (run / "eval.json").write_text(json.dumps({"base": {"preference_margins": [0.0] * 10},
+                                                   "adapter": {"preference_margins": shifted}}))
     result = CliRunner().invoke(tune, ["runs", "--json"])
     assert [run["name"] for run in json.loads(result.output)] == ["high", "low"]
 

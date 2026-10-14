@@ -3716,7 +3716,8 @@ def _feed_find_threads(addresses: list[str]):
             missing.append(address)
             continue
         handle = handles[0]
-        key = f"{handle.source}:{handle.uuid}"
+        # Live, peers.json and whoami name every Cursor chat `cursor:<id>`, IDE or cursor-agent alike.
+        key = f"{'cursor' if handle.source == 'cursor-cli' else handle.source}:{handle.uuid}"
         found[key] = Thread(
             address=key, title=handle.title_hint or Path(handle.project_cwd).name, cwd=handle.project_cwd,
             stamp=_feed_stamp(handle),

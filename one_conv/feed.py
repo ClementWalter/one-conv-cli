@@ -268,6 +268,7 @@ def build_feed_command(find_threads: Callable[[list[str]], tuple[dict[str, Threa
                 else:
                     follows[:] = [a for a in follows if a != address]
                     muted[:] = sorted(set(muted) | {address})
+                    state.data["threads"].pop(address, None)
                 click.echo(f"{'following' if follow_address else 'unfollowed'} {address}")
                 return
             addresses = followed(state, root())

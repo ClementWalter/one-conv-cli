@@ -221,6 +221,24 @@ def run_feed(env: dict, *args: str) -> subprocess.CompletedProcess:
                           capture_output=True, text=True, env=env, check=False)
 
 
+def test_cli_unfollow_cursor_agent_chat_mutes_its_live_partner(cli_env, tmp_path):
+    from test_cursor_cli import CHAT_ID, _write_chat
+
+    from one_conv.live.router import peer_key
+    _write_chat(tmp_path / "cursor-cli")
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / "peers.json").write_text(json.dumps({peer_key(READER, f"cursor:{CHAT_ID}"): 9e12}))
+    run_feed(cli_env, "--unfollow", f"cursor:{CHAT_ID}")
+    assert json.loads(run_feed(cli_env, "--following", "--json").stdout)["following"] == []
+
+
+def test_cli_follow_cursor_agent_chat_uses_the_live_address(cli_env, tmp_path):
+    from test_cursor_cli import CHAT_ID, _write_chat
+    _write_chat(tmp_path / "cursor-cli")
+    assert run_feed(cli_env, "--follow", CHAT_ID[:8].join(["cursor:", ""])).stdout.strip() == f"following cursor:{CHAT_ID}"
+
+
 def test_cli_follow_unknown_address_fails(cli_env):
     assert run_feed(cli_env, "--follow", "claude:does-not-exist").returncode == 1
 

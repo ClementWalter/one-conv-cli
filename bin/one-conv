@@ -2058,6 +2058,7 @@ def _append_log_turn(mouth: str, role: str, text: str, machine: str | None = Non
 
 
 def _native_projects(sources: tuple[str, ...]):
+    # A machine reading only archived Claude history has no projects directory; that is not an error then.
     if "claude" in sources and (PROJECTS_DIR.is_dir() or not os.environ.get("ONE_CONV_ARCHIVE_URL")):
         yield from _claude_iter_projects()
     if "codex" in sources:
@@ -2075,7 +2076,8 @@ def _native_projects(sources: tuple[str, ...]):
     yield from _cloud_projects(sources)
 
 
-def _archive_state(query=None):
+def _archive_state():
+    """Archive metadata for this command, listed once; None when no archive is usable."""
     from one_conv.archive import ArchiveError, configured_client
     context = click.get_current_context(silent=True)
     if context is None:
@@ -2083,11 +2085,11 @@ def _archive_state(query=None):
     if "archive" not in context.meta:
         try:
             client = configured_client()
-            rows = list(client.list_conversations(query=query)) if client else []
+            rows = list(client.list_conversations()) if client else []
             projects = {}
             for row in rows:
                 projects.setdefault((row["source"], row["cwd"]), []).append(row)
-            context.meta["archive"] = ({"client": client, "rows": rows, "projects": projects, "fields": {}}
+            context.meta["archive"] = ({"client": client, "rows": rows, "projects": projects, "manifests": {}, "fields": {}}
                                        if client else None)
         except ArchiveError as error:
             log.warning("%s Showing native history only.", error)
@@ -2101,10 +2103,10 @@ def _archive_field(handle, field):
     state = _archive_state()
     client, key, revision = state["client"], handle.archive["key"], handle.archive["revision"]
     try:
-        if (key, None) not in state["fields"]:
-            state["fields"][key, None] = client.read_conversation(key, revision)
+        if key not in state["manifests"]:
+            state["manifests"][key] = client.read_conversation(key, revision)
         if (key, field) not in state["fields"]:
-            state["fields"][key, field] = client.read_field(state["fields"][key, None], field)
+            state["fields"][key, field] = client.read_field(state["manifests"][key], field)
     except ArchiveError as error:
         raise click.ClickException(str(error)) from error
     return state["fields"][key, field]
@@ -2371,11 +2373,14 @@ def _resolve_projects(query: str, match: int, sources: tuple[str, ...]) -> list[
 
 
 def _all_sessions_for(projects: list[ProjectHandle]) -> list[SessionHandle]:
-    sessions: list[SessionHandle] = []
+    # Two project directories can resolve to one cwd; each merges that cwd's archived copies.
+    newest: dict[tuple[str, str, str], SessionHandle] = {}
     for p in projects:
-        sessions.extend(_project_sessions(p))
-    sessions.sort(key=lambda h: h.mtime, reverse=True)
-    return sessions
+        for h in _project_sessions(p):
+            identity = h.source, h.project_cwd, h.uuid
+            if identity not in newest or h.mtime > newest[identity].mtime:
+                newest[identity] = h
+    return sorted(newest.values(), key=lambda h: h.mtime, reverse=True)
 
 
 def _pick_session_handle(handles: list[SessionHandle], session_uuid: str | None, nth: int) -> SessionHandle:
@@ -2571,7 +2576,9 @@ def chats(source_filter: str | None, limit: int, as_json: bool, conversations: b
                          for account in _chatgpt_cached_accounts()}
         # Labels are presentation metadata; account IDs remain stable cache keys.
         for handle, row in zip(handles, rows):
-            if handle.path and handle.path.suffix == ".json":
+            if handle.archive:
+                row["account_label"] = handle.archive["account_label"]
+            elif handle.path and handle.path.suffix == ".json":
                 try:
                     row["account_label"] = json.loads(handle.path.read_text()).get("account_label")
                 except (OSError, ValueError, AttributeError):
@@ -2902,20 +2909,34 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
     sources = selected_sources(source_filter, SOURCES)
     needle = text.lower()
     needle_bytes = text.encode("utf-8")
-    _archive_state(query=text)  # Fetch candidate metadata before merging native sessions.
     sessions = _sessions_for_scope(project_query, sources)
+    archive = _archive_state()
+    candidates = set()
+    if archive and any(h.archive for h in sessions):
+        from one_conv.archive import ArchiveError
+        try:  # Copies are merged on the full listing; only matching archived ones are read.
+            candidates = {row["key"] for row in archive["client"].list_conversations(query=text)}
+        except ArchiveError as error:
+            log.warning("%s Archived conversations were not searched.", error)
     cursor_ids = _cursor_composer_ids_matching(text) if "cursor" in sources else None
 
     results = []
     for h in sessions:
-        if not h.archive and h.source in ("claude", "codex", "omp"):
+        if not h.archive and h.source in ("claude", "codex", "omp") and text.isascii():
+            # bytes.lower() folds only ASCII, so non-ASCII queries skip this prefilter.
             with h.path.open("rb") as f:
-                payload = f.read()
-                if text.isascii() and needle_bytes.lower() not in payload.lower():
+                if needle_bytes.lower() not in f.read().lower():
                     continue
         elif not h.archive and h.source == "cursor" and cursor_ids is not None and h.composer_id not in cursor_ids:
             continue
-        for turn in _handle_iter_turns(h, include_subagents=False):
+        if h.archive and h.archive["key"] not in candidates:
+            continue
+        try:
+            turns = _handle_iter_turns(h, include_subagents=False)
+        except click.ClickException as error:  # One unreadable archived conversation must not hide the rest.
+            log.warning("%s: %s", h.uuid, error.message)
+            continue
+        for turn in turns:
             rendered = _render_turn(turn, raw=False)
             if not rendered or needle not in rendered.lower():
                 continue

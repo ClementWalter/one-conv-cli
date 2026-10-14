@@ -19,7 +19,10 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from one_conv.archive import ArchiveError, configured_client, conversation_key, encode, pack, revision
+from one_conv.archive import ArchiveError, configured_client, conversation_key, digest, encode, pack, revision
+
+# Captures re-run when the reader or this capture code changes, even if sources did not.
+CAPTURE_VERSION = digest((ROOT / "bin/one-conv").read_bytes() + Path(__file__).read_bytes())
 
 
 def load_reader():
@@ -45,7 +48,7 @@ def origin_id(reader):
 
 def source_paths(reader, handle):
     if handle.source == "cursor":
-        return [reader.CURSOR_GLOBAL_DB]
+        return []  # Its rows live in Cursor's shared database; capture compares them instead.
     paths = [handle.path] if handle.path else []
     if handle.source == "claude":
         paths.extend(sorted(handle.path.parent.glob(f"{handle.uuid}/subagents/*.jsonl")))
@@ -69,9 +72,12 @@ def original_records(reader, handle, paths):
                 (f"composerData:{handle.composer_id}", f"bubbleId:{handle.composer_id}:%")).fetchall()
             if not rows:
                 raise ArchiveError("Cursor conversation records are unavailable")
+            header = conn.execute("SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, value "
+                                  "FROM composerHeaders WHERE composerId = ?", (handle.composer_id,)).fetchone()
             # One record keeps a conversation's many small rows in a few chunks.
             return {"cursorDiskKV": encode({key: base64.b64encode(value if isinstance(value, bytes) else value.encode()).decode()
-                                            for key, value in sorted(rows, key=lambda row: row[0])})}
+                                            for key, value in sorted(rows, key=lambda row: row[0])}),
+                    "composerHeaders": encode(list(header) if header else None)}
         finally:
             conn.close()
     result = {}
@@ -89,20 +95,26 @@ def original_records(reader, handle, paths):
 def capture(reader, handle, origin):
     paths = source_paths(reader, handle)
     before = fingerprint(paths)
+    originals = original_records(reader, handle, paths)
+    account_label = None
     if handle.source in reader.CLOUD_SOURCES or (handle.path and handle.path.suffix == ".json"):
-        if handle.path and json.loads(handle.path.read_text()).get("complete") is False:
+        cached = json.loads(handle.path.read_text()) if handle.path else {}
+        if cached.get("complete") is False:
             raise ArchiveError(f"Incomplete provider capture: {handle.uuid}; pull complete history first")
+        account_label = cached.get("account_label")
     turns = reader._handle_iter_turns(handle, include_subagents=False)
     expanded = reader._handle_iter_turns(handle, include_subagents=True) if handle.source == "claude" else None
     summary = reader._handle_summary(handle, {})
     summary.pop("unread", None)
     document = {"origin": origin, "source": handle.source, "cwd": handle.project_cwd,
-        "session": handle.uuid, "mtime": handle.mtime, "summary": summary,
+        "session": handle.uuid, "mtime": handle.mtime, "capture_version": CAPTURE_VERSION,
+        "account_label": account_label, "summary": summary,
         "unread_native": handle.unread_native, "turns": [asdict(turn) for turn in turns],
         "turns_with_subagents": [asdict(turn) for turn in expanded] if expanded != turns and expanded is not None else None,
         "search_text": [text for turn in turns if (text := reader._render_turn(turn, raw=False))],
-        "originals": original_records(reader, handle, paths)}
-    if fingerprint(paths) != before:
+        "originals": originals}
+    changed = original_records(reader, handle, paths) != originals if handle.source == "cursor" else fingerprint(paths) != before
+    if changed:
         raise ArchiveError(f"Source changed during capture: {handle.uuid}; retry when idle")
     return document
 
@@ -128,7 +140,7 @@ def main():
         try:
             key = conversation_key(origin, handle.source, handle.project_cwd, handle.uuid)
             archived = existing.get(key)
-            if archived and archived["mtime"] == handle.mtime:
+            if archived and archived["mtime"] == handle.mtime and archived["capture_version"] == CAPTURE_VERSION:
                 unchanged += 1  # Avoid re-reading and re-encoding unchanged history.
                 continue
             manifest, chunks = pack(capture(reader, handle, origin))

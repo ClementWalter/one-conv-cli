@@ -1,18 +1,24 @@
 """Exercise real native readers, HTTP sync and unchanged CLI commands on isolated history."""
+import base64
+import copy
+import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import socket
 import sqlite3
 import subprocess
 import sys
 import threading
+import zlib
+from urllib.parse import urlsplit
 
 import pytest
 import uvicorn
 
 from archive.server import create_app
-from archive.store import SQLiteStore, Conflict
+from archive.store import SQLiteStore
 from one_conv.archive import CHUNK_BYTES, ArchiveClient, ArchiveError, pack
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,8 +108,8 @@ def test_native_sync_remote_only_parity_and_updates(tmp_path, archive):
     assert run(env, "scripts/archive-sync.py", "--source", "claude")["uploaded"] == 1
     updated = run(remote_env, "bin/one-conv", "local", "thread", "ancestry", "--source", "claude", "--no-mark-read", "--json")
     assert updated["turns"][-1]["text"] == "An additional message"
-    with pytest.raises(Conflict):
-        store.put(pack(old)[0], metadata["revision"])
+    with pytest.raises(ArchiveError, match="409"):
+        client.put(*pack(old), metadata["revision"])
     assert client.read_capture(metadata["key"], metadata["revision"]) == old
     assert path.exists()  # The test never removes native data to prove remote reads.
     reopened = SQLiteStore(str(store.engine.url))
@@ -122,10 +128,10 @@ def test_auth_failure_and_unavailable_archive_are_visible(tmp_path, archive):
     result = run(env, "bin/one-conv", "local", "search", "Quartz", "--source", "claude", "--json", success=False)
     assert result.returncode == 0 and "401" in result.stderr and "native history only" in result.stderr
     assert len(json.loads(result.stdout)) == 1
-    result = ArchiveClient(url, "test-secret")
+    client = ArchiveClient(url, "test-secret")
     with pytest.raises(ArchiveError, match="422"):
-        result.put({"source": "claude"}, {}, None)
-    assert list(result.list_conversations()) == []
+        client.put({"source": "claude"}, {}, None)
+    assert list(client.list_conversations()) == []
 
 
 @pytest.mark.parametrize("source", ["cursor", "cursor-cli", "omp", "codex", "claude-chat"])
@@ -182,7 +188,8 @@ def test_other_sources_keep_native_thread_shape(tmp_path, archive, source):
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
     assert run(env, "scripts/archive-sync.py", "--source", source)["uploaded"] == 1
     metadata = list(client.list_conversations())[0]
-    assert client.read_conversation(metadata["key"])["originals"]
+    originals = client.read_conversation(metadata["key"])["originals"]
+    assert set(originals) == {"cursorDiskKV", "composerHeaders"} if source == "cursor" else originals
     env[native_root] = str(tmp_path / "empty")
     for args, expected in zip(commands, baseline):
         assert run(env, "bin/one-conv", namespace, *args, "--source", source, "--json") == expected
@@ -190,11 +197,20 @@ def test_other_sources_keep_native_thread_shape(tmp_path, archive, source):
 
 def test_interrupted_upload_does_not_commit(tmp_path, archive):
     _, client, url = archive
-    from urllib.parse import urlsplit
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    capture = client.read_capture(list(client.list_conversations())[0]["key"])
+    capture["session"] = capture["summary"]["uuid"] = "interrupted"
+    manifest, chunks = pack(capture)
+    # Every chunk is already stored; only the manifest commit is cut short.
+    body = json.dumps({"manifest": manifest, "expected": None}).encode()
     target = urlsplit(url)
     with socket.create_connection((target.hostname, target.port)) as connection:
-        connection.sendall(b"POST /v1/conversations HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-secret\r\nContent-Length: 200\r\n\r\n{\"document\":")
-    assert list(client.list_conversations()) == []
+        connection.sendall(b"POST /v1/conversations HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-secret\r\n"
+                           b"Content-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body[:len(body) // 2])
+    assert [row["session"] for row in client.list_conversations()] == ["session-one"]
 
 
 def test_rewrites_advance_and_keep_earlier_revisions(tmp_path, archive):
@@ -297,8 +313,6 @@ def test_collision_does_not_break_other_sources_or_projects(tmp_path, archive):
 
 
 def test_appends_upload_only_changed_tail_and_restore_every_revision(tmp_path, archive):
-    import copy
-    import random
     _, client, url = archive
     env = fixture_env(tmp_path)
     write_claude(env)
@@ -327,12 +341,11 @@ def test_appends_upload_only_changed_tail_and_restore_every_revision(tmp_path, a
 
 
 def test_capture_larger_than_one_request_round_trips(tmp_path):
-    import random
     store = SQLiteStore(f"sqlite:///{tmp_path / 'archive.db'}")
     bound = 2 * CHUNK_BYTES
     url, stop = serve(create_app(store, "test-secret", max_request_bytes=bound))
     try:
-        capture = {"origin": "large", "source": "claude", "cwd": "/example/large", "session": "large", "mtime": 1.0,
+        capture = {"origin": "large", "source": "claude", "cwd": "/example/large", "session": "large", "mtime": 1.0, "capture_version": "test", "account_label": None,
             "summary": {"uuid": "large", "source": "claude", "cwd": "/example/large", "start": "", "end": "",
                         "turns": 0, "tokens": None, "title": "Large"},
             "unread_native": None, "turns": [], "turns_with_subagents": None, "search_text": ["large session"],
@@ -394,3 +407,92 @@ def test_archived_trace_uses_existing_local_views(tmp_path, archive, source):
     env[native_root] = str(tmp_path / "empty")
     for args, expected in zip(commands, baseline):
         assert run(env, "bin/one-conv", "local", *args, "--source", source, "--json") == expected
+
+
+def test_search_follows_the_newest_copy(tmp_path, archive):
+    _, _, url = archive
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    # Another machine holds a newer, edited copy of the same conversation.
+    other = {**fixture_env(tmp_path / "other"), "ONE_CONV_ARCHIVE_URL": url, "ONE_CONV_ARCHIVE_TOKEN": "test-secret"}
+    path = write_claude(other)
+    path.write_text(path.read_text().replace("Quartz", "Basalt"))
+    os.utime(path, (path.stat().st_mtime + 60,) * 2)
+    run(other, "scripts/archive-sync.py", "--source", "claude")
+    assert run(env, "bin/one-conv", "local", "search", "Quartz", "--source", "claude", "--json") == []
+    assert len(run(env, "bin/one-conv", "local", "search", "Basalt", "--source", "claude", "--json")) == 1
+
+
+def test_project_directories_sharing_a_cwd_list_each_thread_once(tmp_path, archive):
+    _, _, url = archive
+    env = fixture_env(tmp_path)
+    first = write_claude(env)
+    second = first.parent.with_name("fixture-renamed") / "session-two.jsonl"
+    second.parent.mkdir()
+    second.write_text(first.read_text().replace("forty-two", "forty-three"))
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    threads = run(env, "bin/one-conv", "local", "read", "ancestry", "--source", "claude", "--json")
+    assert sorted(thread["uuid"] for thread in threads) == ["session-one", "session-two"]
+
+
+def test_one_unreadable_archived_conversation_does_not_hide_other_results(tmp_path, archive):
+    store, client, url = archive
+    env = fixture_env(tmp_path)
+    first = write_claude(env)
+    first.with_name("session-two.jsonl").write_text(first.read_text().replace("forty-two", "forty-three"))
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    broken = next(row for row in client.list_conversations() if row["session"] == "session-two")
+    with store.engine.begin() as conn:
+        conn.execute(store.chunks.delete().where(store.chunks.c.digest.in_(client.read_conversation(broken["key"])["fields"]["turns"])))
+    remote = {**env, "CLAUDE_CONFIG_DIR": str(tmp_path / "empty")}
+    result = run(remote, "bin/one-conv", "local", "search", "Quartz", "--source", "claude", "--json", success=False)
+    assert result.returncode == 0 and "session-two" in result.stderr and "404" in result.stderr
+    assert [row["session"] for row in json.loads(result.stdout)] == ["session-one"]
+
+
+def test_archived_cloud_conversations_keep_their_account_label(tmp_path, archive):
+    _, _, url = archive
+    env = fixture_env(tmp_path)
+    path = Path(env["ONE_CONV_CLOUD_CACHE"]) / "account" / "conversation.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"source": "claude-chat", "cwd": "claude-chat:acct-1", "session": "cloud-one", "complete": True,
+        "account_label": "me@example.com", "turns": [{"role": "user", "ts": "2026-01-01T10:00:00Z", "text": "Quartz question"}]}))
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude-chat")
+    env["ONE_CONV_CLOUD_CACHE"] = str(tmp_path / "empty")
+    rows = run(env, "bin/one-conv", "cloud", "chats", "--source", "claude-chat", "--json")
+    assert [row["account_label"] for row in rows] == ["me@example.com"]
+
+
+def test_server_rejects_corrupt_chunks_and_manifests_without_chunks(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    content = b"chunk content"
+    for data in (zlib.compress(b"other content"), zlib.compress(content) + b"trailing"):
+        with pytest.raises(ArchiveError, match="422"):
+            client.request("chunks", {"chunks": {hashlib.sha256(content).hexdigest(): base64.b64encode(data).decode()}})
+    row = list(client.list_conversations())[0]
+    capture = client.read_capture(row["key"])
+    capture["turns"].append({"ts": "", "role": "user", "blocks": [{"type": "text", "text": "Never uploaded"}]})
+    with pytest.raises(ArchiveError, match="409.*chunks"):
+        client.request("conversations", {"manifest": pack(capture)[0], "expected": row["revision"]})
+
+
+def test_reader_upgrades_recapture_unchanged_sources(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    row = list(client.list_conversations())[0]
+    manifest = client.read_conversation(row["key"])
+    manifest["capture_version"] = "an earlier one-conv"
+    client.put(manifest, {}, row["revision"])
+    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 1, "unchanged": 0}

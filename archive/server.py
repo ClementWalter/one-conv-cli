@@ -15,7 +15,7 @@ from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from archive.store import Conflict, ConversationStore
-from one_conv.archive import MAX_REQUEST_BYTES, ArchiveError, decompress
+from one_conv.archive import DIGEST, FIELDS, MAX_REQUEST_BYTES, ArchiveError, conversation_key, decompress, revision
 
 PAGE_SIZE = 1000
 
@@ -24,30 +24,31 @@ class Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
-class Fields(Strict):
-    turns: list[str]
-    turns_with_subagents: list[str]
-    search_text: list[str]
-
-
 class Manifest(Strict):
     origin: str = Field(min_length=1)
     source: str = Field(min_length=1)
     cwd: str
     session: str = Field(min_length=1)
     mtime: float
+    capture_version: str = Field(min_length=1)
+    account_label: str | None
     summary: dict
     unread_native: bool | None
-    fields: Fields
+    fields: dict[str, list[str]]
     originals: dict[str, list[str]]
 
     @model_validator(mode="after")
     def consistent(self):
         if (self.summary.get("uuid"), self.summary.get("source"), self.summary.get("cwd")) != (self.session, self.source, self.cwd):
             raise ValueError("Summary identity differs from capture")
-        if not all(len(d) == 64 for parts in (*self.fields.model_dump().values(), *self.originals.values()) for d in parts):
+        if set(self.fields) != set(FIELDS):
+            raise ValueError("Capture fields differ from this protocol")
+        if not all(DIGEST.fullmatch(d) for d in self.digests()):
             raise ValueError("Invalid chunk digest")
         return self
+
+    def digests(self):
+        return [d for parts in (*self.fields.values(), *self.originals.values()) for d in parts]
 
 
 class Commit(Strict):
@@ -56,7 +57,7 @@ class Commit(Strict):
 
 
 class Inventory(Strict):
-    digests: list[str] = Field(max_length=MAX_REQUEST_BYTES // 64)
+    digests: list[str]
 
 
 class Chunks(Strict):
@@ -97,15 +98,24 @@ def create_app(store: ConversationStore, token, max_request_bytes=MAX_REQUEST_BY
                 return JSONResponse({"error": str(error)}, status_code=409)
         return wrapped
 
+    def commit(raw):
+        validated = Commit.model_validate_json(raw)
+        # Store and hash the manifest exactly as sent; validation must not reshape what the client digested.
+        manifest = json.loads(raw)["manifest"]
+        if store.missing_chunks(validated.manifest.digests()):
+            raise Conflict("Upload the capture's chunks before its manifest.")
+        parts = manifest["fields"]["search_text"]
+        search_text = "\n".join(json.loads(b"".join(decompress(store.read_chunk(d), d) for d in parts))).lower()
+        metadata = {name: value for name, value in manifest.items() if name not in ("fields", "originals")}
+        key = conversation_key(manifest["origin"], manifest["source"], manifest["cwd"], manifest["session"])
+        return store.put(key, revision(manifest), metadata, search_text, manifest, validated.expected)
+
     @endpoint
     async def conversations(request):
         if request.method == "GET":
             return JSONResponse(await run_in_threadpool(store.list_conversations,
                 request.query_params.get("after", ""), request.query_params.get("query"), PAGE_SIZE))
-        raw = await body(request)
-        commit = Commit.model_validate_json(raw)
-        # Store and hash the manifest exactly as sent; validation must not reshape what the client digested.
-        return JSONResponse(await run_in_threadpool(store.put, json.loads(raw)["manifest"], commit.expected))
+        return JSONResponse(await run_in_threadpool(commit, await body(request)))
 
     @endpoint
     async def conversation(request):

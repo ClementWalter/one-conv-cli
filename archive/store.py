@@ -7,7 +7,7 @@ from sqlalchemy import Column, Float, LargeBinary, MetaData, String, Table, Text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.sqlite import insert
 
-from one_conv.archive import conversation_key, decompress, encode, revision
+from one_conv.archive import encode
 
 
 class Conflict(Exception):
@@ -20,7 +20,7 @@ class ConversationStore(Protocol):
     def missing_chunks(self, digests: list[str]) -> list[str]: ...
     def put_chunks(self, chunks: dict[str, bytes]) -> None: ...
     def read_chunk(self, digest: str) -> bytes | None: ...
-    def put(self, manifest: dict, expected: str | None) -> dict: ...
+    def put(self, key: str, revision: str, metadata: dict, search_text: str, manifest: dict, expected: str | None) -> dict: ...
 
 
 class SQLiteStore:
@@ -78,23 +78,15 @@ class SQLiteStore:
         with self.engine.connect() as conn:
             return conn.execute(select(self.chunks.c.data).where(self.chunks.c.digest == digest)).scalar()
 
-    def put(self, manifest, expected):
-        key = conversation_key(manifest["origin"], manifest["source"], manifest["cwd"], manifest["session"])
-        digest = revision(manifest)
-        if self.missing_chunks([d for parts in (*manifest["fields"].values(), *manifest["originals"].values()) for d in parts]):
-            raise Conflict("Upload the capture's chunks before its manifest.")
-        metadata = {name: manifest[name] for name in ("origin", "source", "cwd", "session", "mtime", "summary", "unread_native")}
-        search_parts = manifest["fields"]["search_text"]
-        search_text = json.loads(b"".join(decompress(self.read_chunk(d), d) for d in search_parts))
-        values = {"revision": digest, "mtime": manifest["mtime"], "metadata": encode(metadata).decode(),
-                  "search_text": "\n".join(search_text).lower()}
+    def put(self, key, revision, metadata, search_text, manifest, expected):
+        values = {"revision": revision, "mtime": metadata["mtime"], "metadata": encode(metadata).decode(), "search_text": search_text}
         h, r = self.heads, self.revisions
         try:
             with self.engine.begin() as conn:
                 current = conn.execute(select(h.c.revision, h.c.mtime).where(h.c.key == key)).first()
-                if current and current.revision == digest:
-                    return {"key": key, "revision": digest}
-                if (current.revision if current else None) != expected or (current and current.mtime > manifest["mtime"]):
+                if current and current.revision == revision:
+                    return {"key": key, "revision": revision}
+                if (current.revision if current else None) != expected or (current and current.mtime > metadata["mtime"]):
                     raise Conflict("Conversation changed; resync from its current source.")
                 if current:
                     result = conn.execute(h.update().where((h.c.key == key) & (h.c.revision == expected)).values(**values))
@@ -102,8 +94,8 @@ class SQLiteStore:
                         raise Conflict("Concurrent sync; retry after reading the current revision.")
                 else:
                     conn.execute(h.insert().values(key=key, **values))
-                if not conn.execute(select(r.c.key).where((r.c.key == key) & (r.c.revision == digest))).first():
-                    conn.execute(r.insert().values(key=key, revision=digest, manifest=encode(manifest).decode()))
+                if not conn.execute(select(r.c.key).where((r.c.key == key) & (r.c.revision == revision))).first():
+                    conn.execute(r.insert().values(key=key, revision=revision, manifest=encode(manifest).decode()))
         except IntegrityError as error:
             raise Conflict("Concurrent sync; retry.") from error
-        return {"key": key, "revision": digest}
+        return {"key": key, "revision": revision}

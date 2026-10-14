@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -13,7 +14,11 @@ import zlib
 CHUNK_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 FIELDS = ("turns", "turns_with_subagents", "search_text")
-WORKERS = 4
+DIGEST = re.compile(r"[0-9a-f]{64}")
+READ_WORKERS = 4
+# Python's socket timeout bounds a whole send, so upload deadlines grow with the body,
+# assuming at least 1 Mbit/s of upstream bandwidth.
+MIN_UPLOAD_BYTES_PER_SECOND = 128 * 1024
 
 
 class ArchiveError(RuntimeError):
@@ -73,7 +78,7 @@ def decompress(data, expected_digest):
         raw = inflater.decompress(data, CHUNK_BYTES)
     except zlib.error as error:
         raise ArchiveError("Chunk is not valid zlib data") from error
-    if inflater.unconsumed_tail or not inflater.eof or digest(raw) != expected_digest:
+    if inflater.unconsumed_tail or inflater.unused_data or not inflater.eof or digest(raw) != expected_digest:
         raise ArchiveError("Chunk does not match its digest")
     return raw
 
@@ -89,12 +94,13 @@ class ArchiveClient:
         self.max_request_bytes = max_request_bytes
 
     def request(self, path, body=None, *, raw=False):
-        request = Request(self.url + "/v1/" + path,
-                          data=encode(body) if body is not None else None,
+        data = encode(body) if body is not None else None
+        request = Request(self.url + "/v1/" + path, data=data,
                           headers={"Authorization": "Bearer " + self.token,
                                    "Content-Type": "application/json"})
+        timeout = self.timeout + len(data or b"") / MIN_UPLOAD_BYTES_PER_SECOND
         try:
-            with build_opener(NoRedirect).open(request, timeout=self.timeout) as response:
+            with build_opener(NoRedirect).open(request, timeout=timeout) as response:
                 return response.read() if raw else json.load(response)
         except HTTPError as error:
             try:
@@ -122,7 +128,7 @@ class ArchiveClient:
         return self.request("conversations/" + key + ("?" + urlencode({"revision": revision}) if revision else ""))
 
     def read_chunks(self, digests):
-        with ThreadPoolExecutor(WORKERS) as pool:
+        with ThreadPoolExecutor(READ_WORKERS) as pool:
             return b"".join(pool.map(lambda d: decompress(self.request("chunks/" + d, raw=True), d), digests))
 
     def read_field(self, manifest, field):
@@ -139,8 +145,7 @@ class ArchiveClient:
         """Upload missing chunks in bounded batches, then advance the conversation to this manifest."""
         missing = set()
         names = list(chunks)
-        # A digest costs about 70 bytes in the request; keep the inventory well under the bound.
-        step = self.max_request_bytes // 128
+        step = self.max_request_bytes // 70  # A digest costs 67 bytes in a JSON list.
         for start in range(0, len(names), step):
             missing.update(self.request("chunks/missing", {"digests": names[start:start + step]})["missing"])
         batches, batch, size = [], {}, 0
@@ -148,15 +153,16 @@ class ArchiveClient:
             if name not in missing:
                 continue
             data = base64.b64encode(compress(chunks[name])).decode()
-            if batch and size + len(data) + 80 > self.max_request_bytes:
+            cost = len(name) + len(data) + 6  # Two quoted strings, a colon and a comma.
+            if batch and size + cost > self.max_request_bytes - 16:
                 batches.append(batch)
                 batch, size = {}, 0
             batch[name] = data
-            size += len(data) + 80
+            size += cost
         if batch:
             batches.append(batch)
-        with ThreadPoolExecutor(WORKERS) as pool:
-            list(pool.map(lambda b: self.request("chunks", {"chunks": b}), batches))
+        for batch in batches:  # Sequential: concurrent uploads would only share the same bandwidth.
+            self.request("chunks", {"chunks": batch})
         return self.request("conversations", {"manifest": manifest, "expected": expected})
 
 

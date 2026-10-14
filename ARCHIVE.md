@@ -80,27 +80,22 @@ before treating the service as durable storage.
 
 ## Add a backend
 
-Implement `ConversationStore` in `archive/store.py`: paginated metadata discovery
-with an optional literal substring filter, manifest reads, chunk inventory, storage
-and reads, and atomic, idempotent manifest commits against an expected revision.
-Configure `ONE_CONV_ARCHIVE_STORE_FACTORY=your_package.module:factory`; the factory
-receives `ONE_CONV_ARCHIVE_DATABASE_URL`. The `/v1` HTTP contract and the client do
-not change. Only SQLite is verified; another engine must pass the same tests first.
+Implement `ConversationStore` in `archive/store.py`: paginated metadata listing
+with an optional literal substring filter over search text, manifest reads, chunk
+inventory, storage and reads, and an atomic commit that advances a conversation only
+from its expected revision. The server validates captures and derives keys,
+revisions and search text. Configure
+`ONE_CONV_ARCHIVE_STORE_FACTORY=your_package.module:factory`; the factory receives
+`ONE_CONV_ARCHIVE_DATABASE_URL`. The `/v1` HTTP contract and the client do not
+change. Only SQLite is verified; another engine must pass the same tests first.
 
 ## Verify
 
 ```sh
-uv run --with sqlalchemy==2.1.4 --with starlette==1.8.0 --with pydantic==2.12.5 \
-  --with uvicorn==0.54.0 --with pytest --with click==8.3.3 \
-  python -m pytest tests/test_archive.py -q
+uv run --with-requirements scripts/archive-server.py --with-requirements scripts/archive-sync.py \
+  --with pytest python -m pytest tests/test_archive.py -q
 ```
 
-The tests run a real HTTP service and the sync script and CLI as subprocesses
-against isolated native fixtures. They compare native output with archive-only
-output and cover retries, updates, multiple installations, outages, oversized
-captures and interrupted uploads. They never remove native conversations.
-
 `tests/benchmark_archive.py` (run with `-s` instead of `tests/test_archive.py`)
-measures search over synthetic captures. It defaults to 0.25 GiB of searchable
-text, about the text of a 12 GiB provider history; set `ONE_CONV_BENCHMARK_GIB` to
-change it.
+measures search over synthetic captures; `ONE_CONV_BENCHMARK_GIB` sets the amount of
+searchable text (default 0.25).

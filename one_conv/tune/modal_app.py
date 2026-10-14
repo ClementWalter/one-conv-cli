@@ -393,3 +393,46 @@ def train_dpo(dataset: str, run: str, base_adapter: str, epochs: float = 2.0, le
     _write_json(run_dir / "train_metrics.json", curves)
     volume.commit()
     return settings
+
+
+@app.function(**GPU, timeout=1800)
+def token_view(run: str, session_path: str = "token_view/session.json") -> dict:
+    """Per-token probabilities of each assistant reply in one conversation, base vs adapter, with each model's top guess."""
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    doc = json.loads((VOL / session_path).read_text())
+    messages = doc["messages"]
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    base = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, device_map="cuda")
+    model = PeftModel.from_pretrained(base, str(VOL / "runs" / run / "adapter"))
+    model.eval()
+
+    def scores(ids, start):
+        with torch.no_grad():
+            logp = torch.log_softmax(model(ids[:, :-1]).logits.float(), dim=-1)[0, start - 1:]
+        targets = ids[0, start:]
+        actual = logp.gather(-1, targets[:, None]).squeeze(-1)
+        top = logp.max(dim=-1)
+        return actual.tolist(), top.indices.tolist(), top.values.tolist()
+
+    replies = []
+    for i, message in enumerate(messages):
+        if message["role"] != "assistant":
+            continue
+        prompt = _token_ids(tokenizer, messages[:i], add_generation_prompt=True)
+        full = _token_ids(tokenizer, messages[:i + 1])
+        ids = torch.tensor([full], device=model.device)
+        with model.disable_adapter():
+            lp_b, top_b, top_lp_b = scores(ids, len(prompt))
+        lp_a, top_a, top_lp_a = scores(ids, len(prompt))
+        tokens = full[len(prompt):]
+        replies.append({"index": i, "tokens": [
+            {"t": tokenizer.decode([tok]), "b": round(b, 4), "a": round(a, 4),
+             "bt": tokenizer.decode([tb]), "bp": round(pb, 4), "at": tokenizer.decode([ta]), "ap": round(pa, 4)}
+            for tok, b, a, tb, pb, ta, pa in zip(tokens, lp_b, lp_a, top_b, top_lp_b, top_a, top_lp_a)]})
+    out = {"run": run, "key": doc["key"], "cwd": doc["cwd"], "messages": messages, "replies": replies}
+    _write_json(VOL / "token_view" / "result.json", out)
+    volume.commit()
+    return {"replies": len(replies)}

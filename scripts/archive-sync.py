@@ -189,6 +189,8 @@ def restore(reader, client, session):
     """Write back each record of a conversation that was freed or is missing here, from its newest copy this
     machine can hold; every target is checked before anything is written."""
     rows = [row for row in client.list_conversations() if row["source"] in FREEABLE_SOURCES and row["session"].startswith(session)]
+    # A full ID can prefix another, e.g. Claude Code's `<id>.orphaned-<time>-<hash>` transcripts.
+    rows = [row for row in rows if row["session"] == session] or rows
     matches = {(row["source"], row["session"]) for row in rows}
     if len(matches) != 1:
         raise ArchiveError(f"{len(matches)} archived conversations match {session!r}; give the full session ID")

@@ -676,6 +676,24 @@ def test_a_freed_conversation_written_again_does_not_replace_its_archive(tmp_pat
     assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 1, "unchanged": 0}  # A new installation.
 
 
+def test_restore_prefers_the_exact_session_over_longer_ids(tmp_path, archive):
+    _, _, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    orphan = path.with_name("session-one.orphaned-1786441964419-f1222adc.jsonl")  # Claude Code leaves these.
+    orphan.write_bytes(path.read_bytes())
+    old = time.time() - 100 * 86400
+    for item in (path, orphan):
+        os.utime(item, (old, old))
+    originals = {item: item.read_bytes() for item in (path, orphan)}
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    assert run(env, "scripts/archive-sync.py", "--source", "claude", "--free-older-than", "30")["freed"] == 2
+    assert run(env, "scripts/archive-sync.py", "--restore", "session-one") == {"restored": 1}
+    assert path.read_bytes() == originals[path] and not orphan.exists()
+    assert run(env, "scripts/archive-sync.py", "--restore", "session-one.orphaned") == {"restored": 1}
+    assert {item: item.read_bytes() for item in originals} == originals
+
+
 @pytest.mark.parametrize("escape", ["outside history", "through a symbolic link"])
 def test_restore_writes_only_inside_native_history(tmp_path, archive, escape):
     _, client, url = archive

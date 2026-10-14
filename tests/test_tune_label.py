@@ -216,3 +216,47 @@ def test_new_info_pairs_stay_out_of_dpo(tmp_path, corrected):
     manifest = write_dataset([corrected], tmp_path, valid=0.0, test=0.0,
                              labels=_labels(corrected, ["correction_new_info", "accepted"]))
     assert (manifest["counts"]["dpo"]["train"], manifest["counts"]["new_info"]["train"]) == (0, 1)
+
+
+def _chat_response(content, status=200):
+    return StubResponse(status, {"model": "gpt-6-luna", "usage": {"prompt_tokens": 300},
+                                 "choices": [{"message": {"content": content}}]})
+
+
+def test_llm_judge_reads_json_label():
+    from one_conv.tune.label import llm_classifier
+    classify = llm_classifier("k", "gpt-6-luna", post=_post([_chat_response('{"label": "question", "confidence": 0.8}')], []))
+    assert classify([STATE])[0]["probabilities"] == {"question": 0.8}
+
+
+def test_llm_judge_unknown_label_becomes_unclear():
+    from one_conv.tune.label import llm_classifier
+    classify = llm_classifier("k", "m", post=_post([_chat_response('{"label": "praise", "confidence": 0.9}')], []))
+    assert classify([STATE])[0]["label"] == "unclear"
+
+
+def test_llm_judge_unparseable_answer_becomes_unclear():
+    from one_conv.tune.label import llm_classifier
+    classify = llm_classifier("k", "m", post=_post([_chat_response("I think it's a correction")], []))
+    assert classify([STATE])[0]["label"] == "unclear"
+
+
+def test_llm_judge_sends_chosen_model():
+    from one_conv.tune.label import llm_classifier
+    calls = []
+    llm_classifier("k", "claude-opus-5.5", post=_post([_chat_response('{"label": "accepted", "confidence": 1}')], calls))([STATE])
+    assert calls[0]["json"]["model"] == "claude-opus-5.5"
+
+
+def test_judge_overrides_only_uncertain_labels():
+    from one_conv.tune.label import adjudicated
+    primary = {"a": {"label": "accepted", "probabilities": {"accepted": 0.9}},
+               "b": {"label": "question", "probabilities": {"question": 0.4}}}
+    judge = {"a": {"label": "unclear", "probabilities": {"unclear": 1.0}},
+             "b": {"label": "correction_preference", "probabilities": {"correction_preference": 0.9}}}
+    assert {k: v["label"] for k, v in adjudicated(primary, judge, 0.6).items()} == {"a": "accepted", "b": "correction_preference"}
+
+
+def test_labels_file_name_includes_judge_model():
+    from one_conv.tune.label import labels_name
+    assert labels_name("boundless", "gpt-6-luna") == "boundless-gpt-6-luna"

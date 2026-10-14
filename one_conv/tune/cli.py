@@ -15,10 +15,13 @@ import click
 from .corpus import AGENT_SOURCES, load_sessions
 from .dataset import write_dataset
 from .label import (
+    JUDGE_PRICES,
     LABELS,
     PROVIDERS,
+    adjudicated,
     build_classifier,
     label_moments,
+    labels_name,
     load_labels,
     moments,
 )
@@ -130,6 +133,8 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
     @click.option("--include-system", is_flag=True, help="Keep heartbeat and worker sessions.")
     @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="classifier", show_default=True,
                   help="Decision model that labeled (or labels) the moments.")
+    @click.option("--judge", default=None,
+                  help="Labels file (e.g. boundless-gpt-6-luna) that overrides labels below --min-probability.")
     @click.option("--labels/--keywords", "use_labels", default=False,
                   help="Use classifier labels from `tune label` instead of the keyword heuristic.")
     @click.option("--min-probability", default=0.6, show_default=True,
@@ -140,7 +145,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
                   help="Synthetic rows per real SFT training row.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the manifest as JSON.")
     def dataset(name, extra_roots, sources, rule, valid, test, max_context_messages, max_chars, include_system,
-                provider, use_labels, min_probability, synth_rule, synth_ratio, as_json):
+                provider, judge, use_labels, min_probability, synth_rule, synth_ratio, as_json):
         """Build SFT examples and DPO pairs from exported sessions.
 
         Accepted assistant turns become SFT targets. A turn followed by a
@@ -160,6 +165,11 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             labels = load_labels(home / "labels" / f"{provider}.jsonl")
             if not labels:
                 raise click.ClickException(f"No labels yet. Run: one-conv tune label --provider {provider}")
+            if judge:
+                verdicts = load_labels(home / "labels" / f"{judge}.jsonl")
+                if not verdicts:
+                    raise click.ClickException(f"No labels file named {judge!r} under {home / 'labels'}.")
+                labels = adjudicated(labels, verdicts, min_probability)
         out = home / "datasets" / name
         synthetic = None
         if synth_rule:
@@ -187,10 +197,16 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
     @tune.command(context_settings=HELP)
     @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="classifier", show_default=True,
                   help="Decision model that labeled (or labels) the moments.")
+    @click.option("--model", default=None, help="Judge model for --provider boundless (default gpt-6-luna).")
+    @click.option("--uncertain-from", "uncertain_from", default=None,
+                  help="Only moments this labels file (e.g. classifier) scored below --min-probability.")
+    @click.option("--min-probability", default=0.6, show_default=True)
+    @click.option("--sample", default=0, show_default=True, help="Label a random sample of this size (0 = all).")
+    @click.option("--seed", default=0, show_default=True)
     @click.option("--limit", default=0, show_default=True, help="Label at most this many new moments (0 = all).")
     @click.option("--workers", default=4, show_default=True, help="Concurrent classifier requests.")
     @click.option("--dry-run", is_flag=True, help="Count pending moments and estimate cost without calling the API.")
-    def label(provider, limit, workers, dry_run):
+    def label(provider, model, uncertain_from, min_probability, sample, seed, limit, workers, dry_run):
         """Classify your reaction to every assistant reply with a decision model.
 
         Each moment (your request, the reply, your next message) gets one
@@ -205,35 +221,74 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
           one-conv tune label --dry-run
           one-conv tune label --limit 50
           one-conv tune label --provider subq
+          one-conv tune label --provider boundless --uncertain-from classifier --model gpt-6-luna
           one-conv tune review
         """
         home = tune_home()
         spec = PROVIDERS[provider]
-        out = home / "labels" / f"{provider}.jsonl"
+        model = model or spec.model
+        out = home / "labels" / f"{labels_name(provider, model)}.jsonl"
         done = load_labels(out)
+        uncertain = None
+        if uncertain_from:
+            primary = load_labels(home / "labels" / f"{uncertain_from}.jsonl")
+            uncertain = {k for k, r in primary.items() if r["probabilities"].get(r["label"], 0.0) < min_probability}
         pending, queued = [], set()
         for session in _sessions(home):
             for moment in moments(session):
-                if moment.key not in done and moment.key not in queued:
-                    queued.add(moment.key)
-                    pending.append(moment)
+                if moment.key in done or moment.key in queued or (uncertain is not None and moment.key not in uncertain):
+                    continue
+                queued.add(moment.key)
+                pending.append(moment)
+        if sample:
+            pending = random.Random(seed).sample(pending, min(sample, len(pending)))
         if limit:
             pending = pending[:limit]
         chars = sum(len(json.dumps(m.state)) for m in pending)
         # ~4 characters per token, plus the question; both providers bill input tokens only.
         tokens = chars // 4 + 400 * len(pending)
-        cost = tokens * spec.usd_per_million / 1e6
-        click.echo(f"{len(done)} labeled, {len(pending)} to label, ~{tokens / 1e6:.1f}M tokens (~${cost:.2f} on {provider})")
+        price = JUDGE_PRICES.get(model, spec.usd_per_million) if provider == "boundless" else spec.usd_per_million
+        cost = tokens * price / 1e6
+        click.echo(f"{len(done)} labeled, {len(pending)} to label, ~{tokens / 1e6:.1f}M tokens "
+                   f"(~${cost:.2f} on {labels_name(provider, model)})")
         if dry_run or not pending:
             return
         api_key = os.environ.get(spec.key_env) if spec.key_env else None
         if spec.key_env and not api_key:
             raise click.ClickException(f"Set {spec.key_env} ({spec.console}).")
         try:
-            count = label_moments(pending, build_classifier(spec, api_key), out, workers, spec.batch_size)
+            count = label_moments(pending, build_classifier(spec, api_key, model), out, workers, spec.batch_size)
         except RuntimeError as error:
             raise click.ClickException(f"{error}. Labels written so far are kept; rerun to resume.") from None
         click.echo(f"Labeled {count} moment(s) into {out}")
+
+    @tune.command(context_settings=HELP)
+    @click.argument("reference")
+    @click.argument("candidates", nargs=-1, required=True)
+    @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+    def compare(reference, candidates, as_json):
+        """Agreement of labels files with a reference, on the moments both labeled.
+
+        \b
+        Examples:
+          one-conv tune compare boundless-claude-opus-5.5 boundless-gpt-6-luna classifier
+        """
+        folder = tune_home() / "labels"
+        ref = load_labels(folder / f"{reference}.jsonl")
+        if not ref:
+            raise click.ClickException(f"No labels file named {reference!r}.")
+        rows = []
+        for name in candidates:
+            other = load_labels(folder / f"{name}.jsonl")
+            shared = [k for k in ref if k in other]
+            agree = sum(ref[k]["label"] == other[k]["label"] for k in shared)
+            rows.append({"candidate": name, "shared": len(shared), "agreement": agree / len(shared) if shared else None})
+        if as_json:
+            click.echo(json.dumps({"reference": reference, "results": rows}))
+            return
+        for row in rows:
+            score = f"{row['agreement']:.0%}" if row["agreement"] is not None else "n/a"
+            click.echo(f"{row['candidate']:36} {score:>5} agreement on {row['shared']} moments")
 
     @tune.command(context_settings=HELP)
     @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="classifier", show_default=True,

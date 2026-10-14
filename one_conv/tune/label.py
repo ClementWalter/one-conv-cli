@@ -43,6 +43,9 @@ PROVIDERS = {
                     0.042, "console.typesafe.ai/settings/keys"),
     "subq": Provider("subq", "https://api.subq.ai/v1/systemone", "subq-snap-preview", "SUBQ_API_KEY",
                      0.05, "console.subq.ai"),
+    # An LLM judge for moments the decision models are unsure about; zero data retention per Boundless.
+    "boundless": Provider("boundless", "https://api.inference.boundless.network/v1/chat/completions", "gpt-6-luna",
+                          "BOUNDLESS_API_KEY", 0.10, "inference.boundless.network/api-keys"),
 }
 LABELS = ("accepted", "correction_preference", "correction_new_info", "new_task", "question", "unclear")
 CORRECTIONS = ("correction_preference", "correction_new_info")
@@ -199,10 +202,68 @@ def classifier_dev_classifier(post: Callable | None = None, max_attempts: int = 
     return classify
 
 
-def build_classifier(provider: Provider, api_key: str | None) -> Classifier:
+# Input price per million tokens on Boundless, for cost estimates only; the receipts are authoritative.
+JUDGE_PRICES = {"gpt-6-luna": 0.10, "gpt-5.6-luna": 0.20, "dsv4": 0.04, "deepseek-v4-pro-0813": 1.04,
+                "glm-5.2": 0.34, "kimi-k3": 2.30, "claude-opus-5.5": 4.00, "claude-opus-5": 5.00}
+
+
+def labels_name(provider: str, model: str | None) -> str:
+    return f"{provider}-{model}" if provider == "boundless" else provider
+
+
+JUDGE_SYSTEM = (FRAMING + " The user message is a JSON object with `user_request`, `assistant_reply` and "
+                "`user_next_message`.\nLabels:\n" + "\n".join(f"- {k}: {v}" for k, v in CRITERIA.items())
+                + '\nAnswer with JSON only: {"label": "<one label>", "confidence": <number from 0 to 1>}')
+
+
+def llm_classifier(api_key: str, model: str, post: Callable | None = None, max_attempts: int = 6) -> Classifier:
+    """OpenAI-compatible chat judge; its self-reported confidence stands in for a probability."""
+    if post is None:
+        from curl_cffi import requests
+        post = requests.post
+
+    def classify(state: dict) -> dict:
+        body = {"model": model, "response_format": {"type": "json_object"}, "max_tokens": 2000,
+                "messages": [{"role": "system", "content": JUDGE_SYSTEM},
+                             {"role": "user", "content": json.dumps(state, ensure_ascii=False)}]}
+        for attempt in range(max_attempts):
+            response = post(PROVIDERS["boundless"].url, json=body, timeout=180,
+                            headers={"Authorization": f"Bearer {api_key}"})
+            if response.status_code in (429, 500, 502, 503, 529) and attempt + 1 < max_attempts:
+                time.sleep(_retry_delay(response, attempt))
+                continue
+            if response.status_code != 200:
+                raise RuntimeError(f"boundless returned HTTP {response.status_code}: {response.text[:300]}")
+            payload = response.json()
+            try:
+                answer = json.loads(payload["choices"][0]["message"]["content"])
+                label, confidence = answer["label"], float(answer["confidence"])
+            except (ValueError, KeyError, TypeError):
+                label, confidence = "unclear", 0.0
+            if label not in CRITERIA:
+                label, confidence = "unclear", 0.0
+            return {"label": label, "probabilities": {label: confidence}, "confidence": confidence,
+                    "model": payload.get("model", model),
+                    "input_tokens": (payload.get("usage") or {}).get("prompt_tokens")}
+        raise RuntimeError("boundless stayed rate-limited")
+    return lambda states: [classify(state) for state in states]
+
+
+def build_classifier(provider: Provider, api_key: str | None, model: str | None = None) -> Classifier:
     if provider.name == "classifier":
         return classifier_dev_classifier()
+    if provider.name == "boundless":
+        return llm_classifier(api_key, model or provider.model)
     return decision_classifier(provider, api_key)
+
+
+def adjudicated(primary: dict[str, dict], judge: dict[str, dict], min_probability: float) -> dict[str, dict]:
+    """Primary labels, with the judge's answer wherever the primary was below `min_probability`."""
+    merged = dict(primary)
+    for key, row in primary.items():
+        if row["probabilities"].get(row["label"], 0.0) < min_probability and key in judge:
+            merged[key] = judge[key]
+    return merged
 
 
 def label_moments(pending: list[Moment], classify: Classifier, out: Path, workers: int = 8,

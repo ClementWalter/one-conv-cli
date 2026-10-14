@@ -108,3 +108,23 @@ def test_label_requires_api_key(home, tmp_path, monkeypatch):
 def test_dataset_with_labels_requires_labels(home, tune):
     result = CliRunner().invoke(tune, ["dataset", "--labels"])
     assert "one-conv tune label" in result.output
+
+
+def _write_labels(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def test_compare_reports_agreement(home, tune):
+    _write_labels(home / "labels" / "ref.jsonl", [{"key": "a", "label": "accepted", "probabilities": {}},
+                                                  {"key": "b", "label": "question", "probabilities": {}}])
+    _write_labels(home / "labels" / "cand.jsonl", [{"key": "a", "label": "accepted", "probabilities": {}},
+                                                   {"key": "b", "label": "unclear", "probabilities": {}}])
+    result = CliRunner().invoke(tune, ["compare", "ref", "cand", "--json"])
+    assert json.loads(result.output)["results"][0]["agreement"] == 0.5
+
+
+def test_dataset_judge_requires_its_labels(home, tune):
+    _write_labels(home / "labels" / "classifier.jsonl", [{"key": "a", "label": "accepted", "probabilities": {"accepted": 1}}])
+    result = CliRunner().invoke(tune, ["dataset", "--labels", "--judge", "missing"])
+    assert "No labels file named 'missing'" in result.output

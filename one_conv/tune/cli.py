@@ -402,10 +402,12 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
     @click.option("--learning-rate", default=1e-4, show_default=True)
     @click.option("--rank", default=16, show_default=True)
     @click.option("--max-steps", default=-1, show_default=True, help="Stop early, for smoke tests.")
-    def cloud_train(dataset_name, run, epochs, learning_rate, rank, max_steps):
+    @click.option("--batch-size", default=1, show_default=True, help="Sequences per forward pass; 1 avoids padding.")
+    @click.option("--grad-accum", default=16, show_default=True, help="Forward passes per optimizer step.")
+    def cloud_train(dataset_name, run, epochs, learning_rate, rank, max_steps, batch_size, grad_accum):
         """Train a LoRA adapter with TRL on the GPU (loss on the final reply only)."""
         _remote("train", dataset=dataset_name, run=run, epochs=epochs, learning_rate=learning_rate,
-                rank=rank, max_steps=max_steps)
+                rank=rank, max_steps=max_steps, batch_size=batch_size, grad_accum=grad_accum)
 
     @cloud.command("eval", context_settings=HELP)
     @click.option("--run", "run", required=True)

@@ -65,7 +65,7 @@ def _prompt_completion(rows: list[dict]) -> list[dict]:
 
 @app.function(**GPU, timeout=4 * 3600)
 def train(dataset: str, run: str, epochs: float = 1.0, learning_rate: float = 1e-4, rank: int = 16,
-          max_length: int = 4096, batch_size: int = 4, grad_accum: int = 4, max_steps: int = -1) -> dict:
+          max_length: int = 4096, batch_size: int = 1, grad_accum: int = 16, max_steps: int = -1) -> dict:
     from datasets import Dataset
     from peft import LoraConfig
     from transformers import TrainerCallback
@@ -82,6 +82,7 @@ def train(dataset: str, run: str, epochs: float = 1.0, learning_rate: float = 1e
             if logs and "eval_loss" in logs:
                 curves["val"].append([state.global_step, logs["eval_loss"]])
 
+    # One sequence per forward pass: padded batches of mixed lengths made bf16 gradients NaN from step ~15.
     config = SFTConfig(
         output_dir=str(run_dir / "checkpoints"), num_train_epochs=epochs, learning_rate=learning_rate,
         per_device_train_batch_size=batch_size, per_device_eval_batch_size=batch_size,
@@ -272,3 +273,44 @@ def benchmark(run: str) -> dict:
     _write_json(VOL / "runs" / run / "benchmark.json", result)
     volume.commit()
     return {v: f"{r['passed']}/{r['total']}" for v, r in result.items()}
+
+
+@app.function(**GPU, timeout=3600)
+def diagnose(dataset: str, micro_batches: int = 64, batch_size: int = 4, max_length: int = 4096) -> list[dict]:
+    """Replay training's first micro-batches one example at a time; report examples with non-finite loss or grads."""
+    import torch
+    from datasets import Dataset
+    from peft import LoraConfig
+    from trl import SFTConfig, SFTTrainer
+
+    rows = _read_jsonl(VOL / "datasets" / dataset / "sft" / "train.jsonl")
+    config = SFTConfig(output_dir="/tmp/diag", per_device_train_batch_size=batch_size, max_length=max_length,
+                       bf16=True, report_to=[], completion_only_loss=True, gradient_checkpointing=True,
+                       model_init_kwargs={"dtype": "bfloat16"})
+    trainer = SFTTrainer(model=MODEL, args=config, train_dataset=Dataset.from_list(_prompt_completion(rows)),
+                         peft_config=LoraConfig(r=16, lora_alpha=32, target_modules="all-linear", task_type="CAUSAL_LM"))
+    model = trainer.model
+    model.train()
+    found = []
+    for b, batch in enumerate(trainer.get_train_dataloader()):
+        if b >= micro_batches:
+            break
+        for i in range(batch["input_ids"].shape[0]):
+            one = {k: v[i:i + 1].to(model.device) for k, v in batch.items() if hasattr(v, "shape")}
+            labels = one["input_ids"].clone()
+            if "completion_mask" in one:
+                labels[one["completion_mask"] == 0] = -100
+            if "attention_mask" in one:
+                labels[one["attention_mask"] == 0] = -100
+            out = model(input_ids=one["input_ids"], attention_mask=one.get("attention_mask"), labels=labels)
+            out.loss.backward()
+            bad_grad = any(p.grad is not None and not torch.isfinite(p.grad).all() for p in model.parameters())
+            model.zero_grad(set_to_none=True)
+            if bad_grad or not torch.isfinite(out.loss):
+                ids = one["input_ids"][0][one["attention_mask"][0].bool()] if "attention_mask" in one else one["input_ids"][0]
+                found.append({"micro_batch": b, "row": i, "loss": float(out.loss), "tokens": int(ids.numel()),
+                              "completion_tokens": int((labels != -100).sum()),
+                              "tail": trainer.processing_class.decode(ids[-200:])})
+    _write_json(VOL / "diagnose.json", {"micro_batches": micro_batches, "found": found})
+    volume.commit()
+    return found

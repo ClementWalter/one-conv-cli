@@ -44,8 +44,18 @@ def session_record(session: Session, reactions: dict[str, dict], moods: dict[str
             "title": " ".join(first.split())[:120], "messages": rendered, **session_heat(levels)}
 
 
+def unique_sessions(sessions: list[Session]) -> list[Session]:
+    """Keep the newest copy of conversations stored twice (old and new caches, other machines)."""
+    newest: dict[int, Session] = {}
+    for session in sessions:
+        content = hash(session.messages)
+        if content not in newest or session.mtime > newest[content].mtime:
+            newest[content] = session
+    return list(newest.values())
+
+
 def write_viewer(sessions: list[Session], reactions: dict[str, dict], moods: dict[str, dict], out: Path) -> int:
-    records = [session_record(s, reactions, moods) for s in sessions if s.messages]
+    records = [session_record(s, reactions, moods) for s in unique_sessions(sessions) if s.messages]
     # Escaping "</" keeps message text from closing the data script tag.
     payload = json.dumps(records, ensure_ascii=False).replace("</", "<\\/")
     template = (Path(__file__).parent / "viewer.html").read_text(encoding="utf-8")

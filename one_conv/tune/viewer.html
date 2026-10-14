@@ -20,9 +20,13 @@ html, body { height: 100%; margin: 0; }
 body { background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); display: grid; grid-template-columns: minmax(300px, 380px) 1fr; }
 aside { border-right: 1px solid var(--rule); display: grid; grid-template-rows: auto 1fr; min-height: 0; background: var(--panel); }
 .controls { padding: 12px; display: grid; gap: 8px; border-bottom: 1px solid var(--rule); }
-.controls input, .controls select { width: 100%; padding: 7px 9px; border: 1px solid var(--rule); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; }
+.controls input[type="search"], .controls select { width: 100%; padding: 7px 9px; border: 1px solid var(--rule); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; }
 .row { display: flex; gap: 8px; } .row > * { flex: 1; }
 .count { font: 12px var(--mono); color: var(--ink-3); }
+.toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); cursor: pointer; }
+.toggle input { width: 16px; height: 16px; margin: 0; accent-color: var(--heat); }
+.hits { color: var(--accent); }
+mark { background: color-mix(in srgb, var(--warm) 45%, transparent); color: inherit; border-radius: 2px; }
 #list { overflow-y: auto; }
 .item { padding: 10px 12px; border-bottom: 1px solid var(--rule); cursor: pointer; display: grid; gap: 3px; }
 .item:hover, .item:focus-visible { background: var(--bg); outline: none; }
@@ -50,16 +54,16 @@ main { overflow-y: auto; min-width: 0; }
 <body>
 <aside>
   <div class="controls">
-    <input id="q" type="search" placeholder="Search text, project or source">
+    <input id="q" type="search" placeholder="Search messages, e.g. uv, revert, tests" aria-label="Search messages">
     <div class="row">
-      <select id="source"><option value="">All sources</option></select>
-      <select id="sort">
+      <select id="source" aria-label="Source"><option value="">All sources</option></select>
+      <select id="sort" aria-label="Sort">
         <option value="heat">Most heated first</option>
         <option value="date">Newest first</option>
         <option value="length">Longest first</option>
       </select>
     </div>
-    <label class="count"><input id="hotonly" type="checkbox"> Only sessions with a frustrated or angry reaction</label>
+    <label class="toggle"><input id="hotonly" type="checkbox"> Heated sessions only (a frustrated or angry reply)</label>
     <span class="count" id="count"></span>
   </div>
   <div id="list"></div>
@@ -77,6 +81,7 @@ for (const src of [...new Set(S.map((s) => s.source))].sort()) {
   document.getElementById("source").insertAdjacentHTML("beforeend", `<option>${esc(src)}</option>`);
 }
 let current = null;
+const hits = new Map();
 function heatDots(s) {
   const n = Math.min(5, s.heated);
   return `<span class="heat" title="${s.heated} heated reactions, peak ${s.peak}">${[0, 1, 2, 3, 4].map((i) => `<i class="${i < n ? "f" : ""}"></i>`).join("")}</span>`;
@@ -87,15 +92,24 @@ function renderList() {
   const hot = document.getElementById("hotonly").checked;
   const sort = document.getElementById("sort").value;
   let rows = S.filter((s) => (!src || s.source === src) && (!hot || s.heated > 0));
-  if (q) rows = rows.filter((s) => (s.title + " " + s.cwd + " " + s.source).toLowerCase().includes(q)
-    || s.messages.some((m) => m.text.toLowerCase().includes(q)));
+  hits.clear();
+  if (q) {
+    rows = rows.filter((s) => {
+      const n = s.messages.reduce((a, m) => a + (m.text.toLowerCase().includes(q) ? 1 : 0), 0);
+      if (n) hits.set(s.id, n);
+      return n > 0 || (s.cwd + " " + s.source).toLowerCase().includes(q);
+    });
+  }
   const key = { heat: (s) => s.heated * 10 + s.peak, date: (s) => s.date, length: (s) => s.messages.length }[sort];
   rows.sort((a, b) => (key(b) > key(a) ? 1 : key(b) < key(a) ? -1 : 0));
-  document.getElementById("count").textContent = `${rows.length.toLocaleString()} of ${S.length.toLocaleString()} sessions`;
+  const total = [...hits.values()].reduce((a, n) => a + n, 0);
+  document.getElementById("count").textContent = q
+    ? `${rows.length.toLocaleString()} sessions, ${total.toLocaleString()} matching messages`
+    : `${rows.length.toLocaleString()} of ${S.length.toLocaleString()} sessions`;
   document.getElementById("list").innerHTML = rows.slice(0, 600).map((s) => `
     <div class="item ${s.id === current ? "on" : ""}" tabindex="0" data-id="${esc(s.id)}">
       <span class="t">${esc(s.title || "(no text)")}</span>
-      <span class="meta">${heatDots(s)}<span>${esc(s.source)}</span><span>${s.date}</span><span>${s.messages.length} msgs</span></span>
+      <span class="meta">${heatDots(s)}<span>${esc(s.source)}</span><span>${s.date}</span><span>${s.messages.length} msgs</span>${hits.get(s.id) ? `<span class="hits">${hits.get(s.id)} match${hits.get(s.id) > 1 ? "es" : ""}</span>` : ""}</span>
     </div>`).join("");
 }
 function show(id) {
@@ -113,12 +127,16 @@ function show(id) {
         ${m.reaction ? `<span class="chip ${m.reaction[0]}" title="Classifier probability ${m.reaction[1]}">${LABEL[m.reaction[0]]} · ${Math.round(m.reaction[1] * 100)}%</span>` : ""}
         ${mood ? `<span class="chip" title="Tone level ${m.mood} on a 0 (calm) to 3 (angry) scale">tone: ${mood}</span>` : ""}</div><div class="text">${text}</div></div>`;
     }).join("")}`;
-  document.querySelector("main").scrollTop = 0;
+  const first = document.querySelector("#conv mark");
+  if (first) first.scrollIntoView({ block: "center" }); else document.querySelector("main").scrollTop = 0;
   renderList();
 }
 document.getElementById("list").addEventListener("click", (e) => { const it = e.target.closest(".item"); if (it) show(it.dataset.id); });
 document.getElementById("list").addEventListener("keydown", (e) => { const it = e.target.closest(".item"); if (it && e.key === "Enter") show(it.dataset.id); });
-for (const id of ["q", "source", "sort", "hotonly"]) document.getElementById(id).addEventListener("input", renderList);
+// Debounced: each search scans every message of every session.
+let pending;
+document.getElementById("q").addEventListener("input", () => { clearTimeout(pending); pending = setTimeout(renderList, 250); });
+for (const id of ["source", "sort", "hotonly"]) document.getElementById(id).addEventListener("input", renderList);
 renderList();
 </script>
 </body>

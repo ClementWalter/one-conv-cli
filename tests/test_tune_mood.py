@@ -89,3 +89,9 @@ def test_viewer_escapes_script_close(tmp_path, labeled):
     out = tmp_path / "viewer.html"
     write_viewer([tricky], *labeled, out)
     assert out.read_text().count("</script>") == 2
+
+
+def test_identical_sessions_appear_once(session):
+    from one_conv.tune.viewer import unique_sessions
+    copy = Session("codex", "rollout-s1", "/repo", "human", 2.0, session.messages)
+    assert [s.session for s in unique_sessions([session, copy])] == ["rollout-s1"]

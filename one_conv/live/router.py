@@ -153,7 +153,8 @@ def _record_peers(sender: str, target: str) -> None:
             fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             peers = json.loads(path.read_text())
-        except FileNotFoundError:
+        except (FileNotFoundError, ValueError):
+            # A corrupt file would otherwise block every later record; it only seeds feed defaults.
             peers = {}
         if not isinstance(peers, dict):
             peers = {}

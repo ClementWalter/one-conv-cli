@@ -268,6 +268,8 @@ two agents that keep replying to each other but does not end the exchange. Live 
 delivery between two identified sessions, `peers.json` there records the pair
 (both addresses sorted, joined by a space) with the time of its last exchange;
 if that record cannot be written, the send still reports delivered with a warning.
+The record only chooses what `local feed` follows by default; it grants no
+permission and is not evidence of anyone's approval.
 
 ### Keeping multi-agent exchanges readable
 

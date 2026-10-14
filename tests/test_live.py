@@ -368,6 +368,25 @@ def test_peer_record_keeps_other_pairs(homes):
     assert sorted(json.loads((homes / "live" / "peers.json").read_text())) == ["claude:c1 omp:o1", "codex:x omp:o1"]
 
 
+def test_peer_record_recovers_from_corrupt_file(homes):
+    _omp_record(homes, os.getpid())
+    (homes / "live" / "peers.json").write_text("{")
+    router.send("omp:o1", "hi", LiveSession("claude", "c1"))
+    assert list(json.loads((homes / "live" / "peers.json").read_text())) == ["claude:c1 omp:o1"]
+
+
+def test_failed_delivery_records_no_pair(homes, monkeypatch):
+    _omp_record(homes, os.getpid())
+
+    def broken(session, text):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(omp, "deliver", broken)
+    with pytest.raises(OSError):
+        router.send("omp:o1", "ping", LiveSession("claude", "c1"))
+    assert not (homes / "live" / "peers.json").exists()
+
+
 def test_send_stops_a_runaway_pair(homes):
     _omp_record(homes, os.getpid())
     for _ in range(router.RATE_LIMIT):

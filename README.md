@@ -319,15 +319,18 @@ A live session whose transcript is not on disk yet can be followed already.
 
 Each reader keeps two positions per thread. The digest moves only "notified"
 and `--full` moves "read" too, so a digest line never hides text you have not
-read. `--peek` moves neither. The digest is capped by `--max-chars` (1500); the
-threads it leaves out stay pending for the next run. A thread seen for the
-first time shows its last 3 readable turns.
+read: unread text starts where the first digest line for that thread began.
+`--peek` moves neither. The digest is capped by `--max-chars` (1500, at least
+80); longer lines are truncated and the threads left out stay pending for the
+next run. A thread seen for the first time shows its last 3 readable turns.
 
 The feed is best-effort incremental history, not exactly-once delivery. If a
 transcript is rewritten so your position can no longer be found, or found in
 more than one place, the feed says the thread changed and shows its last 3
-turns, which can replay or skip turns. A transcript that cannot be read keeps
-its positions and is retried next time. The view is the one `local thread`
+turns, which can replay or skip turns. A transcript that cannot be read, or
+that returns no turns after having some, is reported unavailable, keeps its
+positions and is retried next time. Cursor stores are parsed on every run,
+since new turns can sit in a SQLite write-ahead log. The view is the one `local thread`
 reads, in file order, so omp turns on an abandoned branch appear too. Feed
 state lives under `feeds/` in the live directory, one file per reader.
 

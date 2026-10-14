@@ -159,6 +159,42 @@ def test_unreadable_transcript_is_reported_unavailable(state):
     assert feed.digest(state, {PEER: _unreadable_thread()}, 1500, peek=False)["unavailable"] == [PEER]
 
 
+def test_digest_then_append_then_full_keeps_every_unread_turn(state):
+    turns = conversation(4)
+    feed.digest(state, {PEER: stub_thread(turns)}, 1500, peek=False)
+    turns += [StubTurn("user" if i % 2 == 0 else "assistant", f"turn {i}", ts=f"t{i}") for i in range(4, 8)]
+    rows = feed.full(state, stub_thread(turns), peek=False)["turns"]
+    assert [r["text"] for r in rows] == [f"turn {i}" for i in range(1, 8)]
+
+
+def test_thread_dropping_to_no_turns_is_unavailable(state):
+    feed.digest(state, {PEER: stub_thread(conversation(4))}, 1500, peek=False)
+    assert feed.digest(state, {PEER: stub_thread([])}, 1500, peek=False)["unavailable"] == [PEER]
+
+
+def test_thread_dropping_to_no_turns_keeps_positions(state):
+    feed.digest(state, {PEER: stub_thread(conversation(4))}, 1500, peek=False)
+    before = json.dumps(state.positions(PEER))
+    feed.digest(state, {PEER: stub_thread([])}, 1500, peek=False)
+    assert json.dumps(state.positions(PEER)) == before
+
+
+def test_full_on_unreadable_transcript_is_unavailable(state):
+    assert feed.full(state, _unreadable_thread(), peek=False)["status"] == "unavailable"
+
+
+def test_first_digest_line_respects_the_cap(state):
+    thread = feed.Thread(PEER, "t" * 500, "/work", "", load=lambda: conversation(4),
+                         visible=lambda rows: rows, render=lambda turn: turn.text)
+    assert len(feed.digest(state, {PEER: thread}, 80, peek=False)["lines"][0]) <= 80
+
+
+@pytest.mark.parametrize("target, expected", [
+    ("codex:01a1", "codex:01a13cb5"), ("codex:01a13cb5", "codex:01a13cb5"), ("codex:0", None), ("omp:01", None)])
+def test_match_address_needs_exact_or_unique_prefix(target, expected):
+    assert feed.match_address(target, ["codex:01a13cb5", "codex:0bbb", "claude:01a1"]) == expected
+
+
 def test_state_filename_never_contains_the_address(tmp_path):
     assert ":" not in feed.FeedState(tmp_path, "codex:01a1/../x").path.name
 
@@ -237,6 +273,46 @@ def test_cli_follow_cursor_agent_chat_uses_the_live_address(cli_env, tmp_path):
     from test_cursor_cli import CHAT_ID, _write_chat
     _write_chat(tmp_path / "cursor-cli")
     assert run_feed(cli_env, "--follow", CHAT_ID[:8].join(["cursor:", ""])).stdout.strip() == f"following cursor:{CHAT_ID}"
+
+
+def test_cli_follow_live_omp_session_by_prefix_before_its_transcript_exists(cli_env, tmp_path):
+    registry = tmp_path / "live" / "omp"
+    registry.mkdir(parents=True)
+    session_id = "01a13cca-82f2-75f9-85a0-7c0f30e0c1cc"
+    (registry / f"{session_id}.json").write_text(json.dumps(
+        {"pid": os.getpid(), "sessionId": session_id, "cwd": "/work/app", "title": "omp", "status": "idle"}))
+    assert run_feed(cli_env, "--follow", "omp:01a13cca").stdout.strip() == f"following omp:{session_id}"
+
+
+def test_cli_unfollow_after_transcript_vanished_succeeds(cli_env, tmp_path):
+    path = _write_claude_session(tmp_path / "claude", "aaaa1111-0000", ["fix the parser", "parser fixed"])
+    run_feed(cli_env, "--follow", "claude:aaaa1111")
+    path.unlink()
+    assert run_feed(cli_env, "--unfollow", "claude:aaaa1111-0000").returncode == 0
+
+
+def test_cli_follow_json_returns_a_receipt(cli_env, tmp_path):
+    _write_claude_session(tmp_path / "claude", "aaaa1111-0000", ["fix the parser", "parser fixed"])
+    assert json.loads(run_feed(cli_env, "--follow", "claude:aaaa1111", "--json").stdout)["address"] == "claude:aaaa1111-0000"
+
+
+def test_cli_max_chars_below_minimum_is_rejected(cli_env):
+    assert run_feed(cli_env, "--max-chars", "10").returncode == 2
+
+
+def test_cursor_agent_store_is_always_parsed(tmp_path, monkeypatch):
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("one_conv_launcher_feed", str(CLI))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    launcher = importlib.util.module_from_spec(spec)
+    # Dataclasses resolve annotations through sys.modules while the module executes.
+    monkeypatch.setitem(sys.modules, loader.name, launcher)
+    loader.exec_module(launcher)
+    store = tmp_path / "store.db"
+    store.write_bytes(b"sqlite")
+    handle = launcher.SessionHandle(source="cursor-cli", uuid="c1", project_cwd="/work", path=store)
+    assert launcher._feed_stamp(handle) == ""
 
 
 def test_cli_follow_unknown_address_fails(cli_env):

@@ -3680,8 +3680,11 @@ _FEED_SOURCES = ("claude", "codex", "cursor", "cursor-cli", "omp")
 
 
 def _feed_stamp(handle: SessionHandle) -> str:
-    """size:mtime_ns:inode of a file transcript; empty for SQLite-backed Cursor, which is always parsed."""
-    if handle.path is None:
+    """size:mtime_ns:inode of a file transcript; empty for SQLite stores, which are always parsed.
+
+    A cursor-agent store.db can gain turns in its -wal file while store.db itself is untouched.
+    """
+    if handle.path is None or handle.source in ("cursor", "cursor-cli"):
         return ""
     try:
         stat = handle.path.stat()

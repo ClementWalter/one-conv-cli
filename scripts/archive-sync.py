@@ -51,7 +51,8 @@ def source_paths(reader, handle):
         return []  # Its rows live in Cursor's shared database; capture compares them instead.
     paths = [handle.path] if handle.path else []
     if handle.source == "claude":
-        paths.extend(sorted(handle.path.parent.glob(f"{handle.uuid}/subagents/*.jsonl")))
+        # The session folder holds subagent transcripts, full tool outputs, workflows and the title.
+        paths.extend(sorted(p for p in (handle.path.parent / handle.uuid).rglob("*") if p.is_file()))
     if handle.source == "cursor-cli":
         paths.append(handle.path.parent / "meta.json")
     return paths

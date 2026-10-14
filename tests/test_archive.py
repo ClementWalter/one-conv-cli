@@ -89,6 +89,10 @@ def test_native_sync_remote_only_parity_and_updates(tmp_path, archive):
         ("thread", "ancestry", "--raw", "--no-mark-read"),
         ("thread", "ancestry", "--include-subagents", "--no-mark-read"),
         ("search", "Quartz_100%"), ("search", "CAFÉ"), ("search", "absent")]
+    session_folder = path.with_suffix("")
+    (session_folder / "tool-results").mkdir(parents=True)
+    (session_folder / "tool-results" / "full-output.txt").write_text("complete tool output")
+    (session_folder / "custom-title.json").write_text('{"title": "Ancestry"}')
     baseline = [run(env, "bin/one-conv", "local", *args, "--source", "claude", "--json") for args in commands]
     assert baseline[4]["turns"] == [
         {"ts": "2026-01-01T10:00:00Z", "role": "user", "text": "Remember Quartz_100% and café?"},
@@ -103,7 +107,7 @@ def test_native_sync_remote_only_parity_and_updates(tmp_path, archive):
         assert run(remote_env, "bin/one-conv", "local", *args, "--source", "claude", "--json") == expected
     metadata = list(client.list_conversations())[0]
     old = client.read_capture(metadata["key"])
-    assert old["originals"][str(path)] == path.read_bytes()
+    assert old["originals"] == {str(p): p.read_bytes() for p in (path, *sorted(session_folder.rglob("*"))) if p.is_file()}
     write_claude(env, extra=True)
     assert run(env, "scripts/archive-sync.py", "--source", "claude")["uploaded"] == 1
     updated = run(remote_env, "bin/one-conv", "local", "thread", "ancestry", "--source", "claude", "--no-mark-read", "--json")

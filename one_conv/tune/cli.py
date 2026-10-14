@@ -26,6 +26,7 @@ from .label import (
     moments,
 )
 from .metrics import drift_table, rank_runs
+from .mood import intensity, mood_classifier, session_heat
 from .rules import RULES
 from .runs import (
     DEFAULT_MODEL,
@@ -38,6 +39,7 @@ from .runs import (
     tune_home,
 )
 from .synth import coding_prompts, load_answers, synthetic_examples
+from .viewer import write_viewer
 
 HELP = {"help_option_names": ["-h", "--help"]}
 
@@ -261,6 +263,68 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         except RuntimeError as error:
             raise click.ClickException(f"{error}. Labels written so far are kept; rerun to resume.") from None
         click.echo(f"Labeled {count} moment(s) into {out}")
+
+    @tune.command(context_settings=HELP)
+    @click.option("--top", default=15, show_default=True, help="Sessions to list, most heated first.")
+    @click.option("--dry-run", is_flag=True, help="Count moments still to rate without calling the API.")
+    def mood(top, dry_run):
+        """Rate the tone of every reaction (calm to angry) and list the most heated sessions.
+
+        Uses classifier.dev, free and asked not to keep the text. Ratings are
+        cached by content, so reruns only rate new moments.
+
+        \b
+        Examples:
+          one-conv tune mood --dry-run
+          one-conv tune mood --top 20
+        """
+        home = tune_home()
+        out = home / "labels" / "mood-classifier.jsonl"
+        done = load_labels(out)
+        sessions = _sessions(home)
+        pending, queued = [], set()
+        for session in sessions:
+            for moment in moments(session):
+                if moment.key not in done and moment.key not in queued:
+                    queued.add(moment.key)
+                    pending.append(moment)
+        click.echo(f"{len(done)} rated, {len(pending)} to rate")
+        if pending and not dry_run:
+            try:
+                label_moments(pending, mood_classifier(), out, 4, PROVIDERS["classifier"].batch_size)
+            except RuntimeError as error:
+                raise click.ClickException(f"{error}. Ratings written so far are kept; rerun to resume.") from None
+            done = load_labels(out)
+        ranked = []
+        for session in sessions:
+            levels = [intensity(done[m.key]) for m in moments(session) if m.key in done]
+            if levels:
+                ranked.append((session_heat(levels), session))
+        ranked.sort(key=lambda item: (item[0]["heated"], item[0]["peak"]), reverse=True)
+        for heat, session in ranked[:top]:
+            click.echo(f"{heat['heated']:3} heated of {heat['reactions']:3}  peak {heat['peak']:.1f}  "
+                       f"[{session.source}] {session.cwd[-50:]}  {session.session[:8]}")
+
+    @tune.command(context_settings=HELP)
+    @click.option("--provider", default="classifier", show_default=True, help="Labels file for reply reactions.")
+    @click.option("--no-open", is_flag=True, help="Write the file without opening it.")
+    def view(provider, no_open):
+        """Write a local HTML viewer of every conversation with its labels, and open it.
+
+        Sessions can be searched, filtered by source and sorted by how heated
+        they got (see `tune mood`). The file stays on this machine.
+
+        \b
+        Examples:
+          one-conv tune view
+        """
+        home = tune_home()
+        out = home / "viewer.html"
+        count = write_viewer(_sessions(home), load_labels(home / "labels" / f"{provider}.jsonl"),
+                             load_labels(home / "labels" / "mood-classifier.jsonl"), out)
+        click.echo(f"{count} sessions → {out}")
+        if not no_open:
+            click.launch(str(out))
 
     @tune.command(context_settings=HELP)
     @click.argument("reference")

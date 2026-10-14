@@ -83,7 +83,6 @@ _WORDED = {"accepted": "accepted the reply",
            "new_task": "new unrelated task",
            "question": "neutral question about the reply",
            "unclear": "unclear or automated"}
-_UNWORDED = {words: label for label, words in _WORDED.items()}
 _WORDED_INSTRUCTIONS = FRAMING + " " + " ".join(f"'{_WORDED[k]}': {v}" for k, v in CRITERIA.items())
 
 
@@ -176,15 +175,20 @@ def _as_text(state: dict) -> str:
             f"\n\nUSER NEXT MESSAGE:\n{state['user_next_message']}")
 
 
-def classifier_dev_classifier(post: Callable | None = None, max_attempts: int = 6) -> Classifier:
-    """classifier.dev batch API; asks it not to keep the text for training."""
+def classifier_dev_classifier(post: Callable | None = None, max_attempts: int = 6, worded: dict | None = None,
+                              instructions: str | None = None, as_text: Callable | None = None) -> Classifier:
+    """classifier.dev batch API; asks it not to keep the text for training. Defaults to the reaction labels."""
     if post is None:
         from curl_cffi import requests
         post = requests.post
+    worded = worded or _WORDED
+    unworded = {words: label for label, words in worded.items()}
+    instructions = instructions or _WORDED_INSTRUCTIONS
+    as_text = as_text or _as_text
 
     def classify(states: list[dict]) -> list[dict]:
-        body = {"labels": list(_WORDED.values()), "inputs": [_as_text(state) for state in states],
-                "instructions": _WORDED_INSTRUCTIONS, "share_data": False}
+        body = {"labels": list(worded.values()), "inputs": [as_text(state) for state in states],
+                "instructions": instructions, "share_data": False}
         for attempt in range(max_attempts):
             response = post(PROVIDERS["classifier"].url, json=body, timeout=120,
                             headers={"X-Classifier-Share-Data": "false", "user-agent": "one-conv-tune/1"})
@@ -194,8 +198,8 @@ def classifier_dev_classifier(post: Callable | None = None, max_attempts: int = 
             if response.status_code != 200:
                 raise RuntimeError(f"classifier.dev returned HTTP {response.status_code}: {response.text[:300]}")
             results = response.json()["results"]
-            return [{"label": _UNWORDED[result["label"]],
-                     "probabilities": {_UNWORDED[k]: v for k, v in (result.get("scores") or {}).items()},
+            return [{"label": unworded[result["label"]],
+                     "probabilities": {unworded[k]: v for k, v in (result.get("scores") or {}).items()},
                      "confidence": result.get("confidence"), "model": result.get("model")}
                     for result in results]
         raise RuntimeError("classifier.dev stayed rate-limited")

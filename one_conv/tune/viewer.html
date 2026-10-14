@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>one-conv dataset viewer</title>
+<style>
+/* Two panes: a filterable session list on the left, the selected conversation on the right. */
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #14171c; --ink-2: #4b5260; --ink-3: #737b88; --rule: #e0e4ea;
+  --user: #eaf1fb; --accent: #2a78d6; --heat: #d03b3b; --warm: #eda100; --cool: #1baf7a;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace; --sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #111317; --panel: #1a1c20; --ink: #eef0f3; --ink-2: #c0c5cf; --ink-3: #8b929e; --rule: #2c3038;
+          --user: #1d2a3d; --accent: #5598e7; --heat: #e66767; --warm: #f0b13a; --cool: #39c08f; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); display: grid; grid-template-columns: minmax(300px, 380px) 1fr; }
+aside { border-right: 1px solid var(--rule); display: grid; grid-template-rows: auto 1fr; min-height: 0; background: var(--panel); }
+.controls { padding: 12px; display: grid; gap: 8px; border-bottom: 1px solid var(--rule); }
+.controls input, .controls select { width: 100%; padding: 7px 9px; border: 1px solid var(--rule); border-radius: 6px; background: var(--bg); color: var(--ink); font: inherit; }
+.row { display: flex; gap: 8px; } .row > * { flex: 1; }
+.count { font: 12px var(--mono); color: var(--ink-3); }
+#list { overflow-y: auto; }
+.item { padding: 10px 12px; border-bottom: 1px solid var(--rule); cursor: pointer; display: grid; gap: 3px; }
+.item:hover, .item:focus-visible { background: var(--bg); outline: none; }
+.item.on { background: var(--user); }
+.item .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.meta { display: flex; gap: 8px; align-items: center; font: 11.5px var(--mono); color: var(--ink-3); flex-wrap: wrap; }
+.heat { display: inline-flex; gap: 2px; } .heat i { width: 7px; height: 7px; border-radius: 2px; background: var(--rule); }
+.heat i.f { background: var(--heat); }
+main { overflow-y: auto; min-width: 0; }
+.conv { max-width: 860px; margin: 0 auto; padding: 20px 20px 80px; display: grid; gap: 12px; }
+.conv h1 { font-size: 18px; margin: 0; } .conv .sub { font: 12px var(--mono); color: var(--ink-3); }
+.msg { border-radius: 10px; padding: 10px 14px; border: 1px solid var(--rule); background: var(--panel); min-width: 0; }
+.msg.user { background: var(--user); border-color: transparent; }
+.msg.hot { box-shadow: inset 4px 0 0 var(--heat); }
+.msg.warm { box-shadow: inset 4px 0 0 var(--warm); }
+.who { font: 600 11.5px var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--ink-3); display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
+.chip { font: 500 11px var(--mono); padding: 1px 7px; border-radius: 999px; border: 1px solid var(--rule); color: var(--ink-2); text-transform: none; letter-spacing: 0; }
+.chip.correction_preference, .chip.correction_new_info { border-color: var(--heat); color: var(--heat); }
+.chip.accepted, .chip.new_task { border-color: var(--cool); color: var(--cool); }
+.text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.empty { padding: 40px; color: var(--ink-3); }
+@media (max-width: 760px) { body { grid-template-columns: 1fr; grid-template-rows: 45vh 1fr; } aside { border-right: 0; border-bottom: 1px solid var(--rule); } }
+</style>
+</head>
+<body>
+<aside>
+  <div class="controls">
+    <input id="q" type="search" placeholder="Search text, project or source">
+    <div class="row">
+      <select id="source"><option value="">All sources</option></select>
+      <select id="sort">
+        <option value="heat">Most heated first</option>
+        <option value="date">Newest first</option>
+        <option value="length">Longest first</option>
+      </select>
+    </div>
+    <label class="count"><input id="hotonly" type="checkbox"> Only sessions with a frustrated or angry reaction</label>
+    <span class="count" id="count"></span>
+  </div>
+  <div id="list"></div>
+</aside>
+<main><div class="conv" id="conv"><div class="empty">Pick a session on the left.</div></div></main>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+const S = JSON.parse(document.getElementById("data").textContent);
+const MOOD = (v) => v >= 2.5 ? "angry" : v >= 1.5 ? "frustrated" : v >= 0.75 ? "impatient" : "calm";
+const LABEL = { accepted: "accepted", new_task: "moved on", correction_preference: "correction: preference",
+  correction_new_info: "correction: new info", question: "question", unclear: "unclear" };
+const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+for (const src of [...new Set(S.map((s) => s.source))].sort()) {
+  document.getElementById("source").insertAdjacentHTML("beforeend", `<option>${esc(src)}</option>`);
+}
+let current = null;
+function heatDots(s) {
+  const n = Math.min(5, s.heated);
+  return `<span class="heat" title="${s.heated} heated reactions, peak ${s.peak}">${[0, 1, 2, 3, 4].map((i) => `<i class="${i < n ? "f" : ""}"></i>`).join("")}</span>`;
+}
+function renderList() {
+  const q = document.getElementById("q").value.toLowerCase().trim();
+  const src = document.getElementById("source").value;
+  const hot = document.getElementById("hotonly").checked;
+  const sort = document.getElementById("sort").value;
+  let rows = S.filter((s) => (!src || s.source === src) && (!hot || s.heated > 0));
+  if (q) rows = rows.filter((s) => (s.title + " " + s.cwd + " " + s.source).toLowerCase().includes(q)
+    || s.messages.some((m) => m.text.toLowerCase().includes(q)));
+  const key = { heat: (s) => s.heated * 10 + s.peak, date: (s) => s.date, length: (s) => s.messages.length }[sort];
+  rows.sort((a, b) => (key(b) > key(a) ? 1 : key(b) < key(a) ? -1 : 0));
+  document.getElementById("count").textContent = `${rows.length.toLocaleString()} of ${S.length.toLocaleString()} sessions`;
+  document.getElementById("list").innerHTML = rows.slice(0, 600).map((s) => `
+    <div class="item ${s.id === current ? "on" : ""}" tabindex="0" data-id="${esc(s.id)}">
+      <span class="t">${esc(s.title || "(no text)")}</span>
+      <span class="meta">${heatDots(s)}<span>${esc(s.source)}</span><span>${s.date}</span><span>${s.messages.length} msgs</span></span>
+    </div>`).join("");
+}
+function show(id) {
+  current = id;
+  const s = S.find((x) => x.id === id);
+  const q = document.getElementById("q").value.trim();
+  document.getElementById("conv").innerHTML = `<h1>${esc(s.title || "(no text)")}</h1>
+    <div class="sub">${esc(s.source)} · ${esc(s.cwd)} · ${s.date} · ${s.heated} heated of ${s.reactions} rated reactions</div>
+    ${s.messages.map((m) => {
+      const mood = m.mood != null ? MOOD(m.mood) : null;
+      const cls = mood === "angry" || mood === "frustrated" ? "hot" : mood === "impatient" ? "warm" : "";
+      let text = esc(m.text);
+      if (q) text = text.replace(new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"), (x) => `<mark>${x}</mark>`);
+      return `<div class="msg ${m.role} ${cls}"><div class="who">${m.role === "user" ? "You" : "Agent"}
+        ${m.reaction ? `<span class="chip ${m.reaction[0]}">next reaction: ${LABEL[m.reaction[0]]} ${m.reaction[1]}</span>` : ""}
+        ${mood ? `<span class="chip">tone: ${mood} ${m.mood}</span>` : ""}</div><div class="text">${text}</div></div>`;
+    }).join("")}`;
+  document.querySelector("main").scrollTop = 0;
+  renderList();
+}
+document.getElementById("list").addEventListener("click", (e) => { const it = e.target.closest(".item"); if (it) show(it.dataset.id); });
+document.getElementById("list").addEventListener("keydown", (e) => { const it = e.target.closest(".item"); if (it && e.key === "Enter") show(it.dataset.id); });
+for (const id of ["q", "source", "sort", "hotonly"]) document.getElementById(id).addEventListener("input", renderList);
+renderList();
+</script>
+</body>
+</html>

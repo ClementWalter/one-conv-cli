@@ -366,7 +366,8 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
     def _remote(fn: str, **options) -> None:
         flags = [part for key, value in options.items() if value is not None
                  for part in (f"--{key.replace('_', '-')}", str(value))]
-        _modal("run", f"one_conv/tune/modal_app.py::{fn}", *flags)
+        # Detached, a dropped connection leaves the GPU job running and its results on the volume.
+        _modal("run", "--detach", f"one_conv/tune/modal_app.py::{fn}", *flags)
 
     @cloud.command("push", context_settings=HELP)
     @click.option("--dataset", "dataset_name", required=True)

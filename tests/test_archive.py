@@ -347,6 +347,23 @@ def test_codex_rollouts_sharing_a_session_id_are_archived_separately(tmp_path, a
         assert run(remote, "bin/one-conv", "local", *args, "--source", "codex", "--json") == expected
 
 
+def test_conversations_with_identical_times_keep_one_order(tmp_path, archive):
+    _, _, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    stamp = path.stat().st_mtime
+    for name in ("f", "c", "e", "a", "d", "b"):
+        copy = path.with_name(f"session-{name}.jsonl")
+        copy.write_bytes(path.read_bytes())
+        os.utime(copy, (stamp, stamp))
+    os.utime(path, (stamp, stamp))
+    native = run(env, "bin/one-conv", "local", "read", "ancestry", "--source", "claude", "--json")
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    assert run(env, "scripts/archive-sync.py", "--source", "claude")["uploaded"] == 7
+    remote = {**env, "CLAUDE_CONFIG_DIR": str(tmp_path / "empty")}
+    assert run(remote, "bin/one-conv", "local", "read", "ancestry", "--source", "claude", "--json") == native
+
+
 def test_collision_does_not_break_other_sources_or_projects(tmp_path, archive):
     _, client, url = archive
     env = fixture_env(tmp_path)

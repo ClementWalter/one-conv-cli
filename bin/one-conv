@@ -2193,6 +2193,12 @@ def _record_identity(handle: SessionHandle) -> tuple[str, str, str, str]:
     return handle.source, handle.project_cwd, handle.uuid, _record_locator(handle)
 
 
+def _recency_order(handle: SessionHandle) -> tuple[float, tuple[str, str, str, str]]:
+    # Providers stamp some conversations with identical times; the identity keeps their order the same
+    # whether a conversation is read from native files or from the archive.
+    return handle.mtime, _record_identity(handle)
+
+
 def _project_sessions(project: ProjectHandle) -> list[SessionHandle]:
     native = _native_project_sessions(project)
     archive = _archive_state()
@@ -2208,7 +2214,7 @@ def _project_sessions(project: ProjectHandle) -> list[SessionHandle]:
         existing = by_record.get(_record_identity(handle))
         if not existing or existing.mtime < handle.mtime:
             by_record[_record_identity(handle)] = handle
-    return sorted(by_record.values(), key=lambda h: h.mtime, reverse=True)
+    return sorted(by_record.values(), key=_recency_order, reverse=True)
 
 
 def _handle_iter_turns(handle: SessionHandle, include_subagents: bool) -> list[Turn]:
@@ -2335,7 +2341,7 @@ def _handle_summary(handle: SessionHandle, read_state: dict) -> dict:
 
 def _project_summary_handle(project: ProjectHandle, read_state: dict) -> dict:
     sessions = _project_sessions(project)
-    last_mtime = sessions[0].mtime if sessions else 0
+    last_mtime = max((h.mtime for h in sessions), default=0)  # Some providers list sessions unsorted.
     return {
         "source": project.source,
         "cwd": project.cwd,
@@ -2360,8 +2366,7 @@ def _resolve_projects(query: str, match: int, sources: tuple[str, ...]) -> list[
         raise click.ClickException(f"No project matches {query!r}.")
 
     def _recency(p: ProjectHandle) -> float:
-        sessions = _project_sessions(p)
-        return sessions[0].mtime if sessions else 0
+        return max((h.mtime for h in _project_sessions(p)), default=0)
 
     candidates.sort(key=_recency, reverse=True)
 
@@ -2394,7 +2399,7 @@ def _all_sessions_for(projects: list[ProjectHandle]) -> list[SessionHandle]:
             identity = _record_identity(h)
             if identity not in newest or h.mtime > newest[identity].mtime:
                 newest[identity] = h
-    return sorted(newest.values(), key=lambda h: h.mtime, reverse=True)
+    return sorted(newest.values(), key=_recency_order, reverse=True)
 
 
 def _pick_session_handle(handles: list[SessionHandle], session_uuid: str | None, nth: int) -> SessionHandle:

@@ -179,7 +179,8 @@ Replace `PROJECT` with a name from the listing. `local read` lists its sessions;
 discover cloud accounts.
 
 For agent workflows, `local fork` starts a new Claude Code thread from an
-existing one, `local send` continues a Claude Code thread, and `local port`
+existing one, `local send` continues a closed Claude Code thread (it refuses a
+thread that is open in a running session; use `live send` for that), and `local port`
 seeds a new Claude Code or Codex session from another conversation. These
 commands default to dry-run and require `--yes` to launch an agent. Execution
 can modify files or use tools.
@@ -213,6 +214,53 @@ See [PROVIDERS.md](PROVIDERS.md) for adapter boundaries, API-change handling,
 and verification evidence. `cloud providers` reports implementation coverage,
 not your accounts' live connection status.
 
+## Message running sessions
+
+`one-conv live` relays messages between running Claude Code, Codex, Oh My Pi
+and Cursor sessions. A message arrives as a new user turn, wrapped with the
+sender's address so the receiver can answer:
+
+```text
+<one-conv-message from="codex:01a1..." from-name="Fix tests" from-cwd="/work/api">
+run the migration first
+</one-conv-message>
+To reply, call the one-conv send_message tool with to="codex:01a1...".
+```
+
+Set it up once, then restart the sessions you want to reach:
+
+```bash
+one-conv live install          # lists the missing pieces
+one-conv live install --yes    # applies them
+one-conv live ls               # running sessions and their addresses
+one-conv live send codex:01a1 "run the migration first" --yes
+```
+
+`live send` takes an address, an id prefix, or a substring of a session's title
+or working directory, and defaults to a dry run. Inside an agent, the one-conv
+MCP tools `list_live_sessions` and `send_message` do the same; the sender is
+identified from the calling session.
+
+| Harness | Delivery | Reaches an idle session? | Installed by `live install` |
+| --- | --- | --- | --- |
+| Claude Code | Session inbox socket (`~/.claude/sessions/<pid>.json`) | Yes | MCP server (user scope) and `"crossSessionInbound": "accept"` |
+| Codex | `codex queue` | Yes; an unloaded thread gets it on its next resume | MCP server |
+| Oh My Pi | Extension inbox (`~/.omp/agent/extensions/one-conv-live.ts`) | Yes | Extension, which also adds a `one_conv_send` tool |
+| Cursor | `stop` hook follow-up | No: the message waits until a turn ends | MCP server and `~/.cursor/hooks.json` hook |
+
+Sessions started before the install are reachable only for Claude Code and
+Codex. Cursor's stop hook runs in the IDE and in interactive `cursor-agent`, not
+in `cursor-agent -p`. A Cursor IDE chat cannot be identified as a sender, so its
+messages carry `from="cursor:?unknown"` and cannot be answered.
+
+`crossSessionInbound: "accept"` makes every Claude Code session accept relayed
+messages as user turns, including sessions that skip permission prompts; without
+it, those sessions hold each message for approval. A sender that is not an agent
+session is labelled `user` from an interactive terminal and `unknown` otherwise.
+A sender may send at most 10 messages to one target per 5 minutes, which stops
+two agents from relaying replies forever. Live state lives in
+`~/.config/agent-conv-cli/live` (override with `ONE_CONV_LIVE_DIR`).
+
 ## Local MCP server
 
 Run `one-conv mcp --config` to generate the JSON configuration for your MCP
@@ -237,6 +285,8 @@ chat interface or open a network port. It uses the
 | `search_conversations` | Search saved message text |
 | `find_conversations` | Find conversations by title |
 | `list_accounts` | Saved cloud account groups, without checking login validity |
+| `list_live_sessions` | Running agent sessions and their message addresses |
+| `send_message` | Deliver a user turn into a running session (see above) |
 
 The readers accept `namespace="cloud"` (default) or `namespace="local"`,
 an optional source filter, and a result limit. Reads keep unread markers intact
@@ -249,8 +299,8 @@ not perform interactive login. Refresh retains the CLI's limit of 100
 conversations per account and reports failures instead of silently returning
 stale data as fresh. Searches always use saved history.
 
-The server exposes history access and explicit refresh, with no message sending
-or arbitrary command execution. This repository contains the CLI, agent skill,
+The server exposes history access, explicit refresh, and live-session
+messaging, with no arbitrary command execution. This repository contains the CLI, agent skill,
 and local MCP server. The hosted OneConv application is developed separately.
 
 ## Fine-tune on your history
@@ -326,7 +376,7 @@ own replies would be accepted more often.
 
 ## Command reference
 
-Start with `one-conv --help`, `one-conv cloud --help`, or `one-conv local --help`.
+Start with `one-conv --help`, `one-conv cloud --help`, `one-conv local --help`, or `one-conv live --help`.
 Add `--help` to any command for its options.
 
 Older top-level commands remain callable for existing scripts but are hidden

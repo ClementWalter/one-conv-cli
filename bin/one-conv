@@ -3220,6 +3220,11 @@ def send(
     path = _resolve_one_session(query, match, nth, session_uuid)
     cwd = _session_cwd(path) or str(path.parent)
     title = _session_title(path)
+    from one_conv.live import claude as live_claude
+    if not fork_session and any(s.id == path.stem for s in live_claude.list_sessions()):
+        # A headless resume of an open session writes a second branch into its transcript.
+        raise click.ClickException(f"Thread {path.stem} is open in a running Claude Code session. "
+                                   f"Use `one-conv live send claude:{path.stem} ...` to message it, or --fork.")
 
     cmd = ["claude", "--print", "--resume", path.stem]
     if fork_session:
@@ -3684,6 +3689,14 @@ def _tune_snapshot(out_root: Path) -> tuple[int, int]:
 from one_conv.tune.cli import build_tune_group  # noqa: E402
 
 cli.add_command(build_tune_group(_tune_snapshot, _corpus_roots))
+
+from one_conv.live.cli import build_live_group  # noqa: E402
+
+# Hooks and extensions call back into this checkout through uv, whose script environment
+# survives dependency changes; the running interpreter's cached environment may not.
+_UV = shutil.which("uv")
+cli.add_command(build_live_group([_UV, "run", "--quiet", "--script", str(Path(__file__).resolve())] if _UV
+                                 else [sys.executable, "-O", str(Path(__file__).resolve())]))
 
 
 @cli.command("mcp")

@@ -53,7 +53,8 @@ def fixture_env(tmp_path):
         "CODEX_HOME": str(tmp_path / "codex"), "CURSOR_USER_DIR": str(tmp_path / "cursor"),
         "CURSOR_CLI_HOME": str(tmp_path / "cursor-cli"), "OMP_HOME": str(tmp_path / "omp"),
         "ONE_CONV_CORPUS": str(tmp_path / "corpus"), "ONE_CONV_CLOUD_CACHE": str(tmp_path / "cloud"),
-        "ONE_CONV_STATE_DIR": str(tmp_path / "state"), "AGENT_CONV_STATE_DIR": str(tmp_path / "state")}
+        "ONE_CONV_STATE_DIR": str(tmp_path / "state"), "AGENT_CONV_STATE_DIR": str(tmp_path / "state"),
+        "ONE_CONV_ARCHIVE_SYNC_MINUTES": "0"}
     env.pop("ONE_CONV_ARCHIVE_URL", None)
     env.pop("ONE_CONV_ARCHIVE_TOKEN", None)
     return env
@@ -566,3 +567,87 @@ def test_reader_upgrades_recapture_unchanged_sources(tmp_path, archive):
     manifest["capture_version"] = "an earlier one-conv"
     client.put(manifest, {}, row["revision"])
     assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 1, "unchanged": 0}
+
+
+def test_using_one_conv_syncs_in_the_background(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret", ONE_CONV_ARCHIVE_SYNC_MINUTES="15")
+    assert run(env, "bin/one-conv", "local", "chats", "--source", "claude", "--json")  # Returns without waiting.
+    deadline = time.time() + 60
+    while not list(client.list_conversations()) and time.time() < deadline:
+        time.sleep(0.5)
+    assert [row["session"] for row in client.list_conversations()] == ["session-one"]
+    state = Path(env["ONE_CONV_STATE_DIR"]) / "archive-sync.json"
+    while "succeeded" not in json.loads(state.read_text()) and time.time() < deadline:
+        time.sleep(0.5)
+    assert json.loads(state.read_text())["uploaded"] == 1
+
+
+def test_failing_or_missing_syncs_are_reported_on_every_command(tmp_path, archive):
+    _, _, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    archived = path.stat().st_mtime
+    path.write_text(path.read_text().replace("forty-two", "rewritten"))
+    os.utime(path, (archived - 10,) * 2)  # Older than the archive: rejected as stale.
+    run(env, "scripts/archive-sync.py", "--source", "claude", success=False)
+    for _ in range(2):
+        result = run(env, "bin/one-conv", "local", "chats", "--source", "claude", "--json", success=False)
+        assert result.returncode == 0 and "Archive sync at" in result.stderr and "claude/session-one" in result.stderr
+    state = Path(env["ONE_CONV_STATE_DIR"]) / "archive-sync.json"
+    state.write_text(json.dumps({"requested": time.time() - 2 * 86400, "started": time.time() - 2 * 86400}))
+    result = run(env, "bin/one-conv", "local", "chats", "--source", "claude", "--json", success=False)
+    assert "has not completed in the last day" in result.stderr
+
+
+def test_freeing_deletes_only_verified_files_and_restore_brings_them_back(tmp_path, archive):
+    _, _, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    folder = path.with_suffix("")
+    (folder / "tool-results").mkdir(parents=True)
+    (folder / "tool-results" / "output.txt").write_text("complete tool output")
+    old = time.time() - 100 * 86400
+    for item in (path, folder / "tool-results" / "output.txt"):
+        os.utime(item, (old, old))
+    originals = {item: item.read_bytes() for item in (path, folder / "tool-results" / "output.txt")}
+    commands = [("thread", "ancestry", "--raw", "--no-mark-read"), ("search", "Quartz"), ("chats",)]
+    baseline = [run(env, "bin/one-conv", "local", *args, "--source", "claude", "--json") for args in commands]
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    # A file the archive has not captured blocks freeing the whole conversation.
+    unsynced = folder / "tool-results" / "later.txt"
+    unsynced.write_text("written after the last capture")
+    assert run(env, "scripts/archive-sync.py", "--source", "claude", "--free-older-than", "30")["freed"] == 0
+    assert path.exists() and unsynced.exists()
+    unsynced.unlink()
+    result = run(env, "scripts/archive-sync.py", "--source", "claude", "--free-older-than", "30")
+    assert result["freed"] == 1 and result["freed_bytes"] == sum(map(len, originals.values()))
+    assert not path.exists() and not folder.exists()
+    for args, expected in zip(commands, baseline):
+        assert run(env, "bin/one-conv", "local", *args, "--source", "claude", "--json") == expected
+    assert run(env, "scripts/archive-sync.py", "--restore", "session") == {"restored": 2}
+    assert {item: item.read_bytes() for item in originals} == originals and path.stat().st_mtime == old
+    for args, expected in zip(commands, baseline):
+        assert run(env, "bin/one-conv", "local", *args, "--source", "claude", "--json") == expected
+
+
+def test_offline_archive_keeps_archived_conversations_listed(tmp_path):
+    store = SQLiteStore(f"sqlite:///{tmp_path / 'archive.db'}")
+    url, stop = serve(create_app(store, "test-secret"))
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    remote = {**env, "CLAUDE_CONFIG_DIR": str(tmp_path / "empty")}
+    online = run(remote, "bin/one-conv", "local", "chats", "--source", "claude", "--json")
+    stop()
+    store.engine.dispose()
+    result = run(remote, "bin/one-conv", "local", "chats", "--source", "claude", "--json", success=False)
+    assert result.returncode == 0 and json.loads(result.stdout) == online and "archive's listing from" in result.stderr
+    result = run(remote, "bin/one-conv", "local", "thread", "ancestry", "--source", "claude", "--json", success=False)
+    assert result.returncode != 0 and "stored only in the archive, which is unavailable" in result.stderr

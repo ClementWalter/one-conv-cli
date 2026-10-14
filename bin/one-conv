@@ -2076,25 +2076,75 @@ def _native_projects(sources: tuple[str, ...]):
     yield from _cloud_projects(sources)
 
 
+ARCHIVE_SYNC_SOURCES = tuple(source for source in SOURCES if source != "corpus")  # Corpus holds other machines' exports.
+
+
 def _archive_state():
-    """Archive metadata for this command, listed once; None when no archive is usable."""
-    from one_conv.archive import ArchiveError, configured_client
+    """Archive metadata for this command, listed once; None when no archive is configured or listed.
+
+    When the archive is unreachable, its last listing keeps archived conversations visible;
+    opening one then fails with a clear error.
+    """
+    from one_conv.archive import LISTING_CACHE, ArchiveError, configured_client
     context = click.get_current_context(silent=True)
     if context is None:
         return None
     if "archive" not in context.meta:
+        url, cache = os.environ.get("ONE_CONV_ARCHIVE_URL"), STATE_DIR / LISTING_CACHE
+        client, rows, offline = None, None, None
         try:
             client = configured_client()
-            rows = list(client.list_conversations()) if client else []
+            if client:
+                rows = list(client.list_conversations())
+                STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+                cache.with_suffix(".tmp").write_text(json.dumps({"url": url, "listed": time.time(), "rows": rows}))
+                cache.with_suffix(".tmp").replace(cache)
+        except ArchiveError as error:
+            offline = str(error)
+            cached = json.loads(cache.read_text()) if cache.exists() else {}
+            rows = cached["rows"] if cached.get("url") == url else None
+            listed = (f" and the archive's listing from {datetime.fromtimestamp(cached['listed']):%Y-%m-%d %H:%M}"
+                      if rows is not None else "")
+            log.warning("%s Showing native history%s only.", error, listed)
+        context.meta["archive"] = None
+        if rows is not None:
             projects = {}
             for row in rows:
                 projects.setdefault((row["source"], row["cwd"]), []).append(row)
-            context.meta["archive"] = ({"client": client, "rows": rows, "projects": projects, "manifests": {}, "fields": {}}
-                                       if client else None)
-        except ArchiveError as error:
-            log.warning("%s Showing native history only.", error)
-            context.meta["archive"] = None
+            context.meta["archive"] = {"client": client, "offline": offline, "rows": rows, "projects": projects,
+                                       "manifests": {}, "fields": {}}
+        if url:
+            _archive_sync_in_background()
     return context.meta["archive"]
+
+
+def _archive_sync_in_background():
+    """Start a sync when one is due, without waiting, and report a failing one on stderr."""
+    from one_conv.archive import SYNC_LOCK, SYNC_LOG, SYNC_STATE
+    minutes = float(os.environ.get("ONE_CONV_ARCHIVE_SYNC_MINUTES", "15"))
+    state_path = STATE_DIR / SYNC_STATE
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    if state.get("error") or state.get("failed"):
+        detail = state.get("error") or "; ".join(state.get("failures", []))
+        log.warning("Archive sync at %s failed: %s (log: %s)",
+                    datetime.fromtimestamp(state["finished"]).strftime("%Y-%m-%d %H:%M"), detail, STATE_DIR / SYNC_LOG)
+    elif state and time.time() - (state.get("succeeded") or state["requested"]) > 86400:
+        log.warning("Archive sync has not completed in the last day (log: %s)", STATE_DIR / SYNC_LOG)
+    lock = STATE_DIR / SYNC_LOCK
+    if minutes <= 0 or time.time() - state.get("started", 0) < minutes * 60 or (lock.exists() and time.time() - lock.stat().st_mtime < 600):
+        return
+    script = Path(__file__).resolve().parents[1] / "scripts" / "archive-sync.py"
+    sources = [argument for source in ARCHIVE_SYNC_SOURCES for argument in ("--source", source)]
+    detached = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+                else {"start_new_session": True})
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # Recorded before starting, so a sync that never runs is reported too.
+    state.update(started=time.time(), requested=state.get("requested", time.time()))
+    state_path.with_suffix(".tmp").write_text(json.dumps(state))
+    state_path.with_suffix(".tmp").replace(state_path)
+    with (STATE_DIR / SYNC_LOG).open("a") as output:
+        subprocess.Popen([sys.executable, str(script), *sources], stdin=subprocess.DEVNULL, stdout=output,
+                         stderr=subprocess.STDOUT, **detached)
 
 
 def _archive_field(handle, field):
@@ -2102,6 +2152,8 @@ def _archive_field(handle, field):
     from one_conv.archive import ArchiveError
     state = _archive_state()
     client, key, revision = state["client"], handle.archive["key"], handle.archive["revision"]
+    if state["offline"]:
+        raise click.ClickException(f"{handle.uuid} is stored only in the archive, which is unavailable: {state['offline']}")
     try:
         if key not in state["manifests"]:
             state["manifests"][key] = client.read_conversation(key, revision)
@@ -2931,7 +2983,9 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
     sessions = _sessions_for_scope(project_query, sources)
     archive = _archive_state()
     candidates = set()
-    if archive and any(h.archive for h in sessions):
+    if archive and archive["offline"] and any(h.archive for h in sessions):
+        log.warning("Archived conversations were not searched.")
+    elif archive and any(h.archive for h in sessions):
         from one_conv.archive import ArchiveError
         try:  # Copies are merged on the full listing; only matching archived ones are read.
             candidates = {row["key"] for row in archive["client"].list_conversations(query=text)}

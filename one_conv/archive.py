@@ -16,6 +16,11 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 FIELDS = ("turns", "turns_with_subagents", "search_text")
 DIGEST = re.compile(r"[0-9a-f]{64}")
 READ_WORKERS = 4
+# Files in one-conv's state directory shared by the sync script and readers.
+SYNC_STATE = "archive-sync.json"
+SYNC_LOCK = "archive-sync.lock"
+SYNC_LOG = "archive-sync.log"
+LISTING_CACHE = "archive-listing.json"
 # Python's socket timeout bounds a whole send, so upload deadlines grow with the body,
 # assuming at least 1 Mbit/s of upstream bandwidth.
 MIN_UPLOAD_BYTES_PER_SECOND = 128 * 1024
@@ -46,6 +51,11 @@ def conversation_key(origin, source, cwd, session, locator):
     return revision([origin, source, cwd, session, locator])
 
 
+def split(data):
+    """Content-addressed chunks of one field or original record, in order."""
+    return [(digest(part), part) for part in (data[start:start + CHUNK_BYTES] for start in range(0, len(data), CHUNK_BYTES))]
+
+
 def pack(capture):
     """Split a capture into a manifest and content-addressed raw chunks.
 
@@ -54,17 +64,14 @@ def pack(capture):
     """
     chunks = {}
 
-    def split(data):
-        digests = []
-        for start in range(0, len(data), CHUNK_BYTES):
-            part = data[start:start + CHUNK_BYTES]
-            digests.append(digest(part))
-            chunks[digests[-1]] = part
-        return digests
+    def record(data):
+        parts = split(data)
+        chunks.update(parts)
+        return [name for name, _ in parts]
 
     manifest = {name: value for name, value in capture.items() if name not in (*FIELDS, "originals")}
-    manifest["fields"] = {field: split(encode(capture[field])) for field in FIELDS}
-    manifest["originals"] = {name: split(data) for name, data in capture["originals"].items()}
+    manifest["fields"] = {field: record(encode(capture[field])) for field in FIELDS}
+    manifest["originals"] = {name: record(data) for name, data in capture["originals"].items()}
     return manifest, chunks
 
 

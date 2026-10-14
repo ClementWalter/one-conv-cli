@@ -38,8 +38,8 @@ token, commands warn on stderr and show native history only.
 - The sync script keeps an installation ID in one-conv's state directory. When
   several installations upload one conversation (another machine, or a reset state
   directory), readers show the newest copy.
-- A conversation is re-read only when its main source file's modification time
-  differs from the archived capture.
+- A conversation is re-read only when its main source file's modification time or
+  the one-conv version that captured it differs from the archived capture.
 - Each native record is archived separately, even when records share a session ID
   (Codex subagent rollouts share their parent's).
 - Each upload names the revision it replaces, so concurrent captures are rejected.
@@ -48,7 +48,35 @@ token, commands warn on stderr and show native history only.
   file restored from an older backup; earlier revisions stay readable by revision.
 - A failed conversation is reported on stderr; sync continues and exits nonzero with
   uploaded, unchanged and failed counts. Retry a changing source when it is idle.
-- There is no scheduler, deletion propagation, local eviction or provider resume.
+
+## Automatic sync
+
+With an archive configured, one-conv commands start a sync in the background when
+the last one started more than 15 minutes ago, and return without waiting. Nothing
+is installed on the machine: sync runs only while one-conv is used.
+`ONE_CONV_ARCHIVE_SYNC_MINUTES` changes the interval; `0` turns automatic sync off.
+Automatic sync covers every source except the shared corpus.
+
+Each sync records its result in one-conv's state directory and appends to
+`archive-sync.log` there. While the last sync has failures, or none has completed for
+a day, every command prints a warning on stderr. Only one sync runs at a time.
+
+## Freeing local space
+
+`uv run scripts/archive-sync.py --source claude --source codex --free-older-than 90`
+syncs, then deletes Claude Code, Codex and Oh My Pi conversations unchanged for 90
+days whose every file the archive holds byte for byte. A conversation with any file
+the archive lacks, or that changes during the check, is kept. Cursor conversations
+live in shared databases and are never deleted. Freed conversations still appear in
+every one-conv command, read from the archive.
+
+`uv run scripts/archive-sync.py --restore SESSION` writes a freed conversation's
+files back, for example to resume it in its own tool.
+
+If the archive is unreachable, commands list archived conversations from the last
+successful listing and warn; opening one that exists only in the archive fails
+until the archive is reachable again. There is no deletion propagation between
+machines.
 
 ## What is stored
 

@@ -19,7 +19,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from one_conv.archive import ArchiveError, configured_client, conversation_key, revision
+from one_conv.archive import ArchiveError, configured_client, conversation_key, encode, pack, revision
 
 
 def load_reader():
@@ -69,7 +69,9 @@ def original_records(reader, handle, paths):
                 (f"composerData:{handle.composer_id}", f"bubbleId:{handle.composer_id}:%")).fetchall()
             if not rows:
                 raise ArchiveError("Cursor conversation records are unavailable")
-            return {key: base64.b64encode(value if isinstance(value, bytes) else value.encode()).decode() for key, value in rows}
+            # One record keeps a conversation's many small rows in a few chunks.
+            return {"cursorDiskKV": encode({key: base64.b64encode(value if isinstance(value, bytes) else value.encode()).decode()
+                                            for key, value in sorted(rows, key=lambda row: row[0])})}
         finally:
             conn.close()
     result = {}
@@ -80,7 +82,7 @@ def original_records(reader, handle, paths):
                 data = snapshot.serialize()
         else:
             data = path.read_bytes()
-        result[str(path)] = base64.b64encode(data).decode()
+        result[str(path)] = data
     return result
 
 
@@ -129,19 +131,19 @@ def main():
             if archived and archived["mtime"] == handle.mtime:
                 unchanged += 1  # Avoid re-reading and re-encoding unchanged history.
                 continue
-            document = capture(reader, handle, origin)
-            digest = revision(document)
+            manifest, chunks = pack(capture(reader, handle, origin))
+            digest = revision(manifest)
             if archived and archived["revision"] == digest:
                 unchanged += 1
                 continue
-            receipt = client.put(document, archived["revision"] if archived else None)
+            receipt = client.put(manifest, chunks, archived["revision"] if archived else None)
             if receipt != {"key": key, "revision": digest}:
                 raise ArchiveError("Archive acknowledgement does not match the uploaded capture")
             existing[key] = {"revision": digest, "mtime": handle.mtime}
             uploaded += 1
-        except (ArchiveError, OSError, ValueError, sqlite3.Error) as error:
+        except Exception as error:  # One unreadable conversation must not stop the others.
             failed += 1
-            print(f"{handle.source}/{handle.uuid}: {error}", file=sys.stderr)
+            print(f"{handle.source}/{handle.uuid}: {type(error).__name__}: {error}", file=sys.stderr)
     result = {"uploaded": uploaded, "unchanged": unchanged}
     if failed:
         result["failed"] = failed

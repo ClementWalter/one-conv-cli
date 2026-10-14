@@ -1,6 +1,5 @@
 """Conversation storage contract and SQLite implementation using SQLAlchemy Core."""
 
-import hashlib
 import json
 from typing import Protocol
 
@@ -8,7 +7,7 @@ from sqlalchemy import Column, Float, LargeBinary, MetaData, String, Table, Text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.sqlite import insert
 
-from one_conv.archive import conversation_key, encode, revision
+from one_conv.archive import conversation_key, decompress, encode, revision
 
 
 class Conflict(Exception):
@@ -18,15 +17,14 @@ class Conflict(Exception):
 class ConversationStore(Protocol):
     def list_conversations(self, after: str, query: str | None, limit: int) -> dict: ...
     def read_conversation(self, key: str, revision: str | None = None) -> dict | None: ...
-    def put(self, document: dict, expected: str | None) -> dict: ...
-
-
-CHUNK_BYTES = 64 * 1024
-CAPTURE_FIELDS = ("turns", "turns_with_subagents", "search_text")
+    def missing_chunks(self, digests: list[str]) -> list[str]: ...
+    def put_chunks(self, chunks: dict[str, bytes]) -> None: ...
+    def read_chunk(self, digest: str) -> bytes | None: ...
+    def put(self, manifest: dict, expected: str | None) -> dict: ...
 
 
 class SQLiteStore:
-    """Immutable revisions retain earlier captures; a CAS advances the visible head."""
+    """Immutable manifests and compressed chunks; a CAS advances the visible head."""
 
     def __init__(self, url):
         self.engine = create_engine(url)
@@ -39,12 +37,12 @@ class SQLiteStore:
             Column("search_text", Text, nullable=False))
         self.revisions = Table("revisions_v1", schema,
             Column("key", String, primary_key=True), Column("revision", String, primary_key=True),
-            Column("document", Text, nullable=False))
+            Column("manifest", Text, nullable=False))
         self.chunks = Table("chunks_v1", schema,
             Column("digest", String, primary_key=True), Column("data", LargeBinary, nullable=False))
         schema.create_all(self.engine)
 
-    def list_conversations(self, after="", query=None, limit=100):
+    def list_conversations(self, after="", query=None, limit=1000):
         h = self.heads
         statement = select(h.c.key, h.c.metadata, h.c.revision).where(h.c.key > after).order_by(h.c.key)
         if query is not None:
@@ -57,61 +55,46 @@ class SQLiteStore:
 
     def read_conversation(self, key, revision=None):
         h, r = self.heads, self.revisions
+        statement = (select(r.c.manifest).where((r.c.key == key) & (r.c.revision == revision)) if revision else
+                     select(r.c.manifest).join(h, (h.c.key == r.c.key) & (h.c.revision == r.c.revision)).where(h.c.key == key))
         with self.engine.connect() as conn:
-            statement = (select(r.c.document).where((r.c.key == key) & (r.c.revision == revision)) if revision else
-                         select(r.c.document).join(h, (h.c.key == r.c.key) & (h.c.revision == r.c.revision)).where(h.c.key == key))
             row = conn.execute(statement).first()
-            return self._unpack(conn, json.loads(row[0])) if row else None
+        return json.loads(row.manifest) if row else None
 
-    def _pack(self, conn, document):
-        pending = {}
-        def chunks(value):
-            payload = encode(value)
-            digests = []
-            for start in range(0, len(payload), CHUNK_BYTES):
-                data = payload[start:start + CHUNK_BYTES]
-                digest = hashlib.sha256(data).hexdigest()
-                pending[digest] = data
-                digests.append(digest)
-            return digests
+    def missing_chunks(self, digests):
+        present = set()
+        with self.engine.connect() as conn:
+            for start in range(0, len(digests), 500):
+                present.update(conn.execute(select(self.chunks.c.digest).where(
+                    self.chunks.c.digest.in_(digests[start:start + 500]))).scalars())
+        return [d for d in digests if d not in present]
 
-        # Chunk fields separately so appended turns do not shift original-record chunks.
-        manifest = {k: v for k, v in document.items() if k not in (*CAPTURE_FIELDS, "originals")}
-        manifest["_chunks"] = {field: chunks(document[field]) for field in CAPTURE_FIELDS}
-        manifest["_original_chunks"] = {path: chunks(value) for path, value in document["originals"].items()}
-        conn.execute(insert(self.chunks).on_conflict_do_nothing(),
-            [{"digest": digest, "data": data} for digest, data in pending.items()])
-        return manifest
+    def put_chunks(self, chunks):
+        with self.engine.begin() as conn:
+            conn.execute(insert(self.chunks).on_conflict_do_nothing(),
+                         [{"digest": d, "data": data} for d, data in chunks.items()])
 
-    def _unpack(self, conn, document):
-        if "_chunks" not in document:
-            return document  # Captures written before chunk storage remain readable.
-        fields = document.pop("_chunks")
-        originals = document.pop("_original_chunks")
-        digests = list({digest for parts in (*fields.values(), *originals.values()) for digest in parts})
-        data = {}
-        for start in range(0, len(digests), 500):
-            data.update(conn.execute(select(self.chunks.c.digest, self.chunks.c.data).where(
-                self.chunks.c.digest.in_(digests[start:start + 500]))).all())
-        def restore(parts):
-            return json.loads(b"".join(data[digest] for digest in parts))
-        document.update({field: restore(parts) for field, parts in fields.items()})
-        document["originals"] = {path: restore(parts) for path, parts in originals.items()}
-        return document
+    def read_chunk(self, digest):
+        with self.engine.connect() as conn:
+            return conn.execute(select(self.chunks.c.data).where(self.chunks.c.digest == digest)).scalar()
 
-    def put(self, document, expected):
-        key = conversation_key(document["origin"], document["source"], document["cwd"], document["session"])
-        digest = revision(document)
-        metadata = {name: document[name] for name in ("origin", "source", "cwd", "session", "mtime", "summary", "unread_native")}
-        values = {"revision": digest, "mtime": document["mtime"], "metadata": encode(metadata).decode(),
-                  "search_text": "\n".join(document["search_text"]).lower()}
+    def put(self, manifest, expected):
+        key = conversation_key(manifest["origin"], manifest["source"], manifest["cwd"], manifest["session"])
+        digest = revision(manifest)
+        if self.missing_chunks([d for parts in (*manifest["fields"].values(), *manifest["originals"].values()) for d in parts]):
+            raise Conflict("Upload the capture's chunks before its manifest.")
+        metadata = {name: manifest[name] for name in ("origin", "source", "cwd", "session", "mtime", "summary", "unread_native")}
+        search_parts = manifest["fields"]["search_text"]
+        search_text = json.loads(b"".join(decompress(self.read_chunk(d), d) for d in search_parts))
+        values = {"revision": digest, "mtime": manifest["mtime"], "metadata": encode(metadata).decode(),
+                  "search_text": "\n".join(search_text).lower()}
         h, r = self.heads, self.revisions
         try:
             with self.engine.begin() as conn:
                 current = conn.execute(select(h.c.revision, h.c.mtime).where(h.c.key == key)).first()
                 if current and current.revision == digest:
                     return {"key": key, "revision": digest}
-                if (current.revision if current else None) != expected or (current and current.mtime > document["mtime"]):
+                if (current.revision if current else None) != expected or (current and current.mtime > manifest["mtime"]):
                     raise Conflict("Conversation changed; resync from its current source.")
                 if current:
                     result = conn.execute(h.update().where((h.c.key == key) & (h.c.revision == expected)).values(**values))
@@ -120,7 +103,7 @@ class SQLiteStore:
                 else:
                     conn.execute(h.insert().values(key=key, **values))
                 if not conn.execute(select(r.c.key).where((r.c.key == key) & (r.c.revision == digest))).first():
-                    conn.execute(r.insert().values(key=key, revision=digest, document=encode(self._pack(conn, document)).decode()))
+                    conn.execute(r.insert().values(key=key, revision=digest, manifest=encode(manifest).decode()))
         except IntegrityError as error:
             raise Conflict("Concurrent sync; retry.") from error
         return {"key": key, "revision": digest}

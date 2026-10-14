@@ -1,5 +1,4 @@
 """Exercise real native readers, HTTP sync and unchanged CLI commands on isolated history."""
-import base64
 import json
 import os
 from pathlib import Path
@@ -14,24 +13,31 @@ import uvicorn
 
 from archive.server import create_app
 from archive.store import SQLiteStore, Conflict
-from one_conv.archive import ArchiveClient, ArchiveError
+from one_conv.archive import CHUNK_BYTES, ArchiveClient, ArchiveError, pack
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def serve(app):
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False))
+    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
+    thread.start()
+
+    def stop():
+        server.should_exit = True
+        thread.join(timeout=5)
+        sock.close()
+    return f"http://127.0.0.1:{sock.getsockname()[1]}", stop
 
 
 @pytest.fixture
 def archive(tmp_path):
     store = SQLiteStore(f"sqlite:///{tmp_path / 'archive.db'}")
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    server = uvicorn.Server(uvicorn.Config(create_app(store, "test-secret"), log_level="error", access_log=False))
-    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
-    thread.start()
-    url = f"http://127.0.0.1:{sock.getsockname()[1]}"
+    url, stop = serve(create_app(store, "test-secret"))
     yield store, ArchiveClient(url, "test-secret"), url
-    server.should_exit = True
-    thread.join(timeout=5)
-    sock.close()
+    stop()
     store.engine.dispose()
 
 
@@ -90,19 +96,20 @@ def test_native_sync_remote_only_parity_and_updates(tmp_path, archive):
     for args, expected in zip(commands, baseline):
         assert run(remote_env, "bin/one-conv", "local", *args, "--source", "claude", "--json") == expected
     metadata = list(client.list_conversations())[0]
-    old = client.read_conversation(metadata["key"])
-    assert base64.b64decode(old["originals"][str(path)]) == path.read_bytes()
+    old = client.read_capture(metadata["key"])
+    assert old["originals"][str(path)] == path.read_bytes()
     write_claude(env, extra=True)
     assert run(env, "scripts/archive-sync.py", "--source", "claude")["uploaded"] == 1
     updated = run(remote_env, "bin/one-conv", "local", "thread", "ancestry", "--source", "claude", "--no-mark-read", "--json")
     assert updated["turns"][-1]["text"] == "An additional message"
     with pytest.raises(Conflict):
-        store.put(old, metadata["revision"])
-    assert client.read_conversation(metadata["key"], metadata["revision"]) == old
+        store.put(pack(old)[0], metadata["revision"])
+    assert client.read_capture(metadata["key"], metadata["revision"]) == old
     assert path.exists()  # The test never removes native data to prove remote reads.
     reopened = SQLiteStore(str(store.engine.url))
-    assert len(reopened.read_conversation(metadata["key"])["turns"]) == 3
+    assert reopened.read_conversation(metadata["key"]) == client.read_conversation(metadata["key"])
     reopened.engine.dispose()
+    assert len(client.read_capture(metadata["key"])["turns"]) == 3
 
 
 def test_auth_failure_and_unavailable_archive_are_visible(tmp_path, archive):
@@ -117,7 +124,7 @@ def test_auth_failure_and_unavailable_archive_are_visible(tmp_path, archive):
     assert len(json.loads(result.stdout)) == 1
     result = ArchiveClient(url, "test-secret")
     with pytest.raises(ArchiveError, match="422"):
-        result.put({"source": "claude"}, None)
+        result.put({"source": "claude"}, {}, None)
     assert list(result.list_conversations()) == []
 
 
@@ -197,15 +204,15 @@ def test_rewrites_advance_and_keep_earlier_revisions(tmp_path, archive):
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
     run(env, "scripts/archive-sync.py", "--source", "claude")
     row = list(client.list_conversations())[0]
-    document = client.read_conversation(row["key"])
-    document["summary"]["uuid"] = "wrong"
+    manifest = client.read_conversation(row["key"])
+    manifest["summary"]["uuid"] = "wrong"
     with pytest.raises(ArchiveError, match="422"):
-        client.put(document, row["revision"])
+        client.put(manifest, {}, row["revision"])
     # Provider edits, regenerations and parser upgrades all rewrite earlier turns.
     path.write_text(path.read_text().replace("forty-two", "edited"))
     assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 1, "unchanged": 0}
-    assert "edited" in client.read_conversation(row["key"])["turns"][1]["blocks"][-1]["text"]
-    assert "forty-two" in client.read_conversation(row["key"], row["revision"])["turns"][1]["blocks"][-1]["text"]
+    assert "edited" in client.read_capture(row["key"])["turns"][1]["blocks"][-1]["text"]
+    assert "forty-two" in client.read_capture(row["key"], row["revision"])["turns"][1]["blocks"][-1]["text"]
 
 
 def test_copies_from_two_installations_show_the_newest(tmp_path, archive):
@@ -235,7 +242,7 @@ def test_sync_skips_captures_whose_source_time_is_unchanged(tmp_path, archive):
     write_claude(env, extra=True)
     os.utime(path, ns=(archived, archived))  # Same modification time: the file is not re-read.
     assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 0, "unchanged": 1}
-    assert len(client.read_conversation(list(client.list_conversations())[0]["key"])["turns"]) == 2
+    assert len(client.read_capture(list(client.list_conversations())[0]["key"])["turns"]) == 2
 
 
 def test_unavailable_archive_warns_and_keeps_native_results(tmp_path):
@@ -278,63 +285,66 @@ def test_collision_does_not_break_other_sources_or_projects(tmp_path, archive):
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
     run(env, "scripts/archive-sync.py", "--source", "claude")
     row = list(client.list_conversations())[0]
-    document = client.read_conversation(row["key"])
-    document["origin"] = "second-machine"
-    client.put(document, None)
+    manifest = client.read_conversation(row["key"])
+    manifest["origin"] = "second-machine"
+    client.put(manifest, {}, None)
     assert run(env, "bin/one-conv", "local", "chats", "--source", "codex", "--json") == []
-    document["cwd"] = document["summary"]["cwd"] = "/example/independent"
-    client.put(document, None)
+    manifest["cwd"] = manifest["summary"]["cwd"] = "/example/independent"
+    client.put(manifest, {}, None)
     assert len(list(client.list_conversations())) == 3  # Both conflicting captures still exist.
     results = run(env, "bin/one-conv", "local", "search", "Quartz", "--project", "independent", "--source", "claude", "--json")
     assert len(results) == 1 and results[0]["cwd"] == "/example/independent"
 
 
-def test_revisions_share_unchanged_payload_and_restore_exactly(tmp_path, archive):
+def test_appends_upload_only_changed_tail_and_restore_every_revision(tmp_path, archive):
     import copy
     import random
-    store, client, url = archive
+    _, client, url = archive
     env = fixture_env(tmp_path)
     write_claude(env)
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
     run(env, "scripts/archive-sync.py", "--source", "claude")
     row = list(client.list_conversations())[0]
-    document = client.read_conversation(row["key"])
-    # Incompressible records prevent compression from disguising repeated full copies.
-    native = random.Random(42).randbytes(1024 * 1024)
-    document["originals"] = {"record": base64.b64encode(native).decode()}
-    expected = row["revision"]
-    captures = []
-    for i in range(10):
-        document["mtime"] += 1
+    capture = client.read_capture(row["key"])
+    native = random.Random(42).randbytes(3 * CHUNK_BYTES)  # Incompressible, several chunks long.
+    capture["originals"] = {"record": native}
+    expected = client.put(*pack(capture), row["revision"])["revision"]
+    captures = [(expected, copy.deepcopy(capture))]
+    for i in range(3):
+        capture["mtime"] += 1
         text = f"Appended message {i}"
-        document["turns"].append({"ts": "", "role": "user", "blocks": [{"type": "text", "text": text}]})
-        document["search_text"].append(text)
-        native += text.encode()
-        document["originals"]["record"] = base64.b64encode(native).decode()
-        expected = client.put(document, expected)["revision"]
-        captures.append((expected, copy.deepcopy(document)))
-    for digest, capture in captures:
-        assert client.read_conversation(row["key"], digest) == capture
-    # Ten growing captures should cost near one payload, not ten payloads.
-    assert Path(store.engine.url.database).stat().st_size < 3 * 1024 * 1024
+        capture["turns"].append({"ts": "", "role": "user", "blocks": [{"type": "text", "text": text}]})
+        capture["search_text"].append(text)
+        capture["originals"]["record"] += text.encode()
+        manifest, chunks = pack(capture)
+        missing = client.request("chunks/missing", {"digests": list(chunks)})["missing"]
+        # Only the tails of turns, search text and the original record change.
+        assert len(missing) == 3 and sum(len(chunks[d]) for d in missing) < CHUNK_BYTES
+        expected = client.put(manifest, chunks, expected)["revision"]
+        captures.append((expected, copy.deepcopy(capture)))
+    for revision, saved in captures:
+        assert client.read_capture(row["key"], revision) == saved
 
 
-def test_existing_full_captures_survive_chunked_updates(tmp_path, archive):
-    from one_conv.archive import encode
-    store, client, url = archive
-    env = fixture_env(tmp_path)
-    write_claude(env)
-    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
-    run(env, "scripts/archive-sync.py", "--source", "claude")
-    row = list(client.list_conversations())[0]
-    old = client.read_conversation(row["key"])
-    # Recreate the full-document row written by the previous archive version.
-    with store.engine.begin() as conn:
-        conn.execute(store.revisions.update().where(store.revisions.c.key == row["key"]).values(document=encode(old).decode()))
-    write_claude(env, extra=True)
-    assert run(env, "scripts/archive-sync.py", "--source", "claude")["uploaded"] == 1
-    assert client.read_conversation(row["key"], row["revision"]) == old
-    assert client.read_conversation(row["key"])["turns"][-1]["blocks"][0]["text"] == "An additional message"
+def test_capture_larger_than_one_request_round_trips(tmp_path):
+    import random
+    store = SQLiteStore(f"sqlite:///{tmp_path / 'archive.db'}")
+    bound = 2 * CHUNK_BYTES
+    url, stop = serve(create_app(store, "test-secret", max_request_bytes=bound))
+    try:
+        capture = {"origin": "large", "source": "claude", "cwd": "/example/large", "session": "large", "mtime": 1.0,
+            "summary": {"uuid": "large", "source": "claude", "cwd": "/example/large", "start": "", "end": "",
+                        "turns": 0, "tokens": None, "title": "Large"},
+            "unread_native": None, "turns": [], "turns_with_subagents": None, "search_text": ["large session"],
+            "originals": {"session.jsonl": random.Random(7).randbytes(3 * bound)}}
+        with pytest.raises(ArchiveError, match="413"):
+            ArchiveClient(url, "test-secret").put(*pack(capture), None)  # One default-sized batch exceeds this server.
+        client = ArchiveClient(url, "test-secret", max_request_bytes=bound)
+        receipt = client.put(*pack(capture), None)
+        assert client.read_capture(receipt["key"]) == capture
+    finally:
+        stop()
+        store.engine.dispose()
 
 
 @pytest.mark.parametrize("source", ["claude", "codex"])
@@ -378,8 +388,8 @@ def test_archived_trace_uses_existing_local_views(tmp_path, archive, source):
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
     run(env, "scripts/archive-sync.py", "--source", source)
     row = list(client.list_conversations())[0]
-    captured = client.read_conversation(row["key"])
-    assert base64.b64decode(captured["originals"][str(path)]) == path.read_bytes()
+    captured = client.read_capture(row["key"])
+    assert captured["originals"][str(path)] == path.read_bytes()
     assert any(block.get("content") == result_text for turn in captured["turns"] for block in turn["blocks"])
     env[native_root] = str(tmp_path / "empty")
     for args, expected in zip(commands, baseline):

@@ -1,9 +1,9 @@
 """Opt-in scale benchmark: uv run ... python -m pytest tests/benchmark_archive.py -s.
 
-ONE_CONV_BENCHMARK_GIB defaults to 7 GiB of synthetic searchable/native text.
+ONE_CONV_BENCHMARK_GIB defaults to 0.25 GiB of synthetic searchable text. Searchable
+text is about 2% of provider history bytes, so this approximates a 12 GiB history.
 Uses isolated storage, the production SQLite writer and real HTTP/CLI reads.
 """
-import base64
 import json
 import math
 import os
@@ -13,12 +13,13 @@ import sqlite3
 import time
 from pathlib import Path
 
+from one_conv.archive import compress, pack
 from test_archive import archive, fixture_env, run
 
 
 def test_search_scale(tmp_path, archive):
     store, _, url = archive
-    target = float(os.environ.get("ONE_CONV_BENCHMARK_GIB", "7")) * 1024 ** 3
+    target = float(os.environ.get("ONE_CONV_BENCHMARK_GIB", "0.25")) * 1024 ** 3
     assert target > 0
     text_bytes = 1024 ** 2
     count = math.ceil(target / text_bytes)
@@ -38,8 +39,10 @@ def test_search_scale(tmp_path, archive):
             "summary": {"uuid": session, "source": "claude", "cwd": "/benchmark", "start": turn["ts"],
                 "end": turn["ts"], "turns": 1, "tokens": None, "title": "Benchmark conversation"},
             "turns": [turn], "turns_with_subagents": None, "search_text": [text],
-            "originals": {"synthetic.jsonl": base64.b64encode(json.dumps(turn).encode()).decode()}}
-        store.put(document, None)
+            "originals": {"synthetic.jsonl": json.dumps(turn).encode()}}
+        manifest, chunks = pack(document)
+        store.put_chunks({digest: compress(data) for digest, data in chunks.items()})
+        store.put(manifest, None)
         if (i + 1) % 1000 == 0:
             print(json.dumps({"populated": i + 1, "seconds": round(time.perf_counter() - start, 2)}), flush=True)
     report = {"platform": platform.platform(), "python": platform.python_version(), "sqlite": sqlite3.sqlite_version,

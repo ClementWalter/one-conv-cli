@@ -2087,7 +2087,7 @@ def _archive_state(query=None):
             projects = {}
             for row in rows:
                 projects.setdefault((row["source"], row["cwd"]), []).append(row)
-            context.meta["archive"] = ({"client": client, "rows": rows, "projects": projects, "documents": {}}
+            context.meta["archive"] = ({"client": client, "rows": rows, "projects": projects, "fields": {}}
                                        if client else None)
         except ArchiveError as error:
             log.warning("%s Showing native history only.", error)
@@ -2095,16 +2095,19 @@ def _archive_state(query=None):
     return context.meta["archive"]
 
 
-def _archive_document(handle):
+def _archive_field(handle, field):
+    """One field of the listed revision; reads never transfer original records."""
     from one_conv.archive import ArchiveError
     state = _archive_state()
-    key = handle.archive["key"]
-    if key not in state["documents"]:
-        try:
-            state["documents"][key] = state["client"].read_conversation(key, handle.archive["revision"])
-        except ArchiveError as error:
-            raise click.ClickException(str(error)) from error
-    return state["documents"][key]
+    client, key, revision = state["client"], handle.archive["key"], handle.archive["revision"]
+    try:
+        if (key, None) not in state["fields"]:
+            state["fields"][key, None] = client.read_conversation(key, revision)
+        if (key, field) not in state["fields"]:
+            state["fields"][key, field] = client.read_field(state["fields"][key, None], field)
+    except ArchiveError as error:
+        raise click.ClickException(str(error)) from error
+    return state["fields"][key, field]
 
 
 def _iter_all_projects(sources: tuple[str, ...]):
@@ -2194,9 +2197,8 @@ def _project_sessions(project: ProjectHandle) -> list[SessionHandle]:
 
 def _handle_iter_turns(handle: SessionHandle, include_subagents: bool) -> list[Turn]:
     if handle.archive:
-        document = _archive_document(handle)
-        rows = document["turns_with_subagents"] if include_subagents and document["turns_with_subagents"] is not None else document["turns"]
-        return [Turn(**row) for row in rows]
+        rows = _archive_field(handle, "turns_with_subagents") if include_subagents else None
+        return [Turn(**row) for row in (rows if rows is not None else _archive_field(handle, "turns"))]
     if handle.source in CLOUD_SOURCES or (handle.source == "chatgpt" and handle.path.parent.parent == Path(os.environ.get("ONE_CONV_CLOUD_CACHE", str(Path.home() / ".cache/one-conv-cli/cloud")))):
         rows = json.loads(handle.path.read_text()).get("turns", [])
         return [Turn(ts=row.get("ts") or "", role=row.get("role") or "user",

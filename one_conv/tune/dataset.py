@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .corpus import Message, Session, merge_runs
+from .corpus import CODING_SOURCES, Message, Session, merge_runs
 from .label import CORRECTIONS, moment_key, moment_state
 from .rules import Rule
 
@@ -103,6 +103,16 @@ def session_examples(session: Session, max_context_messages: int = 16, max_chars
     return sft, pairs
 
 
+def assign_splits(sessions: list[Session], valid: float, test: float, split_by: str = "time") -> dict[str, str]:
+    """Split per session: by recency (newest held out, to predict what comes next) or by key hash."""
+    if split_by == "hash":
+        return {s.key: split_of(s.key, valid, test) for s in sessions}
+    newest_first = sorted(sessions, key=lambda s: s.mtime, reverse=True)
+    n_test, n_valid = round(len(sessions) * test), round(len(sessions) * valid)
+    return {s.key: "test" if i < n_test else "valid" if i < n_test + n_valid else "train"
+            for i, s in enumerate(newest_first)}
+
+
 def split_of(key: str, valid: float, test: float) -> str:
     """Deterministic split from the session key, stable across rebuilds."""
     bucket = int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
@@ -133,12 +143,14 @@ def _first_time(line: str, seen: set[str]) -> bool:
 def write_dataset(sessions: list[Session], out_dir: Path, valid: float = 0.05, test: float = 0.05,
                   rule: Rule | None = None, max_context_messages: int = 16, max_chars: int = 12_000,
                   labels: dict[str, dict] | None = None, min_probability: float = 0.6,
-                  synthetic: list[dict] | None = None) -> dict:
+                  synthetic: list[dict] | None = None, split_by: str = "time",
+                  target_sources: tuple[str, ...] = CODING_SOURCES) -> dict:
     """Write mlx-lm chat JSONL under sft/, preference pairs under dpo/, and return the manifest.
 
     Corrections that supplied facts the assistant could not know go to new_info/: the
     accepted answer depends on information absent from the prompt, so they are kept
-    for evaluation and never used as preference training data.
+    for evaluation and never used as preference training data. Only sessions from
+    `target_sources` contribute rows, so the adapter learns agentic coding replies.
     """
     folders = ("sft", "dpo", "new_info")
     counts = {kind: {split: 0 for split in SPLITS} for kind in folders}
@@ -151,8 +163,11 @@ def write_dataset(sessions: list[Session], out_dir: Path, valid: float = 0.05, t
         for split in SPLITS:
             handles[kind, split] = (out_dir / kind / f"{split}.jsonl").open("w", encoding="utf-8")
     try:
+        splits = assign_splits(sessions, valid, test, split_by)
         for session in sessions:
-            split = split_of(session.key, valid, test)
+            if session.source not in target_sources:
+                continue
+            split = splits[session.key]
             sft, pairs = session_examples(session, max_context_messages, max_chars, labels, min_probability)
             for example in sft:
                 if rule is not None:
@@ -185,7 +200,7 @@ def write_dataset(sessions: list[Session], out_dir: Path, valid: float = 0.05, t
                 "rule_rewritten_targets": rewritten, "duplicates_skipped": duplicates,
                 "synthetic_train_rows": len(synthetic or []), "valid": valid, "test": test,
                 "max_context_messages": max_context_messages, "max_chars": max_chars,
-                "labeled": labels is not None, "min_probability": min_probability if labels is not None else None}
+                "labeled": labels is not None, "split_by": split_by, "target_sources": list(target_sources), "min_probability": min_probability if labels is not None else None}
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
     log.info("Wrote dataset to %s: %s", out_dir, counts)
     return manifest

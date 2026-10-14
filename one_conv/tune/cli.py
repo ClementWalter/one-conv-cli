@@ -8,11 +8,12 @@ import subprocess
 import sys
 from collections import Counter
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 import click
 
-from .corpus import AGENT_SOURCES, load_sessions
+from .corpus import AGENT_SOURCES, CODING_SOURCES, load_sessions
 from .dataset import write_dataset
 from .label import (
     JUDGE_PRICES,
@@ -142,13 +143,17 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
                   help="Use classifier labels from `tune label` instead of the keyword heuristic.")
     @click.option("--min-probability", default=0.6, show_default=True,
                   help="With --labels, ignore moments whose label probability is below this.")
+    @click.option("--split", "split_by", type=click.Choice(["time", "hash"]), default="time", show_default=True,
+                  help="time: newest sessions are held out; hash: a stable random share.")
+    @click.option("--targets", "target_sources", multiple=True, type=click.Choice(AGENT_SOURCES),
+                  help="Sources whose replies become training rows (repeatable). Default: the coding agents.")
     @click.option("--synth", "synth_rule", type=click.Choice(sorted(RULES)), default=None,
                   help="Add synthetic rule-following examples from `tune synth` to the training split.")
     @click.option("--synth-ratio", default=1.0, show_default=True,
                   help="Synthetic rows per real SFT training row.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the manifest as JSON.")
     def dataset(name, extra_roots, sources, rule, valid, test, max_context_messages, max_chars, include_system,
-                provider, judge, use_labels, min_probability, synth_rule, synth_ratio, as_json):
+                provider, judge, use_labels, min_probability, split_by, target_sources, synth_rule, synth_ratio, as_json):
         """Build SFT examples and DPO pairs from exported sessions.
 
         Accepted assistant turns become SFT targets. A turn followed by a
@@ -174,6 +179,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
                     raise click.ClickException(f"No labels file named {judge!r} under {home / 'labels'}.")
                 labels = adjudicated(labels, verdicts, min_probability)
         out = home / "datasets" / name
+        targets = tuple(target_sources) or CODING_SOURCES
         synthetic = None
         if synth_rule:
             answers = load_answers(home / "synth" / synth_rule / "answers.jsonl")
@@ -181,10 +187,10 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
                 raise click.ClickException(f"No synthetic answers yet. Run: one-conv tune synth --rule {synth_rule}")
             # Sized against the real training rows: build once without them to count, then mix.
             real = write_dataset(sessions, out, valid, test, RULES[rule] if rule else None,
-                                 max_context_messages, max_chars, labels, min_probability)
+                                 max_context_messages, max_chars, labels, min_probability, None, split_by, targets)
             synthetic = synthetic_examples(answers, RULES[synth_rule], int(real["counts"]["sft"]["train"] * synth_ratio))
         manifest = write_dataset(sessions, out, valid, test, RULES[rule] if rule else None,
-                                 max_context_messages, max_chars, labels, min_probability, synthetic)
+                                 max_context_messages, max_chars, labels, min_probability, synthetic, split_by, targets)
         if as_json:
             click.echo(json.dumps({"dataset": str(out), **manifest}))
             return
@@ -417,13 +423,55 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         """Run the drift probe with several samples per task, on the GPU."""
         _remote("probe", run=run, dataset=dataset_name, rule=rule, samples=samples, lengths=lengths)
 
+    @cloud.command("benchmark", context_settings=HELP)
+    @click.option("--run", "run", required=True)
+    def cloud_benchmark(run):
+        """HumanEval pass@1, base vs adapter, to catch lost general coding ability."""
+        _remote("benchmark", run=run)
+
+    @cloud.command("nightly", context_settings=HELP)
+    @click.option("--rule", type=click.Choice(sorted(RULES)), default="no-comments", show_default=True)
+    @click.option("--judge", default="boundless-claude-opus-5.5", show_default=True,
+                  help="Labels file that overrides uncertain labels; new uncertain moments wait for it.")
+    @click.option("--dry-run", is_flag=True, help="Print the steps without running them.")
+    def cloud_nightly(rule, judge, dry_run):
+        """Refresh everything from new sessions and retrain on Modal (~30 min, ~$2-3 of H100 time).
+
+        Snapshots this machine, labels and rates new moments (free), rebuilds
+        the dataset with the newest sessions held out, then trains, evaluates,
+        benchmarks and probes a run named nightly-YYYY-MM-DD, and pulls it back.
+
+        \b
+        Examples:
+          one-conv tune cloud nightly --dry-run
+          one-conv tune cloud nightly
+        """
+        run = "nightly-" + datetime.now().date().isoformat()
+        me = [sys.executable, str(PACKAGE_ROOT / "bin" / "one-conv"), "tune"]
+        steps = [
+            ["snapshot"], ["label"], ["mood", "--top", "0"],
+            ["dataset", "--name", "nightly", "--labels", "--judge", judge, "--rule", rule]
+            + (["--synth", rule] if (tune_home() / "synth" / rule / "answers.jsonl").exists() else []),
+            ["cloud", "push", "--dataset", "nightly"],
+            ["cloud", "train", "--dataset", "nightly", "--run", run],
+            ["cloud", "eval", "--run", run, "--dataset", "nightly"],
+            ["cloud", "benchmark", "--run", run],
+            ["cloud", "probe", "--run", run, "--dataset", "nightly", "--rule", rule],
+            ["cloud", "pull", "--run", run],
+        ]
+        for step in steps:
+            click.echo("→ one-conv tune " + shlex.join(step), err=True)
+            if not dry_run and subprocess.run(me + step, cwd=PACKAGE_ROOT, check=False).returncode != 0:
+                raise click.ClickException(f"Nightly stopped at: one-conv tune {shlex.join(step)}")
+        click.echo(f"Run {run} ready. Compare with: one-conv tune runs")
+
     @cloud.command("pull", context_settings=HELP)
     @click.option("--run", "run", required=True)
     def cloud_pull(run):
         """Download a run's results (adapter, metrics, eval, probe) into the local workspace."""
         local = tune_home() / "runs" / run
         local.mkdir(parents=True, exist_ok=True)
-        for name in ("train.json", "train_metrics.json", "eval.json", "probe.json", "adapter"):
+        for name in ("train.json", "train_metrics.json", "eval.json", "probe.json", "benchmark.json", "adapter"):
             # Missing files only mean that step has not run yet.
             subprocess.run(["modal", "volume", "get", "--force", "one-conv-tune", f"/runs/{run}/{name}", str(local)],
                            cwd=PACKAGE_ROOT, check=False)
@@ -436,6 +484,60 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         if not yes:
             raise click.ClickException("This deletes every file in the one-conv-tune volume. Rerun with --yes.")
         _modal("volume", "delete", "--yes", "one-conv-tune")
+
+    @tune.command(context_settings=HELP)
+    @click.option("-n", "count", default=100, show_default=True, help="Moments to label in this sitting.")
+    @click.option("--uncertain-from", "uncertain_from", default="classifier", show_default=True,
+                  help="Labels file whose low-confidence moments you label.")
+    @click.option("--min-probability", default=0.6, show_default=True)
+    @click.option("--seed", default=0, show_default=True)
+    def annotate(count, uncertain_from, min_probability, seed):
+        """Label uncertain moments yourself, one key per moment; your labels are the reference.
+
+        Shows your request, the agent's reply and your next message, then waits
+        for a key: 1 accepted, 2 moved on, 3 correction (avoidable), 4 correction
+        (new facts), 5 question, 6 unclear, s skip, q quit. Each answer is saved
+        immediately to labels/human.jsonl, so you can stop and resume.
+
+        \b
+        Examples:
+          one-conv tune annotate -n 50
+          one-conv tune compare human boundless-claude-opus-5.5 classifier
+        """
+        home = tune_home()
+        out = home / "labels" / "human.jsonl"
+        done = load_labels(out)
+        primary = load_labels(home / "labels" / f"{uncertain_from}.jsonl")
+        uncertain = {k for k, r in primary.items() if r["probabilities"].get(r["label"], 0.0) < min_probability}
+        pool = [m for s in _sessions(home) for m in moments(s) if m.key in uncertain and m.key not in done]
+        unique = list({m.key: m for m in pool}.values())
+        picks = random.Random(seed).sample(unique, min(count, len(unique)))
+        keys = {"1": "accepted", "2": "new_task", "3": "correction_preference", "4": "correction_new_info",
+                "5": "question", "6": "unclear"}
+        out.parent.mkdir(parents=True, exist_ok=True)
+        labeled = 0
+        with out.open("a", encoding="utf-8") as stream:
+            for i, moment in enumerate(picks, 1):
+                state = moment.state
+                click.echo(click.style(f"\n── {i}/{len(picks)} ──", bold=True))
+                click.echo(click.style("Your request: ", fg="blue") + state["user_request"][:500])
+                click.echo(click.style("Agent reply:  ", fg="yellow") + state["assistant_reply"][:1200])
+                click.echo(click.style("Your answer:  ", fg="green") + state["user_next_message"][:800])
+                click.echo("1 accepted  2 moved on  3 correction (avoidable)  4 correction (new facts)  "
+                           "5 question  6 unclear  s skip  q quit")
+                key = click.getchar()
+                while key not in keys and key not in "sq":
+                    key = click.getchar()
+                if key == "q":
+                    break
+                if key == "s":
+                    continue
+                stream.write(json.dumps({"key": moment.key, "session": moment.session, "index": moment.index,
+                                         "label": keys[key], "probabilities": {keys[key]: 1.0}}) + "\n")
+                stream.flush()
+                labeled += 1
+                click.echo(f"→ {keys[key]}")
+        click.echo(f"\n{labeled} labeled this sitting, {len(done) + labeled} in total → {out}")
 
     @tune.command(context_settings=HELP)
     @click.argument("reference")

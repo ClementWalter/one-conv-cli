@@ -12,6 +12,8 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+# Agentic coding tools: the only sources whose replies become training targets.
+CODING_SOURCES = ("claude", "codex", "cursor", "cursor-cli", "omp", "codex-cloud")
 AGENT_SOURCES = ("claude", "codex", "cursor", "cursor-cli", "omp", "chatgpt",
                  "claude-chat", "codex-cloud", "cowork-cloud")
 

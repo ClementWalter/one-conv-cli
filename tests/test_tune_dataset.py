@@ -128,3 +128,30 @@ def test_budget_drops_oldest_history():
 def test_target_longer_than_budget_is_skipped():
     sft, _ = session_examples(_session(("user", "q"), ("assistant", "z" * 100)), max_chars=50)
     assert sft == []
+
+
+def _dated(key, mtime, source="claude"):
+    return Session(source, key, "/repo", "human", mtime, (Message("user", "q"), Message("assistant", f"a {key}")))
+
+
+def test_time_split_holds_out_newest():
+    from one_conv.tune.dataset import assign_splits
+    sessions = [_dated(str(i), float(i)) for i in range(10)]
+    assert assign_splits(sessions, valid=0.1, test=0.1)["claude:9"] == "test"
+
+
+def test_time_split_trains_on_oldest():
+    from one_conv.tune.dataset import assign_splits
+    sessions = [_dated(str(i), float(i)) for i in range(10)]
+    assert assign_splits(sessions, valid=0.1, test=0.1)["claude:0"] == "train"
+
+
+def test_chat_sessions_give_no_training_rows(tmp_path):
+    manifest = write_dataset([_dated("c", 1.0, source="chatgpt")], tmp_path, valid=0.0, test=0.0)
+    assert manifest["counts"]["sft"]["train"] == 0
+
+
+def test_explicit_targets_include_chat(tmp_path):
+    manifest = write_dataset([_dated("c", 1.0, source="chatgpt")], tmp_path, valid=0.0, test=0.0,
+                             target_sources=("chatgpt",))
+    assert manifest["counts"]["sft"]["train"] == 1

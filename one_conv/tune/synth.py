@@ -10,11 +10,9 @@ import hashlib
 import json
 from pathlib import Path
 
-from .corpus import Session, merge_runs
-from .dataset import _context, split_of
+from .corpus import CODING_SOURCES, Session, merge_runs
+from .dataset import _context, assign_splits
 from .rules import Rule, code_blocks
-
-CODING_SOURCES = ("claude", "codex", "cursor", "cursor-cli", "omp", "codex-cloud")
 
 
 def prompt_key(messages: list[dict]) -> str:
@@ -22,7 +20,7 @@ def prompt_key(messages: list[dict]) -> str:
 
 
 def coding_prompts(sessions: list[Session], valid: float, test: float, max_messages: int = 8,
-                   max_chars: int = 6_000) -> list[dict]:
+                   max_chars: int = 6_000, split_by: str = "time") -> list[dict]:
     """Every user request of training-split coding sessions, with the conversation before it.
 
     The history keeps follow-ups answerable; it is capped in messages and
@@ -30,8 +28,10 @@ def coding_prompts(sessions: list[Session], valid: float, test: float, max_messa
     """
     seen: set[str] = set()
     prompts = []
+    # Same split as the dataset, so no held-out conversation is distilled into training.
+    splits = assign_splits(sessions, valid, test, split_by)
     for session in sessions:
-        if session.source not in CODING_SOURCES or split_of(session.key, valid, test) != "train":
+        if session.source not in CODING_SOURCES or splits[session.key] != "train":
             continue
         messages = merge_runs(session.messages)
         for index, message in enumerate(messages):

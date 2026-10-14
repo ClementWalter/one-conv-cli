@@ -222,3 +222,53 @@ def probe(run: str, dataset: str, rule: str, lengths: str = "0,2000,8000,16000",
     for row in rows:
         summary.setdefault(row["variant"], {}).setdefault(row["context_tokens"], []).append(row["violated"])
     return {v: {k: sum(f) / len(f) for k, f in d.items()} for v, d in summary.items()}
+
+
+def _extract_code(text: str, prompt: str, entry_point: str) -> str:
+    """The first fenced code block, completed with the given signature if the model omitted it."""
+    fence = text.find("```")
+    if fence != -1:
+        start = text.find("\n", fence) + 1
+        end = text.find("```", start)
+        text = text[start:end if end != -1 else None]
+    return text if f"def {entry_point}" in text else prompt + text
+
+
+def _passes(program: str, timeout: int = 15) -> bool:
+    import subprocess
+    import sys
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as handle:
+        handle.write(program)
+    try:
+        return subprocess.run([sys.executable, handle.name], capture_output=True, timeout=timeout, check=False).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
+@app.function(**GPU, timeout=3600)
+def benchmark(run: str) -> dict:
+    """HumanEval pass@1 (greedy) for base vs adapter: does fitting the user cost general coding ability?"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from datasets import load_dataset
+    from vllm import LLM, SamplingParams
+    from vllm.lora.request import LoRARequest
+
+    problems = list(load_dataset("openai/openai_humaneval", split="test"))
+    llm = LLM(MODEL, max_model_len=4096, dtype="bfloat16", enable_lora=True, max_lora_rank=64)
+    params = SamplingParams(temperature=0.0, max_tokens=768)
+    chats = [[{"role": "user", "content": "Complete this Python function. Reply with the whole function in one "
+                                          "```python code block.\n\n" + p["prompt"]}] for p in problems]
+    result = {}
+    for variant, lora in (("base", None), ("adapter", LoRARequest("run", 1, str(VOL / "runs" / run / "adapter")))):
+        outputs = llm.chat(chats, params, lora_request=lora)
+        programs = [_extract_code(o.outputs[0].text, p["prompt"], p["entry_point"]) + "\n\n" + p["test"]
+                    + f"\n\ncheck({p['entry_point']})\n" for p, o in zip(problems, outputs)]
+        with ThreadPoolExecutor(16) as pool:
+            passed = list(pool.map(_passes, programs))
+        result[variant] = {"passed": sum(passed), "total": len(passed), "pass_at_1": sum(passed) / len(passed),
+                           "failed": [p["task_id"] for p, ok in zip(problems, passed) if not ok]}
+    _write_json(VOL / "runs" / run / "benchmark.json", result)
+    volume.commit()
+    return {v: f"{r['passed']}/{r['total']}" for v, r in result.items()}

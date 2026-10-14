@@ -128,3 +128,31 @@ def test_dataset_judge_requires_its_labels(home, tune):
     _write_labels(home / "labels" / "classifier.jsonl", [{"key": "a", "label": "accepted", "probabilities": {"accepted": 1}}])
     result = CliRunner().invoke(tune, ["dataset", "--labels", "--judge", "missing"])
     assert "No labels file named 'missing'" in result.output
+
+
+def test_annotate_saves_pressed_label(home, tmp_path):
+    root = tmp_path / "answered"
+    root.mkdir()
+    (root / "s.json").write_text(json.dumps({
+        "source": "codex", "session": "s9", "cwd": "/repo", "author": "human", "mtime": 1.0,
+        "turns": [{"role": "user", "text": "a"}, {"role": "assistant", "text": "b"}, {"role": "user", "text": "no, simpler"}]}))
+    tune = build_tune_group(snapshot=lambda out: (0, 0), corpus_roots=lambda: [root])
+    from one_conv.tune.corpus import load_sessions
+    from one_conv.tune.label import moments
+    key = next(moments(load_sessions([root])[0])).key
+    _write_labels(home / "labels" / "classifier.jsonl", [{"key": key, "label": "question", "probabilities": {"question": 0.3}}])
+    CliRunner().invoke(tune, ["annotate", "-n", "1"], input="3")
+    assert json.loads((home / "labels" / "human.jsonl").read_text())["label"] == "correction_preference"
+
+
+def test_nightly_dry_run_lists_training_step(home, tune):
+    result = CliRunner().invoke(tune, ["cloud", "nightly", "--dry-run"])
+    assert "cloud train --dataset nightly" in result.output
+
+
+def test_runs_show_benchmark(home, tune):
+    run = home / "runs" / "r"
+    run.mkdir(parents=True)
+    (run / "benchmark.json").write_text(json.dumps({"adapter": {"pass_at_1": 0.8}}))
+    result = CliRunner().invoke(tune, ["runs", "--json"])
+    assert json.loads(result.output)[0]["metrics"]["adapter_humaneval"] == 0.8

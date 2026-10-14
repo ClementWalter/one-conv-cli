@@ -65,11 +65,16 @@ def probe_metrics(result: dict) -> dict:
     return {f"{variant}_violation@{max(rates)}": rates[max(rates)] for variant, rates in table.items()}
 
 
+def benchmark_metrics(result: dict) -> dict:
+    return {f"{variant}_humaneval": scores["pass_at_1"] for variant, scores in result.items()}
+
+
 def load_runs(home: Path) -> list[dict]:
     runs = []
     for run_dir in sorted((home / "runs").glob("*/")):
         run = {"name": run_dir.name, "metrics": {}}
-        for name, summarize in (("eval.json", eval_metrics), ("probe.json", probe_metrics)):
+        for name, summarize in (("eval.json", eval_metrics), ("probe.json", probe_metrics),
+                                ("benchmark.json", benchmark_metrics)):
             path = run_dir / name
             if path.exists():
                 run["metrics"].update(summarize(json.loads(path.read_text())))

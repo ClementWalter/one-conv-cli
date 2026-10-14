@@ -114,13 +114,6 @@ class SQLiteStore:
                 if (current.revision if current else None) != expected or (current and current.mtime > document["mtime"]):
                     raise Conflict("Conversation changed; resync from its current source.")
                 if current:
-                    previous = self._unpack(conn, json.loads(conn.execute(select(r.c.document).where(
-                        (r.c.key == key) & (r.c.revision == current.revision))).scalar_one()))
-                    for field in ("turns", "turns_with_subagents"):
-                        old = previous[field] if previous[field] is not None else previous["turns"]
-                        new = document[field] if document[field] is not None else document["turns"]
-                        if new[:len(old)] != old:
-                            raise Conflict("Capture rewrites archived messages; keeping the previous capture.")
                     result = conn.execute(h.update().where((h.c.key == key) & (h.c.revision == expected)).values(**values))
                     if result.rowcount != 1:
                         raise Conflict("Concurrent sync; retry after reading the current revision.")

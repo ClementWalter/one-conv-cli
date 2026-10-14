@@ -113,8 +113,8 @@ def test_auth_failure_and_unavailable_archive_are_visible(tmp_path, archive):
     write_claude(env)
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="wrong")
     result = run(env, "bin/one-conv", "local", "search", "Quartz", "--source", "claude", "--json", success=False)
-    assert result.returncode != 0 and "401" in result.stderr
-    assert result.stdout == ""
+    assert result.returncode == 0 and "401" in result.stderr and "native history only" in result.stderr
+    assert len(json.loads(result.stdout)) == 1
     result = ArchiveClient(url, "test-secret")
     with pytest.raises(ArchiveError, match="422"):
         result.put({"source": "claude"}, None)
@@ -190,7 +190,7 @@ def test_interrupted_upload_does_not_commit(tmp_path, archive):
     assert list(client.list_conversations()) == []
 
 
-def test_rewrites_and_identity_mismatch_cannot_hide_history(tmp_path, archive):
+def test_rewrites_advance_and_keep_earlier_revisions(tmp_path, archive):
     _, client, url = archive
     env = fixture_env(tmp_path)
     path = write_claude(env)
@@ -201,37 +201,53 @@ def test_rewrites_and_identity_mismatch_cannot_hide_history(tmp_path, archive):
     document["summary"]["uuid"] = "wrong"
     with pytest.raises(ArchiveError, match="422"):
         client.put(document, row["revision"])
-    path.write_text(path.read_text().replace("forty-two", "erased"))
-    result = run(env, "scripts/archive-sync.py", "--source", "claude", success=False)
-    assert result.returncode == 1 and "409" in result.stderr
-    assert "forty-two" in client.read_conversation(row["key"])["turns"][1]["blocks"][-1]["text"]
+    # Provider edits, regenerations and parser upgrades all rewrite earlier turns.
+    path.write_text(path.read_text().replace("forty-two", "edited"))
+    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 1, "unchanged": 0}
+    assert "edited" in client.read_conversation(row["key"])["turns"][1]["blocks"][-1]["text"]
+    assert "forty-two" in client.read_conversation(row["key"], row["revision"])["turns"][1]["blocks"][-1]["text"]
 
 
-def test_two_origins_are_not_silently_merged_with_native(tmp_path, archive):
+def test_copies_from_two_installations_show_the_newest(tmp_path, archive):
     _, client, url = archive
     env = fixture_env(tmp_path)
     write_claude(env)
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
     run(env, "scripts/archive-sync.py", "--source", "claude")
-    row = list(client.list_conversations())[0]
-    document = client.read_conversation(row["key"])
-    document["origin"] = "another-installation"
-    document["mtime"] += 1
-    client.put(document, None)
-    result = run(env, "bin/one-conv", "local", "read", "ancestry", "--source", "claude", "--json", success=False)
-    assert result.returncode != 0 and "conflicting origins" in result.stderr
-    assert result.stdout == ""
+    # Another machine, or a reset state directory, uploads the same conversation under a new installation ID.
+    second = {**env, "ONE_CONV_STATE_DIR": str(tmp_path / "state-two"), "AGENT_CONV_STATE_DIR": str(tmp_path / "state-two")}
+    write_claude(env, extra=True)
+    assert run(second, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 1, "unchanged": 0}
+    assert len(list(client.list_conversations())) == 2
+    for reader_env in (env, {**env, "CLAUDE_CONFIG_DIR": str(tmp_path / "empty")}):
+        assert [row["threads"] for row in run(reader_env, "bin/one-conv", "local", "chats", "--source", "claude", "--json")] == [1]
+        thread = run(reader_env, "bin/one-conv", "local", "thread", "ancestry", "--source", "claude", "--no-mark-read", "--json")
+        assert thread["turns"][-1]["text"] == "An additional message"
 
 
-def test_unavailable_archive_is_not_an_empty_result(tmp_path):
+def test_sync_skips_captures_whose_source_time_is_unchanged(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    archived = path.stat().st_mtime_ns
+    write_claude(env, extra=True)
+    os.utime(path, ns=(archived, archived))  # Same modification time: the file is not re-read.
+    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 0, "unchanged": 1}
+    assert len(client.read_conversation(list(client.list_conversations())[0]["key"])["turns"]) == 2
+
+
+def test_unavailable_archive_warns_and_keeps_native_results(tmp_path):
     env = fixture_env(tmp_path)
     write_claude(env)
     with socket.socket() as reserved:
         reserved.bind(("127.0.0.1", 0))  # Bound but not listening: connection must fail.
         env.update(ONE_CONV_ARCHIVE_URL=f"http://127.0.0.1:{reserved.getsockname()[1]}", ONE_CONV_ARCHIVE_TOKEN="secret")
-        result = run(env, "bin/one-conv", "local", "search", "Quartz", "--source", "claude", "--json", success=False)
-        assert result.returncode != 0 and "unavailable" in result.stderr
-        assert result.stdout == ""
+        for args in (("search", "Quartz"), ("chats",), ("thread", "ancestry", "--no-mark-read")):
+            result = run(env, "bin/one-conv", "local", *args, "--source", "claude", "--json", success=False)
+            assert result.returncode == 0 and "unavailable" in result.stderr and "native history only" in result.stderr
+            assert json.loads(result.stdout)
 
 
 def test_failed_capture_does_not_starve_older_history(tmp_path, archive):
@@ -240,15 +256,17 @@ def test_failed_capture_does_not_starve_older_history(tmp_path, archive):
     path = write_claude(env)
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
     run(env, "scripts/archive-sync.py", "--source", "claude")
+    archived = path.stat().st_mtime
     older = path.with_name("older-unarchived.jsonl")
     older.write_bytes(path.read_bytes())
-    os.utime(older, (path.stat().st_mtime - 20,) * 2)
+    os.utime(older, (archived - 20,) * 2)
     path.write_text(path.read_text().replace("forty-two", "rewritten"))
+    os.utime(path, (archived - 10,) * 2)  # Older than the archived capture: stale.
     before = {p: p.read_bytes() for p in (older, path)}
     result = run(env, "scripts/archive-sync.py", "--source", "claude", success=False)
     assert result.returncode == 1
     assert {row["session"] for row in client.list_conversations()} == {"session-one", "older-unarchived"}
-    assert "claude/session-one" in result.stderr and "409" in result.stderr
+    assert "claude/session-one" in result.stderr and "409" in result.stderr and "Conversation changed" in result.stderr
     assert json.loads(result.stdout) == {"uploaded": 1, "unchanged": 0, "failed": 1}
     assert {p: p.read_bytes() for p in before} == before
 

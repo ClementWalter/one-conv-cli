@@ -2090,7 +2090,8 @@ def _archive_state(query=None):
             context.meta["archive"] = ({"client": client, "rows": rows, "projects": projects, "documents": {}}
                                        if client else None)
         except ArchiveError as error:
-            raise click.ClickException(str(error)) from error
+            log.warning("%s Showing native history only.", error)
+            context.meta["archive"] = None
     return context.meta["archive"]
 
 
@@ -2179,12 +2180,9 @@ def _project_sessions(project: ProjectHandle) -> list[SessionHandle]:
     native = _native_project_sessions(project)
     by_id = {(h.source, h.project_cwd, h.uuid): h for h in native}
     archive = _archive_state()
-    origins = {}
+    # Machines or reset state directories can upload one conversation under several origins.
     for row in archive["projects"].get((project.source, project.cwd), ()) if archive else ():
         identity = row["source"], row["cwd"], row["session"]
-        if identity in origins and origins[identity] != row["origin"]:
-            raise click.ClickException("Archive contains conflicting origins for the same source/project/session identity.")
-        origins[identity] = row["origin"]
         existing = by_id.get(identity)
         if existing and existing.mtime >= row["mtime"]:
             continue
@@ -2911,7 +2909,7 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
         if not h.archive and h.source in ("claude", "codex", "omp"):
             with h.path.open("rb") as f:
                 payload = f.read()
-                if text.isascii() and b"\\u" not in payload and needle_bytes.lower() not in payload.lower():
+                if text.isascii() and needle_bytes.lower() not in payload.lower():
                     continue
         elif not h.archive and h.source == "cursor" and cursor_ids is not None and h.composer_id not in cursor_ids:
             continue

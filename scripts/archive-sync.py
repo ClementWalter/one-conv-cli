@@ -118,22 +118,26 @@ def main():
     if client is None:
         parser.error("Set ONE_CONV_ARCHIVE_URL and ONE_CONV_ARCHIVE_TOKEN")
     origin = origin_id(reader)
-    existing = {row["key"]: row["revision"] for row in client.list_conversations()}
+    existing = {row["key"]: row for row in client.list_conversations()}
     projects = [p for p in reader._native_projects(tuple(args.source)) if not args.project or args.project.lower() in p.cwd.lower()]
     handles = sorted((h for p in projects for h in reader._native_project_sessions(p)), key=lambda h: h.mtime, reverse=True)
     uploaded = unchanged = failed = 0
     for handle in handles[:args.limit] if args.limit else handles:
         try:
-            document = capture(reader, handle, origin)
             key = conversation_key(origin, handle.source, handle.project_cwd, handle.uuid)
+            archived = existing.get(key)
+            if archived and archived["mtime"] == handle.mtime:
+                unchanged += 1  # Avoid re-reading and re-encoding unchanged history.
+                continue
+            document = capture(reader, handle, origin)
             digest = revision(document)
-            if existing.get(key) == digest:
+            if archived and archived["revision"] == digest:
                 unchanged += 1
                 continue
-            receipt = client.put(document, existing.get(key))
+            receipt = client.put(document, archived["revision"] if archived else None)
             if receipt != {"key": key, "revision": digest}:
                 raise ArchiveError("Archive acknowledgement does not match the uploaded capture")
-            existing[key] = digest
+            existing[key] = {"revision": digest, "mtime": handle.mtime}
             uploaded += 1
         except (ArchiveError, OSError, ValueError, sqlite3.Error) as error:
             failed += 1

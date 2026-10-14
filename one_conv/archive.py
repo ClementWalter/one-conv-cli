@@ -47,7 +47,11 @@ class ArchiveClient:
             with build_opener(NoRedirect).open(request, timeout=self.timeout) as response:
                 return json.load(response)
         except HTTPError as error:
-            raise ArchiveError(f"Archive returned HTTP {error.code}; no changes acknowledged.") from error
+            try:
+                reason = json.load(error)["error"]
+            except (OSError, ValueError, KeyError, TypeError):
+                reason = error.reason
+            raise ArchiveError(f"Archive returned HTTP {error.code} ({reason}); no changes acknowledged.") from error
         except (URLError, TimeoutError, OSError, ValueError) as error:
             raise ArchiveError("Archive unavailable or returned an invalid response.") from error
 

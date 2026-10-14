@@ -29,17 +29,20 @@ one-conv local thread PROJECT --source claude --no-mark-read --json
 Cloud sources copy already pulled provider caches; they do not log in or pull.
 Configure the URL/token in the environment running one-conv, including its MCP
 server. Unset the URL for native-only reads. Archives remain in their original
-local/cloud provider namespace. An unavailable configured archive fails explicitly
-rather than presenting an incomplete result as complete.
+local/cloud provider namespace. If the configured archive is unreachable or rejects
+the token, commands warn on stderr and show native history only.
 
-The sync script persists an installation ID in one-conv's state directory. Keep
-that directory across runs. Uploads are content-addressed and compare the expected
-remote revision before advancing a conversation. Repeats are idempotent; stale,
-concurrent and rewritten/truncated histories are rejected (including compaction
-that replaces prior turns). Failed captures are reported individually; sync
-continues with the remaining
-conversations and exits nonzero with uploaded/unchanged/failed counts. A changing
-source can be retried when idle. Earlier revisions remain stored. No automatic
+The sync script persists an installation ID in one-conv's state directory. If the
+same conversation is uploaded by several installations (another machine, or a reset
+state directory), readers show the newest copy. Sync skips conversations whose
+source modification time matches the archive. Uploads are content-addressed and
+compare the expected remote revision before advancing a conversation. Repeats are
+idempotent; stale and concurrent captures are rejected. A capture that rewrites
+earlier turns (a provider edit or regeneration, or a parser upgrade) becomes the
+current version; earlier revisions remain stored and readable by revision. Failed
+captures are reported individually; sync continues with the remaining conversations
+and exits nonzero with uploaded/unchanged/failed counts. A changing source can be
+retried when idle. No automatic
 scheduler, deletion propagation, local eviction or provider resume restoration
 is included.
 

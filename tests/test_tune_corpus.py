@@ -66,3 +66,30 @@ def test_load_ignores_invalid_json(corpus):
     root, _ = corpus
     (root / "broken.json").write_text("{")
     assert load_sessions([root]) == []
+
+
+@pytest.mark.parametrize("text", [
+    "Tu es le même cerveau que sur tous les autres canaux. Le message arrive de telegram.",
+    "Another Claude session sent a message:\n<teammate-message>",
+    "Warning: apply_patch was requested via exec_command. Use the apply_patch tool",
+    "This session is being continued from a previous conversation that ran out of context.",
+])
+def test_automated_user_turns_are_dropped(text):
+    doc = _doc(turns=[{"role": "user", "text": "Fix it"}, {"role": "assistant", "text": "Done"},
+                      {"role": "user", "text": text}])
+    assert parse_session(doc).messages == (Message("user", "Fix it"), Message("assistant", "Done"))
+
+
+def test_typed_message_is_kept():
+    doc = _doc(turns=[{"role": "user", "text": "Implement the plan as specified"}])
+    assert parse_session(doc).messages == (Message("user", "Implement the plan as specified"),)
+
+
+def test_voice_turn_keeps_transcription():
+    voice = json.dumps([{"content_type": "multimodal_text", "parts": [
+        {"content_type": "audio_transcription", "text": " non, plus simple", "direction": "in"}]}])
+    assert parse_session(_doc(turns=[{"role": "user", "text": voice}])).messages == (Message("user", "non, plus simple"),)
+
+
+def test_plain_text_is_not_parsed_as_voice():
+    assert parse_session(_doc(turns=[{"role": "user", "text": "[1, 2]"}])).messages == (Message("user", "[1, 2]"),)

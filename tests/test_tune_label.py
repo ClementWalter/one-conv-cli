@@ -85,7 +85,7 @@ def test_unlabeled_moment_is_ignored(corrected):
     assert (sft, pairs) == ([], [])
 
 
-@pytest.mark.parametrize("verdict", ["new_task", "question", "unclear"])
+@pytest.mark.parametrize("verdict", ["question", "unclear"])
 def test_neutral_labels_produce_nothing(corrected, verdict):
     sft, pairs = session_examples(corrected, labels=_labels(corrected, [verdict, verdict]))
     assert (sft, pairs) == ([], [])
@@ -204,3 +204,15 @@ def test_batched_labeling_writes_every_moment(tmp_path, corrected):
     label_moments(list(moments(corrected)), lambda states: [{"label": "accepted", "probabilities": {}} for _ in states],
                   out, batch_size=40)
     assert len(load_labels(out)) == 2
+
+
+def test_new_task_counts_as_acceptance(corrected):
+    sft, _ = session_examples(corrected, labels=_labels(corrected, ["new_task", "new_task"]))
+    assert [example.messages[-1].text for example in sft] == ["Added three abstraction layers", "Added one dict"]
+
+
+def test_new_info_pairs_stay_out_of_dpo(tmp_path, corrected):
+    from one_conv.tune.dataset import write_dataset
+    manifest = write_dataset([corrected], tmp_path, valid=0.0, test=0.0,
+                             labels=_labels(corrected, ["correction_new_info", "accepted"]))
+    assert (manifest["counts"]["dpo"]["train"], manifest["counts"]["new_info"]["train"]) == (0, 1)

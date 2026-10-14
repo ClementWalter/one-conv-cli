@@ -151,7 +151,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             return
         counts = manifest["counts"]
         click.echo(f"{manifest['sessions']} sessions → {out}")
-        for kind in ("sft", "dpo"):
+        for kind in counts:
             click.echo(f"  {kind}: " + ", ".join(f"{split} {n}" for split, n in counts[kind].items()))
         if rule:
             click.echo(f"  rule {rule}: {manifest['rule_rewritten_targets']} target(s) rewritten")

@@ -60,9 +60,13 @@ def _context(messages: list[Message], end: int, max_messages: int, budget: int) 
     return tuple(window)
 
 
+# Moving on without complaint is an implicit acceptance.
+ACCEPTING = ("accepted", "new_task")
+
+
 def session_examples(session: Session, max_context_messages: int = 16, max_chars: int = 12_000,
-                     labels: dict[str, dict] | None = None,
-                     min_probability: float = 0.6) -> tuple[list[SFTExample], list[PreferencePair]]:
+                     labels: dict[str, dict] | None = None, min_probability: float = 0.6,
+                     accepting: tuple[str, ...] = ACCEPTING) -> tuple[list[SFTExample], list[PreferencePair]]:
     """Without `labels`, a keyword heuristic spots corrections; with them, only confident labels count."""
     messages = merge_runs(session.messages)
     sft: list[SFTExample] = []
@@ -91,7 +95,7 @@ def session_examples(session: Session, max_context_messages: int = 16, max_chars
                 pairs.append(PreferencePair(context, chosen=retry.text, rejected=message.text,
                                             kind=verdict, correction=follow.text))
             continue
-        if verdict != "accepted":
+        if verdict not in ("accepted", *accepting):
             continue
         context = _context(messages, index, max_context_messages, max_chars - len(message.text))
         if context:
@@ -129,13 +133,19 @@ def _first_time(line: str, seen: set[str]) -> bool:
 def write_dataset(sessions: list[Session], out_dir: Path, valid: float = 0.05, test: float = 0.05,
                   rule: Rule | None = None, max_context_messages: int = 16, max_chars: int = 12_000,
                   labels: dict[str, dict] | None = None, min_probability: float = 0.6) -> dict:
-    """Write mlx-lm chat JSONL under sft/ and preference JSONL under dpo/; return the manifest."""
-    counts = {kind: {split: 0 for split in SPLITS} for kind in ("sft", "dpo")}
+    """Write mlx-lm chat JSONL under sft/, preference pairs under dpo/, and return the manifest.
+
+    Corrections that supplied facts the assistant could not know go to new_info/: the
+    accepted answer depends on information absent from the prompt, so they are kept
+    for evaluation and never used as preference training data.
+    """
+    folders = ("sft", "dpo", "new_info")
+    counts = {kind: {split: 0 for split in SPLITS} for kind in folders}
     rewritten = duplicates = 0
     # The same conversation can be stored twice (archived copies, other machines' exports).
     seen: set[str] = set()
     handles = {}
-    for kind in ("sft", "dpo"):
+    for kind in folders:
         (out_dir / kind).mkdir(parents=True, exist_ok=True)
         for split in SPLITS:
             handles[kind, split] = (out_dir / kind / f"{split}.jsonl").open("w", encoding="utf-8")
@@ -158,9 +168,10 @@ def write_dataset(sessions: list[Session], out_dir: Path, valid: float = 0.05, t
                 line = json.dumps({"prompt": _chat(pair.prompt), "chosen": pair.chosen,
                                    "rejected": pair.rejected, "kind": pair.kind,
                                    "correction": pair.correction}, ensure_ascii=False)
+                folder = "new_info" if pair.kind == "correction_new_info" else "dpo"
                 if _first_time(line, seen):
-                    handles["dpo", split].write(line + "\n")
-                    counts["dpo"][split] += 1
+                    handles[folder, split].write(line + "\n")
+                    counts[folder][split] += 1
                 else:
                     duplicates += 1
     finally:

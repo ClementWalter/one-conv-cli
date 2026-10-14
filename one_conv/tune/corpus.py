@@ -36,18 +36,62 @@ class Session:
         return f"{self.source}:{self.session}"
 
 
+# Injected by harnesses, relays or schedulers rather than typed by the user.
+AUTOMATED_PREFIXES = (
+    "Tu es le même cerveau que sur tous les autres canaux",
+    "Tu réponds à Clément en direct",
+    "Another Claude session sent a message:",
+    "Warning: apply_patch was requested via exec_command",
+    "<local-command-caveat>",
+    "<system_notification>",
+    "<task-notification>",
+    "This session is being continued from a previous conversation",
+    "Base directory for this skill:",
+    "Run the `continual-learning` skill now",
+    "<user_shell_command>",
+)
+
+
+def is_automated(text: str) -> bool:
+    return text.lstrip().startswith(AUTOMATED_PREFIXES)
+
+
+def spoken_text(text: str) -> str:
+    """ChatGPT voice turns are stored as JSON parts; keep only what was said or typed."""
+    stripped = text.lstrip()
+    if not stripped.startswith('[{"content_type"'):
+        return text
+    try:
+        parts = json.loads(stripped)
+    except ValueError:
+        return text
+    spoken = []
+    for part in parts if isinstance(parts, list) else []:
+        for item in part.get("parts", []) if isinstance(part, dict) else []:
+            if isinstance(item, str):
+                spoken.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                spoken.append(item["text"])
+    return " ".join(chunk.strip() for chunk in spoken if chunk.strip()) or text
+
+
 def parse_session(doc: object) -> Session | None:
     """Return None for documents that are not exported conversations."""
     if not isinstance(doc, dict) or not isinstance(doc.get("turns"), list):
         return None
     if not isinstance(doc.get("source"), str) or not isinstance(doc.get("session"), str):
         return None
-    messages = tuple(
-        Message(turn["role"], turn["text"])
-        for turn in doc["turns"]
-        if isinstance(turn, dict) and turn.get("role") in ("user", "assistant")
-        and isinstance(turn.get("text"), str) and turn["text"].strip()
-    )
+    messages = []
+    for turn in doc["turns"]:
+        if not isinstance(turn, dict) or turn.get("role") not in ("user", "assistant"):
+            continue
+        if not isinstance(turn.get("text"), str) or not turn["text"].strip():
+            continue
+        text = spoken_text(turn["text"])
+        if turn["role"] == "user" and is_automated(text):
+            continue
+        messages.append(Message(turn["role"], text))
+    messages = tuple(messages)
     return Session(doc["source"], doc["session"], str(doc.get("cwd") or ""),
                    str(doc.get("author") or "human"), float(doc.get("mtime") or 0.0), messages)
 

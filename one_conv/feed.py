@@ -185,12 +185,24 @@ def peers(root: Path, reader: str, now: float | None = None) -> list[str]:
     return sorted(set(found))
 
 
+class Ambiguous(Exception):
+    """A prefix names more than one thread; resolution must stop, not narrow by availability."""
+
+    def __init__(self, target: str, matches: Sequence[str]):
+        super().__init__(f"{target!r} matches several threads: {', '.join(sorted(matches))}")
+
+
 def match_address(target: str, candidates: Sequence[str]) -> str | None:
-    """`target` itself or the one candidate it is a prefix of, as `live send` resolves ids."""
+    """`target` itself or the one candidate it is a prefix of, as `live send` resolves ids.
+
+    None means no candidate matches; several matches raise Ambiguous.
+    """
     if target in candidates:
         return target
-    matches = [c for c in candidates if c.startswith(target)]
-    return matches[0] if len(matches) == 1 else None
+    matches = sorted({c for c in candidates if c.startswith(target)})
+    if len(matches) > 1:
+        raise Ambiguous(target, matches)
+    return matches[0] if matches else None
 
 
 def followed(state: FeedState, root: Path) -> list[str]:
@@ -293,6 +305,12 @@ def build_feed_command(find_threads: Callable[[list[str]], tuple[dict[str, Threa
         reader = reader or whoami()
         if not reader:
             raise click.UsageError("Not inside an agent session; pass --as ADDRESS.")
+        try:
+            run(reader, full_address, follow_address, unfollow_address, following, peek, max_chars, as_json)
+        except Ambiguous as error:
+            raise click.ClickException(f"{error} Give a longer id.") from None
+
+    def run(reader, full_address, follow_address, unfollow_address, following, peek, max_chars, as_json):
         with locked_state(root(), reader) as state:
             if follow_address or unfollow_address:
                 target = follow_address or unfollow_address

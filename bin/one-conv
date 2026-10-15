@@ -3696,9 +3696,9 @@ def _feed_stamp(handle: SessionHandle) -> str:
 def _feed_find_threads(addresses: list[str]):
     """Resolve `source:id` addresses (id or unique prefix) to feed threads over local transcripts.
 
-    A `cursor:` address may name an IDE chat or a cursor-agent chat; it must match exactly one.
+    A `cursor:` address may name an IDE chat or a cursor-agent chat; several matches raise Ambiguous.
     """
-    from one_conv.feed import Thread
+    from one_conv.feed import Ambiguous, Thread
     wanted: dict[str, list[tuple[str, str]]] = {}
     for address in addresses:
         source, _, ident = address.partition(":")
@@ -3715,7 +3715,9 @@ def _feed_find_threads(addresses: list[str]):
     found, missing = {}, []
     for address in addresses:
         handles = matches[address]
-        if len(handles) != 1:
+        if len(handles) > 1:
+            raise Ambiguous(address, [f"{h.source}:{h.uuid}" for h in handles])
+        if not handles:
             missing.append(address)
             continue
         handle = handles[0]

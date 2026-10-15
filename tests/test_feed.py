@@ -190,9 +190,14 @@ def test_first_digest_line_respects_the_cap(state):
 
 
 @pytest.mark.parametrize("target, expected", [
-    ("codex:01a1", "codex:01a13cb5"), ("codex:01a13cb5", "codex:01a13cb5"), ("codex:0", None), ("omp:01", None)])
+    ("codex:01a1", "codex:01a13cb5"), ("codex:01a13cb5", "codex:01a13cb5"), ("omp:01", None)])
 def test_match_address_needs_exact_or_unique_prefix(target, expected):
     assert feed.match_address(target, ["codex:01a13cb5", "codex:0bbb", "claude:01a1"]) == expected
+
+
+def test_match_address_with_several_prefix_matches_is_ambiguous():
+    with pytest.raises(feed.Ambiguous):
+        feed.match_address("codex:0", ["codex:01a13cb5", "codex:0bbb"])
 
 
 def test_state_filename_never_contains_the_address(tmp_path):
@@ -289,6 +294,34 @@ def test_cli_unfollow_after_transcript_vanished_succeeds(cli_env, tmp_path):
     run_feed(cli_env, "--follow", "claude:aaaa1111")
     path.unlink()
     assert run_feed(cli_env, "--unfollow", "claude:aaaa1111-0000").returncode == 0
+
+
+@pytest.fixture
+def two_follows_one_vanished(cli_env, tmp_path):
+    home = tmp_path / "claude"
+    _write_claude_session(home, "aaaa1111-0000-4000-8000-000000000002", ["first", "one"])
+    vanished = _write_claude_session(home, "aaaa1111-0000-4000-8000-000000000003", ["second", "two"])
+    run_feed(cli_env, "--follow", "claude:aaaa1111-0000-4000-8000-000000000002")
+    run_feed(cli_env, "--follow", "claude:aaaa1111-0000-4000-8000-000000000003")
+    vanished.unlink()
+    return cli_env
+
+
+def test_cli_unfollow_ambiguous_saved_prefix_fails(two_follows_one_vanished):
+    assert run_feed(two_follows_one_vanished, "--unfollow", "claude:aaaa1111", "--json").returncode == 1
+
+
+def test_cli_unfollow_ambiguous_saved_prefix_keeps_both_follows(two_follows_one_vanished):
+    run_feed(two_follows_one_vanished, "--unfollow", "claude:aaaa1111", "--json")
+    following = json.loads(run_feed(two_follows_one_vanished, "--following", "--json").stdout)["following"]
+    assert len(following) == 2
+
+
+def test_cli_follow_ambiguous_local_prefix_fails(cli_env, tmp_path):
+    home = tmp_path / "claude"
+    _write_claude_session(home, "aaaa1111-0000-4000-8000-000000000002", ["first", "one"])
+    _write_claude_session(home, "aaaa1111-0000-4000-8000-000000000003", ["second", "two"])
+    assert run_feed(cli_env, "--follow", "claude:aaaa1111").returncode == 1
 
 
 def test_cli_follow_json_returns_a_receipt(cli_env, tmp_path):

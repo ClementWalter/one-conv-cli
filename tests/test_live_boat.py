@@ -41,6 +41,11 @@ elif command == "prompt":
     time.sleep(float(os.environ.get("BOX_STUB_DELAY", "0")))
     print(json.dumps({"event": "chat", "final": True, "data": {"conversationId": args[3], "type": "prompt",
           "timestamp": 1, "data": {"prompt": args[-1], "status": "finished"}}}), flush=True)
+elif command == "steer":
+    if os.environ.get("BOX_STUB_STEER") == "ended":
+        print(json.dumps({"code": "no_running_turn", "error": "The last turn already ended", "event": "error", "status": 409}))
+        sys.exit(1)
+    print(json.dumps({"conversationId": args[3], "mode": "native", "status": "steered"}))
 elif command == "events":
     rows = [
         {"event": "chat", "final": True, "data": {"type": "prompt", "timestamp": 1, "data": {"prompt": "question"}}},
@@ -100,15 +105,21 @@ def test_delivery_resumes_the_target_conversation(box):
     assert calls(box)[-1][:4] == ["prompt", SANDBOX, "--resume", IDLE]
 
 
-def test_busy_conversation_is_refused_without_steering(box):
-    with pytest.raises(RuntimeError, match="running a turn"):
-        boat.deliver(LiveSession("boat", f"{SANDBOX}/{BUSY}", status="busy"), "<one-conv-message>hi</one-conv-message>")
+def test_busy_conversation_is_steered(box):
+    status = boat.deliver(LiveSession("boat", f"{SANDBOX}/{BUSY}", status="busy"), "<one-conv-message>hi</one-conv-message>")
+    assert status.startswith("steered into the running turn")
 
 
-def test_busy_refusal_calls_no_box_command(box):
-    with pytest.raises(RuntimeError):
-        boat.deliver(LiveSession("boat", f"{SANDBOX}/{BUSY}", status="busy"), "<one-conv-message>hi</one-conv-message>")
-    assert calls(box) == []
+def test_steer_passes_the_text_as_one_argument(box):
+    text = '<one-conv-message from="claude:c1">\nline "two" $(echo PWNED) x;y\n</one-conv-message>'
+    boat.deliver(LiveSession("boat", f"{SANDBOX}/{BUSY}", status="busy"), text)
+    assert calls(box)[-1] == ["steer", SANDBOX, "--convo", BUSY, "--json", "--no-update", text]
+
+
+def test_steer_after_the_turn_ended_falls_back_to_prompt(box, monkeypatch):
+    monkeypatch.setenv("BOX_STUB_STEER", "ended")
+    boat.deliver(LiveSession("boat", f"{SANDBOX}/{BUSY}", status="busy"), "<one-conv-message>hi</one-conv-message>")
+    assert calls(box)[-1][:4] == ["prompt", SANDBOX, "--resume", BUSY]
 
 
 def test_refused_prompt_reports_boats_reason(box, monkeypatch):

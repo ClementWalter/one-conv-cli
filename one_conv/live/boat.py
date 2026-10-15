@@ -2,8 +2,9 @@
 
 An address is `boat:<sandbox>/<conversation>`, using Boat's conversation id; the agent's
 native session id inside the sandbox is a different value and is not used for routing.
-Messages go only into idle conversations with `box prompt --resume`: Boat's `steer`
-relabels the text as the user's own instruction, which a peer message must never become.
+An idle conversation gets `box prompt --resume`; a busy one gets `box steer`. Boat wraps
+a steered text as a message from the user and may stop the running command, so the
+one-conv envelope inside it is what still names the real sender.
 Replies are read back with `box events`, so nothing in the sandbox has to reach this machine.
 """
 
@@ -145,22 +146,23 @@ def _pending_for(address: str) -> str | None:
 
 
 def deliver(session: LiveSession, text: str) -> str:
-    """Prompt an idle conversation; the idle state is read just before, not held.
+    """Prompt an idle conversation or steer a busy one; the state is read just before, not held.
 
     A turn that starts between that read and Boat accepting the prompt would receive the
     message mid-turn as a normal prompt; Boat offers no conditional prompt to close this.
     A prompt Boat has not confirmed in time is reported as pending, not failed: the
     detached `box prompt` may still deliver it, so resending could deliver it twice.
     """
-    if session.status != "idle":
-        raise RuntimeError(f"{session.address} is running a turn. Boat can only steer a busy "
-                           "conversation, which would present this message as the user's own "
-                           "instruction; send it again once the turn has ended.")
     earlier = _pending_for(session.address)
     if earlier:
         raise RuntimeError(f"An earlier message to {session.address} has no confirmed outcome (op {earlier}). "
                            f"Check it with `one-conv live status {earlier}` before sending again.")
     sandbox, conversation = split(session.id)
+    if session.status != "idle":
+        steered = _steer(sandbox, conversation, text)
+        if steered is not None:
+            return steered
+        # The turn ended between listing and steering: prompt it like an idle conversation.
     op = uuid.uuid4().hex[:OP_ID_LENGTH]
     _operations().mkdir(parents=True, exist_ok=True)
     log_path = _operations() / f"{op}.log.jsonl"
@@ -187,6 +189,32 @@ def deliver(session: LiveSession, text: str) -> str:
         time.sleep(0.2)
     return (f"pending: Boat has not confirmed the prompt yet (op {op}). Do not resend; "
             f"check it with `one-conv live status {op}`")
+
+
+def _steer(sandbox: str, conversation: str, text: str) -> str | None:
+    """Add `text` to the running turn; None when the turn has already ended."""
+    try:
+        result = subprocess.run(
+            ["box", "steer", sandbox, "--convo", conversation, "--json", "--no-update", text],
+            check=False, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Boat gave no answer to the steer within 60s; it may still arrive. "
+                           f"Do not resend; read the conversation with `one-conv live pull boat:{sandbox}/{conversation}`"
+                           ) from error
+    for line in result.stdout.splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("status") == "steered":
+            return ("steered into the running turn (Boat shows it as a message from the user; the "
+                    f"envelope names the sender); read the reply with `one-conv live pull boat:{sandbox}/{conversation}`")
+        if row.get("code") == "no_running_turn":
+            return None
+        if row.get("event") == "error":
+            raise RuntimeError(f"Boat refused the steer: {row.get('code')}: {row.get('error', '')}")
+    raise RuntimeError(f"box steer exited {result.returncode} without an answer; it may still arrive. "
+                       f"Do not resend; read the conversation with `one-conv live pull boat:{sandbox}/{conversation}`")
 
 
 def pull(ident: str) -> list[dict]:

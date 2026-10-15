@@ -72,14 +72,17 @@ def _attr(value: str) -> str:
     return html.escape(value, quote=True)
 
 
-def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", reply: str = "expected") -> str:
-    """Wrap a message so the receiver knows who sent it and whether an answer is wanted.
+def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", reply: str = "expected",
+             message_id: str | None = None, topic: str | None = None, handle: str | None = None) -> str:
+    """Wrap a message so the receiver knows who sent it, on which topic, and whether to answer.
 
-    `origin` labels a sender that is not an agent session: "user" only for an
-    interactive terminal, "unknown" for anything else (a detached or scripted process).
-    `reply="none"` marks a notice that ends an exchange: it carries no reply instruction.
+    The sender is a teammate working for the same user: the message is a request to act on
+    within that user's task, but it is not the user typing and it grants no new approval.
+    `origin` labels a sender that is not an agent session: "user" only for an interactive
+    terminal, "unknown" otherwise. `reply="none"` marks a notice that ends an exchange.
     `reply="inline"` is for a receiver the sender reads back from (a Boat sandbox), which
     answers in its own conversation because it cannot message this machine.
+    `message_id` stays the same across retries so a receiver can drop duplicates.
     """
     text = _ENVELOPE_TAG.sub(r"&lt;\1", text)
     if reply not in ("expected", "none", "inline"):
@@ -88,10 +91,16 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
         attrs = f'from="{_attr(origin)}"'
     else:
         attrs = f'from="{_attr(sender.address)}"'
+        if handle:
+            attrs += f' from-handle="@{_attr(handle)}"'
         if sender.title:
             attrs += f' from-name="{_attr(sender.title)}"'
         if sender.cwd:
             attrs += f' from-cwd="{_attr(sender.cwd)}"'
+    if topic:
+        attrs += f' topic="#{_attr(topic)}"'
+    if message_id:
+        attrs += f' id="{_attr(message_id)}"'
     footer = ""
     if reply == "none":
         attrs += ' reply="none"'
@@ -100,5 +109,6 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
         attrs += ' reply="inline"'
         footer = "\nAnswer in this conversation; the sender reads your reply back from here."
     elif sender is not None and not sender.id.startswith("?"):
-        footer = f'\nTo reply, call the one-conv send_message tool with to="{_attr(sender.address)}".'
+        footer = f'\nTo reply, call the one-conv send_message tool with to="{_attr(sender.address)}"'
+        footer += f', or to="#{_attr(topic)}" to answer everyone on the topic.' if topic else "."
     return f"<one-conv-message {attrs}>\n{text}\n</one-conv-message>{footer}"

@@ -178,6 +178,12 @@ def submit(hub: HubClient, message: dict) -> dict | None:
     return detail
 
 
+def _joined(answer, topic: str, sender: str) -> bool:
+    """The hub names this topic and this sender, qualified by whichever node it was published on."""
+    return (isinstance(answer, dict) and answer.get("topic") == topic
+            and isinstance(answer.get("member"), str) and answer["member"].endswith("/" + sender))
+
+
 def _classify(error: Exception) -> str:
     # Only a 4xx is the hub's verdict on this message; a redirect or 5xx may follow a commit.
     if isinstance(error, HubRefused) and 400 <= error.status < 500 and error.status not in RETRYABLE:
@@ -194,9 +200,12 @@ def _outcome(hub: HubClient, message: dict) -> tuple[str, object]:
     """
     if message.get("join_topic"):
         try:
-            hub.join(message["topic"], message["from"])
+            joined = hub.join(message["topic"], message["from"])
         except (HubUnavailable, HubRefused) as error:
             return _classify(error), error
+        if not _joined(joined, message["topic"], message["from"]):
+            # Without proof of membership a post could reach an empty topic and be refused for good.
+            return "retry", "the hub's answer to the join does not confirm this sender's membership"
     try:
         receipt = hub.post({key: value for key, value in message.items() if key != "join_topic"})
     except (HubUnavailable, HubRefused) as error:

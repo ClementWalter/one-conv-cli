@@ -203,7 +203,8 @@ def test_topic_post_carries_a_push_delivery_mode(capture_server, tmp_path, monke
     monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
     monkeypatch.setenv("ONE_CONV_HUB_URL", target)
     monkeypatch.setenv("ONE_CONV_HUB_TOKEN", "t")
-    router.send("#release", "go", LiveSession("claude", "c1"))
+    # A sender that is not a session posts without joining, so the capture sees the POST itself.
+    router.send("#release", "go", None, "user")
     assert json.loads(seen[-1]["body"])["mode"] == "push"
 
 
@@ -553,4 +554,37 @@ def test_after_a_failed_join_the_peers_reply_reaches_the_sender(hub, flaky):
     flaky.clear()
     hubclient.drain(hubclient.configured())
     as_box(url, box).post({"id": "e" * 32, "to": "#release", "from": BOX_SESSION, "text": "on it"})
+    assert [m["text"] for m in state.inbox("mac", 0)] == ["on it"]
+
+
+@pytest.mark.parametrize("answer", [{}, None, {"topic": "release"}, {"topic": "other", "member": "mac/claude:c1"},
+                                    {"topic": "release", "member": "mac/claude:someone-else"}])
+def test_unconfirmed_join_keeps_the_send_queued_and_posts_nothing(hub, monkeypatch, answer):
+    state, url, box = hub
+    as_box(url, box).join("release", BOX_SESSION)
+    monkeypatch.setattr(hubclient.HubClient, "join", lambda self, topic, address: answer)
+    router.send("#release", "go", LiveSession("claude", "c1"))
+    assert (state.inbox("box", 0), len(list(hubclient.outbox().glob("*.json")))) == ([], 1)
+
+
+def test_after_an_unconfirmed_join_the_drain_stores_one_post(hub, monkeypatch):
+    _, url, box = hub
+    real_join = hubclient.HubClient.join
+    monkeypatch.setattr(hubclient.HubClient, "join", lambda self, topic, address: {})
+    router.send("#empty-answer-topic", "kickoff", LiveSession("claude", "c1"))
+    monkeypatch.setattr(hubclient.HubClient, "join", real_join)
+    hubclient.drain(hubclient.configured())
+    hubclient.drain(hubclient.configured())
+    assert [m["text"] for m in as_box(url, box).history("empty-answer-topic")] == ["kickoff"]
+
+
+def test_after_an_unconfirmed_join_replies_reach_the_sender(hub, monkeypatch):
+    state, url, box = hub
+    as_box(url, box).join("release", BOX_SESSION)
+    real_join = hubclient.HubClient.join
+    monkeypatch.setattr(hubclient.HubClient, "join", lambda self, topic, address: {})
+    router.send("#release", "go", LiveSession("claude", "c1"))
+    monkeypatch.setattr(hubclient.HubClient, "join", real_join)
+    hubclient.drain(hubclient.configured())
+    as_box(url, box).post({"id": "f" * 32, "to": "#release", "from": BOX_SESSION, "text": "on it"})
     assert [m["text"] for m in state.inbox("mac", 0)] == ["on it"]

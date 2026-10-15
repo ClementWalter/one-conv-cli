@@ -1,6 +1,7 @@
 """Exercise real native readers, HTTP sync and unchanged CLI commands on isolated history."""
 import base64
 import copy
+import dataclasses
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -528,6 +529,47 @@ def test_capture_ignores_a_transcript_swapped_and_restored_during_the_parse(tmp_
     monkeypatch.setattr(reader, "_handle_iter_turns", swap_parse_restore)
     document = sync.capture(reader, handle, "origin")
     assert not any(outside_word in json.dumps(turn) for turn in document["turns"])
+
+
+@pytest.fixture
+def cursor_cli_title_swapped_at_discovery(tmp_path, monkeypatch):
+    """A Cursor CLI chat whose meta.json was a link to an outside title only while discovery read it."""
+    from test_cursor_cli import CHAT_ID, _write_chat
+    env = fixture_env(tmp_path)
+    _write_chat(Path(env["CURSOR_CLI_HOME"]))
+    meta = next(Path(env["CURSOR_CLI_HOME"]).glob(f"**/{CHAT_ID}/meta.json"))
+    outside = tmp_path / "outside-meta.json"
+    outside.write_text(meta.read_text().replace("Fix the widget", "FIX THE WIDGET"))
+    for name in ("CURSOR_CLI_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    parked = meta.with_name("parked.json")
+    meta.rename(parked)
+    meta.symlink_to(outside)
+    try:
+        handle = next(h for p in reader._native_projects(("cursor-cli",)) for h in reader._native_project_sessions(p))
+    finally:
+        meta.unlink()
+        parked.rename(meta)
+    return sync, reader, handle
+
+
+def test_discovery_title_from_a_swapped_meta_file_is_not_archived(cursor_cli_title_swapped_at_discovery):
+    sync, reader, handle = cursor_cli_title_swapped_at_discovery
+    assert sync.capture(reader, handle, "origin")["summary"]["title"] == "Fix the widget"
+
+
+def test_omp_title_comes_from_the_captured_transcript(tmp_path, monkeypatch):
+    env = fixture_env(tmp_path)
+    path = write_omp_transcript(env)
+    for name in ("OMP_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects(("omp",)) for h in reader._native_project_sessions(p))
+    stale = dataclasses.replace(handle, title_hint="A TITLE READ FROM ELSEWHERE")
+    assert sync.capture(reader, stale, "origin")["summary"]["title"] == reader._omp_session_meta(path)["title"]
 
 
 def test_read_regular_refuses_without_nofollow_opens(tmp_path, monkeypatch):

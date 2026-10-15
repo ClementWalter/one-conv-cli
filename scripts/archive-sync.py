@@ -229,12 +229,26 @@ def snapshot_store(path):
 PROTECTED_SOURCES = ("claude", "codex", "omp", "cursor-cli")
 
 
+def captured_title(reader, source, copy):
+    """The title discovery would give, read again from the private copy instead of the live files."""
+    if source == "cursor-cli":
+        try:
+            meta = json.loads((copy.parent / "meta.json").read_text())
+        except (OSError, ValueError):
+            return None
+        return (meta.get("title") or None) if isinstance(meta, dict) else None
+    if source == "omp":
+        return reader._omp_session_meta(copy).get("title") or None
+    return None  # Claude Code and Codex titles come from the turns, which are parsed from the copy.
+
+
 @contextmanager
-def captured_copy(handle, paths, originals):
+def captured_copy(reader, handle, paths, originals):
     """`handle` pointed at a private copy of its captured bytes, laid out as on disk.
 
     The reader opens files by path; parsing the copy means turns, summary and title come from the
-    same bytes as the archived originals, whatever replaces the real paths meanwhile.
+    same bytes as the archived originals, whatever replaces the real paths meanwhile. The title hint
+    found at discovery is replaced too: it was read from the live files, possibly through a link.
     """
     if handle.source not in PROTECTED_SOURCES or handle.path is None:
         yield handle
@@ -246,7 +260,8 @@ def captured_copy(handle, paths, originals):
             target = root / path.relative_to(base)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(originals[str(path)])
-        yield dataclasses.replace(handle, path=root / handle.path.relative_to(base))
+        copy = root / handle.path.relative_to(base)
+        yield dataclasses.replace(handle, path=copy, title_hint=captured_title(reader, handle.source, copy))
 
 
 def original_records(reader, handle, paths):
@@ -291,7 +306,7 @@ def capture(reader, handle, origin):
         if cached.get("complete") is False:
             raise ArchiveError(f"Incomplete provider capture: {handle.uuid}; pull complete history first")
         account_label = cached.get("account_label")
-    with captured_copy(handle, paths, originals) as parsed:
+    with captured_copy(reader, handle, paths, originals) as parsed:
         turns = reader._handle_iter_turns(parsed, include_subagents=False)
         expanded = reader._handle_iter_turns(parsed, include_subagents=True) if handle.source == "claude" else None
         summary = reader._handle_summary(parsed, {})

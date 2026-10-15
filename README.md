@@ -271,6 +271,26 @@ if that record cannot be written, the send still reports delivered with a warnin
 The record only chooses what `local feed` follows by default; it grants no
 permission and is not evidence of anyone's approval.
 
+### Agents in Boat sandboxes
+
+`boat:<sandbox>/<conversation>` addresses a coding agent running in a
+[Boat](https://boat.dev) sandbox, through the `box` CLI and your Boat account.
+The conversation id is Boat's, not the agent's own session id.
+
+```bash
+one-conv live ls --harness boat            # running sandboxes' conversations, idle or busy
+one-conv live send boat:bx_ab12/2ab1… "run the tests" --yes
+one-conv live pull boat:bx_ab12/2ab1…      # read the agent's answers back
+```
+
+- Delivery uses `box prompt --resume` and only reaches an idle conversation. A busy
+  one is refused, because Boat's `steer` would present a peer message as your
+  own instruction.
+- The remote agent cannot message this machine, so the envelope asks it to answer
+  in its own conversation, and `live pull` reads that back with `box events`.
+- `--fyi` cannot reach a sandbox. Boat is listed only when asked for by name
+  (`--harness boat` or a `boat:` address), since listing calls Boat's API.
+
 ### Keeping multi-agent exchanges readable
 
 Any agent can read another agent's thread with `one-conv local thread`, so an

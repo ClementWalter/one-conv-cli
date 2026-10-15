@@ -6,7 +6,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-HARNESSES = ("claude", "codex", "omp", "cursor")
+HARNESSES = ("claude", "codex", "omp", "cursor", "boat")
 
 
 @dataclass(frozen=True)
@@ -78,10 +78,12 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
     `origin` labels a sender that is not an agent session: "user" only for an
     interactive terminal, "unknown" for anything else (a detached or scripted process).
     `reply="none"` marks a notice that ends an exchange: it carries no reply instruction.
+    `reply="inline"` is for a receiver the sender reads back from (a Boat sandbox), which
+    answers in its own conversation because it cannot message this machine.
     """
     text = _ENVELOPE_TAG.sub(r"&lt;\1", text)
-    if reply not in ("expected", "none"):
-        raise ValueError(f"reply must be 'expected' or 'none', got {reply!r}")
+    if reply not in ("expected", "none", "inline"):
+        raise ValueError(f"reply must be 'expected', 'none' or 'inline', got {reply!r}")
     if sender is None:
         attrs = f'from="{_attr(origin)}"'
     else:
@@ -94,6 +96,8 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
     if reply == "none":
         attrs += ' reply="none"'
         footer = "\nNo reply expected. Do not reply to this message."
+    elif reply == "inline":
+        footer = "\nAnswer in this conversation; the sender reads your reply back from here."
     elif sender is not None and not sender.id.startswith("?"):
         footer = f'\nTo reply, call the one-conv send_message tool with to="{_attr(sender.address)}".'
     return f"<one-conv-message {attrs}>\n{text}\n</one-conv-message>{footer}"

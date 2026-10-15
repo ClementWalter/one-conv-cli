@@ -17,6 +17,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
+from . import tunnel
 from .model import live_home
 
 
@@ -59,12 +60,18 @@ def check_url(url: str) -> str:
 
 
 class HubClient:
-    def __init__(self, url: str, token: str, node: str | None = None, timeout: float = 15):
+    def __init__(self, url: str, token: str, node: str | None = None, timeout: float = 15,
+                 listener_pid: int | None = None):
         self.url, self.token, self.node, self.timeout = check_url(url), token, node, timeout
+        # The bridge's ssh process: a forwarded port is trusted only while that process holds it.
+        self.listener_pid = listener_pid
         # An empty ProxyHandler keeps http_proxy/https_proxy from routing the token and body elsewhere.
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
     def request(self, method: str, path: str, body: dict | None = None) -> dict:
+        if self.listener_pid is not None and not tunnel.listening(self.listener_pid, urlsplit(self.url).port or 0):
+            # The bridge's forward is gone; whatever listens on that port now must not get the token.
+            raise HubUnavailable("the bridge's ssh forward is not running")
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(self.url + path, data=data, method=method,
                                          headers={"Authorization": f"Bearer {self.token}"})
@@ -118,18 +125,36 @@ def configured() -> HubClient | None:
                 raise HubRefused(0, "ONE_CONV_HUB_TOKEN is set but no hub URL is configured")
             return None
         url, node = config.get("url"), node or config.get("node")
+        listener = config.get("tunnel_pid") if isinstance(config.get("tunnel_pid"), int) else None
         # A token on its own rotates the credential for the configured hub, nothing else.
         token = env_token or config.get("token")
     if not (isinstance(url, str) and isinstance(token, str) and url and token):
         return None
     try:
-        return HubClient(url, token, node if isinstance(node, str) else None)
+        return HubClient(url, token, node if isinstance(node, str) else None,
+                         listener_pid=None if env_url else listener)
     except ValueError as error:
         raise HubRefused(0, f"configured hub URL rejected: {error}") from None
 
 
 def outbox() -> Path:
     return live_home() / "bridge" / "outbox"
+
+
+def post_durably(client: HubClient, message: dict) -> dict:
+    """Post `message`, with its outbox record written first so a crash mid-post leaves it to resume.
+
+    The record goes once the hub has answered either way; on HubUnavailable it stays, and the
+    bridge posts it under the same id, which the hub answers with the first receipt.
+    """
+    path = queue(message)
+    try:
+        receipt = client.post(message)
+    except HubRefused:
+        path.unlink(missing_ok=True)
+        raise
+    path.unlink(missing_ok=True)
+    return receipt
 
 
 def queue(message: dict) -> Path:

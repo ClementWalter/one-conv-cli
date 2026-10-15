@@ -105,6 +105,7 @@ def test_stdio_discovers_tools(saved_history):
     result = protocol_call(saved_history, None, {})
     assert {tool.name for tool in result.tools} == {
         "list_chats", "read_conversation", "search_conversations", "find_conversations", "list_accounts",
+        "list_live_sessions", "send_message",
     }
 
 
@@ -132,4 +133,40 @@ def test_generated_config_starts_server():
         async with Client(StdioServerParameters(**config)) as client:
             return await client.list_tools()
 
-    assert len(asyncio.run(discover()).tools) == 5
+    assert len(asyncio.run(discover()).tools) == 7
+
+
+def test_stdio_send_message_names_codex_caller_from_tool_meta(tmp_path):
+    """Codex identifies its thread only in each tool call's `_meta`."""
+    live = tmp_path / "live"
+    (live / "omp").mkdir(parents=True)
+    (live / "omp" / "o1.json").write_text(json.dumps({"pid": os.getpid(), "sessionId": "o1", "cwd": "/work"}))
+
+    async def send():
+        parameters = StdioServerParameters(
+            command=sys.executable, args=["-O", str(mcp_server.LAUNCHER), "mcp"],
+            env={**os.environ, "ONE_CONV_LIVE_DIR": str(live), "CODEX_HOME": str(tmp_path / "codex")})
+        async with Client(parameters) as client:
+            return await client.call_tool("send_message", {"to": "omp:o1", "text": "hi"},
+                                          meta={"threadId": "t-123"})
+
+    asyncio.run(send())
+    [message] = (live / "inbox" / "omp" / "o1").glob("*.json")
+    assert 'from="codex:t-123"' in json.loads(message.read_text())["text"]
+
+
+def test_stdio_send_message_fyi_leaves_notice(tmp_path):
+    live = tmp_path / "live"
+    (live / "omp").mkdir(parents=True)
+    (live / "omp" / "o1.json").write_text(json.dumps({"pid": os.getpid(), "sessionId": "o1", "cwd": "/work"}))
+
+    async def send():
+        parameters = StdioServerParameters(
+            command=sys.executable, args=["-O", str(mcp_server.LAUNCHER), "mcp"],
+            env={**os.environ, "ONE_CONV_LIVE_DIR": str(live), "CODEX_HOME": str(tmp_path / "codex")})
+        async with Client(parameters) as client:
+            return await client.call_tool("send_message", {"to": "omp:o1", "text": "merged", "fyi": True},
+                                          meta={"threadId": "t-123"})
+
+    asyncio.run(send())
+    assert json.loads((live / "fyi" / "omp-o1.jsonl").read_text())["from"] == "codex:t-123"

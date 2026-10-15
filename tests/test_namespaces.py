@@ -28,7 +28,7 @@ def app(monkeypatch):
 def test_root_lists_only_namespaces(app):
     result = CliRunner().invoke(app.cli, ["--help"])
     commands = result.output.split("Commands:\n")[1].split("\n\n")[0]
-    assert [line.strip().split()[0] for line in commands.splitlines()] == ["cloud", "local", "mcp"]
+    assert [line.strip().split()[0] for line in commands.splitlines()] == ["cloud", "local", "live", "tune", "mcp"]
 
 
 @pytest.fixture

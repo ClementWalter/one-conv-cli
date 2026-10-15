@@ -106,7 +106,8 @@ def retry_response(request, pauses=(5, 15, 45), sleep=time.sleep):
 class JsonTransport:
     """Bound GET retries and prohibit redirects from carrying provider credentials."""
 
-    def __init__(self, session, base_url, fingerprint, max_attempts=3, timeout=20, sleep=time.sleep):
+    def __init__(self, session, base_url, fingerprint, max_attempts=3, timeout=20, sleep=time.sleep,
+                 max_retry_delay=30):
         if max_attempts < 1 or timeout <= 0:
             raise ValueError("Attempts and timeout must be positive")
         parsed = urlsplit(base_url)
@@ -118,6 +119,7 @@ class JsonTransport:
         self.max_attempts = max_attempts
         self.timeout = timeout
         self.sleep = sleep
+        self.max_retry_delay = max_retry_delay
 
     def get(self, path, params=None):
         return self._request("get", path, {"params": params})
@@ -148,7 +150,7 @@ class JsonTransport:
                 delay = retry_delay(getattr(response, "headers", {}).get("Retry-After"))
                 delay = 2 ** attempt if delay is None else delay
                 # Long provider delays belong in a job queue, not a blocked MCP request.
-                if attempt + 1 == self.max_attempts or delay > 30:
+                if attempt + 1 == self.max_attempts or delay > self.max_retry_delay:
                     if status == 429:
                         raise RateLimited(f"{self.fingerprint}: retry later", delay)
                     raise ProviderUnavailable(f"{self.fingerprint}: upstream unavailable")

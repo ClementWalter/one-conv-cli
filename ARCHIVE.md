@@ -38,8 +38,17 @@ token, commands warn on stderr and show native history only.
 - The sync script keeps an installation ID in one-conv's state directory. When
   several installations upload one conversation (another machine, or a reset state
   directory), readers show the newest copy.
-- A conversation is re-read only when its main source file's modification time or
-  the one-conv version that captured it differs from the archived capture.
+- A conversation is re-read when its main file's modification time, the one-conv
+  version that captured it, or its source stamp differs from the last capture, or
+  when the archive's current revision is no longer the one this machine uploaded or
+  confirmed. The source stamp covers every file a conversation reads: the files in a
+  Claude session folder, a Cursor CLI store's write-ahead log, and, for Cursor IDE,
+  that conversation's own database rows. Stamps live in `archive-stamps.json` in the
+  state directory.
+- Inside a Claude session folder, a file or subfolder that is already a symlink is
+  skipped, and one replaced by a symlink during capture makes the read refuse. This
+  covers the session folder only: a conversation's main transcript is read at its
+  path, and a symlink there is followed.
 - Each native record is archived separately, even when records share a session ID
   (Codex subagent rollouts share their parent's).
 - Each upload names the revision it replaces, so concurrent captures are rejected.
@@ -68,8 +77,10 @@ stopped without finishing blocks others for at most an hour.
 `uv run scripts/archive-sync.py --source claude --source codex --source omp --free-older-than 90`
 syncs, then deletes Claude Code, Codex and Oh My Pi conversations unchanged for 90
 days whose every file the archive holds byte for byte. A conversation with any file
-the archive lacks, or that changes during the check, is kept, and the reason is
-printed. Cursor conversations live in shared databases and are never deleted. Freed
+the archive lacks, that changes during the check, whose session is running (listed by
+`one-conv live` or held open by a process), or whose folders cannot be opened without
+following symlinks, is kept, and the reason is printed. Deletion goes through folders
+opened once at the start, so a folder replaced during the check cannot redirect it. Cursor conversations live in shared databases and are never deleted. Freed
 conversations still appear in every one-conv command, read from the archive.
 
 Before deleting, freeing marks the archived capture as freed from this machine.

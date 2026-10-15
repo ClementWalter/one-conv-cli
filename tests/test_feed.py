@@ -200,6 +200,82 @@ def test_match_address_with_several_prefix_matches_is_ambiguous():
         feed.match_address("codex:0", ["codex:01a13cb5", "codex:0bbb"])
 
 
+def fyi(path: Path, n: int, start: int = 0, at: float = 1000.0) -> None:
+    with path.open("a") as handle:
+        for i in range(start, start + n):
+            handle.write(json.dumps({"id": f"m{i}", "at": at + i, "from": PEER, "to": READER,
+                                     "text": f'<one-conv-message from="{PEER}" reply="none">\nnote {i}\n'
+                                             f"</one-conv-message>\nNo reply expected."}) + "\n")
+
+
+@pytest.fixture
+def inbox(tmp_path):
+    return tmp_path / "inbox.jsonl"
+
+
+def test_message_body_strips_the_envelope():
+    assert feed.message_body('<one-conv-message from="x">\nhello\n</one-conv-message>\nNo reply expected.') == "hello"
+
+
+def test_inbox_digest_lists_each_unseen_message(state, inbox):
+    fyi(inbox, 2)
+    assert len(feed.inbox_digest(state, inbox, 1500, peek=False)["lines"]) == 2
+
+
+def test_inbox_digest_line_shows_the_body(state, inbox):
+    fyi(inbox, 1)
+    assert feed.inbox_digest(state, inbox, 1500, peek=False)["lines"][0].endswith("note 0")
+
+
+def test_repeated_inbox_digest_is_quiet(state, inbox):
+    fyi(inbox, 2)
+    feed.inbox_digest(state, inbox, 1500, peek=False)
+    assert feed.inbox_digest(state, inbox, 1500, peek=False)["lines"] == []
+
+
+def test_inbox_digest_then_full_still_returns_the_text(state, inbox):
+    fyi(inbox, 2)
+    feed.inbox_digest(state, inbox, 1500, peek=False)
+    assert [m["body"] for m in feed.inbox_full(state, inbox, peek=False)] == ["note 0", "note 1"]
+
+
+def test_inbox_full_after_append_returns_only_new(state, inbox):
+    fyi(inbox, 2)
+    feed.inbox_full(state, inbox, peek=False)
+    fyi(inbox, 1, start=2)
+    assert [m["body"] for m in feed.inbox_full(state, inbox, peek=False)] == ["note 2"]
+
+
+def test_inbox_peek_moves_nothing(state, inbox):
+    fyi(inbox, 2)
+    feed.inbox_digest(state, inbox, 1500, peek=True)
+    assert state.data.get("inbox") == {}
+
+
+def test_inbox_cap_leaves_the_rest_pending(state, inbox):
+    fyi(inbox, 3)
+    feed.inbox_digest(state, inbox, 80, peek=False)
+    assert len(feed.inbox_digest(state, inbox, 1500, peek=False)["lines"]) == 2
+
+
+def test_inbox_after_pruning_resumes_by_time(state, inbox):
+    fyi(inbox, 3)
+    feed.inbox_full(state, inbox, peek=False)
+    inbox.write_text("")
+    fyi(inbox, 2, start=3)
+    assert [m["body"] for m in feed.inbox_full(state, inbox, peek=False)] == ["note 3", "note 4"]
+
+
+def test_missing_inbox_is_empty(state, tmp_path):
+    assert feed.inbox_digest(state, tmp_path / "absent.jsonl", 1500, peek=False)["lines"] == []
+
+
+def test_malformed_inbox_line_is_skipped(state, inbox):
+    inbox.write_text("{\n")
+    fyi(inbox, 1)
+    assert len(feed.inbox_digest(state, inbox, 1500, peek=False)["lines"]) == 1
+
+
 def test_state_filename_never_contains_the_address(tmp_path):
     assert ":" not in feed.FeedState(tmp_path, "codex:01a1/../x").path.name
 

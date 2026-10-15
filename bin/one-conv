@@ -3748,9 +3748,18 @@ def _feed_live_addresses() -> list[str]:
     return [session.address for session in router.list_all()]
 
 
+def _feed_inbox_path(reader: str) -> Path | None:
+    from one_conv.live import router
+    try:
+        return router.fyi_inbox(reader)
+    except ValueError:  # a reader address that cannot name an inbox file has no FYI messages
+        return None
+
+
 from one_conv.feed import build_feed_command  # noqa: E402
 
-_feed_command = build_feed_command(_feed_find_threads, _feed_whoami, _feed_root, _feed_live_addresses)
+_feed_command = build_feed_command(_feed_find_threads, _feed_whoami, _feed_root, _feed_live_addresses,
+                                   _feed_inbox_path)
 _feed_command.hidden = True
 cli.add_command(_feed_command)
 

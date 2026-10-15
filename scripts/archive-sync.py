@@ -52,15 +52,49 @@ def source_paths(reader, handle):
     paths = [handle.path] if handle.path else []
     if handle.source == "claude":
         # The session folder holds subagent transcripts, full tool outputs, workflows and the title.
-        paths.extend(sorted(p for p in (handle.path.parent / handle.uuid).rglob("*") if p.is_file()))
+        paths.extend(session_files(handle.path.parent / handle.uuid))
     if handle.source == "cursor-cli":
         paths.append(handle.path.parent / "meta.json")
     return paths
 
 
+def session_files(folder):
+    """Regular files under a session folder; symlinks are skipped so a capture never reads outside it."""
+    files = []
+    for directory, _, names in os.walk(folder, followlinks=False):
+        for name in names:
+            path = Path(directory) / name
+            if not path.is_symlink() and path.is_file():
+                files.append(path)
+    return sorted(files)
+
+
+def source_stamp(paths):
+    """Size and time of every source file, write-ahead logs included, as one comparable value."""
+    return digest(encode(fingerprint(paths)))
+
+
+def load_stamps(reader):
+    try:
+        stamps = json.loads((reader.STATE_DIR / "archive-stamps.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return stamps if isinstance(stamps, dict) else {}
+
+
+def save_stamps(reader, stamps):
+    path = reader.STATE_DIR / "archive-stamps.json"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    partial.write_text(json.dumps(stamps, sort_keys=True))
+    os.replace(partial, path)
+
+
 def fingerprint(paths):
     files = [p for path in paths for p in (path, Path(str(path) + "-wal"))]
-    return [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in files if p.exists()]
+    # Reading a checkpointed SQLite store creates an empty -wal; it holds no data, so it counts as absent.
+    return [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in files
+            if p.exists() and not (p.name.endswith("-wal") and p.stat().st_size == 0)]
 
 
 def original_records(reader, handle, paths):
@@ -137,26 +171,34 @@ def main():
     projects = [p for p in reader._native_projects(tuple(args.source)) if not args.project or args.project.lower() in p.cwd.lower()]
     handles = sorted((h for p in projects for h in reader._native_project_sessions(p)), key=lambda h: h.mtime, reverse=True)
     uploaded = unchanged = failed = 0
+    stamps = load_stamps(reader)
     for handle in handles[:args.limit] if args.limit else handles:
         try:
             key = conversation_key(origin, handle.source, handle.project_cwd, handle.uuid, reader._record_locator(handle))
             archived = existing.get(key)
-            if archived and archived["mtime"] == handle.mtime and archived["capture_version"] == CAPTURE_VERSION:
+            # The listed time covers only the main file; the stamp also covers a Cursor CLI
+            # write-ahead log and every file in a Claude session folder.
+            stamp = source_stamp(source_paths(reader, handle))
+            if (archived and archived["mtime"] == handle.mtime and archived["capture_version"] == CAPTURE_VERSION
+                    and stamps.get(key) == stamp):
                 unchanged += 1  # Avoid re-reading and re-encoding unchanged history.
                 continue
             manifest, chunks = pack(capture(reader, handle, origin))
             digest = revision(manifest)
             if archived and archived["revision"] == digest:
+                stamps[key] = stamp
                 unchanged += 1
                 continue
             receipt = client.put(manifest, chunks, archived["revision"] if archived else None)
             if receipt != {"key": key, "revision": digest}:
                 raise ArchiveError("Archive acknowledgement does not match the uploaded capture")
             existing[key] = {"revision": digest, "mtime": handle.mtime}
+            stamps[key] = stamp
             uploaded += 1
         except Exception as error:  # One unreadable conversation must not stop the others.
             failed += 1
             print(f"{handle.source}/{handle.uuid}: {type(error).__name__}: {error}", file=sys.stderr)
+    save_stamps(reader, stamps)
     result = {"uploaded": uploaded, "unchanged": unchanged}
     if failed:
         result["failed"] = failed

@@ -7,19 +7,27 @@
 
 import argparse
 import base64
-from dataclasses import asdict
 import importlib.machinery
 import importlib.util
 import json
 import os
-from pathlib import Path
 import sqlite3
 import sys
 import uuid
+from dataclasses import asdict
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from one_conv.archive import ArchiveError, configured_client, conversation_key, digest, encode, pack, revision
+from one_conv.archive import (
+    ArchiveError,
+    configured_client,
+    conversation_key,
+    digest,
+    encode,
+    pack,
+    revision,
+)
 
 # Captures re-run when the reader or this capture code changes, even if sources did not.
 CAPTURE_VERSION = digest((ROOT / "bin/one-conv").read_bytes() + Path(__file__).read_bytes())
@@ -195,7 +203,9 @@ def main():
             existing[key] = {"revision": digest, "mtime": handle.mtime}
             stamps[key] = stamp
             uploaded += 1
-        except Exception as error:  # One unreadable conversation must not stop the others.
+        # One unreadable or malformed conversation must not stop the others.
+        except (ArchiveError, OSError, ValueError, LookupError, TypeError, AttributeError,
+                sqlite3.Error, reader.click.ClickException) as error:
             failed += 1
             print(f"{handle.source}/{handle.uuid}: {type(error).__name__}: {error}", file=sys.stderr)
     save_stamps(reader, stamps)

@@ -70,15 +70,35 @@ def sync_record(raw):
     }
 
 
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _present(mapping, field, check):
+    """`field` exists in `mapping` and its value passes `check`; a missing key never passes."""
+    return field in mapping and check(mapping[field])
+
+
 def valid_row(row):
-    """Whether an archive listing row has every field the readers index into, with usable types."""
+    """Whether an archive listing row satisfies everything the readers index into.
+
+    The summary must hold every field a native summary has, because readers show an archived
+    summary in place of one: a partial summary would crash a listing much later.
+    """
     if not isinstance(row, dict):
         return False
     summary = row.get("summary")
-    return (all(isinstance(row.get(field), str) for field in ("key", "revision", "source", "cwd", "session"))
+    text = lambda value: isinstance(value, str)
+    optional_text = lambda value: value is None or isinstance(value, str)
+    return (all(_present(row, field, text) for field in ("key", "revision", "source", "cwd", "session", "locator"))
             and timestamp(row.get("mtime")) is not None
-            and isinstance(summary, dict) and isinstance(summary.get("title"), (str, type(None)))
-            and isinstance(row.get("unread_native"), (bool, type(None))))
+            and _present(row, "unread_native", lambda value: value is None or isinstance(value, bool))
+            and _present(row, "account_label", optional_text)
+            and isinstance(summary, dict)
+            and all(_present(summary, field, text) for field in ("uuid", "source", "cwd", "start", "end"))
+            and _present(summary, "title", text)
+            and _present(summary, "turns", _is_int)
+            and _present(summary, "tokens", lambda value: value is None or _is_int(value)))
 
 
 def listing_record(raw):

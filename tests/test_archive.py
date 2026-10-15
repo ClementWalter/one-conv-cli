@@ -900,10 +900,54 @@ def test_damaged_sync_state_does_not_break_an_unrelated_command(tmp_path, state)
     assert run(env, "bin/one-conv", "cloud", "providers", success=False).returncode == 0
 
 
+def complete_row():
+    """An archive listing row with every field the readers use, as the sync script writes it."""
+    return {"key": "k1", "revision": "r1", "source": "claude", "cwd": "/example/ancestry", "session": "s1",
+            "locator": "s1.jsonl", "mtime": 1000.0, "unread_native": None, "account_label": None,
+            "summary": {"uuid": "s1", "source": "claude", "cwd": "/example/ancestry", "start": "", "end": "",
+                        "turns": 2, "tokens": None, "title": "a title"}}
+
+
+def without(field):
+    row = copy.deepcopy(complete_row())
+    if field.startswith("summary."):
+        del row["summary"][field.removeprefix("summary.")]
+    else:
+        del row[field]
+    return row
+
+
+def test_a_complete_listing_row_is_valid():
+    from one_conv.archive import valid_row
+    assert valid_row(complete_row())
+
+
+@pytest.mark.parametrize("field", ["key", "revision", "source", "cwd", "session", "locator", "mtime",
+                                   "unread_native", "account_label", "summary", "summary.uuid", "summary.source",
+                                   "summary.cwd", "summary.start", "summary.end", "summary.turns",
+                                   "summary.tokens", "summary.title"])
+def test_a_listing_row_missing_a_required_field_is_invalid(field):
+    from one_conv.archive import valid_row
+    assert not valid_row(without(field))
+
+
+def test_damaged_listing_cache_still_lists_its_complete_rows(tmp_path):
+    env = fixture_env(tmp_path)
+    env.update(ONE_CONV_ARCHIVE_URL="http://127.0.0.1:1", ONE_CONV_ARCHIVE_TOKEN="t", ONE_CONV_ARCHIVE_SYNC_MINUTES="0")
+    state_dir = Path(env["ONE_CONV_STATE_DIR"])
+    state_dir.mkdir(parents=True)
+    rows = [complete_row(), {**complete_row(), "key": "k2", "session": "s2", "summary": {}}]
+    (state_dir / "archive-listing.json").write_text(json.dumps({"url": "http://127.0.0.1:1", "listed": 1000.0, "rows": rows}))
+    result = run(env, "bin/one-conv", "local", "chats", "--source", "claude", "--json", success=False)
+    assert [row["cwd"] for row in json.loads(result.stdout)] == ["/example/ancestry"]
+
+
 @pytest.mark.parametrize("cached", [
     {"url": "http://127.0.0.1:1", "listed": "then", "rows": []},
     {"url": "http://127.0.0.1:1", "listed": 1000.0, "rows": [{"source": "claude"}, None, 7]},
     {"url": "http://127.0.0.1:1", "listed": 1000.0, "rows": "not a list"},
+    {"url": "http://127.0.0.1:1", "listed": 1000.0, "rows": [{**complete_row(), "summary": {}}]},
+    {"url": "http://127.0.0.1:1", "listed": 1000.0, "rows": [{k: v for k, v in complete_row().items() if k != "locator"}]},
 ])
 def test_damaged_listing_cache_does_not_break_local_reads(tmp_path, cached):
     env = fixture_env(tmp_path)

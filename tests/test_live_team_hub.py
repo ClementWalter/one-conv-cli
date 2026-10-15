@@ -385,3 +385,41 @@ def test_requeueing_identical_pending_work_is_allowed(tmp_path, monkeypatch):
     monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
     hubclient.queue(dict(MESSAGE))
     assert hubclient.queue(dict(MESSAGE)).exists()
+
+
+def _queued(tmp_path, monkeypatch, *ids):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    for message_id in ids:
+        hubclient.queue({**MESSAGE, "id": message_id})
+
+
+def test_drain_posts_queued_messages_and_empties_the_outbox(tmp_path, monkeypatch):
+    _queued(tmp_path, monkeypatch, "a" * 32, "b" * 32)
+    monkeypatch.setattr(hubclient.HubClient, "post", lambda self, m: {"id": m["id"], "recipients": []})
+    hubclient.drain(hubclient.HubClient("http://127.0.0.1:9", "t"))
+    assert list(hubclient.outbox().glob("*.json")) == []
+
+
+def test_drain_keeps_everything_queued_on_a_transient_error(tmp_path, monkeypatch):
+    _queued(tmp_path, monkeypatch, "a" * 32, "b" * 32)
+    hubclient.drain(_stub_post(monkeypatch, hubclient.HubRefused(503, "busy")))
+    assert sorted(p.stem for p in hubclient.outbox().glob("*.json")) == ["a" * 32, "b" * 32]
+
+
+def test_drain_never_moves_a_transient_failure_to_refused(tmp_path, monkeypatch):
+    _queued(tmp_path, monkeypatch, "a" * 32)
+    hubclient.drain(_stub_post(monkeypatch, hubclient.HubRefused(503, "busy")))
+    assert not (hubclient.outbox() / "refused").exists()
+
+
+def test_drain_sets_a_definitive_refusal_aside(tmp_path, monkeypatch):
+    _queued(tmp_path, monkeypatch, "a" * 32)
+    hubclient.drain(_stub_post(monkeypatch, hubclient.HubRefused(400, "bad")))
+    assert (hubclient.outbox() / "refused" / f"{'a' * 32}.json").exists()
+
+
+def test_drain_after_a_transient_error_posts_on_the_next_attempt(tmp_path, monkeypatch):
+    _queued(tmp_path, monkeypatch, "a" * 32)
+    hubclient.drain(_stub_post(monkeypatch, hubclient.HubRefused(503, "busy")))
+    monkeypatch.setattr(hubclient.HubClient, "post", lambda self, m: {"id": m["id"], "recipients": []})
+    assert hubclient.drain(hubclient.HubClient("http://127.0.0.1:9", "t"))["sent"] == ["a" * 32]

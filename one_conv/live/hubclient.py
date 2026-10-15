@@ -155,19 +155,56 @@ def submit(hub: HubClient, message: dict) -> dict | None:
     queued under the same id for the bridge to repost, and returns None.
     """
     path = queue(message)
-    try:
-        receipt = hub.post(message)
-    except HubUnavailable:
-        return None
-    except HubRefused as error:
-        if error.status >= 500 or error.status in RETRYABLE:
-            return None
-        path.unlink(missing_ok=True)
-        raise
-    if not _receipt_for(receipt, message["id"]):
+    state, detail = _outcome(hub, message)
+    if state == "retry":
         return None  # The hub may or may not have stored it; only a retry under this id can tell.
     path.unlink(missing_ok=True)
-    return receipt
+    if state == "refused":
+        raise detail
+    return detail
+
+
+def _outcome(hub: HubClient, message: dict) -> tuple[str, object]:
+    """("sent", receipt), ("refused", error) for a definitive 4xx, or ("retry", reason)."""
+    try:
+        receipt = hub.post(message)
+    except HubUnavailable as error:
+        return "retry", error
+    except HubRefused as error:
+        if error.status >= 500 or error.status in RETRYABLE:
+            return "retry", error
+        return "refused", error
+    if not _receipt_for(receipt, message["id"]):
+        return "retry", "the hub's answer is not a receipt for this message"
+    return "sent", receipt
+
+
+def drain(hub: HubClient) -> dict:
+    """Post queued messages oldest first, under the policy submit() uses.
+
+    A receipt for the id removes the message; a definitive refusal moves it to
+    outbox/refused/ for a person to inspect; anything ambiguous stops the drain and
+    keeps the rest queued under their ids, so the order is kept for the next attempt.
+    """
+    sent, refused, waiting = [], [], []
+    files = sorted(outbox().glob("*.json"), key=lambda path: (path.stat().st_mtime_ns, path.name))
+    for index, path in enumerate(files):
+        try:
+            message = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue  # Unreadable files stay for a person to look at; they never block the rest.
+        state, detail = _outcome(hub, message)
+        if state == "sent":
+            path.unlink(missing_ok=True)
+            sent.append(message["id"])
+        elif state == "refused":
+            (outbox() / "refused").mkdir(exist_ok=True)
+            os.replace(path, outbox() / "refused" / path.name)
+            refused.append({"id": message["id"], "error": str(detail)})
+        else:
+            waiting = [p.stem for p in files[index:]]
+            break
+    return {"sent": sent, "refused": refused, "waiting": waiting}
 
 
 class PendingConflict(Exception):

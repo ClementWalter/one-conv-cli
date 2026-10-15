@@ -392,3 +392,9 @@ def test_a_chunked_body_growing_too_large_is_refused(two_nodes):
 def test_a_malformed_message_is_refused(two_nodes, bad):
     _, url, mac, _ = two_nodes
     assert call(url, "/v1/messages", mac, "POST", {**message("box/claude:bbb"), **bad})[0] in (400, 404)
+
+
+def test_a_cursor_past_any_sqlite_integer_returns_an_empty_page(topic):
+    _, url, mac, box = topic
+    call(url, "/v1/messages", mac, "POST", message("#release"))
+    assert call(url, "/v1/topics/release/messages?after=9223372036854775808", box) == (200, {"messages": []})

@@ -395,7 +395,8 @@ def application(hub: Hub):
             after = req.query_params.get("after", "0")
             if not after.isdigit():
                 raise HubError(400, "after is the cursor of a history row")
-            return {"messages": hub.history(req.path_params["topic"], int(after), limit)}
+            # SQLite integers stop at 2**63 - 1; a cursor past every post simply has nothing after it.
+            return {"messages": hub.history(req.path_params["topic"], min(int(after), 2**63 - 1), limit)}
         return await handle(request, work)
 
     async def whoami(request):

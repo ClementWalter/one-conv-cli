@@ -47,8 +47,10 @@ token, commands warn on stderr and show native history only.
   state directory.
 - Inside a Claude session folder, a file or subfolder that is already a symlink is
   skipped, and one replaced by a symlink during capture makes the read refuse. This
-  covers the session folder only: a conversation's main transcript is read at its
-  path, and a symlink there is followed.
+  covers the session folder only.
+- A conversation's own files outside that folder (its transcript, a Cursor CLI
+  store and its `meta.json`) must be regular files: one that is a symlink, before
+  or during capture, makes that conversation fail instead of archiving another file.
 - Each native record is archived separately, even when records share a session ID
   (Codex subagent rollouts share their parent's).
 - Each upload names the revision it replaces, so concurrent captures are rejected.

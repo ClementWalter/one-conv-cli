@@ -7,6 +7,7 @@
 
 import argparse
 import base64
+import errno
 import importlib.machinery
 import importlib.util
 import json
@@ -130,7 +131,45 @@ def read_source(handle, path):
         folder = handle.path.parent / handle.uuid
         if folder in path.parents:
             return read_inside(folder, path)
-    return path.read_bytes()
+    return read_regular(path)
+
+
+def read_regular(path):
+    """Bytes of `path` only if it is a regular file itself, not a symlink to one."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        # No no-follow open here: refuse a symlink seen just before reading.
+        require_regular([path])
+        return path.read_bytes()
+    try:
+        descriptor = os.open(path, os.O_RDONLY | nofollow)
+    except OSError as error:
+        if error.errno == errno.ELOOP:  # What a no-follow open of a symlink reports.
+            raise ArchiveError(f"{path} is a symlink or not a regular file; it is not archived") from error
+        raise
+    with os.fdopen(descriptor, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ArchiveError(f"Not a regular file: {path}")
+        return stream.read()
+
+
+def main_files(handle, paths):
+    """A conversation's own files outside a Claude session folder: its transcript, a Cursor CLI
+    store and that store's meta.json."""
+    folder = handle.path.parent / handle.uuid if handle.source == "claude" and handle.path else None
+    return [path for path in paths if folder is None or folder not in path.parents]
+
+
+def require_regular(paths):
+    """Refuse files that are symlinks or not regular files. The reader opens a transcript by path,
+    so a symlink there would put text from outside history into the archived turns."""
+    for path in paths:
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            continue  # A missing file fails the capture where it is read.
+        if not stat.S_ISREG(mode):
+            raise ArchiveError(f"{path} is a symlink or not a regular file; it is not archived")
 
 
 def source_stamp(reader, handle, paths):
@@ -203,6 +242,8 @@ def original_records(reader, handle, paths):
 
 def capture(reader, handle, origin):
     paths = source_paths(reader, handle)
+    # Before the reader opens anything by path, and again after, to catch a swap during capture.
+    require_regular(main_files(handle, paths))
     before = fingerprint(paths)
     originals = original_records(reader, handle, paths)
     account_label = None
@@ -225,6 +266,7 @@ def capture(reader, handle, origin):
     changed = original_records(reader, handle, paths) != originals if handle.source == "cursor" else fingerprint(paths) != before
     if changed:
         raise ArchiveError(f"Source changed during capture: {handle.uuid}; retry when idle")
+    require_regular(main_files(handle, paths))
     return document
 
 

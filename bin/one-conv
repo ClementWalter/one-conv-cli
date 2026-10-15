@@ -1431,10 +1431,49 @@ def _chatgpt_cookie_jars(domain="chatgpt.com", required_cookie="__Secure-next-au
                 yield f"{label}/{Path(store).parent.name}", jar
 
 
+def _session_vault():
+    from one_conv.session_vault import SessionVault
+    return SessionVault(Path(os.environ.get("ONE_CONV_SESSION_VAULT", str(STATE_DIR / "sessions"))))
+
+
 def _claude_accounts():
-    """Reuse provider-scoped browser session discovery for Claude organization access."""
+    """Claude organizations from live browser logins plus saved sessions of other logins."""
     from one_conv.browser_auth import claude_accounts
-    yield from claude_accounts(lambda: _chatgpt_cookie_jars("claude.ai", "sessionKey"))
+    vault = _session_vault()
+    verified: set[str] = set()
+
+    def identity(profile, organizations):
+        return profile + ":" + ",".join(sorted(org["uuid"] for org in organizations))
+
+    saved: dict[str, object] = {}
+
+    def remember(profile, cookies, organizations):
+        key = identity(profile, organizations)
+        verified.add(key)
+        names = ", ".join(org.get("name") or org["uuid"] for org in organizations)
+        vault.save("claude", key, profile, cookies, description=names)
+
+    def expired(profile, cookies):
+        entry = saved.get(cookies.get("sessionKey"))
+        if entry is None:
+            log.warning("The Claude login in %s is signed out; sign in again on claude.ai", profile)
+            return
+        # Signing out on claude.ai revokes the session server-side, so the saved copy is dead too.
+        vault.remove("claude", entry.identity)
+        log.warning("Removed the saved Claude session for %s: it was signed out on claude.ai. "
+                    "Sign in to it again to re-add it.", entry.description or entry.identity)
+
+    def jars():
+        live = list(_chatgpt_cookie_jars("claude.ai", "sessionKey"))
+        live_keys = {cookies.get("sessionKey") for _, cookies in live}
+        yield from live
+        # Lazy: live logins are verified first, so an older saved copy never overwrites them.
+        for entry in vault.entries("claude"):
+            if entry.cookies.get("sessionKey") not in live_keys and entry.identity not in verified:
+                saved[entry.cookies.get("sessionKey")] = entry
+                yield entry.label, entry.cookies
+
+    yield from claude_accounts(jars, on_verified=remember, on_expired=expired)
 
 
 def _chatgpt_client(jar: dict[str, str]):
@@ -1462,11 +1501,16 @@ def _chatgpt_authenticate(jar: dict[str, str]) -> dict | None:
     Returns None when that profile is signed out."""
     session = _chatgpt_client(jar)
     try:
-        payload = session.get(f"{CHATGPT_HOST}/api/auth/session", timeout=30).json()
+        response = session.get(f"{CHATGPT_HOST}/api/auth/session", timeout=30)
+        payload = response.json()
     except Exception:
         return None
     token = payload.get("accessToken")
     if not token:
+        return None
+    if payload.get("error"):
+        # A stale token comes back with RefreshAccessTokenError and is refused by every API route.
+        log.warning("A ChatGPT session has expired; sign in again with: one-conv cloud chatgpt connect --login")
         return None
     account = payload.get("account") or {}
     session.headers["Authorization"] = f"Bearer {token}"
@@ -1475,6 +1519,7 @@ def _chatgpt_authenticate(jar: dict[str, str]) -> dict | None:
         session.headers["ChatGPT-Account-ID"] = account_id
     return {
         "session": session,
+        "jar": _chatgpt_rotated_jar(jar, response),
         "account_id": account_id,
         "email": (payload.get("user") or {}).get("email") or "",
         "plan": account.get("planType") or "",
@@ -1482,15 +1527,33 @@ def _chatgpt_authenticate(jar: dict[str, str]) -> dict | None:
     }
 
 
+def _chatgpt_rotated_jar(jar: dict[str, str], response) -> dict[str, str]:
+    """Fold a refreshed session cookie into the jar so the saved copy stays current."""
+    token = "__Secure-next-auth.session-token"
+    issued = {name: value for name, value in response.cookies.items() if name.startswith(token) and value}
+    if not issued:
+        return dict(jar)
+    chunks = sorted(name for name in issued if name != token)
+    fresh = "".join(issued[name] for name in chunks) if chunks else issued[token]
+    return {**jar, token: fresh}
+
+
 def _chatgpt_accounts():
-    """Every signed-in ChatGPT account reachable from a local browser profile."""
+    """Every ChatGPT account from live browser logins plus saved sessions of other logins."""
+    token = "__Secure-next-auth.session-token"
+    vault = _session_vault()
     seen: set[str] = set()
-    for label, jar in _chatgpt_cookie_jars():
+    live = list(_chatgpt_cookie_jars())
+    live_tokens = {jar.get(token) for _, jar in live}
+    saved = [(entry.label, entry.cookies) for entry in vault.entries("chatgpt")
+             if entry.cookies.get(token) not in live_tokens]
+    for label, jar in live + saved:
         auth = _chatgpt_authenticate(jar)
         if not auth or not auth["account_id"] or auth["account_id"] in seen:
             continue
         seen.add(auth["account_id"])
         auth["profile"] = label
+        vault.save("chatgpt", auth["account_id"], label, auth.pop("jar"))
         yield auth
 
 
@@ -2837,25 +2900,8 @@ def _export_session(handle: SessionHandle, machine: str, out_root: Path) -> Path
     return target
 
 
-@cli.command()
-@click.option("--out", "out_dir", required=True, help="Root of the corpus checkout, e.g. ~/Documents/corpus.")
-@click.option("--machine", default=None, help="Folder name for this machine (default: hostname).")
-@click.option("--source", "source_filter", type=click.Choice(SOURCES), default=None, help="Only this backend.")
-@click.option("--since", default=None, help="Only sessions active at/after this ISO date (default: all).")
-@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
-def export(out_dir: str, machine: str | None, source_filter: str | None, since: str | None, as_json: bool) -> None:
-    """Export every session as text to OUT/<machine>/<source>/<cwd>/<uuid>.json.
-
-    Only user and assistant text is kept, with tool calls summarized and
-    tool output dropped, and token-shaped strings are redacted. A session
-    whose stored copy is already as recent as the source is skipped, so the
-    command is cheap to run hourly. Each file carries `author`: "human" for
-    sessions a person drove, "system" for heartbeat/worker prompts.
-    """
-    out_root = Path(out_dir).expanduser()
-    machine = machine or socket.gethostname().split(".")[0]
-    sources = selected_sources(source_filter, SOURCES)
-    cutoff = datetime.fromisoformat(since).timestamp() if since else 0.0
+def _export_all(out_root: Path, machine: str, sources: tuple[str, ...], cutoff: float = 0.0) -> tuple[list[str], int]:
+    """Export every session in scope; return written relative paths and the already-current count."""
     written, skipped = [], 0
     for project in _iter_all_projects(sources):
         for handle in _project_sessions(project):
@@ -2866,6 +2912,30 @@ def export(out_dir: str, machine: str | None, source_filter: str | None, since: 
                 skipped += 1
             else:
                 written.append(str(path.relative_to(out_root)))
+    return written, skipped
+
+
+@cli.command()
+@click.option("--out", "out_dir", required=True, help="Root of the corpus checkout, e.g. ~/Documents/corpus.")
+@click.option("--machine", default=None, help="Folder name for this machine (default: hostname).")
+@click.option("--source", "source_filter", type=click.Choice(SOURCES), default=None, help="Only this backend.")
+@click.option("--since", default=None, help="Only sessions active at/after this ISO date (default: all).")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+def export(out_dir: str, machine: str | None, source_filter: str | None, since: str | None, as_json: bool) -> None:
+    """Export every session as text to OUT/<machine>/<source>/<cwd>/<uuid>.json.
+
+    Only user and assistant text blocks are kept: tool calls, tool output,
+    thinking and sub-agent turns are dropped, and token-shaped strings are
+    redacted. A session
+    whose stored copy is already as recent as the source is skipped, so the
+    command is cheap to run hourly. Each file carries `author`: "human" for
+    sessions a person drove, "system" for heartbeat/worker prompts.
+    """
+    out_root = Path(out_dir).expanduser()
+    machine = machine or socket.gethostname().split(".")[0]
+    sources = selected_sources(source_filter, SOURCES)
+    cutoff = datetime.fromisoformat(since).timestamp() if since else 0.0
+    written, skipped = _export_all(out_root, machine, sources, cutoff)
     if as_json:
         click.echo(json.dumps({"machine": machine, "written": written, "skipped": skipped}))
         return
@@ -3266,6 +3336,11 @@ def send(
     path = _resolve_one_session(query, match, nth, session_uuid)
     cwd = _session_cwd(path) or str(path.parent)
     title = _session_title(path)
+    from one_conv.live import claude as live_claude
+    if not fork_session and any(s.id == path.stem for s in live_claude.list_sessions()):
+        # A headless resume of an open session writes a second branch into its transcript.
+        raise click.ClickException(f"Thread {path.stem} is open in a running Claude Code session. "
+                                   f"Use `one-conv live send claude:{path.stem} ...` to message it, or --fork.")
 
     cmd = ["claude", "--print", "--resume", path.stem]
     if fork_session:
@@ -3717,7 +3792,114 @@ def cloud_command(context):
                     obj={"browser_accounts": _chatgpt_accounts})
 
 
+_FEED_SOURCES = ("claude", "codex", "cursor", "cursor-cli", "omp")
+
+
+def _feed_stamp(handle: SessionHandle) -> str:
+    """size:mtime_ns:inode of a file transcript; empty for SQLite stores, which are always parsed.
+
+    A cursor-agent store.db can gain turns in its -wal file while store.db itself is untouched.
+    """
+    if handle.path is None or handle.source in ("cursor", "cursor-cli"):
+        return ""
+    try:
+        stat = handle.path.stat()
+    except OSError:
+        return ""
+    return f"{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ino}"
+
+
+def _feed_find_threads(addresses: list[str]):
+    """Resolve `source:id` addresses (id or unique prefix) to feed threads over local transcripts.
+
+    A `cursor:` address may name an IDE chat or a cursor-agent chat; several matches raise Ambiguous.
+    """
+    from one_conv.feed import Ambiguous, Thread
+    wanted: dict[str, list[tuple[str, str]]] = {}
+    for address in addresses:
+        source, _, ident = address.partition(":")
+        if source in _FEED_SOURCES and ident:
+            for candidate in (("cursor", "cursor-cli") if source == "cursor" else (source,)):
+                wanted.setdefault(candidate, []).append((address, ident))
+    matches: dict[str, list[SessionHandle]] = {address: [] for address in addresses}
+    for source, queries in wanted.items():
+        for project in _iter_all_projects((source,)):
+            for handle in _project_sessions(project):
+                for address, ident in queries:
+                    if handle.uuid == ident or handle.uuid.startswith(ident):
+                        matches[address].append(handle)
+    found, missing = {}, []
+    for address in addresses:
+        handles = matches[address]
+        if len(handles) > 1:
+            raise Ambiguous(address, [f"{h.source}:{h.uuid}" for h in handles])
+        if not handles:
+            missing.append(address)
+            continue
+        handle = handles[0]
+        # Live, peers.json and whoami name every Cursor chat `cursor:<id>`, IDE or cursor-agent alike.
+        key = f"{'cursor' if handle.source == 'cursor-cli' else handle.source}:{handle.uuid}"
+        found[key] = Thread(
+            address=key, title=handle.title_hint or Path(handle.project_cwd).name, cwd=handle.project_cwd,
+            stamp=_feed_stamp(handle),
+            load=lambda h=handle: _handle_iter_turns(h, include_subagents=False),
+            visible=lambda turns, h=handle: _handle_drop_noise(h, turns),
+            render=lambda turn: _render_turn(turn, raw=False))
+    return found, missing
+
+
+def _feed_whoami() -> str | None:
+    from one_conv.live import router
+    me = router.whoami()
+    return me.address if me and not me.id.startswith("?") else None
+
+
+def _feed_root() -> Path:
+    from one_conv.live.model import live_home
+    return live_home()
+
+
+def _feed_live_addresses() -> list[str]:
+    from one_conv.live import router
+    return [session.address for session in router.list_all()]
+
+
+def _feed_inbox_path(reader: str) -> Path | None:
+    from one_conv.live import router
+    try:
+        return router.fyi_inbox(reader)
+    except router.LiveError:  # a reader address that cannot name an inbox file has no FYI messages
+        return None
+
+
+from one_conv.feed import build_feed_command  # noqa: E402
+
+_feed_command = build_feed_command(_feed_find_threads, _feed_whoami, _feed_root, _feed_live_addresses,
+                                   _feed_inbox_path)
+_feed_command.hidden = True
+cli.add_command(_feed_command)
+
 install_namespaces(cli, lambda: _chatgpt_accounts(), lambda: _claude_accounts())
+
+
+def _tune_snapshot(out_root: Path) -> tuple[int, int]:
+    # The corpus source re-reads exports, so excluding it avoids training on duplicates.
+    sources = tuple(source for source in SOURCES if source != "corpus")
+    written, skipped = _export_all(out_root, _THIS_MACHINE, sources)
+    return len(written), skipped
+
+
+from one_conv.tune.cli import build_tune_group  # noqa: E402
+
+cli.add_command(build_tune_group(_tune_snapshot, _corpus_roots))
+
+from one_conv.live.cli import build_live_group  # noqa: E402
+
+# Hooks and extensions call back into this checkout through uv, whose script environment
+# survives dependency changes; the running interpreter's cached environment may not.
+_UV = shutil.which("uv")
+cli.add_command(build_live_group([_UV, "run", "--quiet", "--script", str(Path(__file__).resolve())] if _UV
+                                 else [sys.executable, "-O", str(Path(__file__).resolve())]))
 
 
 @cli.command("mcp")

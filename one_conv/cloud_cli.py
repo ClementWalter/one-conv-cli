@@ -139,6 +139,11 @@ def sync(context, product, session_file, browser_account, organization, limit):
                                         (context.obj or {}).get(callback), organization=organization)
         else:
             provider = session_provider(product, session_file, organization)
+        transport = getattr(provider, "transport", None)
+        if transport is not None:
+            # A CLI backfill can wait out long provider throttles that would stall an MCP request.
+            transport.max_retry_delay = 600
+            transport.max_attempts = max(transport.max_attempts, 10)
         report = synchronize(provider, product, limit=limit)
     except ProviderError as error:
         raise click.ClickException(str(error)) from None

@@ -76,10 +76,11 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
              message_id: str | None = None, topic: str | None = None, handle: str | None = None) -> str:
     """Wrap a message so the receiver knows who sent it, on which topic, and whether to answer.
 
-    The sender is a teammate working for the same user: the message is a request to act on
-    within that user's task, but it is not the user typing and it grants no new approval.
-    `origin` labels a sender that is not an agent session: "user" only for an interactive
-    terminal, "unknown" otherwise. `reply="none"` marks a notice that ends an exchange.
+    An agent sender is a teammate working for the same user: the message is a request to
+    act within that user's task and grants no new approval. Human senders are labelled
+    separately; these local labels are not authenticated identities.
+    `origin` labels a sender that is not an agent session: "user" for an interactive
+    terminal or human workspace, "unknown" otherwise. `reply="none"` ends an exchange.
     `reply="inline"` is for a receiver the sender reads back from (a Boat sandbox), which
     answers in its own conversation because it cannot message this machine.
     `message_id` stays the same across retries so a receiver can drop duplicates.
@@ -87,10 +88,12 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
     text = _ENVELOPE_TAG.sub(r"&lt;\1", text)
     if reply not in ("expected", "none", "inline"):
         raise ValueError(f"reply must be 'expected', 'none' or 'inline', got {reply!r}")
-    if sender is None:
-        attrs = f'from="{_attr(origin)}"'
-    else:
-        attrs = f'from="{_attr(sender.address)}"'
+    address = sender.address if sender is not None else origin
+    human = address == "user" or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}/user", address)
+    attrs = f'from="{_attr(address)}"'
+    if human:
+        attrs += ' kind="human"'
+    elif sender is not None:
         if handle:
             attrs += f' from-handle="@{_attr(handle)}"'
         if sender.title:
@@ -108,6 +111,14 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
     elif reply == "inline":
         attrs += ' reply="inline"'
         footer = "\nAnswer in this conversation; the sender reads your reply back from here."
+    elif human and address == "user":
+        footer = '\nA human sent this message. To reply, call the one-conv send_message tool with to="user"'
+        footer += f', or to="#{_attr(topic)}" to answer everyone on the topic.' if topic else "."
+    elif human and topic:
+        footer = f'\nA human sent this message. To reply, call the one-conv send_message tool with to="#{_attr(topic)}".'
+    elif human:
+        footer = "\nA human sent this message from another machine. Reply through a shared topic; "
+        footer += "the remote human workspace has no direct return route."
     elif sender is not None and not sender.id.startswith("?"):
         footer = f'\nTo reply, call the one-conv send_message tool with to="{_attr(sender.address)}"'
         footer += f', or to="#{_attr(topic)}" to answer everyone on the topic.' if topic else "."

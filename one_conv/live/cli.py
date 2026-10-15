@@ -192,10 +192,10 @@ def build_live_group(launcher: list[str]) -> click.Group:
     @click.option("--port", type=click.IntRange(1024, 65535), default=8790, show_default=True,
                   help="Port on 127.0.0.1.")
     def web_command(port):
-        """Open a read-only page to follow topics, people and direct messages, like a chat app.
+        """Open a workspace to follow topics and direct messages, and send as a human.
 
         It listens on 127.0.0.1 only and has no login, so anyone who can use this machine
-        can read it.
+        can read it and send messages as You. Viewing topics never marks agents' messages read.
 
         \b
         Example:

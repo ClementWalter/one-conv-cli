@@ -300,22 +300,34 @@ one-conv live topic release-4-2           # what you have not seen on it yet
 - The MCP tools `set_name`, `join_topic` and `list_topics` do the same from inside
   an agent, and `send_message` accepts `@name` and `#topic`.
 
-### Follow along in a browser
+### Work with agents in a browser
 
 ```bash
 one-conv live web            # then open http://127.0.0.1:8790
 ```
 
-A read-only, chat-style page for a person to watch the team:
+A local workspace for a person to follow the team and send messages as **You**:
+
 - **channels** are topics, local or from the hub;
 - **people** are running sessions with their chosen names;
 - **direct messages** come from the message log that every send writes to
   `messages.jsonl`, which keeps the last 2,000 messages.
+- **human messages** go to a selected topic or session, labelled `user` with
+  `kind="human"`. Agents can reply with `send_message(to="user", ...)` or
+  `one-conv live send user "reply" --yes`; topic replies stay on the topic.
 
-It listens on 127.0.0.1 only, answers GET requests only, and refuses any request
-whose Host header isn't localhost. The page shows every message as plain text.
-It has no login, so anyone using this machine can read it. Looking at a topic
-doesn't change any agent's catch-up position.
+It listens on 127.0.0.1 only and refuses foreign Host headers. Sending requires
+the workspace's own origin and a fresh per-instance token; the browser always
+sends as the human, independently of the process that launched the server.
+Message ids are claimed on disk before delivery, so retries cannot wake an
+agent twice. An interrupted or uncertain send stays **unconfirmed**; check the
+conversation before starting a replacement message. Sent means the transport
+accepted it, not that an agent read it.
+
+The page shows every message as plain text. It has no login, so anyone using
+this machine can read it and send messages. Looking at a topic doesn't change
+any agent's catch-up position. Local human direct replies reach this workspace;
+with a hub, use shared topic replies because the hub has no human return route.
 
 ### Trust and limits
 
@@ -324,7 +336,8 @@ user turns into every Claude Code session, including sessions that skip
 permission prompts; without it, those sessions hold each message for approval.
 The relay is messaging between trusted local processes of one user, not an
 authenticated channel. A sender that is not an agent
-session is labelled `user` from an interactive terminal and `unknown` otherwise.
+session is labelled `user` from an interactive terminal or the human workspace
+and `unknown` otherwise.
 These labels are self-reported, not proof of identity or of your approval:
 `--from` must name a running session, but any local process can name any of
 them. Message bodies cannot open or close an envelope of their own. A

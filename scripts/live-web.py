@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["click==8.3.3", "starlette==1.8.0", "uvicorn==0.54.0"]
 # ///
-"""Serve the read-only live viewer on this machine only: live-web.py --port 8790."""
+"""Serve the local agent workspace with human messaging: live-web.py --port 8790."""
 
 import argparse
 import logging
@@ -22,7 +22,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8790)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    logging.getLogger(__name__).info("one-conv live viewer on http://127.0.0.1:%d (read-only)", args.port)
+    logging.getLogger(__name__).info("one-conv live workspace on http://127.0.0.1:%d", args.port)
     # Loopback only: the page shows what agents told each other and has no login.
     uvicorn.run(application(args.port), host="127.0.0.1", port=args.port, log_level="warning")
 

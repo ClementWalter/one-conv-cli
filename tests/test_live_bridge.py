@@ -1,6 +1,6 @@
 """The bridge against a real loopback hub: ingress at most once, fyi never wakes, outbox, remote sends, ssh forward.
 
-The local adapter is a stub that records what it is handed, so no agent is prompted.
+Most tests record adapter calls; human ingress writes to a disposable OMP inbox.
 """
 
 import json
@@ -23,7 +23,7 @@ pytest.importorskip("starlette")
 
 from one_conv.live import bridge, hubclient, router, tunnel
 from one_conv.live.hub import Hub, application
-from one_conv.live.model import LiveSession
+from one_conv.live.model import LiveSession, envelope
 
 SESSION = LiveSession("omp", "worker-1", "/work", "worker")
 
@@ -83,6 +83,63 @@ def post(hub, **extra):
 
 def outcome(hub, message):
     return hub.mac.request("GET", f"/v1/messages/{message['id']}")["recipients"][0]["outcome"]
+
+
+@pytest.mark.parametrize(("address", "human"), [
+    ("user", True), ("mac/user", True), ("omp:user", False), ("mac/omp:user", False),
+    ("INVALID/user", False), ("../user", False), ("mac/user/extra", False),
+])
+def test_sender_objects_classify_only_reserved_human_addresses(address, human):
+    wrapped = envelope("Please review.", bridge.RemoteSender(address), topic="release")
+    assert ('kind="human"' in wrapped) is human
+
+
+def test_remote_human_sender_object_replies_to_the_topic():
+    wrapped = envelope("Please review.", bridge.RemoteSender("mac/user"), topic="release")
+    assert 'to="#release"' in wrapped
+
+
+def test_remote_human_sender_object_has_no_invalid_direct_reply():
+    wrapped = envelope("Please review.", bridge.RemoteSender("mac/user"), topic="release")
+    assert 'to="mac/user"' not in wrapped
+
+
+def test_agent_identity_takes_precedence_over_a_human_origin():
+    wrapped = envelope("Please review.", bridge.RemoteSender("mac/omp:user"), origin="user")
+    assert 'kind="human"' not in wrapped
+
+
+@pytest.fixture
+def human_omp_delivery(hub, tmp_path, monkeypatch):
+    """Push a hub human message through the real bridge into an isolated OMP inbox."""
+    for name, variable in (("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME"), ("omp", "OMP_HOME"),
+                           ("cursor", "ONE_CONV_CURSOR_HOME"), ("live", "ONE_CONV_LIVE_DIR")):
+        directory = tmp_path / name
+        directory.mkdir(exist_ok=True)
+        monkeypatch.setenv(variable, str(directory))
+    registry = tmp_path / "live" / "omp"
+    registry.mkdir()
+    (registry / "worker-1.json").write_text(json.dumps({"pid": os.getpid(), "sessionId": "worker-1"}))
+    client = hubclient.HubClient(hub.url, hub.box_token, "box")
+    node = bridge.Bridge(client, "box", bridge.Ingress(bridge.bridge_dir() / "ingress.db"))
+    node.publish()
+    hub.mac.post({"id": uuid.uuid4().hex, "to": "box/omp:worker-1", "from": "user",
+                  "text": "Please review the release.", "topic": "release"})
+    node.step(wait=0)
+    path = next((tmp_path / "live" / "inbox" / "omp" / "worker-1").glob("*.json"))
+    return json.loads(path.read_text())["text"]
+
+
+def test_real_bridge_human_ingress_is_marked_human(human_omp_delivery):
+    assert 'from="mac/user" kind="human"' in human_omp_delivery
+
+
+def test_real_bridge_human_ingress_offers_the_topic_reply(human_omp_delivery):
+    assert 'to="#release"' in human_omp_delivery
+
+
+def test_real_bridge_human_ingress_has_no_invalid_human_route(human_omp_delivery):
+    assert 'to="mac/user"' not in human_omp_delivery
 
 
 def test_a_push_from_another_machine_reaches_the_local_adapter(hub, box, delivered):

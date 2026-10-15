@@ -1,0 +1,284 @@
+"""`live spawn`: resident agents in tmux. tmux and the harnesses are stubbed, so no agent starts."""
+
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+import pytest
+
+from one_conv.live import codex, router, spawn
+from one_conv.live.model import LiveSession
+from one_conv.live.spawn_cli import introduction
+
+THREAD = "01a14043-8f91-74f3-8668-76ec80b61266"
+
+
+@pytest.fixture
+def homes(tmp_path, monkeypatch):
+    for name, var in (("codex", "CODEX_HOME"), ("live", "ONE_CONV_LIVE_DIR"), ("omp", "OMP_HOME")):
+        (tmp_path / name).mkdir()
+        monkeypatch.setenv(var, str(tmp_path / name))
+    return tmp_path
+
+
+@pytest.mark.parametrize("harness, expected", [
+    ("claude", ["claude", "--dangerously-skip-permissions", "--model", "sonnet", "do it"]),
+    ("codex", ["codex", "--dangerously-skip-permissions", "--model", "sonnet", "do it"]),
+    ("omp", ["omp", "--dangerously-skip-permissions", "--model=sonnet", "do it"]),
+])
+def test_command_puts_extra_flags_before_the_prompt(harness, expected):
+    assert spawn.command(harness, "do it", "sonnet", ("--dangerously-skip-permissions",)) == expected
+
+
+def test_command_keeps_a_tricky_prompt_as_one_argument():
+    prompt = 'a "b" $(echo PWNED) x;y\n--leading'
+    assert spawn.command("codex", prompt, None, ())[-1] == prompt
+
+
+def test_command_refuses_an_empty_prompt():
+    with pytest.raises(spawn.SpawnError, match="first prompt"):
+        spawn.command("claude", "  ", None, ())
+
+
+def test_command_refuses_an_unknown_harness():
+    with pytest.raises(spawn.SpawnError, match="cannot spawn"):
+        spawn.command("cursor", "do it", None, ())
+
+
+def test_preflight_needs_tmux(monkeypatch):
+    monkeypatch.setattr(spawn.shutil, "which", lambda name: None if name == "tmux" else f"/bin/{name}")
+    with pytest.raises(spawn.SpawnError, match="needs tmux"):
+        spawn.preflight("codex")
+
+
+def test_preflight_needs_the_omp_extension(homes, monkeypatch):
+    monkeypatch.setattr(spawn.shutil, "which", lambda name: f"/bin/{name}")
+    with pytest.raises(spawn.SpawnError, match="live extension"):
+        spawn.preflight("omp")
+
+
+def stub_tmux(monkeypatch, alive=True, pane="", owned=lambda session, name: True):
+    monkeypatch.setattr(spawn, "_alive", lambda name: alive)
+    monkeypatch.setattr(spawn, "_pane", lambda name: pane)
+    monkeypatch.setattr(spawn, "owned_by_spawn", owned)
+    sent = []
+    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: sent.append(argv))
+    monkeypatch.setattr(spawn.time, "sleep", lambda seconds: None)
+    return sent
+
+
+def test_wait_returns_the_new_session_in_that_folder(monkeypatch, tmp_path):
+    stub_tmux(monkeypatch)
+    sessions = [LiveSession("codex", "old", str(tmp_path)), LiveSession("codex", "new", str(tmp_path)),
+                LiveSession("codex", "elsewhere", "/other")]
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: sessions)
+    assert spawn.wait_for_session("codex", tmp_path, {"codex:old"}, "t", 5) == "codex:new"
+
+
+def test_wait_skips_an_unrelated_agent_that_registered_first_in_that_folder(monkeypatch, tmp_path):
+    stub_tmux(monkeypatch, owned=lambda session, name: session.id == "mine")
+    sessions = [LiveSession("claude", "unrelated", str(tmp_path)), LiveSession("claude", "mine", str(tmp_path))]
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: sessions)
+    assert spawn.wait_for_session("claude", tmp_path, set(), "t", 5) == "claude:mine"
+
+
+@pytest.fixture
+def pane_tree(monkeypatch):
+    """A tmux pane whose process 100 started 101, which started 102; 200 runs elsewhere."""
+    monkeypatch.setattr(spawn, "_pane_pid", lambda name: 100)
+    table = "100 1\n101 100\n102 101\n200 1\n"
+    monkeypatch.setattr(spawn.subprocess, "run",
+                        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, table, ""))
+
+
+def test_process_tree_holds_the_descendants(pane_tree):
+    assert spawn._process_tree(100) == {100, 101, 102}
+
+
+def test_a_session_run_by_the_pane_is_owned(pane_tree):
+    assert spawn.owned_by_spawn(LiveSession("omp", "x", pid=102), "t")
+
+
+def test_a_session_run_elsewhere_is_not_owned(pane_tree):
+    assert not spawn.owned_by_spawn(LiveSession("claude", "x", pid=200), "t")
+
+
+def rollout(homes, text: str) -> None:
+    folder = homes / "codex" / "sessions" / "2026" / "10" / "15"
+    folder.mkdir(parents=True)
+    (folder / f"rollout-2026-10-15T00-00-00-{THREAD}.jsonl").write_text(json.dumps({"text": text}) + "\n")
+
+
+def test_a_codex_thread_whose_prompt_names_the_spawn_is_owned(homes):
+    rollout(homes, "do it\n\n(one-conv spawn oneconv-codex-1)")
+    assert spawn.owned_by_spawn(LiveSession("codex", THREAD), "oneconv-codex-1")
+
+
+def test_a_codex_thread_naming_another_spawn_is_not_owned(homes):
+    rollout(homes, "do it\n\n(one-conv spawn oneconv-codex-2)")
+    assert not spawn.owned_by_spawn(LiveSession("codex", THREAD), "oneconv-codex-1")
+
+
+def test_start_names_the_spawn_in_a_codex_prompt(homes, monkeypatch):
+    monkeypatch.setattr(spawn, "preflight", lambda harness: None)
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
+    monkeypatch.setattr(spawn, "wait_for_session", lambda *args, **kw: "codex:x")
+    started = []
+    monkeypatch.setattr(spawn.subprocess, "run",
+                        lambda argv, **kw: started.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
+    spawned = spawn.start("codex", "do it", homes)
+    assert started[0][-1] == f"do it\n\n(one-conv spawn {spawned.tmux})"
+
+
+def test_wait_refuses_when_the_agent_exits(monkeypatch, tmp_path):
+    stub_tmux(monkeypatch, alive=False)
+    with pytest.raises(spawn.SpawnError, match="exited before registering"):
+        spawn.wait_for_session("codex", tmp_path, set(), "t", 5)
+
+
+def test_wait_stops_at_claudes_trust_question(monkeypatch, tmp_path):
+    stub_tmux(monkeypatch, pane=spawn.TRUST_QUESTION)
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
+    with pytest.raises(spawn.SpawnError, match="--trust-folder"):
+        spawn.wait_for_session("claude", tmp_path, set(), "t", 5)
+
+
+def test_wait_answers_the_trust_question_when_asked(monkeypatch, tmp_path):
+    sent = stub_tmux(monkeypatch, pane=spawn.TRUST_QUESTION)
+    calls = iter([[], [LiveSession("claude", "new", str(tmp_path))]])
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: next(calls))
+    spawn.wait_for_session("claude", tmp_path, set(), "t", 5, trust_folder=True)
+    assert [argv[-1] for argv in sent] == ["Down", "Enter"]
+
+
+def test_wait_gives_up_after_the_deadline(monkeypatch, tmp_path):
+    stub_tmux(monkeypatch)
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
+    with pytest.raises(spawn.SpawnError, match="did not register"):
+        spawn.wait_for_session("codex", tmp_path, set(), "t", 0)
+
+
+def test_listing_drops_finished_sessions(homes, monkeypatch):
+    spawn._save({"oneconv-a": {"tmux": "oneconv-a"}, "oneconv-b": {"tmux": "oneconv-b"}})
+    monkeypatch.setattr(spawn, "_alive", lambda name: name == "oneconv-a")
+    assert [row["tmux"] for row in spawn.listing()] == ["oneconv-a"]
+
+
+def test_stop_refuses_an_unknown_agent(homes):
+    with pytest.raises(spawn.SpawnError, match="no spawned agent"):
+        spawn.stop("codex:nobody")
+
+
+def tmux_answers(monkeypatch, kill: tuple[int, str], has: tuple[int, str]) -> None:
+    """tmux kill-session and has-session each exit with this (status, stderr)."""
+    def run(argv, **kw):
+        status, stderr = kill if argv[1] == "kill-session" else has
+        return subprocess.CompletedProcess(argv, status, "", stderr)
+    monkeypatch.setattr(spawn.subprocess, "run", run)
+
+
+@pytest.mark.parametrize("stderr, state", [
+    ("can't find session: oneconv-c", "absent"),
+    ("no server running on /private/tmp/tmux-501/default", "absent"),
+    ("error connecting to /private/tmp/tmux-501/default (Permission denied)", "unknown"),
+])
+def test_a_failed_tmux_probe_is_absent_only_when_tmux_says_so(monkeypatch, stderr, state):
+    tmux_answers(monkeypatch, kill=(1, ""), has=(1, stderr))
+    assert spawn._state("oneconv-c") == state
+
+
+@pytest.fixture(params=["kill fails, session still there", "kill and probe both cannot reach the server"])
+def unkillable(homes, monkeypatch, request):
+    """A spawned Codex agent that kill-session did not end, or whose end tmux cannot confirm."""
+    spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": f"codex:{THREAD}"}})
+    unreachable = (1, "error connecting to /private/tmp/tmux-501/default (Permission denied)")
+    if request.param.startswith("kill fails"):
+        tmux_answers(monkeypatch, kill=(1, "denied"), has=(0, ""))
+    else:
+        tmux_answers(monkeypatch, kill=unreachable, has=unreachable)
+
+
+def test_stop_accepts_a_session_that_had_already_ended(homes, monkeypatch):
+    spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": "claude:x"}})
+    tmux_answers(monkeypatch, kill=(1, "can't find session: oneconv-c"), has=(1, "can't find session: oneconv-c"))
+    spawn.stop("claude:x")
+    assert spawn._load() == {}
+
+
+def test_stop_reports_a_session_it_could_not_end(unkillable):
+    with pytest.raises(spawn.SpawnError, match="could not end"):
+        spawn.stop(f"codex:{THREAD}")
+
+
+def test_stop_keeps_the_record_of_a_session_it_could_not_end(unkillable):
+    with pytest.raises(spawn.SpawnError):
+        spawn.stop(f"codex:{THREAD}")
+    assert "oneconv-c" in spawn._load()
+
+
+def test_stop_leaves_a_codex_thread_it_could_not_end_listed(unkillable):
+    with pytest.raises(spawn.SpawnError):
+        spawn.stop(f"codex:{THREAD}")
+    assert THREAD not in codex.stopped_threads()
+
+
+def lock(homes, thread=THREAD) -> Path:
+    path = Path(homes / "codex" / "thread-writer-locks" / f"{thread}.lock")
+    path.parent.mkdir(exist_ok=True)
+    path.touch()
+    return path
+
+
+def test_a_stopped_codex_thread_is_not_listed_while_its_lock_lingers(homes, monkeypatch):
+    path = lock(homes)
+    old = time.time() - 60
+    os.utime(path, (old, old))
+    spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": f"codex:{THREAD}"}})
+    tmux_answers(monkeypatch, kill=(0, ""), has=(1, "can't find session: oneconv-c"))
+    spawn.stop(f"codex:{THREAD}")
+    assert THREAD not in [s.id for s in codex.list_sessions()]
+
+
+def test_a_stopped_codex_thread_resumed_later_is_listed_again(homes):
+    path = lock(homes)
+    (homes / "live" / "codex-stopped.json").write_text(json.dumps({THREAD: time.time() - 60}))
+    os.utime(path, None)  # Touched after the stop, as a resume would.
+    assert THREAD in [s.id for s in codex.list_sessions()]
+
+
+def test_introduction_names_who_started_the_agent():
+    sender = LiveSession("claude", "abc", "/work", "lead")
+    assert "claude:abc (lead)" in introduction("do it", sender)
+
+
+def test_introduction_keeps_the_prompt():
+    assert introduction("do it", None).endswith("do it")
+
+
+@pytest.fixture
+def ended_thread(homes):
+    """A Codex thread ended with `live stop`, whose rollout still exists."""
+    rollout(homes, "do it")
+    (homes / "live" / "codex-stopped.json").write_text(json.dumps({THREAD: time.time()}))
+    return homes
+
+
+def test_sending_to_an_ended_codex_thread_is_refused_while_its_lock_lingers(ended_thread):
+    path = lock(ended_thread)
+    old = time.time() - 60
+    os.utime(path, (old, old))
+    with pytest.raises(router.LiveError, match="ended with `live stop`"):
+        router.resolve(f"codex:{THREAD}")
+
+
+def test_sending_to_an_ended_codex_thread_is_refused_once_its_lock_is_gone(ended_thread):
+    with pytest.raises(router.LiveError, match="ended with `live stop`"):
+        router.resolve(f"codex:{THREAD}")
+
+
+def test_a_resumed_codex_thread_is_reachable_again(ended_thread):
+    lock(ended_thread)
+    os.utime(ended_thread / "codex" / "thread-writer-locks" / f"{THREAD}.lock", (time.time() + 5, time.time() + 5))
+    assert router.resolve(f"codex:{THREAD}").address == f"codex:{THREAD}"

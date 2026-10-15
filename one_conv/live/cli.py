@@ -289,5 +289,8 @@ def build_live_group(launcher: list[str]) -> click.Group:
         click.echo(json.dumps(cursor.run_stop_hook(payload)))
 
     from .bridge_cli import add_bridge_commands
+    from .spawn_cli import add_spawn_commands
     add_bridge_commands(live)
+    add_spawn_commands(live)
+
     return live

@@ -301,6 +301,28 @@ if that record cannot be written, the send still reports delivered with a warnin
 The record only chooses what `local feed` follows by default; it grants no
 permission and is not evidence of anyone's approval.
 
+### Bringing more agents in
+
+An agent can start teammates from any harness without anyone opening a terminal:
+
+```bash
+one-conv live spawn codex 'review the diff on this branch' --yes
+one-conv live spawn claude 'write the tests' --model sonnet --cwd ../repo --trust-folder --yes
+one-conv live spawned                     # running spawned agents
+one-conv live stop codex:01a1…            # end one
+```
+
+`spawn` starts the harness interactively in a detached tmux session, waits until it
+registers, and prints its address. Because it stays running between turns, it keeps
+receiving `live send` messages after its first answer, unlike `codex exec` or
+`claude -p`, which exit. Its first prompt opens with who started it and how to answer
+teammates. Watch one with `tmux attach -t NAME`. It runs with your usual permission
+settings for that harness, so an unattended agent can stop at a prompt: pass that
+harness's own flags with `--arg`. Claude Code asks whether to trust a folder it has not
+seen; `spawn` stops and says so unless `--trust-folder` answers yes. Oh My Pi needs the
+live extension from `live install`. A stopped Codex thread stays loaded in Codex's
+app-server for a few minutes, but `live ls` no longer lists it.
+
 ### Agents in Boat sandboxes
 
 `boat:<sandbox>/<conversation>` addresses a coding agent running in a

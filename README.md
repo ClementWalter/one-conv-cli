@@ -362,8 +362,8 @@ app-server for a few minutes, but `live ls` no longer lists it.
 ### Working across machines
 
 Agents on different machines reach each other through a hub. Each machine runs
-one bridge, `live serve`, which only connects out: nothing listens on the
-machines themselves. Agents never need to know where another one runs beyond its
+one bridge, `live serve`, which needs no inbound network access. Agents never
+need to know where another one runs beyond its
 address, `NODE/harness:id` with the full id, as `live serve` publishes it.
 
 On the machine that hosts the hub (the hub binds to localhost by default):

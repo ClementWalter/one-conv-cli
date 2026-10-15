@@ -39,8 +39,8 @@ def add_bridge_commands(live: click.Group) -> None:
 
         The bridge publishes the sessions running here, delivers messages the hub holds for
         them through their usual adapters, and posts what `live send` queued while the hub
-        was unreachable. It only connects out: nothing listens on this machine. Run one per
-        machine, in the foreground or under tmux; its token comes from `live-hub.py token add`.
+        was unreachable. No inbound network access is required. Run one per machine, in
+        the foreground or under tmux; its token comes from `live-hub.py token add`.
         """
         if show_status:
             state = bridge.status()

@@ -31,6 +31,8 @@ MESSAGE_ID = re.compile(r"[0-9a-f]{32}")
 # the adapter refused it, or the bridge cannot tell (it crashed between claiming and reporting).
 OUTCOMES = ("accepted", "refused", "unconfirmed")
 MAX_TEXT = 200_000
+# A JSON-escaped text can take up to six bytes per character, plus the envelope fields.
+MAX_BODY = MAX_TEXT * 6 + 4096
 MAX_WAIT = 30.0
 # A node that has not published or polled for this long is listed as offline.
 LEASE_SECONDS = 60.0
@@ -294,16 +296,17 @@ class Hub:
                 f"{node}/{address}")
         return list(listing.values())
 
-    def history(self, topic: str, after: str | None, limit: int = 100) -> list[dict]:
-        """A topic's posts, oldest first, after the post with id `after` if given."""
+    def history(self, topic: str, after: int = 0, limit: int = 100) -> list[dict]:
+        """A topic's posts, oldest first, after the row whose `cursor` is `after`.
+
+        The cursor is the hub's own post sequence: client ids are unique only per sending node.
+        """
         with self._db() as db:
-            since = 0
-            if after:
-                row = db.execute("SELECT MIN(seq) FROM posts WHERE topic = ? AND id = ?", (topic, after)).fetchone()
-                since = row[0] or 0
-            rows = db.execute("SELECT id, from_node, sender, reply, text, created FROM posts WHERE topic = ? AND seq > ?"
-                              " ORDER BY seq LIMIT ?", (topic, since, max(1, min(limit, 500)))).fetchall()
-        return [{"id": i, "from": f"{fn}/{s}", "reply": r, "text": x, "created": c} for i, fn, s, r, x, c in rows]
+            rows = db.execute("SELECT seq, id, from_node, sender, reply, text, created FROM posts"
+                              " WHERE topic = ? AND seq > ? ORDER BY seq LIMIT ?",
+                              (topic, after, max(1, min(limit, 500)))).fetchall()
+        return [{"cursor": str(q), "id": i, "from": f"{fn}/{s}", "reply": r, "text": x, "created": c}
+                for q, i, fn, s, r, x, c in rows]
 
 
 def application(hub: Hub):
@@ -321,10 +324,7 @@ def application(hub: Hub):
             node = await run_in_threadpool(hub.node_for, token)
             body = {}
             if request.method in ("POST", "PUT"):
-                raw = await request.body()
-                if len(raw) > MAX_TEXT * 4:
-                    raise HubError(413, "request too large")
-                body = json.loads(raw or b"{}")
+                body = json.loads(await bounded_body(request) or b"{}")
                 if not isinstance(body, dict):
                     raise HubError(400, "the request body must be a JSON object")
             return JSONResponse(await run_in_threadpool(work, node, body, request))
@@ -332,6 +332,19 @@ def application(hub: Hub):
             return JSONResponse({"error": str(error)}, status_code=error.status)
         except ValueError:
             return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    async def bounded_body(request) -> bytes:
+        """The request body, refused as soon as it would exceed MAX_BODY, whatever Content-Length says."""
+        declared = request.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > MAX_BODY:
+            raise HubError(413, "request too large")
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > MAX_BODY:
+                raise HubError(413, "request too large")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     def wait_param(request) -> float:
         try:
@@ -372,7 +385,10 @@ def application(hub: Hub):
                 limit = int(req.query_params.get("limit", "100"))
             except ValueError:
                 limit = 100
-            return {"messages": hub.history(req.path_params["topic"], req.query_params.get("after"), limit)}
+            after = req.query_params.get("after", "0")
+            if not after.isdigit():
+                raise HubError(400, "after is the cursor of a history row")
+            return {"messages": hub.history(req.path_params["topic"], int(after), limit)}
         return await handle(request, work)
 
     async def whoami(request):

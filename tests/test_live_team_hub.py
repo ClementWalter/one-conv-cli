@@ -87,8 +87,6 @@ def test_retried_topic_id_is_stored_once(hub):
     assert len(state.inbox("box", 0)) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="the hub stores a topic post only per recipient, so a post made before "
-                   "anyone else joined is lost to later joiners; reported on PR #21")
 def test_catch_up_reads_the_hub_history(hub):
     _, url, box = hub
     as_box(url, box).join("release", BOX_SESSION)

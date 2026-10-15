@@ -231,13 +231,14 @@ class Bridge:
             except (OSError, ValueError):
                 continue
             try:
-                self.client.post(message)
+                hubclient.post_queued(self.client, message, path)
             except hubclient.HubRefused as error:
+                # Only a terminal refusal reaches here; it is set aside for a person to look at.
                 refused = hubclient.outbox() / "refused"
                 refused.mkdir(exist_ok=True)
                 _write_private(refused / path.name, {**message, "error": str(error)})
+                path.unlink(missing_ok=True)
                 logger.warning("the hub refused queued message %s: %s", path.stem, error)
-            path.unlink(missing_ok=True)
             sent += 1
         return sent
 
@@ -291,7 +292,9 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None) 
         while not (stop_requested or stopping()):
             try:
                 url = forward.open() if forward else hub
-                client = hubclient.HubClient(url, token, node, timeout=POLL_SECONDS + 15)
+                # Every request checks the forward is still this ssh's, as the CLI's do.
+                client = hubclient.HubClient(url, token, node, timeout=POLL_SECONDS + 15,
+                                             listener_pid=forward.process.pid if forward else None)
                 answered = client.request("GET", "/v1/whoami").get("node")
                 if answered != node:
                     logger.error("this token belongs to node %r, not %r", answered, node)

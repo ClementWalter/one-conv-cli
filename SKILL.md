@@ -227,7 +227,10 @@ writes one turn to the shared corpus log. These are writes, not history reads.
 
 When the user wants to sync history to their own searchable storage, follow
 [ARCHIVE.md](ARCHIVE.md). Start with a bounded copy and verify existing commands
-against the archive. Use `uv` for Python. Never delete native history as part of sync.
+against the archive. Use `uv` for Python. Once configured, one-conv syncs in the
+background as it is used and warns when sync fails. Free local space only when the
+user asks, with `--free-older-than`; it deletes only files the archive holds exactly,
+and `--restore` writes them back.
 
 ## Verification
 

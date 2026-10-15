@@ -1,21 +1,31 @@
 """Versioned archive transport and capture format, shared by the client and the server."""
 
-from concurrent.futures import ThreadPoolExecutor
 import base64
 import hashlib
 import json
+import math
 import os
 import re
+import tempfile
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, build_opener, HTTPRedirectHandler
-import zlib
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 CHUNK_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 FIELDS = ("turns", "turns_with_subagents", "search_text")
 DIGEST = re.compile(r"[0-9a-f]{64}")
 READ_WORKERS = 4
+# Files in one-conv's state directory shared by the sync script and readers.
+SYNC_STATE = "archive-sync.json"
+SYNC_LOCK = "archive-sync.lock"
+SYNC_LOG = "archive-sync.log"
+LISTING_CACHE = "archive-listing.json"
+# A running sync refreshes its lock after every conversation; one conversation's upload
+# can take minutes on a slow link, so only a much older lock belongs to a stopped sync.
+SYNC_STALE_SECONDS = 3600
 # Python's socket timeout bounds a whole send, so upload deadlines grow with the body,
 # assuming at least 1 Mbit/s of upstream bandwidth.
 MIN_UPLOAD_BYTES_PER_SECOND = 128 * 1024
@@ -23,6 +33,98 @@ MIN_UPLOAD_BYTES_PER_SECOND = 128 * 1024
 
 class ArchiveError(RuntimeError):
     pass
+
+
+def read_json(path):
+    """A state file's content; a missing or damaged file reads as empty so it is rewritten, not fatal."""
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+# Year 3000: later, non-finite or non-numeric times cannot be formatted or compared safely.
+_LATEST_TIME = 32_503_680_000
+
+
+def timestamp(value):
+    """`value` as epoch seconds, or None unless it is a plain number in a representable range."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    # Bounds first: a huge JSON integer overflows float conversion inside math.isfinite.
+    if not 0 <= value < _LATEST_TIME or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def sync_record(raw):
+    """The sync state file's fields with their expected types; anything else reads as absent."""
+    failures = raw.get("failures")
+    failed = raw.get("failed")
+    return {
+        "error": raw["error"] if isinstance(raw.get("error"), str) and raw["error"] else None,
+        "failed": failed if isinstance(failed, int) and not isinstance(failed, bool) and failed > 0 else 0,
+        "failures": [item for item in failures if isinstance(item, str)] if isinstance(failures, list) else [],
+        **{field: timestamp(raw.get(field)) for field in ("finished", "succeeded", "requested", "started")},
+    }
+
+
+# Counts above this cannot be real and overflow the formatters' float arithmetic.
+_LARGEST_COUNT = 10 ** 15
+
+
+def _is_int(value):
+    """A plain, non-negative count small enough for every formatter."""
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < _LARGEST_COUNT
+
+
+def _present(mapping, field, check):
+    """`field` exists in `mapping` and its value passes `check`; a missing key never passes."""
+    return field in mapping and check(mapping[field])
+
+
+def valid_row(row):
+    """Whether an archive listing row satisfies everything the readers index into.
+
+    The summary must hold every field a native summary has, because readers show an archived
+    summary in place of one: a partial summary would crash a listing much later.
+    """
+    if not isinstance(row, dict):
+        return False
+    summary = row.get("summary")
+    text = lambda value: isinstance(value, str)
+    optional_text = lambda value: value is None or isinstance(value, str)
+    return (all(_present(row, field, text) for field in ("key", "revision", "source", "cwd", "session", "locator"))
+            and timestamp(row.get("mtime")) is not None
+            and _present(row, "unread_native", lambda value: value is None or isinstance(value, bool))
+            and _present(row, "account_label", optional_text)
+            and isinstance(summary, dict)
+            and all(_present(summary, field, text) for field in ("uuid", "source", "cwd", "start", "end"))
+            and _present(summary, "title", text)
+            and _present(summary, "turns", _is_int)
+            and _present(summary, "tokens", lambda value: value is None or _is_int(value)))
+
+
+def listing_record(raw):
+    """The cached listing's fields with their expected types; malformed rows are dropped."""
+    rows = raw.get("rows")
+    return {"url": raw["url"] if isinstance(raw.get("url"), str) else None,
+            "listed": timestamp(raw.get("listed")),
+            "rows": [row for row in rows if valid_row(row)] if isinstance(rows, list) else None}
+
+
+def write_json(path, value):
+    """Replace a state file atomically; concurrent writers never share a temporary file. Readable by the owner only."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(value, stream)
+        os.replace(temporary, path)
+    except BaseException:
+        os.unlink(temporary)
+        raise
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -46,6 +148,11 @@ def conversation_key(origin, source, cwd, session, locator):
     return revision([origin, source, cwd, session, locator])
 
 
+def split(data):
+    """Content-addressed chunks of one field or original record, in order."""
+    return [(digest(part), part) for part in (data[start:start + CHUNK_BYTES] for start in range(0, len(data), CHUNK_BYTES))]
+
+
 def pack(capture):
     """Split a capture into a manifest and content-addressed raw chunks.
 
@@ -54,17 +161,14 @@ def pack(capture):
     """
     chunks = {}
 
-    def split(data):
-        digests = []
-        for start in range(0, len(data), CHUNK_BYTES):
-            part = data[start:start + CHUNK_BYTES]
-            digests.append(digest(part))
-            chunks[digests[-1]] = part
-        return digests
+    def record(data):
+        parts = split(data)
+        chunks.update(parts)
+        return [name for name, _ in parts]
 
     manifest = {name: value for name, value in capture.items() if name not in (*FIELDS, "originals")}
-    manifest["fields"] = {field: split(encode(capture[field])) for field in FIELDS}
-    manifest["originals"] = {name: split(data) for name, data in capture["originals"].items()}
+    manifest["fields"] = {field: record(encode(capture[field])) for field in FIELDS}
+    manifest["originals"] = {name: record(data) for name, data in capture["originals"].items()}
     return manifest, chunks
 
 
@@ -166,6 +270,10 @@ class ArchiveClient:
         return self.request("conversations", {"manifest": manifest, "expected": expected})
 
 
+def configured_url():
+    return os.environ.get("ONE_CONV_ARCHIVE_URL")
+
+
 def configured_client():
-    url = os.environ.get("ONE_CONV_ARCHIVE_URL")
+    url = configured_url()
     return ArchiveClient(url, os.environ.get("ONE_CONV_ARCHIVE_TOKEN", "")) if url else None

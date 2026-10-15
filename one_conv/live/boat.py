@@ -74,6 +74,11 @@ def _accepted(log_path) -> str | None:
 
 
 def deliver(session: LiveSession, text: str) -> str:
+    """Prompt an idle conversation; the idle state is read just before, not held.
+
+    A turn that starts between that read and Boat accepting the prompt would receive the
+    message mid-turn as a normal prompt; Boat offers no conditional prompt to close this.
+    """
     if session.status != "idle":
         raise RuntimeError(f"{session.address} is running a turn. Boat can only steer a busy "
                            "conversation, which would present this message as the user's own "
@@ -110,8 +115,9 @@ def pull(ident: str) -> list[dict]:
         inner = data.get("data") or {}
         if row.get("event") != "chat" or row.get("final") is False or inner.get("is_reverted"):
             continue
-        if data.get("type") == "prompt":
-            turns.append({"ts": data.get("timestamp"), "role": "user", "text": inner.get("prompt", "")})
-        elif data.get("type") == "response":
-            turns.append({"ts": data.get("timestamp"), "role": "assistant", "text": inner.get("content", "")})
+        role, text = {"prompt": ("user", inner.get("prompt")),
+                      "response": ("assistant", inner.get("content"))}.get(data.get("type"), (None, None))
+        # Tool-only steps arrive as responses with no text; they carry nothing to read.
+        if role and isinstance(text, str) and text.strip():
+            turns.append({"ts": data.get("timestamp"), "role": role, "text": text})
     return sorted(turns, key=lambda turn: turn["ts"] or 0)

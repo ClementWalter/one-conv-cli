@@ -285,7 +285,8 @@ one-conv live pull boat:bx_ab12/2ab1…      # read the agent's answers back
 
 - Delivery uses `box prompt --resume` and only reaches an idle conversation. A busy
   one is refused, because Boat's `steer` would present a peer message as your
-  own instruction.
+  own instruction. Idle is checked just before prompting, so a turn that starts
+  in that moment receives the message as an ordinary prompt.
 - The remote agent cannot message this machine, so the envelope asks it to answer
   in its own conversation, and `live pull` reads that back with `box events`.
 - `--fyi` cannot reach a sandbox. Boat is listed only when asked for by name

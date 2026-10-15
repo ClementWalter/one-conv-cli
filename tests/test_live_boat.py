@@ -42,6 +42,7 @@ elif command == "events":
         {"event": "chat", "final": True, "data": {"type": "response", "timestamp": 3, "data": {"content": "Ready."}}},
         {"event": "chat", "final": True, "data": {"type": "response", "timestamp": 4,
          "data": {"content": "withdrawn", "is_reverted": True}}},
+        {"event": "chat", "final": True, "data": {"type": "response", "timestamp": 5, "data": {"content": ""}}},
     ]
     for row in rows:
         print(json.dumps(row))
@@ -125,7 +126,7 @@ def test_fyi_to_boat_is_refused(box):
         router.send(f"boat:{SANDBOX}/{IDLE}", "merged", LiveSession("claude", "c1"), fyi=True)
 
 
-def test_pull_keeps_final_unreverted_turns(box):
+def test_pull_keeps_final_unreverted_turns_with_text(box):
     assert [(t["role"], t["text"]) for t in boat.pull(f"{SANDBOX}/{IDLE}")] == [
         ("user", "question"), ("assistant", "Ready.")]
 

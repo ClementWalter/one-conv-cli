@@ -368,6 +368,8 @@ one-conv live send ci-runner/codex:019a 'rerun the flaky test' --yes
   host whose key is already known; `https://` verifies the certificate; plain
   `http://` is accepted only to 127.0.0.1. The token travels only in a request
   header, no redirect is followed, and no proxy from the environment is used.
+  Through `ssh://`, `live send` uses the forwarded port only while the bridge's
+  own ssh process holds it; once the bridge has stopped, sends are queued instead.
 - The bridge publishes this machine's live sessions every 15 seconds and
   long-polls for messages addressed to them, handing each to that session's own
   harness as a local send would. A message for a session that is not live here is

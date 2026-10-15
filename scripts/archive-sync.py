@@ -7,6 +7,7 @@
 
 import argparse
 import base64
+import dataclasses
 import errno
 import importlib.machinery
 import importlib.util
@@ -17,8 +18,10 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -138,9 +141,8 @@ def read_regular(path):
     """Bytes of `path` only if it is a regular file itself, not a symlink to one."""
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
-        # No no-follow open here: refuse a symlink seen just before reading.
-        require_regular([path])
-        return path.read_bytes()
+        # A pathname check before reading would leave a check-then-use race; refuse instead.
+        raise ArchiveError("archiving needs no-follow file opens, which this system lacks")
     try:
         descriptor = os.open(path, os.O_RDONLY | nofollow)
     except OSError as error:
@@ -208,6 +210,45 @@ def fingerprint(paths):
             if p.exists() and not (p.name.endswith("-wal") and p.stat().st_size == 0)]
 
 
+def snapshot_store(path):
+    """A consistent SQLite image of a Cursor CLI store, taken from no-follow copies of the store and
+    its write-ahead log in a private folder, so SQLite itself never opens a path that could be a link."""
+    with tempfile.TemporaryDirectory(prefix="one-conv-store-") as private:
+        copy = Path(private) / path.name
+        copy.write_bytes(read_regular(path))
+        try:
+            Path(str(copy) + "-wal").write_bytes(read_regular(Path(str(path) + "-wal")))
+        except FileNotFoundError:
+            pass  # A checkpointed store has no write-ahead log.
+        with sqlite3.connect(copy) as source, sqlite3.connect(":memory:") as snapshot:
+            source.backup(snapshot)
+            return snapshot.serialize()
+
+
+# Sources whose conversation is parsed again from the captured bytes; the rest read cloud caches one-conv wrote itself.
+PROTECTED_SOURCES = ("claude", "codex", "omp", "cursor-cli")
+
+
+@contextmanager
+def captured_copy(handle, paths, originals):
+    """`handle` pointed at a private copy of its captured bytes, laid out as on disk.
+
+    The reader opens files by path; parsing the copy means turns, summary and title come from the
+    same bytes as the archived originals, whatever replaces the real paths meanwhile.
+    """
+    if handle.source not in PROTECTED_SOURCES or handle.path is None:
+        yield handle
+        return
+    base = handle.path.parent
+    with tempfile.TemporaryDirectory(prefix="one-conv-capture-") as private:
+        root = Path(private)
+        for path in paths:
+            target = root / path.relative_to(base)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(originals[str(path)])
+        yield dataclasses.replace(handle, path=root / handle.path.relative_to(base))
+
+
 def original_records(reader, handle, paths):
     if handle.source == "cursor":
         conn = reader._cursor_connect()
@@ -231,9 +272,7 @@ def original_records(reader, handle, paths):
         # Only the Cursor CLI store is a live database to snapshot; any other file, whatever its
         # name, goes through read_source so a session-folder sidecar stays inside its boundary.
         if handle.source == "cursor-cli" and path == handle.path:
-            with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as source, sqlite3.connect(":memory:") as snapshot:
-                source.backup(snapshot)
-                data = snapshot.serialize()
+            data = snapshot_store(path)
         else:
             data = read_source(handle, path)
         result[str(path)] = data
@@ -248,13 +287,14 @@ def capture(reader, handle, origin):
     originals = original_records(reader, handle, paths)
     account_label = None
     if handle.source in reader.CLOUD_SOURCES or (handle.path and handle.path.suffix == ".json"):
-        cached = json.loads(handle.path.read_text()) if handle.path else {}
+        cached = json.loads(originals[str(handle.path)]) if handle.path else {}
         if cached.get("complete") is False:
             raise ArchiveError(f"Incomplete provider capture: {handle.uuid}; pull complete history first")
         account_label = cached.get("account_label")
-    turns = reader._handle_iter_turns(handle, include_subagents=False)
-    expanded = reader._handle_iter_turns(handle, include_subagents=True) if handle.source == "claude" else None
-    summary = reader._handle_summary(handle, {})
+    with captured_copy(handle, paths, originals) as parsed:
+        turns = reader._handle_iter_turns(parsed, include_subagents=False)
+        expanded = reader._handle_iter_turns(parsed, include_subagents=True) if handle.source == "claude" else None
+        summary = reader._handle_summary(parsed, {})
     summary.pop("unread", None)
     document = {"origin": origin, "source": handle.source, "cwd": handle.project_cwd,
         "session": handle.uuid, "locator": reader._record_locator(handle), "mtime": handle.mtime, "capture_version": CAPTURE_VERSION,

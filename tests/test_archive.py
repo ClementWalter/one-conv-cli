@@ -485,6 +485,60 @@ def test_capture_refuses_a_cursor_cli_meta_file_that_is_a_symlink(tmp_path, monk
         sync.capture(reader, handle, "origin")
 
 
+def write_omp_transcript(env):
+    from test_omp import _write_session
+    return _write_session(Path(env["OMP_HOME"]))
+
+
+# Each source's transcript, one word in it, and that word uppercased: same size, so only the content differs.
+PARSER_RACE_SOURCES = {
+    "claude": (write_claude, "Quartz", "QUARTZ"),
+    "codex": (write_codex, "Quartz", "QUARTZ"),
+    "omp": (write_omp_transcript, "Widget", "WIDGET"),
+}
+
+
+@pytest.mark.parametrize("source", sorted(PARSER_RACE_SOURCES))
+def test_capture_ignores_a_transcript_swapped_and_restored_during_the_parse(tmp_path, monkeypatch, source):
+    """The reader parses a private copy of the captured bytes, so a swap made and undone while it parses changes nothing."""
+    write, word, outside_word = PARSER_RACE_SOURCES[source]
+    env = fixture_env(tmp_path)
+    path = write(env)
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text(path.read_text().replace(word, outside_word))
+    times = path.stat()
+    os.utime(outside, ns=(times.st_atime_ns, times.st_mtime_ns))
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "OMP_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects((source,)) for h in reader._native_project_sessions(p))
+    parse = reader._handle_iter_turns
+    parked = path.with_name("parked.jsonl")
+
+    def swap_parse_restore(*args, **kwargs):
+        path.rename(parked)
+        path.symlink_to(outside)
+        try:
+            return parse(*args, **kwargs)
+        finally:
+            path.unlink()
+            parked.rename(path)
+
+    monkeypatch.setattr(reader, "_handle_iter_turns", swap_parse_restore)
+    document = sync.capture(reader, handle, "origin")
+    assert not any(outside_word in json.dumps(turn) for turn in document["turns"])
+
+
+def test_read_regular_refuses_without_nofollow_opens(tmp_path, monkeypatch):
+    sync = load_sync_script()
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    regular = tmp_path / "regular.txt"
+    regular.write_text("own text")
+    with pytest.raises(ArchiveError, match="no-follow file opens"):
+        sync.read_regular(regular)
+
+
 def test_read_regular_refuses_a_symlink(tmp_path):
     target = tmp_path / "target.txt"
     target.write_text("outside")

@@ -112,15 +112,19 @@ def create_server() -> MCPServer:
 
     @server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=False),
                  structured_output=True)
-    def send_message(to: str, text: str, ctx: Context) -> dict[str, Any]:
+    def send_message(to: str, text: str, ctx: Context, fyi: bool = False,
+                     expect_reply: bool = True) -> dict[str, Any]:
         """Send text as a new user turn into the running session `to` (address, id prefix or title).
 
-        The receiver sees your session's address and can answer with this same tool.
+        Use fyi=true for acknowledgments, sign-offs and completion notices: they wait in the
+        receiver's `local feed` and do not wake it. expect_reply=false marks a pushed message
+        as needing no answer. Never answer a message marked reply="none".
         """
         from .live import router
         meta = dict(ctx.request_context.meta or {})
         try:
-            return router.send(to, text, router.whoami(meta=meta))
+            return router.send(to, text, router.whoami(meta=meta), fyi=fyi,
+                               reply="expected" if expect_reply else "none")
         except (router.LiveError, RuntimeError, OSError) as error:
             raise ValueError(str(error)) from error
 

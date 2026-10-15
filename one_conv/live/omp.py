@@ -127,10 +127,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "one_conv_send",
     label: "one-conv send",
-    description: "Send a message to another live agent session (address like claude:<id>, codex:<id>, omp:<id>). Run `one-conv live ls` to list them.",
-    parameters: z.object({ to: z.string(), message: z.string() }),
+    description: "Send a message to another live agent session (address like claude:<id>, codex:<id>, omp:<id>). Run `one-conv live ls` to list them. Set fyi for acknowledgments, sign-offs and completion notices: they wait in the receiver's feed and expect no reply. Set noReply to push an awaited result or blocker that needs no answer. Never answer a message marked reply=\"none\".",
+    parameters: z.object({ to: z.string(), message: z.string(), fyi: z.boolean().optional(),
+                           noReply: z.boolean().optional() }),
     async execute(_id, params) {
-      const args = [...LAUNCHER.slice(1), "live", "send", "--yes", "--from", `omp:${current}`, "--", params.to, params.message];
+      const flags = params.fyi ? ["--fyi"] : params.noReply ? ["--no-reply"] : [];
+      const args = [...LAUNCHER.slice(1), "live", "send", "--yes", ...flags, "--from", `omp:${current}`, "--", params.to, params.message];
       const text: string = await new Promise((resolve) => {
         execFile(LAUNCHER[0], args, { timeout: 60000 }, (error, stdout, stderr) =>
           resolve(error ? `failed: ${stderr || error.message}` : stdout.trim()));

@@ -154,6 +154,20 @@ def test_a_retried_message_id_reports_a_duplicate(two_nodes):
     assert call(url, "/v1/messages", mac, "POST", sent)[1]["duplicate"] is True
 
 
+@pytest.mark.parametrize("sent, mode", [({}, "push"), ({"mode": "fyi"}, "fyi")])
+def test_the_inbox_carries_the_delivery_mode(two_nodes, sent, mode):
+    _, url, mac, box = two_nodes
+    call(url, "/v1/messages", mac, "POST", message("box/claude:bbb", reply="none", **sent))
+    assert call(url, "/v1/inbox?wait=0", box)[1]["messages"][0]["mode"] == mode
+
+
+def test_an_fyi_and_a_no_reply_push_under_one_id_conflict(two_nodes):
+    _, url, mac, _ = two_nodes
+    sent = message("box/claude:bbb", reply="none")
+    call(url, "/v1/messages", mac, "POST", sent)
+    assert call(url, "/v1/messages", mac, "POST", {**sent, "mode": "fyi"})[0] == 409
+
+
 def test_a_lost_response_is_answered_by_the_original_receipt(two_nodes):
     _, url, mac, _ = two_nodes
     sent = message("box/claude:bbb")
@@ -374,7 +388,7 @@ def test_a_chunked_body_growing_too_large_is_refused(two_nodes):
 
 
 @pytest.mark.parametrize("bad", [
-    {"id": "short"}, {"text": ""}, {"reply": "maybe"}, {"to": "nowhere"}, {"to": "box/claude:nobody"}])
+    {"id": "short"}, {"text": ""}, {"reply": "maybe"}, {"mode": "wake"}, {"to": "nowhere"}, {"to": "box/claude:nobody"}])
 def test_a_malformed_message_is_refused(two_nodes, bad):
     _, url, mac, _ = two_nodes
     assert call(url, "/v1/messages", mac, "POST", {**message("box/claude:bbb"), **bad})[0] in (400, 404)

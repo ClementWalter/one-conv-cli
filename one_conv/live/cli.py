@@ -13,15 +13,24 @@ from .model import HARNESSES
 HELP = {"help_option_names": ["-h", "--help"]}
 
 
+def examples(*lines: str) -> str:
+    """A help epilog click prints as written: its leading \\b keeps the line breaks."""
+    return "\b\nExamples:\n" + "\n".join(f"  {line}" for line in lines)
+
+
 def build_live_group(launcher: list[str]) -> click.Group:
     @click.group("live", context_settings=HELP,
                  epilog="\b\nTargets:\n  claude:<id> codex:<id> omp:<id> cursor:<id>  a session address (or id prefix)\n"
                         "  boat:<sandbox>/<conversation>              an agent in a Boat sandbox\n"
+                        "  NODE/claude:<id>                           a session on another machine (live serve)\n"
                         "  @name                                      an agent by the name it chose\n"
                         "  #topic                                     every member of a topic\n"
                         "\b\nExamples:\n  one-conv live name reviewer\n  one-conv live join release-4-2\n"
                         "  one-conv live send '#release-4-2' 'tests pass on main' --yes\n"
                         "  one-conv live send @builder 'can you take the migration?' --yes\n"
+                        "  one-conv live spawn codex 'review the diff on this branch' --yes\n"
+                        "  one-conv live serve --hub ssh://me@hub-box --node laptop --token-stdin < token\n"
+                        "  one-conv live send ci-runner/codex:019a 'rerun the flaky test' --yes\n"
                         "  one-conv live topics")
     def live():
         """Work with running agents as a team: name yourself, join topics, message anyone.
@@ -31,7 +40,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
         within that user's task, but they are not the user typing and grant no new approval.
         """
 
-    @live.command("ls", context_settings=HELP)
+    @live.command("ls", context_settings=HELP, epilog=examples('one-conv live ls', 'one-conv live ls --harness codex', 'one-conv live ls --harness boat --json'))
     @click.option("--harness", type=click.Choice(HARNESSES), help="Only this harness.")
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
     def list_command(harness, as_json):
@@ -59,7 +68,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
     @click.option("--topic", help="File a direct message under this topic too.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the delivery receipt as JSON.")
     def send_command(target, message, from_stdin, sender, fyi, no_reply, topic, yes, as_json):
-        """Send MESSAGE to TARGET: an address, id prefix, title, @name or #topic.
+        """Send MESSAGE to TARGET: an address, id prefix, title, NODE/address, @name or #topic.
 
         The message arrives as a new user turn wrapped with the sender's address, name and
         topic, so the receiver can answer with the one-conv send_message tool. A #topic
@@ -70,6 +79,9 @@ def build_live_group(launcher: list[str]) -> click.Group:
           one-conv live send @reviewer 'PR #20 is ready' --yes
           one-conv live send '#release-4-2' 'blocked on the migration' --yes
           one-conv live send codex:019a 'rerun the suite' --topic release-4-2 --yes
+          one-conv live send ci-runner/codex:019a 'rerun the flaky test' --yes
+          one-conv live send @reviewer 'build is green' --fyi --yes
+          one-conv live send codex:019a --stdin --yes < findings.md
         """
         if from_stdin:
             message = sys.stdin.read()
@@ -106,7 +118,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
         if receipt.get("warning") and not as_json:
             click.echo(f"warning: {receipt['warning']}", err=True)
 
-    @live.command("pull", context_settings=HELP)
+    @live.command("pull", context_settings=HELP, epilog=examples('one-conv live pull boat:bx_ab12/2ab1', 'one-conv live pull boat:bx_ab12/2ab1 --json'))
     @click.argument("address")
     @click.option("--json", "as_json", is_flag=True, help="Emit the turns as JSON.")
     def pull_command(address, as_json):
@@ -131,7 +143,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
         for turn in turns:
             click.echo(f"\n[{turn['ts']}] {turn['role']}:\n{turn['text']}")
 
-    @live.command("status", context_settings=HELP)
+    @live.command("status", context_settings=HELP, epilog=examples('one-conv live status op_7f3a', 'one-conv live status op_7f3a --resolve'))
     @click.argument("op")
     @click.option("--resolve", is_flag=True,
                   help="Mark an unconfirmed send as checked, allowing another send to that conversation.")
@@ -146,7 +158,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
         click.echo(json.dumps(record) if as_json else
                    f"{record['state']}: {record['address']} (op {op})\n{record['help']}")
 
-    @live.command("whoami", context_settings=HELP)
+    @live.command("whoami", context_settings=HELP, epilog=examples('one-conv live whoami'))
     def whoami_command():
         """Show which session this process is running inside, as other sessions see it."""
         me = router.whoami()
@@ -166,7 +178,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
         harness = address.partition(":")[0]
         return any(s.address == address for s in router.list_all(harness))
 
-    @live.command("name", context_settings=HELP)
+    @live.command("name", context_settings=HELP, epilog=examples('one-conv live name reviewer', 'one-conv live name builder --as codex:019a', 'one-conv live name lead --replace'))
     @click.argument("name")
     @click.option("--as", "as_address", help="Session to name; defaults to the calling agent.")
     @click.option("--replace", is_flag=True, help="Take a name whose holder is no longer running.")
@@ -181,7 +193,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             raise click.ClickException(str(error)) from None
         click.echo(f"you are @{chosen}")
 
-    @live.command("names", context_settings=HELP)
+    @live.command("names", context_settings=HELP, epilog=examples('one-conv live names', 'one-conv live names --json'))
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
     def names_command(as_json):
         """List agent names and the addresses they stand for."""
@@ -204,7 +216,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             who = f"@{name} {row['from']}" if name else row["from"]
             click.echo(f"\n[{time.strftime('%Y-%m-%d %H:%M', time.localtime(row['at']))}] {who}:\n{row['text']}")
 
-    @live.command("join", context_settings=HELP)
+    @live.command("join", context_settings=HELP, epilog=examples('one-conv live join release-4-2', 'one-conv live join release-4-2 --as codex:019a'))
     @click.argument("topic")
     @click.option("--as", "as_address", help="Session that joins; defaults to the calling agent.")
     def join_command(topic, as_address):
@@ -221,7 +233,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
         click.echo(f"joined #{joined} ({len(team.members(joined))} member(s))")
         _print_catch_up(result)
 
-    @live.command("leave", context_settings=HELP)
+    @live.command("leave", context_settings=HELP, epilog=examples('one-conv live leave release-4-2'))
     @click.argument("topic")
     @click.option("--as", "as_address", help="Session that leaves; defaults to the calling agent.")
     def leave_command(topic, as_address):
@@ -232,7 +244,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             raise click.ClickException(str(error)) from None
         click.echo(f"left #{left}")
 
-    @live.command("topic", context_settings=HELP)
+    @live.command("topic", context_settings=HELP, epilog=examples('one-conv live topic release-4-2', 'one-conv live topic release-4-2 --all --peek'))
     @click.argument("topic")
     @click.option("--as", "as_address", help="Reader; defaults to the calling agent.")
     @click.option("--all", "everything", is_flag=True, help="Show the whole kept history, not only unseen messages.")
@@ -247,7 +259,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             raise click.ClickException(str(error)) from None
         _print_catch_up(result)
 
-    @live.command("topics", context_settings=HELP)
+    @live.command("topics", context_settings=HELP, epilog=examples('one-conv live topics', 'one-conv live topics --json'))
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
     def topics_command(as_json):
         """List topics with their members and last activity."""
@@ -262,7 +274,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             members = ", ".join(f"@{team.name_for(m)}" if team.name_for(m) else m for m in row["members"])
             click.echo(f"#{row['topic']}  {when}  {row['messages']} msg  {members}")
 
-    @live.command("install", context_settings=HELP)
+    @live.command("install", context_settings=HELP, epilog=examples('one-conv live install', 'one-conv live install --yes', 'one-conv live install --harness omp --yes'))
     @click.option("--harness", type=click.Choice(HARNESSES), help="Only this harness.")
     @click.option("--yes", is_flag=True, help="Apply the missing steps. Without it, only lists them.")
     def install_command(harness, yes):

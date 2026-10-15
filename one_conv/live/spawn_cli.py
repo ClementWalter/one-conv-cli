@@ -7,6 +7,7 @@ from pathlib import Path
 import click
 
 from . import router, spawn
+from .cli import examples
 
 HELP = {"help_option_names": ["-h", "--help"]}
 
@@ -72,7 +73,7 @@ def add_spawn_commands(live: click.Group) -> None:
         click.echo(f"  message it: one-conv live send {started.address} 'text' --yes")
         click.echo(f"  watch it:   tmux attach -t {started.tmux}")
 
-    @live.command("spawned", context_settings=HELP)
+    @live.command("spawned", context_settings=HELP, epilog=examples('one-conv live spawned', 'one-conv live spawned --json'))
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
     def spawned_command(as_json):
         """List agents started with `live spawn` whose tmux session is still running."""
@@ -85,7 +86,7 @@ def add_spawn_commands(live: click.Group) -> None:
         for row in rows:
             click.echo(f"{row['address'] or '(not registered)'}  {row['harness']:<7}  {row['tmux']}  {row['cwd']}")
 
-    @live.command("stop", context_settings=HELP)
+    @live.command("stop", context_settings=HELP, epilog=examples('one-conv live stop codex:019a', 'one-conv live stop oneconv-codex-1a2b3c4d'))
     @click.argument("target")
     def stop_command(target):
         """End a spawned agent, by its address or tmux session name."""

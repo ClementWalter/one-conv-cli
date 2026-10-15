@@ -241,10 +241,28 @@ one-conv live ls               # running sessions and their addresses
 one-conv live send codex:01a1 "run the migration first" --yes
 ```
 
-`live send` takes an address, an id prefix, a substring of a session's title or
-working directory, an `@name` or a `#topic`, and defaults to a dry run. Inside an agent, the one-conv
-MCP tools `list_live_sessions` and `send_message` do the same; the sender is
-identified from the calling session.
+One `live send` reaches any of these, and defaults to a dry run until `--yes`:
+
+| Target | Reaches |
+| --- | --- |
+| `claude:<id>`, `codex:<id>`, `omp:<id>`, `cursor:<id>` | a session on this machine; a unique id prefix or a substring of its title or folder works too |
+| `boat:<sandbox>/<conversation>` | an agent in a Boat sandbox |
+| `NODE/claude:<id>` (any harness) | a session on another machine, through a hub (see [Working across machines](#working-across-machines)) |
+| `@name` | the agent on this machine that chose that name |
+| `#topic` | every member of the topic but you |
+
+Inside an agent, the one-conv MCP tools `list_live_sessions` and `send_message`
+do the same; the sender is identified from the calling session.
+
+A typical start, from the first agent you prompt:
+
+```bash
+one-conv live name lead                                   # others can write to @lead
+one-conv live join release-4-2                            # a topic for this piece of work
+one-conv live spawn codex 'review the migration; join #release-4-2' --yes
+one-conv live send '#release-4-2' 'migration is on branch m42' --yes
+one-conv live send @reviewer 'fyi: CI is green' --fyi --yes   # lands in its feed, no wake
+```
 
 | Harness | Delivery | Reaches an idle session? | Installed by `live install` |
 | --- | --- | --- | --- |
@@ -322,6 +340,53 @@ harness's own flags with `--arg`. Claude Code asks whether to trust a folder it 
 seen; `spawn` stops and says so unless `--trust-folder` answers yes. Oh My Pi needs the
 live extension from `live install`. A stopped Codex thread stays loaded in Codex's
 app-server for a few minutes, but `live ls` no longer lists it.
+
+### Working across machines
+
+Agents on different machines reach each other through a hub. Each machine runs
+one bridge, `live serve`, which only connects out: nothing listens on the
+machines themselves. Agents never need to know where another one runs beyond its
+address, `NODE/harness:id`, or its `@name`.
+
+On the machine that hosts the hub (the hub binds to localhost by default):
+
+```bash
+uv run scripts/live-hub.py token add laptop --db hub.db > laptop.token   # one token per machine
+uv run scripts/live-hub.py serve --db hub.db                             # 127.0.0.1:8789
+```
+
+On each machine, with the token issued to it:
+
+```bash
+one-conv live serve --hub ssh://me@hub-box --node laptop --token-stdin < laptop.token
+one-conv live serve --hub https://hub.example.com --node ci-runner      # behind a TLS proxy
+one-conv live serve --status
+one-conv live send ci-runner/codex:019a 'rerun the flaky test' --yes
+```
+
+- `ssh://` opens `ssh -N -L` to the hub's port, non-interactively and only to a
+  host whose key is already known; `https://` verifies the certificate; plain
+  `http://` is accepted only to 127.0.0.1. The token travels only in a request
+  header, no redirect is followed, and no proxy from the environment is used.
+- The bridge publishes this machine's live sessions every 15 seconds and
+  long-polls for messages addressed to them, handing each to that session's own
+  harness as a local send would. A message for a session that is not live here is
+  refused, not queued.
+- While the hub is unreachable, `live send` queues the message and the bridge
+  posts it later under the same id, so the hub never stores it twice.
+- Each message is recorded on the receiving machine before its harness is
+  called. A message the hub hands out again is not delivered again. If the
+  bridge stopped in the middle of a delivery, the sender sees `unconfirmed`
+  rather than a second prompt. The outcome the sender can read is what the
+  harness did (`accepted`, `refused` or `unconfirmed`), not whether the agent
+  has read it yet.
+- A machine's token vouches for the sessions its bridge publishes, not for each
+  process on that machine. `token revoke NODE` cuts one machine off.
+- Topics work across machines once a bridge runs: a `#topic` post goes to every
+  member wherever it runs, and catch-up reads the hub's history. Names are
+  published with each session and shown on received messages, but `@name`
+  resolves only on the sender's machine for now: address a remote agent as
+  `NODE/harness:id`, which is also what its messages give as the reply address.
 
 ### Agents in Boat sandboxes
 

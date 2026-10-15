@@ -377,6 +377,38 @@ def test_capture_refuses_a_session_folder_swapped_for_a_symlink_after_enumeratio
         sync.capture(reader, handle, "origin")
 
 
+def test_capture_refuses_a_swapped_session_folder_for_a_db_named_sidecar(tmp_path, monkeypatch):
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    folder = path.parent / "session-one"
+    folder.mkdir()
+    with sqlite3.connect(folder / "result.db") as conn:
+        conn.execute("CREATE TABLE t (x)")
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    with sqlite3.connect(outside / "result.db") as conn:
+        conn.execute("CREATE TABLE t (x)")
+        conn.execute("INSERT INTO t VALUES ('EXTERNAL-SENTINEL')")
+    for name in ("CLAUDE_CONFIG_DIR", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects(("claude",)) for h in reader._native_project_sessions(p))
+    enumerate_sources = sync.fingerprint
+
+    def swap_after_enumeration(paths):
+        stamp = enumerate_sources(paths)
+        if folder.is_dir() and not folder.is_symlink():
+            (folder / "result.db").unlink()
+            folder.rmdir()
+            folder.symlink_to(outside, target_is_directory=True)
+        return stamp
+
+    monkeypatch.setattr(sync, "fingerprint", swap_after_enumeration)
+    with pytest.raises(OSError):
+        sync.capture(reader, handle, "origin")
+
+
 def test_read_source_refuses_a_swapped_session_folder(tmp_path):
     sync = load_sync_script()
     transcript = tmp_path / "session-one.jsonl"

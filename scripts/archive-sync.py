@@ -189,7 +189,9 @@ def original_records(reader, handle, paths):
             conn.close()
     result = {}
     for path in paths:
-        if path.suffix == ".db":
+        # Only the Cursor CLI store is a live database to snapshot; any other file, whatever its
+        # name, goes through read_source so a session-folder sidecar stays inside its boundary.
+        if handle.source == "cursor-cli" and path == handle.path:
             with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as source, sqlite3.connect(":memory:") as snapshot:
                 source.backup(snapshot)
                 data = snapshot.serialize()

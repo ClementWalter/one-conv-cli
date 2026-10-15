@@ -169,17 +169,29 @@ def submit(hub: HubClient, message: dict) -> dict | None:
     return detail
 
 
+def _classify(error: Exception) -> str:
+    # Only a 4xx is the hub's verdict on this message; a redirect or 5xx may follow a commit.
+    if isinstance(error, HubRefused) and 400 <= error.status < 500 and error.status not in RETRYABLE:
+        return "refused"
+    return "retry"
+
+
 def _outcome(hub: HubClient, message: dict) -> tuple[str, object]:
-    """("sent", receipt), ("refused", error) for a definitive 4xx, or ("retry", reason)."""
+    """("sent", receipt), ("refused", error) for a definitive 4xx, or ("retry", reason).
+
+    A message flagged `join_topic` first adds its sender to the topic; that join is part of
+    the queued send, so a transient failure keeps the whole message queued and nothing is
+    posted until the sender is a member. Joining twice is harmless on the hub.
+    """
+    if message.get("join_topic"):
+        try:
+            hub.join(message["topic"], message["from"])
+        except (HubUnavailable, HubRefused) as error:
+            return _classify(error), error
     try:
-        receipt = hub.post(message)
-    except HubUnavailable as error:
-        return "retry", error
-    except HubRefused as error:
-        # Only a 4xx is the hub's verdict on this message; a redirect or 5xx may follow a commit.
-        if 400 <= error.status < 500 and error.status not in RETRYABLE:
-            return "refused", error
-        return "retry", error
+        receipt = hub.post({key: value for key, value in message.items() if key != "join_topic"})
+    except (HubUnavailable, HubRefused) as error:
+        return _classify(error), error
     if not _receipt_for(receipt, message["id"]):
         return "retry", "the hub's answer is not a receipt for this message"
     return "sent", receipt

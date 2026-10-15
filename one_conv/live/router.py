@@ -337,17 +337,14 @@ def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id:
 
     The message sits in the bridge's outbox from before the request until the hub answers,
     so a crash or an unreachable hub leaves it for the bridge to repost under the same id.
-    The sender joins the topic first, as sending to a local topic does, so replies reach it.
+    A session sender joins the topic as part of the same queued send, as sending to a local
+    topic does, so replies reach it; the post waits until that join has succeeded.
     """
-    if ":" in sender:
-        try:
-            hub.join(topic, sender)
-        except (hubclient.HubRefused, hubclient.HubUnavailable) as error:
-            # The post itself reports a real problem; a failed join alone must not block it.
-            logger.info("could not join #%s before posting: %s", topic, error)
     # mode is the delivery mode (wake the receiver or not), kept apart from the reply policy.
     message = {"id": message_id, "to": f"#{topic}", "from": sender, "topic": topic,
                "mode": mode, "reply": reply, "text": text}
+    if ":" in sender:
+        message["join_topic"] = True
     try:
         receipt = hubclient.submit(hub, message)
     except (hubclient.HubRefused, hubclient.PendingConflict) as error:

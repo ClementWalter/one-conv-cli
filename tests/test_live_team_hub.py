@@ -491,3 +491,66 @@ def test_hub_topic_post_with_no_one_else_there_is_kept(hub):
     router.send("#release", "first word", LiveSession("claude", "c1"))
     as_box(url, box).join("release", BOX_SESSION)
     assert [m["text"] for m in as_box(url, box).history("release")] == ["first word"]
+
+
+@pytest.fixture
+def flaky(monkeypatch):
+    """Make chosen hub calls answer 503 until `flaky.clear()`; the rest reach the real hub."""
+    failing = set()
+    real = {name: getattr(hubclient.HubClient, name) for name in ("join", "post")}
+
+    def wrap(name):
+        def call(self, *args, **kwargs):
+            if name in failing:
+                raise hubclient.HubRefused(503, "temporarily unavailable")
+            return real[name](self, *args, **kwargs)
+        return call
+
+    for name in real:
+        monkeypatch.setattr(hubclient.HubClient, name, wrap(name))
+    return failing
+
+
+def test_failed_join_and_post_are_both_replayed_by_the_drain(hub, flaky):
+    _, url, box = hub
+    flaky.update({"join", "post"})
+    router.send("#new-topic", "kickoff", LiveSession("claude", "c1"))
+    flaky.clear()
+    hubclient.drain(hubclient.configured())
+    assert [m["text"] for m in as_box(url, box).history("new-topic")] == ["kickoff"]
+
+
+def test_replayed_join_makes_the_sender_a_member(hub, flaky):
+    state, _, _ = hub
+    flaky.update({"join", "post"})
+    router.send("#new-topic", "kickoff", LiveSession("claude", "c1"))
+    flaky.clear()
+    hubclient.drain(hubclient.configured())
+    assert state.topics()[0]["members"] == ["mac/claude:c1"]
+
+
+def test_failed_join_alone_posts_nothing_yet(hub, flaky):
+    state, url, box = hub
+    as_box(url, box).join("release", BOX_SESSION)
+    flaky.add("join")
+    router.send("#release", "go", LiveSession("claude", "c1"))
+    assert state.inbox("box", 0) == []
+
+
+def test_failed_join_alone_keeps_the_send_queued(hub, flaky):
+    _, url, box = hub
+    as_box(url, box).join("release", BOX_SESSION)
+    flaky.add("join")
+    router.send("#release", "go", LiveSession("claude", "c1"))
+    assert len(list(hubclient.outbox().glob("*.json"))) == 1
+
+
+def test_after_a_failed_join_the_peers_reply_reaches_the_sender(hub, flaky):
+    state, url, box = hub
+    as_box(url, box).join("release", BOX_SESSION)
+    flaky.add("join")
+    router.send("#release", "go", LiveSession("claude", "c1"))
+    flaky.clear()
+    hubclient.drain(hubclient.configured())
+    as_box(url, box).post({"id": "e" * 32, "to": "#release", "from": BOX_SESSION, "text": "on it"})
+    assert [m["text"] for m in state.inbox("mac", 0)] == ["on it"]

@@ -288,4 +288,6 @@ def build_live_group(launcher: list[str]) -> click.Group:
             payload = {}
         click.echo(json.dumps(cursor.run_stop_hook(payload)))
 
+    from .spawn_cli import add_spawn_commands
+    add_spawn_commands(live)
     return live

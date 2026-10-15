@@ -19,6 +19,11 @@ from urllib.parse import quote, urlsplit
 
 from .model import live_home
 
+try:
+    import fcntl
+except ImportError:  # Windows has no flock; the outbox is then written unlocked.
+    fcntl = None
+
 
 class HubUnavailable(Exception):
     """The hub could not be reached; nothing was acknowledged."""
@@ -132,31 +137,64 @@ def outbox() -> Path:
     return live_home() / "bridge" / "outbox"
 
 
-def submit(hub: HubClient, message: dict) -> dict | None:
-    """Post a message so that a crash at any point can neither lose it nor post it twice.
+# Statuses that say nothing final about the message: it stays queued under its id.
+RETRYABLE = {408, 425, 429}
 
-    The message is written to the outbox before any network I/O and removed once the hub
-    has answered, accepted or refused. If the process dies in between, the bridge reposts
-    the outbox file under the same id and the hub returns the original receipt. Returns
-    None while the hub is unreachable (the message stays queued); a refusal is raised.
+
+def _receipt_for(receipt, message_id: str) -> bool:
+    return (isinstance(receipt, dict) and receipt.get("id") == message_id
+            and isinstance(receipt.get("recipients"), list))
+
+
+def submit(hub: HubClient, message: dict) -> dict | None:
+    """Post a message so that a crash or an ambiguous answer can neither lose it nor double it.
+
+    The message is written to the outbox before any network I/O. It is removed only on a
+    receipt for this id, or on a definitive refusal (a 4xx other than 408/425/429), which
+    is raised. An unreachable hub, a 5xx, a rate limit or an unreadable receipt leaves it
+    queued under the same id for the bridge to repost, and returns None.
     """
     path = queue(message)
     try:
         receipt = hub.post(message)
     except HubUnavailable:
         return None
-    except HubRefused:
+    except HubRefused as error:
+        if error.status >= 500 or error.status in RETRYABLE:
+            return None
         path.unlink(missing_ok=True)
         raise
+    if not _receipt_for(receipt, message["id"]):
+        return None  # The hub may or may not have stored it; only a retry under this id can tell.
     path.unlink(missing_ok=True)
     return receipt
 
 
+class PendingConflict(Exception):
+    """A different message is already waiting under this id."""
+
+
 def queue(message: dict) -> Path:
-    """Leave a message for the bridge to post once the hub is reachable; its id makes retries safe."""
+    """Leave a message for the bridge to post once the hub is reachable; its id makes retries safe.
+
+    A message already waiting under the same id is kept: an identical one reuses it, a
+    different one raises PendingConflict, so a reused id never replaces pending work.
+    """
     outbox().mkdir(parents=True, exist_ok=True)
     path = outbox() / f"{message['id']}.json"
-    partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    partial.write_text(json.dumps(message))
-    os.replace(partial, path)
+    with (outbox() / ".lock").open("a") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        if path.exists():
+            try:
+                waiting = json.loads(path.read_text())
+            except (OSError, ValueError):
+                waiting = None
+            if waiting == message:
+                return path
+            raise PendingConflict(f"message {message['id']} is already waiting with different content; "
+                                  "use a new id for a new message")
+        partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        partial.write_text(json.dumps(message))
+        os.replace(partial, path)
     return path

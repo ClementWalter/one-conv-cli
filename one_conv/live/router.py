@@ -342,11 +342,12 @@ def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id:
                "mode": mode, "reply": reply, "text": text}
     try:
         receipt = hubclient.submit(hub, message)
-    except hubclient.HubRefused as error:
+    except (hubclient.HubRefused, hubclient.PendingConflict) as error:
         raise LiveError(str(error)) from error
     if receipt is None:
         return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
-                "deliveries": [{"to": f"#{topic}", "status": "queued for the hub (unreachable now)"}]}
+                "deliveries": [{"to": f"#{topic}", "status": "queued for the hub: no receipt yet, the bridge "
+                                                             "will resend it under the same id"}]}
     return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
             "deliveries": [{"to": row["to"], "status": row["status"]} for row in receipt.get("recipients", [])]}
 

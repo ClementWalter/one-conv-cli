@@ -327,3 +327,61 @@ def test_refused_topic_post_is_not_left_to_retry(hub, monkeypatch):
     with pytest.raises(router.LiveError):
         router.send("#release", "go", LiveSession("claude", "c1"))
     assert list(hubclient.outbox().glob("*.json")) == []
+
+
+MESSAGE = {"id": "5" * 32, "to": "#release", "from": "claude:c1", "topic": "release", "mode": "push",
+           "reply": "expected", "text": "original"}
+
+
+def _stub_post(monkeypatch, outcome):
+    def post(self, message):
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(hubclient.HubClient, "post", post)
+    return hubclient.HubClient("http://127.0.0.1:9", "t")
+
+
+@pytest.mark.parametrize("outcome", [hubclient.HubRefused(500, "after commit"), hubclient.HubRefused(503, "busy"),
+                                     hubclient.HubRefused(429, "slow down"), hubclient.HubRefused(408, "timeout"),
+                                     {}, {"id": "6" * 32, "recipients": []}])
+def test_ambiguous_answer_keeps_the_message_queued(tmp_path, monkeypatch, outcome):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.submit(_stub_post(monkeypatch, outcome), dict(MESSAGE))
+    assert (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+@pytest.mark.parametrize("status", [400, 409, 401])
+def test_definitive_refusal_removes_the_queued_message(tmp_path, monkeypatch, status):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    with pytest.raises(hubclient.HubRefused):
+        hubclient.submit(_stub_post(monkeypatch, hubclient.HubRefused(status, "no")), dict(MESSAGE))
+    assert not (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+def test_receipt_for_the_id_removes_the_queued_message(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.submit(_stub_post(monkeypatch, {"id": MESSAGE["id"], "recipients": []}), dict(MESSAGE))
+    assert not (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+def test_reusing_a_pending_id_with_new_content_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.queue(dict(MESSAGE))
+    with pytest.raises(hubclient.PendingConflict):
+        hubclient.queue({**MESSAGE, "text": "changed"})
+
+
+def test_reusing_a_pending_id_keeps_the_original_content(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.queue(dict(MESSAGE))
+    with pytest.raises(hubclient.PendingConflict):
+        hubclient.queue({**MESSAGE, "text": "changed"})
+    assert json.loads((hubclient.outbox() / f"{MESSAGE['id']}.json").read_text())["text"] == "original"
+
+
+def test_requeueing_identical_pending_work_is_allowed(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.queue(dict(MESSAGE))
+    assert hubclient.queue(dict(MESSAGE)).exists()

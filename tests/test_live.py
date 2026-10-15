@@ -1,6 +1,7 @@
 """Live relay: session discovery, sender identity, target resolution and per-harness delivery."""
 
 import json
+import math
 import os
 import shutil
 import socket
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -459,10 +461,27 @@ def test_fyi_prunes_notices_past_the_keep_window(homes):
 def test_fyi_time_never_goes_backwards(homes):
     _omp_record(homes, os.getpid())
     router.fyi_inbox("omp:o1").parent.mkdir(parents=True)
-    future = 4_000_000_000.0
-    router.fyi_inbox("omp:o1").write_text(json.dumps({"id": "ahead", "at": future, "text": "x"}) + "\n")
+    ahead = time.time() + 60
+    router.fyi_inbox("omp:o1").write_text(json.dumps({"id": "ahead", "at": ahead, "text": "x"}) + "\n")
     router.send("omp:o1", "merged", LiveSession("claude", "c1"), fyi=True)
-    assert _fyi_rows(homes)[-1]["at"] == future
+    assert _fyi_rows(homes)[-1]["at"] == ahead
+
+
+@pytest.mark.parametrize("bad_time", ["Infinity", "-Infinity", "NaN", "4000000000.0", "-5", "true"])
+def test_fyi_drops_rows_with_unusable_time(homes, bad_time):
+    _omp_record(homes, os.getpid())
+    router.fyi_inbox("omp:o1").parent.mkdir(parents=True)
+    router.fyi_inbox("omp:o1").write_text('{"id": "bad", "at": ' + bad_time + ', "text": "x"}\n')
+    router.send("omp:o1", "merged", LiveSession("claude", "c1"), fyi=True)
+    assert [r["from"] for r in _fyi_rows(homes)] == ["claude:c1"]
+
+
+def test_fyi_after_infinite_time_is_stamped_finitely(homes):
+    _omp_record(homes, os.getpid())
+    router.fyi_inbox("omp:o1").parent.mkdir(parents=True)
+    router.fyi_inbox("omp:o1").write_text('{"id": "bad", "at": Infinity, "text": "x"}\n')
+    router.send("omp:o1", "merged", LiveSession("claude", "c1"), fyi=True)
+    assert math.isfinite(_fyi_rows(homes)[-1]["at"])
 
 
 def test_fyi_survives_a_corrupt_inbox_line(homes):

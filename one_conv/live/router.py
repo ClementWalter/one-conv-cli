@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import os
 import subprocess
 import time
@@ -24,6 +25,14 @@ RATE_LIMIT = 10
 RATE_WINDOW_SECONDS = 300
 # Notices sent with --fyi stay readable by `local feed` this long.
 FYI_KEEP_SECONDS = 7 * 24 * 3600
+# Clock skew tolerated on an existing notice; anything further ahead is corrupt.
+FYI_MAX_SKEW_SECONDS = 3600
+
+
+def _valid_fyi_time(at: object, now: float) -> bool:
+    """A finite epoch time not far in the future; later notices are stamped no earlier than it."""
+    return (isinstance(at, (int, float)) and not isinstance(at, bool) and math.isfinite(at)
+            and 0 < at <= now + FYI_MAX_SKEW_SECONDS)
 
 
 class LiveError(Exception):
@@ -198,8 +207,9 @@ def _append_fyi(target: str, sender: str, text: str) -> None:
             except ValueError:
                 # A corrupt line is dropped on rewrite; failing here would lose every later notice.
                 continue
-            # Rows without a numeric time cannot be ordered or aged, so they are dropped too.
-            if isinstance(row, dict) and isinstance(row.get("at"), (int, float)):
+            # A row whose time is missing, infinite or far ahead would stamp every later
+            # notice with it and never age out, so it is dropped like a corrupt line.
+            if isinstance(row, dict) and _valid_fyi_time(row.get("at"), now):
                 rows.append(row)
         # Never decreasing `at` lets a reader resume after the last entry it saw.
         at = max([now, *(r["at"] for r in rows)])

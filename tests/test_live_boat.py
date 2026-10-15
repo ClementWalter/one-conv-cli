@@ -187,12 +187,30 @@ def test_second_send_while_first_is_pending_is_refused(slow_box):
         boat.deliver(target, "<one-conv-message>hi</one-conv-message>")
 
 
-def test_second_send_while_first_is_pending_starts_no_prompt(slow_box):
+@pytest.fixture
+def launches(monkeypatch):
+    """`box prompt` processes started by this test, counted in this process.
+
+    The slow stub may not have written its own call log yet when the test checks,
+    so its log cannot tell a missing second prompt from one that has not started.
+    """
+    started = []
+    real_popen = subprocess.Popen
+
+    def counting_popen(args, *rest, **kwargs):
+        started.append(list(args))
+        return real_popen(args, *rest, **kwargs)
+
+    monkeypatch.setattr(boat.subprocess, "Popen", counting_popen)
+    return started
+
+
+def test_second_send_while_first_is_pending_starts_no_prompt(slow_box, launches):
     target = LiveSession("boat", f"{SANDBOX}/{IDLE}", status="idle")
     boat.deliver(target, "<one-conv-message>hi</one-conv-message>")
     with pytest.raises(RuntimeError):
         boat.deliver(target, "<one-conv-message>hi</one-conv-message>")
-    assert [c[0] for c in calls(slow_box)].count("prompt") == 1
+    assert [args[1] for args in launches].count("prompt") == 1
 
 
 def test_pending_prompt_later_reads_as_accepted(slow_box):

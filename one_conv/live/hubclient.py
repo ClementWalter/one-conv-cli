@@ -1,10 +1,12 @@
 """Client for the live hub, shared by the CLI and the per-machine bridge (`live serve`).
 
 The bridge writes `<live_home>/bridge/hub.json` (mode 0600) with the hub URL it can reach
-right now (a local ssh tunnel, or https), this machine's node name and its token;
-ONE_CONV_HUB_URL and ONE_CONV_HUB_TOKEN override it. Without either there is no hub and
-topics stay on this machine. The bearer token is sent only to the configured URL: a
-redirect is refused rather than followed.
+right now (a local ssh tunnel, or https), this machine's node name and its token.
+ONE_CONV_HUB_URL with ONE_CONV_HUB_TOKEN selects another hub; ONE_CONV_HUB_TOKEN alone
+rotates the token for the configured hub; a URL without a token is refused, so an old
+token is never sent to a new endpoint. Without any of these there is no hub and topics
+stay on this machine. The bearer token goes only to the configured URL, over a direct
+connection: a redirect is refused, and proxies from the environment are ignored.
 """
 
 import ipaddress
@@ -59,7 +61,8 @@ def check_url(url: str) -> str:
 class HubClient:
     def __init__(self, url: str, token: str, node: str | None = None, timeout: float = 15):
         self.url, self.token, self.node, self.timeout = check_url(url), token, node, timeout
-        self._opener = urllib.request.build_opener(_NoRedirect)
+        # An empty ProxyHandler keeps http_proxy/https_proxy from routing the token and body elsewhere.
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
     def request(self, method: str, path: str, body: dict | None = None) -> dict:
         data = json.dumps(body).encode() if body is not None else None
@@ -100,16 +103,23 @@ class HubClient:
 
 def configured() -> HubClient | None:
     """The hub this machine reaches, or None when none is set up."""
-    url, token = os.environ.get("ONE_CONV_HUB_URL"), os.environ.get("ONE_CONV_HUB_TOKEN")
+    env_url, env_token = os.environ.get("ONE_CONV_HUB_URL"), os.environ.get("ONE_CONV_HUB_TOKEN")
     node = os.environ.get("ONE_CONV_HUB_NODE")
-    if not (url and token):
+    if env_url and not env_token:
+        raise HubRefused(0, "ONE_CONV_HUB_URL is set without ONE_CONV_HUB_TOKEN; set both to use another hub")
+    url, token = env_url, env_token
+    if not env_url:
         try:
             config = json.loads((live_home() / "bridge" / "hub.json").read_text())
         except (OSError, ValueError):
-            return None
+            config = None
         if not isinstance(config, dict):
+            if env_token:
+                raise HubRefused(0, "ONE_CONV_HUB_TOKEN is set but no hub URL is configured")
             return None
-        url, token, node = config.get("url"), config.get("token"), config.get("node")
+        url, node = config.get("url"), node or config.get("node")
+        # A token on its own rotates the credential for the configured hub, nothing else.
+        token = env_token or config.get("token")
     if not (isinstance(url, str) and isinstance(token, str) and url and token):
         return None
     try:

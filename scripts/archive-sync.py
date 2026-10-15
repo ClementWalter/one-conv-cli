@@ -268,6 +268,62 @@ def running_reason(handle, paths):
     return None
 
 
+class PinnedFiles:
+    """One conversation's files, reached through directory descriptors opened once without
+    following symlinks. Verifying, measuring, deleting and tidying all act on those same
+    directories, so a folder replaced by a symlink in between cannot redirect any of them."""
+
+    DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def __init__(self, base, paths):
+        self.base, self.descriptors = base, {}
+        try:
+            self.descriptors[()] = os.open(base, self.DIRECTORY)
+            for path in paths:
+                self._directory(path.relative_to(base).parts[:-1])
+        except (OSError, ValueError) as error:
+            self.close()
+            raise ArchiveError(f"its folders cannot be opened safely: {error}") from error
+
+    def _directory(self, parts):
+        if parts not in self.descriptors:
+            parent = self._directory(parts[:-1])
+            self.descriptors[parts] = os.open(parts[-1], self.DIRECTORY, dir_fd=parent)
+        return self.descriptors[parts]
+
+    def _locate(self, path):
+        parts = path.relative_to(self.base).parts
+        return self._directory(parts[:-1]), parts[-1]
+
+    def read(self, path):
+        directory, name = self._locate(path)
+        with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory), "rb") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ArchiveError(f"Not a regular file: {path}")
+            return stream.read()
+
+    def size(self, path):
+        directory, name = self._locate(path)
+        return os.stat(name, dir_fd=directory, follow_symlinks=False).st_size
+
+    def unlink(self, path):
+        directory, name = self._locate(path)
+        os.unlink(name, dir_fd=directory)  # Removes the entry itself; a symlink found here is not followed.
+
+    def remove_empty_directories(self):
+        """Remove pinned subfolders left empty, deepest first, each through its pinned parent."""
+        for parts in sorted((p for p in self.descriptors if p), key=len, reverse=True):
+            try:
+                os.rmdir(parts[-1], dir_fd=self.descriptors[parts[:-1]])
+            except OSError:
+                pass  # Not empty, or no longer a directory at that name (a symlink is refused, not followed).
+
+    def close(self):
+        for descriptor in self.descriptors.values():
+            os.close(descriptor)
+        self.descriptors = {}
+
+
 def free(reader, client, handle, archived):
     """Delete a conversation's native files only if the archive holds exactly these bytes and no
     agent is using them; return the bytes freed."""
@@ -275,29 +331,27 @@ def free(reader, client, handle, archived):
     reason = running_reason(handle, paths)
     if reason:
         raise ArchiveError(reason)
-    before = fingerprint(paths)
-    manifest = client.read_conversation(archived["key"], archived["revision"])
-    originals = manifest["originals"]
-    # Read exactly as capture does, so a session folder swapped for a symlink refuses here too.
-    parts = {path: [name for name, _ in split(read_source(handle, path))] for path in paths}
-    folder = session_folder(handle) if handle.source == "claude" else None
-    if any(originals.get(str(path)) != names for path, names in parts.items()):
-        raise ArchiveError("its files differ from the archived capture")
-    if client.request("chunks/missing", {"digests": [name for names in parts.values() for name in names]})["missing"]:
-        raise ArchiveError("the archive is missing some of its content")
-    if source_paths(reader, handle) != paths or fingerprint(paths) != before:
-        raise ArchiveError("it changed while being verified")
-    # Marked in the archive first, so sync refuses a partial file that reappears here, even after a state reset.
-    client.put({**manifest, "freed": time.time()}, {}, archived["revision"])
-    size = sum(path.stat().st_size for path in paths)
-    for path in paths:
-        path.unlink()
-    # Only a real session folder is tidied; walking a symlinked one would remove folders outside history.
-    if folder is not None:
-        for directory in sorted((d for d in folder.rglob("*") if d.is_dir() and not d.is_symlink()), reverse=True) + [folder]:
-            if directory.is_dir() and not any(directory.iterdir()):
-                directory.rmdir()
-    return size
+    pinned = PinnedFiles(handle.path.parent, paths)
+    try:
+        before = fingerprint(paths)
+        manifest = client.read_conversation(archived["key"], archived["revision"])
+        originals = manifest["originals"]
+        parts = {path: [name for name, _ in split(pinned.read(path))] for path in paths}
+        if any(originals.get(str(path)) != names for path, names in parts.items()):
+            raise ArchiveError("its files differ from the archived capture")
+        if client.request("chunks/missing", {"digests": [name for names in parts.values() for name in names]})["missing"]:
+            raise ArchiveError("the archive is missing some of its content")
+        if source_paths(reader, handle) != paths or fingerprint(paths) != before:
+            raise ArchiveError("it changed while being verified")
+        # Marked in the archive first, so sync refuses a partial file that reappears here, even after a state reset.
+        client.put({**manifest, "freed": time.time()}, {}, archived["revision"])
+        size = sum(pinned.size(path) for path in paths)
+        for path in paths:
+            pinned.unlink(path)
+        pinned.remove_empty_directories()
+        return size
+    finally:
+        pinned.close()
 
 
 def restore_target(roots, name):

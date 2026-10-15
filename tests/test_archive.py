@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import zlib
 from urllib.parse import urlsplit
 
@@ -23,7 +24,7 @@ import uvicorn
 
 from archive.server import create_app
 from archive.store import SQLiteStore
-from one_conv.archive import CHUNK_BYTES, SYNC_STALE_SECONDS, ArchiveClient, ArchiveError, pack
+from one_conv.archive import CHUNK_BYTES, SYNC_STALE_SECONDS, ArchiveClient, ArchiveError, pack, split
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -1112,30 +1113,68 @@ def test_free_leaves_folders_behind_a_symlinked_session_folder(old_synced_claude
     assert outside.is_dir()
 
 
-class StubArchive:
-    """Just enough of ArchiveClient for free() to reach its byte check."""
+class SwappingArchive:
+    """Holds a conversation's exact bytes, and replaces its session folder with a symlink to
+    an outside folder the moment it acknowledges the freed marker, as a racing process could."""
+
+    def __init__(self, originals, folder, outside):
+        self.originals, self.folder, self.outside = originals, folder, outside
 
     def read_conversation(self, key, revision):
-        return {"originals": {}}
+        return {"originals": self.originals}
+
+    def request(self, path, body):
+        return {"missing": []}
+
+    def put(self, manifest, chunks, revision):
+        self.folder.rename(self.folder.with_name("parked"))
+        self.folder.symlink_to(self.outside, target_is_directory=True)
 
 
-def test_free_refuses_when_the_guarded_reader_refuses(monkeypatch, tmp_path):
-    """Free reads through capture's read_source, so a folder swapped between listing and reading refuses."""
+@pytest.fixture
+def free_racing_a_folder_swap(monkeypatch, tmp_path):
+    """Run free() on a Claude session whose folder is swapped for a symlink during the archive acknowledgement."""
     loader = importlib.machinery.SourceFileLoader("archive_sync_free", str(ROOT / "scripts" / "archive-sync.py"))
     module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
     monkeypatch.setitem(sys.modules, loader.name, module)
     loader.exec_module(module)
-    transcript = tmp_path / "s1.jsonl"
-    transcript.write_text("{}\n")
-    monkeypatch.setattr(module, "source_paths", lambda reader, handle: [transcript])
+    base = tmp_path / "projects" / "fixture"
+    folder = base / "session-one" / "tool-results"
+    folder.mkdir(parents=True)
+    transcript, sidecar = base / "session-one.jsonl", folder / "output.txt"
+    transcript.write_text('{"type": "user"}\n')
+    sidecar.write_text("verified tool output")
+    outside = tmp_path / "outside"
+    (outside / "tool-results").mkdir(parents=True)
+    (outside / "tool-results" / "output.txt").write_text("an unrelated file outside history")
+    paths = [transcript, sidecar]
+    originals = {str(path): [name for name, _ in split(path.read_bytes())] for path in paths}
+    monkeypatch.setattr(module, "source_paths", lambda reader, handle: paths)
     monkeypatch.setattr(module, "running_reason", lambda handle, paths: None)
+    handle = types.SimpleNamespace(source="claude", path=transcript, uuid="session-one")
+    result = module.free(None, SwappingArchive(originals, base / "session-one", outside), handle,
+                         {"key": "k", "revision": "r"})
+    return result, base, outside
 
-    def refuse(handle, path):
-        raise ArchiveError("swapped folder refused")
 
-    monkeypatch.setattr(module, "read_source", refuse)
-    with pytest.raises(ArchiveError, match="swapped folder refused"):
-        module.free(None, StubArchive(), object(), {"key": "k", "revision": "r"})
+def test_free_racing_a_folder_swap_leaves_the_outside_file(free_racing_a_folder_swap):
+    _, _, outside = free_racing_a_folder_swap
+    assert (outside / "tool-results" / "output.txt").read_text() == "an unrelated file outside history"
+
+
+def test_free_racing_a_folder_swap_deletes_the_verified_file(free_racing_a_folder_swap):
+    _, base, _ = free_racing_a_folder_swap
+    assert not (base / "parked" / "tool-results" / "output.txt").exists()
+
+
+def test_free_racing_a_folder_swap_deletes_the_transcript(free_racing_a_folder_swap):
+    _, base, _ = free_racing_a_folder_swap
+    assert not (base / "session-one.jsonl").exists()
+
+
+def test_free_racing_a_folder_swap_reports_the_verified_bytes(free_racing_a_folder_swap):
+    size, _, _ = free_racing_a_folder_swap
+    assert size == len('{"type": "user"}\n') + len("verified tool output")
 
 
 def test_free_still_frees_an_idle_unopened_session(old_synced_claude):

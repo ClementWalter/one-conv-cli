@@ -1,11 +1,13 @@
 """The live hub over real HTTP: node tokens, publishing, routing, dedup, topics and outcomes."""
 
+import http.client
 import json
 import socket
 import sqlite3
 import threading
 import uuid
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 import pytest
@@ -13,7 +15,7 @@ import pytest
 uvicorn = pytest.importorskip("uvicorn")
 pytest.importorskip("starlette")
 
-from one_conv.live.hub import Hub, application
+from one_conv.live.hub import MAX_BODY, Hub, application
 
 
 def serve(app):
@@ -150,6 +152,20 @@ def test_a_retried_message_id_reports_a_duplicate(two_nodes):
     sent = message("box/claude:bbb")
     call(url, "/v1/messages", mac, "POST", sent)
     assert call(url, "/v1/messages", mac, "POST", sent)[1]["duplicate"] is True
+
+
+@pytest.mark.parametrize("sent, mode", [({}, "push"), ({"mode": "fyi"}, "fyi")])
+def test_the_inbox_carries_the_delivery_mode(two_nodes, sent, mode):
+    _, url, mac, box = two_nodes
+    call(url, "/v1/messages", mac, "POST", message("box/claude:bbb", reply="none", **sent))
+    assert call(url, "/v1/inbox?wait=0", box)[1]["messages"][0]["mode"] == mode
+
+
+def test_an_fyi_and_a_no_reply_push_under_one_id_conflict(two_nodes):
+    _, url, mac, _ = two_nodes
+    sent = message("box/claude:bbb", reply="none")
+    call(url, "/v1/messages", mac, "POST", sent)
+    assert call(url, "/v1/messages", mac, "POST", {**sent, "mode": "fyi"})[0] == 409
 
 
 def test_a_lost_response_is_answered_by_the_original_receipt(two_nodes):
@@ -306,17 +322,73 @@ def test_topic_history_lists_a_post_once_for_all_its_recipients(topic):
     assert len(call(url, "/v1/topics/release/messages", box)[1]["messages"]) == 1
 
 
-def test_topic_history_after_a_message_returns_the_later_ones(topic):
+def test_topic_history_after_a_cursor_returns_the_later_ones(topic):
     _, url, mac, box = topic
-    first = message("#release", text="first")
-    call(url, "/v1/messages", mac, "POST", first)
+    call(url, "/v1/messages", mac, "POST", message("#release", text="first"))
     call(url, "/v1/messages", mac, "POST", message("#release", text="second"))
-    page = call(url, f"/v1/topics/release/messages?after={first['id']}", box)[1]["messages"]
+    cursor = call(url, "/v1/topics/release/messages?limit=1", box)[1]["messages"][0]["cursor"]
+    page = call(url, f"/v1/topics/release/messages?after={cursor}", box)[1]["messages"]
     assert [m["text"] for m in page] == ["second"]
 
 
+def test_topic_history_pages_through_two_nodes_sharing_an_id(topic):
+    _, url, mac, box = topic
+    shared = uuid.uuid4().hex
+    call(url, "/v1/messages", mac, "POST", {**message("#release", text="mac"), "id": shared})
+    call(url, "/v1/messages", box, "POST", {**message("#release", sender="claude:bbb", text="box"), "id": shared})
+    call(url, "/v1/messages", mac, "POST", message("#release", text="third"))
+    seen, cursor = [], "0"
+    for _ in range(4):
+        page = call(url, f"/v1/topics/release/messages?limit=1&after={cursor}", box)[1]["messages"]
+        if not page:
+            break
+        seen.append(page[0]["text"])
+        cursor = page[0]["cursor"]
+    assert seen == ["mac", "box", "third"]
+
+
+def raw_post(url, token, body, headers):
+    """Status of a POST sent with http.client, so the body can be streamed in chunks."""
+    parts = urlsplit(url)
+    connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=10)
+    try:
+        connection.request("POST", "/v1/messages", body=body, headers={"Authorization": f"Bearer {token}", **headers})
+        return connection.getresponse().status
+    finally:
+        connection.close()
+
+
+def test_a_body_declared_too_large_is_refused(two_nodes):
+    _, url, mac, _ = two_nodes
+    assert raw_post(url, mac, b"{}", {"Content-Length": str(MAX_BODY + 1)}) == 413
+
+
+def chunked_status_line(url, token, total: int) -> bytes:
+    """Stream `total` bytes as a chunked POST and return the status line the hub answers with.
+
+    The hub may answer and close before the body is complete, so a broken pipe ends the upload.
+    """
+    parts = urlsplit(url)
+    with socket.create_connection((parts.hostname, parts.port), timeout=10) as sock:
+        sock.sendall(f"POST /v1/messages HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n"
+                     "Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n".encode())
+        chunk = b"10000\r\n" + b"x" * 0x10000 + b"\r\n"
+        try:
+            for _ in range(total // 0x10000 + 1):
+                sock.sendall(chunk)
+            sock.sendall(b"0\r\n\r\n")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return sock.makefile("rb").readline()
+
+
+def test_a_chunked_body_growing_too_large_is_refused(two_nodes):
+    _, url, mac, _ = two_nodes
+    assert chunked_status_line(url, mac, MAX_BODY + 0x10000).split()[1] == b"413"
+
+
 @pytest.mark.parametrize("bad", [
-    {"id": "short"}, {"text": ""}, {"reply": "maybe"}, {"to": "nowhere"}, {"to": "box/claude:nobody"}])
+    {"id": "short"}, {"text": ""}, {"reply": "maybe"}, {"mode": "wake"}, {"to": "nowhere"}, {"to": "box/claude:nobody"}])
 def test_a_malformed_message_is_refused(two_nodes, bad):
     _, url, mac, _ = two_nodes
     assert call(url, "/v1/messages", mac, "POST", {**message("box/claude:bbb"), **bad})[0] in (400, 404)

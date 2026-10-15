@@ -30,7 +30,10 @@ MESSAGE_ID = re.compile(r"[0-9a-f]{32}")
 # What the receiving bridge reports: the adapter accepted it (not that the agent read it),
 # the adapter refused it, or the bridge cannot tell (it crashed between claiming and reporting).
 OUTCOMES = ("accepted", "refused", "unconfirmed")
+MODES = ("push", "fyi")
 MAX_TEXT = 200_000
+# A JSON-escaped text can take up to six bytes per character, plus the envelope fields.
+MAX_BODY = MAX_TEXT * 6 + 4096
 MAX_WAIT = 30.0
 # A node that has not published or polled for this long is listed as offline.
 LEASE_SECONDS = 60.0
@@ -43,6 +46,7 @@ CREATE TABLE IF NOT EXISTS members (topic TEXT NOT NULL, node TEXT NOT NULL, add
     joined REAL NOT NULL, PRIMARY KEY (topic, node, address));
 CREATE TABLE IF NOT EXISTS posts (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_node TEXT NOT NULL, id TEXT NOT NULL,
     digest TEXT NOT NULL, target TEXT NOT NULL, sender TEXT NOT NULL, topic TEXT, reply TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'push',
     text TEXT NOT NULL, created REAL NOT NULL, UNIQUE (from_node, id));
 CREATE INDEX IF NOT EXISTS by_topic ON posts (topic, seq);
 CREATE TABLE IF NOT EXISTS deliveries (delivery TEXT PRIMARY KEY, post INTEGER NOT NULL REFERENCES posts (seq),
@@ -197,13 +201,17 @@ class Hub:
         reply = message.get("reply", "expected")
         if reply not in ("expected", "none", "inline"):
             raise HubError(400, "reply must be expected, none or inline")
+        # push wakes the receiver; fyi only files a notice for it to read when it chooses.
+        mode = message.get("mode", "push")
+        if mode not in MODES:
+            raise HubError(400, f"mode must be one of {', '.join(MODES)}")
         target = message.get("to")
         if not isinstance(target, str) or not target:
             raise HubError(400, "to must be NODE/harness:id, @name or #topic")
         topic = target[1:] if target.startswith("#") else message.get("topic")
         if topic is not None and (not isinstance(topic, str) or not TOPIC.fullmatch(topic)):
             raise HubError(400, "a topic is lowercase letters, digits and dashes")
-        digest = hashlib.sha256(json.dumps([target, sender, topic, reply, text]).encode()).hexdigest()
+        digest = hashlib.sha256(json.dumps([target, sender, topic, reply, mode, text]).encode()).hexdigest()
         with self.lock, self._db() as db:
             existing = db.execute("SELECT seq, digest FROM posts WHERE from_node = ? AND id = ?",
                                   (node, msg_id)).fetchone()
@@ -215,9 +223,9 @@ class Hub:
             if not isinstance(sender, str) or (not self._published(db, node, sender) and sender not in ("user", "unknown")):
                 raise HubError(403, "from must be a session this node published, or user/unknown")
             recipients = self._recipients(db, target, node, sender)
-            seq = db.execute("INSERT INTO posts (from_node, id, digest, target, sender, topic, reply, text, created)"
-                             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                             (node, msg_id, digest, target, sender, topic, reply, text, time.time())).lastrowid
+            seq = db.execute("INSERT INTO posts (from_node, id, digest, target, sender, topic, reply, mode, text, created)"
+                             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             (node, msg_id, digest, target, sender, topic, reply, mode, text, time.time())).lastrowid
             db.executemany("INSERT INTO deliveries (delivery, post, to_node, to_address) VALUES (?, ?, ?, ?)",
                            [(secrets.token_hex(16), seq, n, a) for n, a in recipients])
             return self._receipt(db, seq, msg_id, False)
@@ -233,15 +241,16 @@ class Hub:
             with self.lock, self._db() as db:
                 self._seen(db, node)
                 rows = db.execute(
-                    "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.topic, p.reply, p.text, p.created"
+                    "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.topic, p.reply, p.mode, p.text,"
+                    " p.created"
                     " FROM deliveries d JOIN posts p ON p.seq = d.post WHERE d.to_node = ? AND d.outcome IS NULL"
                     " ORDER BY d.post LIMIT 50", (node,)).fetchall()
                 if rows:
                     db.executemany("UPDATE deliveries SET taken = ? WHERE delivery = ?",
                                    [(time.time(), r[0]) for r in rows])
             if rows or time.monotonic() >= deadline:
-                return [{"delivery": d, "id": i, "to": a, "from": f"{fn}/{s}", "topic": t, "reply": r, "text": x,
-                         "created": c} for d, i, a, fn, s, t, r, x, c in rows]
+                return [{"delivery": d, "id": i, "to": a, "from": f"{fn}/{s}", "topic": t, "reply": r, "mode": m,
+                         "text": x, "created": c} for d, i, a, fn, s, t, r, m, x, c in rows]
             time.sleep(0.25)
 
     def ack(self, node: str, delivery: str, outcome: str) -> dict:
@@ -294,16 +303,17 @@ class Hub:
                 f"{node}/{address}")
         return list(listing.values())
 
-    def history(self, topic: str, after: str | None, limit: int = 100) -> list[dict]:
-        """A topic's posts, oldest first, after the post with id `after` if given."""
+    def history(self, topic: str, after: int = 0, limit: int = 100) -> list[dict]:
+        """A topic's posts, oldest first, after the row whose `cursor` is `after`.
+
+        The cursor is the hub's own post sequence: client ids are unique only per sending node.
+        """
         with self._db() as db:
-            since = 0
-            if after:
-                row = db.execute("SELECT MIN(seq) FROM posts WHERE topic = ? AND id = ?", (topic, after)).fetchone()
-                since = row[0] or 0
-            rows = db.execute("SELECT id, from_node, sender, reply, text, created FROM posts WHERE topic = ? AND seq > ?"
-                              " ORDER BY seq LIMIT ?", (topic, since, max(1, min(limit, 500)))).fetchall()
-        return [{"id": i, "from": f"{fn}/{s}", "reply": r, "text": x, "created": c} for i, fn, s, r, x, c in rows]
+            rows = db.execute("SELECT seq, id, from_node, sender, reply, mode, text, created FROM posts"
+                              " WHERE topic = ? AND seq > ? ORDER BY seq LIMIT ?",
+                              (topic, after, max(1, min(limit, 500)))).fetchall()
+        return [{"cursor": str(q), "id": i, "from": f"{fn}/{s}", "reply": r, "mode": m, "text": x,
+                 "created": c} for q, i, fn, s, r, m, x, c in rows]
 
 
 def application(hub: Hub):
@@ -321,10 +331,7 @@ def application(hub: Hub):
             node = await run_in_threadpool(hub.node_for, token)
             body = {}
             if request.method in ("POST", "PUT"):
-                raw = await request.body()
-                if len(raw) > MAX_TEXT * 4:
-                    raise HubError(413, "request too large")
-                body = json.loads(raw or b"{}")
+                body = json.loads(await bounded_body(request) or b"{}")
                 if not isinstance(body, dict):
                     raise HubError(400, "the request body must be a JSON object")
             return JSONResponse(await run_in_threadpool(work, node, body, request))
@@ -332,6 +339,19 @@ def application(hub: Hub):
             return JSONResponse({"error": str(error)}, status_code=error.status)
         except ValueError:
             return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    async def bounded_body(request) -> bytes:
+        """The request body, refused as soon as it would exceed MAX_BODY, whatever Content-Length says."""
+        declared = request.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > MAX_BODY:
+            raise HubError(413, "request too large")
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > MAX_BODY:
+                raise HubError(413, "request too large")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     def wait_param(request) -> float:
         try:
@@ -372,7 +392,10 @@ def application(hub: Hub):
                 limit = int(req.query_params.get("limit", "100"))
             except ValueError:
                 limit = 100
-            return {"messages": hub.history(req.path_params["topic"], req.query_params.get("after"), limit)}
+            after = req.query_params.get("after", "0")
+            if not after.isdigit():
+                raise HubError(400, "after is the cursor of a history row")
+            return {"messages": hub.history(req.path_params["topic"], int(after), limit)}
         return await handle(request, work)
 
     async def whoami(request):

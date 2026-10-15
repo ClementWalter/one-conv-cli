@@ -2,8 +2,9 @@
 
 An address is `boat:<sandbox>/<conversation>`, using Boat's conversation id; the agent's
 native session id inside the sandbox is a different value and is not used for routing.
-Messages go only into idle conversations with `box prompt --resume`: Boat's `steer`
-relabels the text as the user's own instruction, which a peer message must never become.
+An idle conversation gets `box prompt --resume`; a busy one gets `box steer`. Boat wraps
+a steered text as a message from the user and may stop the running command, so the
+one-conv envelope inside it is what still names the real sender.
 Replies are read back with `box events`, so nothing in the sandbox has to reach this machine.
 """
 
@@ -60,7 +61,11 @@ def list_sessions() -> list[LiveSession]:
 
 
 def _accepted(log_path) -> str | None:
-    """"accepted" once Boat echoes the prompt, an error text if it refused, None while waiting."""
+    """Boat's answer so far in a prompt or steer log.
+
+    "accepted" once Boat echoes the prompt or reports the steer, "ended" when a steer found
+    no running turn, an error text if Boat refused, None while it has not answered.
+    """
     try:
         lines = log_path.read_text().splitlines()
     except FileNotFoundError:
@@ -70,9 +75,13 @@ def _accepted(log_path) -> str | None:
             row = json.loads(line)
         except ValueError:
             continue
+        if row.get("code") == "no_running_turn":
+            return "ended"
         if row.get("event") == "error":
             return f"{row.get('code', 'error')}: {row.get('error', '')}"
         if row.get("event") == "chat" and (row.get("data") or {}).get("type") == "prompt":
+            return "accepted"
+        if row.get("status") == "steered":
             return "accepted"
     return None
 
@@ -98,6 +107,8 @@ def operation_state(record: dict) -> str:
     state = _accepted(Path(record["log"]))
     if state == "accepted":
         return "accepted"
+    if state == "ended":
+        return "refused: no_running_turn (the turn had ended, so the steer was not delivered)"
     if state is not None:
         return f"refused: {state}"
     if record.get("resolved"):
@@ -145,47 +156,70 @@ def _pending_for(address: str) -> str | None:
 
 
 def deliver(session: LiveSession, text: str) -> str:
-    """Prompt an idle conversation; the idle state is read just before, not held.
+    """Prompt an idle conversation or steer a busy one; the state is read just before, not held.
 
     A turn that starts between that read and Boat accepting the prompt would receive the
     message mid-turn as a normal prompt; Boat offers no conditional prompt to close this.
     A prompt Boat has not confirmed in time is reported as pending, not failed: the
     detached `box prompt` may still deliver it, so resending could deliver it twice.
     """
-    if session.status != "idle":
-        raise RuntimeError(f"{session.address} is running a turn. Boat can only steer a busy "
-                           "conversation, which would present this message as the user's own "
-                           "instruction; send it again once the turn has ended.")
     earlier = _pending_for(session.address)
     if earlier:
         raise RuntimeError(f"An earlier message to {session.address} has no confirmed outcome (op {earlier}). "
                            f"Check it with `one-conv live status {earlier}` before sending again.")
     sandbox, conversation = split(session.id)
+    if session.status != "idle":
+        steered = _tracked(session, "steer", [
+            "box", "steer", sandbox, "--convo", conversation, "--json", "--no-update", text])
+        if steered is not None:
+            return steered
+        # Boat confirmed the turn had ended, so nothing was steered: prompt it as idle.
+    prompted = _tracked(session, "prompt", [
+        "box", "prompt", sandbox, "--resume", conversation, "--json", "--no-update", text])
+    if prompted is None:
+        raise RuntimeError("Boat answered a prompt with no_running_turn, which a prompt never expects")
+    return prompted
+
+
+def _tracked(session: LiveSession, kind: str, argv: list[str]) -> str | None:
+    """Run one `box prompt` or `box steer` as a recorded operation and report its outcome.
+
+    The operation is recorded before launch. A lost acknowledgment or a timeout returns
+    an unconfirmed or pending receipt that blocks another send, because the text may have
+    reached the agent. Only an explicit Boat refusal raises. None means Boat confirmed
+    that a steer found no running turn, so nothing was delivered.
+    """
     op = uuid.uuid4().hex[:OP_ID_LENGTH]
     _operations().mkdir(parents=True, exist_ok=True)
     log_path = _operations() / f"{op}.log.jsonl"
+    record = {"op": op, "kind": kind, "address": session.address, "pid": None, "log": str(log_path),
+              "started": time.time()}
+    (_operations() / f"{op}.json").write_text(json.dumps(record))
     with log_path.open("w") as log:
         # The text is one argv element: Boat delivers it byte for byte, and it starts with
         # "<one-conv-message", so it cannot be read as an option.
-        process = subprocess.Popen(
-            ["box", "prompt", sandbox, "--resume", conversation, "--json", "--no-update", text],
-            stdout=log, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
-    record = {"op": op, "address": session.address, "pid": process.pid, "log": str(log_path),
-              "started": time.time()}
+        process = subprocess.Popen(argv, stdout=log, stderr=subprocess.DEVNULL,
+                                   stdin=subprocess.DEVNULL, start_new_session=True)
+    record["pid"] = process.pid
     (_operations() / f"{op}.json").write_text(json.dumps(record))
     deadline = time.monotonic() + ACCEPT_SECONDS
     while time.monotonic() < deadline:
         state = _accepted(log_path)
         if state == "accepted":
+            if kind == "steer":
+                return ("steered into the running turn (Boat shows it as a message from the user; the "
+                        f"envelope names the sender); read the reply with `one-conv live pull {session.address}`")
             return f"delivered; the turn runs in the sandbox, read it with `one-conv live pull {session.address}`"
+        if state == "ended":
+            return None
         if state is not None:
-            raise RuntimeError(f"Boat refused the prompt: {state}")
-        if process.poll() is not None:
-            # A local exit is not a refusal from Boat: the prompt may have been forwarded anyway.
-            return (f"unconfirmed: box prompt exited {process.returncode} without Boat accepting or "
+            raise RuntimeError(f"Boat refused the {kind}: {state}")
+        if process.poll() is not None and _accepted(log_path) is None:
+            # A local exit is not a refusal from Boat: the text may have been forwarded anyway.
+            return (f"unconfirmed: box {kind} exited {process.returncode} without Boat accepting or "
                     f"refusing (op {op}). Do not resend; check it with `one-conv live status {op}`")
         time.sleep(0.2)
-    return (f"pending: Boat has not confirmed the prompt yet (op {op}). Do not resend; "
+    return (f"pending: Boat has not confirmed the {kind} yet (op {op}). Do not resend; "
             f"check it with `one-conv live status {op}`")
 
 

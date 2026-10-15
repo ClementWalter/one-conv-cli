@@ -10,7 +10,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import boat, claude, codex, cursor, omp
+from . import boat, claude, codex, cursor, omp, team
 from .model import LiveSession, envelope, is_session_id, live_home, parse_address
 
 try:
@@ -109,6 +109,14 @@ def whoami(explicit: str | None = None, meta: dict | None = None, pid: int | Non
 def resolve(target: str, sessions: list[LiveSession] | None = None,
             exclude: LiveSession | None = None) -> LiveSession:
     """Match an address, id prefix, then title/cwd substring; `exclude` drops the sender first."""
+    if target.startswith("@"):
+        try:
+            bound = team.address_for(target)
+        except team.TeamError as error:
+            raise LiveError(str(error)) from error
+        if bound is None:
+            raise LiveError(f"No agent is called {target}. Run `one-conv live names`.")
+        target = bound
     harness, query = parse_address(target)
     if exclude is not None and target in (exclude.address, exclude.id):
         raise LiveError(f"{exclude.address} is the sending session itself.")
@@ -224,9 +232,57 @@ def _append_fyi(target: str, sender: str, text: str) -> None:
         os.replace(partial, path)
 
 
+def topic_of(target: str) -> str | None:
+    """The topic a `#name` or `topic:name` target addresses, else None."""
+    if target.startswith("#"):
+        return target[1:]
+    if target.startswith("topic:"):
+        return target[len("topic:"):]
+    return None
+
+
 def send(target: str, text: str, sender: LiveSession | None, origin: str = "unknown",
-         fyi: bool = False, reply: str = "expected") -> dict:
-    """Push a user turn into `target`, or with `fyi` leave a notice that never wakes it."""
+         fyi: bool = False, reply: str = "expected", topic: str | None = None,
+         message_id: str | None = None) -> dict:
+    """Deliver to one session, or to every member of a topic for a `#topic` target.
+
+    `message_id` is chosen once and reused on retry, so a receiver can drop a duplicate.
+    """
+    message_id = message_id or uuid.uuid4().hex
+    named = topic_of(target)
+    try:
+        if named is not None:
+            return _send_topic(named, text, sender, origin, fyi, reply, message_id)
+        if topic is not None:
+            topic = team._check("topic", topic)
+    except team.TeamError as error:
+        raise LiveError(str(error)) from error
+    receipt = _send_one(target, text, sender, origin, fyi, reply, topic, message_id)
+    if topic is not None:
+        team.record(topic, message_id, receipt["from"], text)
+    return receipt
+
+
+def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
+                reply: str, message_id: str) -> dict:
+    """Record the message on the topic, then deliver it to each member but the sender."""
+    topic = team._check("topic", topic)
+    sender_label = sender.address if sender else origin
+    team.record(topic, message_id, sender_label, text)
+    deliveries = []
+    for member in team.members(topic):
+        if member == sender_label:
+            continue
+        try:
+            deliveries.append(_send_one(member, text, sender, origin, fyi, reply, topic, message_id))
+        except (LiveError, RuntimeError, OSError, ValueError) as error:
+            # A member that cannot be reached now still finds the message when it catches up.
+            deliveries.append({"to": member, "status": f"not delivered: {error}"})
+    return {"topic": topic, "id": message_id, "from": sender_label, "deliveries": deliveries}
+
+
+def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
+              reply: str, topic: str | None, message_id: str) -> dict:
     session = resolve(target, exclude=sender)
     if sender is not None and session.address == sender.address:
         raise LiveError(f"{session.address} is the sending session itself.")
@@ -236,7 +292,8 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
                         "machine's feed. Push it once the conversation is idle, or skip it.")
     if session.harness == "boat" and reply == "expected":
         reply = "inline"
-    wrapped = envelope(text, sender, origin, "none" if fyi else reply)
+    handle = team.name_for(sender.address) if sender is not None else None
+    wrapped = envelope(text, sender, origin, "none" if fyi else reply, message_id, topic, handle)
     with _rate_slot(sender_label, session.address):
         if fyi:
             _append_fyi(session.address, sender_label, wrapped)
@@ -244,7 +301,7 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
         else:
             status, delivery = ADAPTERS[session.harness].deliver(session, wrapped), session.delivery
     receipt = {"to": session.address, "title": session.title, "cwd": session.cwd,
-               "delivery": delivery, "status": status, "from": sender_label}
+               "delivery": delivery, "status": status, "from": sender_label, "id": message_id}
     # Only two identified sessions form a pair; "user", "unknown" and "?unknown" ids do not.
     if sender is not None and not sender.id.startswith("?"):
         try:

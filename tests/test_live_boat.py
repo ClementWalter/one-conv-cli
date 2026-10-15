@@ -41,6 +41,17 @@ elif command == "prompt":
     time.sleep(float(os.environ.get("BOX_STUB_DELAY", "0")))
     print(json.dumps({"event": "chat", "final": True, "data": {"conversationId": args[3], "type": "prompt",
           "timestamp": 1, "data": {"prompt": args[-1], "status": "finished"}}}), flush=True)
+elif command == "steer":
+    steer = os.environ.get("BOX_STUB_STEER", "steered")
+    if steer == "lost":
+        sys.exit(1)  # The steer may have been forwarded; the acknowledgement never comes back.
+    if steer == "slow":
+        import time
+        time.sleep(float(os.environ.get("BOX_STUB_DELAY", "1.5")))
+    if steer == "ended":
+        print(json.dumps({"code": "no_running_turn", "error": "The last turn already ended", "event": "error", "status": 409}))
+        sys.exit(1)
+    print(json.dumps({"conversationId": args[3], "mode": "native", "status": "steered"}))
 elif command == "events":
     rows = [
         {"event": "chat", "final": True, "data": {"type": "prompt", "timestamp": 1, "data": {"prompt": "question"}}},
@@ -100,15 +111,21 @@ def test_delivery_resumes_the_target_conversation(box):
     assert calls(box)[-1][:4] == ["prompt", SANDBOX, "--resume", IDLE]
 
 
-def test_busy_conversation_is_refused_without_steering(box):
-    with pytest.raises(RuntimeError, match="running a turn"):
-        boat.deliver(LiveSession("boat", f"{SANDBOX}/{BUSY}", status="busy"), "<one-conv-message>hi</one-conv-message>")
+def test_busy_conversation_is_steered(box):
+    status = boat.deliver(LiveSession("boat", f"{SANDBOX}/{BUSY}", status="busy"), "<one-conv-message>hi</one-conv-message>")
+    assert status.startswith("steered into the running turn")
 
 
-def test_busy_refusal_calls_no_box_command(box):
-    with pytest.raises(RuntimeError):
-        boat.deliver(LiveSession("boat", f"{SANDBOX}/{BUSY}", status="busy"), "<one-conv-message>hi</one-conv-message>")
-    assert calls(box) == []
+def test_steer_passes_the_text_as_one_argument(box):
+    text = '<one-conv-message from="claude:c1">\nline "two" $(echo PWNED) x;y\n</one-conv-message>'
+    boat.deliver(LiveSession("boat", f"{SANDBOX}/{BUSY}", status="busy"), text)
+    assert calls(box)[-1] == ["steer", SANDBOX, "--convo", BUSY, "--json", "--no-update", text]
+
+
+def test_steer_after_the_turn_ended_falls_back_to_prompt(box, monkeypatch):
+    monkeypatch.setenv("BOX_STUB_STEER", "ended")
+    boat.deliver(LiveSession("boat", f"{SANDBOX}/{BUSY}", status="busy"), "<one-conv-message>hi</one-conv-message>")
+    assert calls(box)[-1][:4] == ["prompt", SANDBOX, "--resume", BUSY]
 
 
 def test_refused_prompt_reports_boats_reason(box, monkeypatch):
@@ -290,3 +307,56 @@ def test_only_an_unconfirmed_send_can_be_resolved(box):
 def test_operation_id_must_be_twelve_hex_characters(box, op):
     with pytest.raises(RuntimeError, match="no Boat send operation"):
         boat.operation(op)
+
+
+BUSY_TARGET = LiveSession("boat", f"{SANDBOX}/{BUSY}", status="busy")
+TEXT = "<one-conv-message>hi</one-conv-message>"
+
+
+def test_lost_steer_acknowledgement_is_unconfirmed(box, monkeypatch):
+    monkeypatch.setenv("BOX_STUB_STEER", "lost")
+    assert boat.deliver(BUSY_TARGET, TEXT).startswith("unconfirmed: box steer")
+
+
+def test_lost_steer_blocks_a_second_steer(box, monkeypatch, launches):
+    monkeypatch.setenv("BOX_STUB_STEER", "lost")
+    boat.deliver(BUSY_TARGET, TEXT)
+    with pytest.raises(RuntimeError, match="no confirmed outcome"):
+        boat.deliver(BUSY_TARGET, TEXT)
+    assert [args[1] for args in launches].count("steer") == 1
+
+
+def test_lost_steer_uses_a_rate_slot(box, monkeypatch):
+    monkeypatch.setenv("BOX_STUB_STEER", "lost")
+    router.send(f"boat:{SANDBOX}/{BUSY}", "status?", LiveSession("claude", "c1"))
+    assert (Path(os.environ["ONE_CONV_LIVE_DIR"]) / "sent.jsonl").exists()
+
+
+def test_slow_steer_is_pending(box, monkeypatch):
+    monkeypatch.setenv("BOX_STUB_STEER", "slow")
+    monkeypatch.setattr(boat, "ACCEPT_SECONDS", 0.3)
+    assert boat.deliver(BUSY_TARGET, TEXT).startswith("pending: Boat has not confirmed the steer")
+
+
+def test_slow_steer_later_reads_as_accepted(box, monkeypatch):
+    monkeypatch.setenv("BOX_STUB_STEER", "slow")
+    monkeypatch.setattr(boat, "ACCEPT_SECONDS", 0.3)
+    op = _op(boat.deliver(BUSY_TARGET, TEXT))
+    deadline = time.monotonic() + 10
+    while boat.operation(op)["state"] == "pending" and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert boat.operation(op)["state"] == "accepted"
+
+
+def test_steer_into_an_ended_turn_does_not_block_later_sends(box, monkeypatch):
+    monkeypatch.setenv("BOX_STUB_STEER", "ended")
+    boat.deliver(BUSY_TARGET, TEXT)
+    assert boat._pending_for(BUSY_TARGET.address) is None
+
+
+def test_topic_fan_out_keeps_an_unknown_outcome(box, monkeypatch):
+    from one_conv.live import team
+    monkeypatch.setenv("BOX_STUB_STEER", "lost")
+    team.join("release", f"boat:{SANDBOX}/{BUSY}")
+    receipt = router.send("#release", "status?", LiveSession("claude", "c1"))
+    assert receipt["deliveries"][0]["status"].startswith("unconfirmed")

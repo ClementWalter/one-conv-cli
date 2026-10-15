@@ -4,6 +4,8 @@ A name is an alias for a session address; messages still route and reply by addr
 renaming never breaks a reply. A topic has members and a bounded message history; sending
 to a topic delivers to every member. Files are keyed by a hash of the topic, never by the
 raw text, and each member keeps a read position so catching up shows only what is new.
+When a hub is configured it holds topic membership and history for every machine; this
+machine then keeps only each reader's position.
 """
 
 import hashlib
@@ -14,6 +16,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import hubclient
 from .model import live_home
 
 try:
@@ -131,12 +134,49 @@ def _messages(topic: str) -> list[dict]:
     return rows
 
 
+def _hub():
+    try:
+        return hubclient.configured()
+    except hubclient.HubRefused as error:
+        raise TeamError(str(error)) from None
+
+
+def _hub_call(work):
+    try:
+        return work()
+    except hubclient.HubRefused as error:
+        if error.status == 403:
+            raise TeamError(f"{error} (is `one-conv live serve` running, so this session is published?)") from None
+        raise TeamError(str(error)) from None
+    except hubclient.HubUnavailable as error:
+        raise TeamError(f"{error}; topics are shared through the hub, so try again once it is reachable") from None
+
+
 def members(topic: str) -> list[str]:
-    return sorted(_meta(_check("topic", topic)).get("members", {}))
+    topic = _check("topic", topic)
+    hub = _hub()
+    if hub is not None:
+        rows = _hub_call(hub.topics)
+        return sorted(next((row["members"] for row in rows if row.get("topic") == topic), []))
+    return sorted(_meta(topic).get("members", {}))
+
+
+def _remember_member(topic: str, address: str) -> None:
+    """Keep this reader's position locally, whichever side holds the membership."""
+    _topic_dir(topic).mkdir(parents=True, exist_ok=True)
+    meta = _meta(topic) or {"topic": topic, "created": time.time(), "members": {}}
+    meta["members"].setdefault(address, {"joined": time.time(), "seen": None})
+    _write(_topic_dir(topic) / "meta.json", meta)
 
 
 def join(topic: str, address: str) -> str:
     topic = _check("topic", topic)
+    hub = _hub()
+    if hub is not None:
+        _hub_call(lambda: hub.join(topic, address))
+        with _locked():
+            _remember_member(topic, address)
+        return topic
     with _locked():
         _topic_dir(topic).mkdir(parents=True, exist_ok=True)
         meta = _meta(topic) or {"topic": topic, "created": time.time(), "members": {}}
@@ -148,6 +188,12 @@ def join(topic: str, address: str) -> str:
 
 def leave(topic: str, address: str) -> str:
     topic = _check("topic", topic)
+    hub = _hub()
+    if hub is not None:
+        result = _hub_call(lambda: hub.leave(topic, address))
+        if not result.get("removed"):
+            raise TeamError(f"{address} is not a member of #{topic}")
+        return topic
     with _locked():
         meta = _meta(topic)
         if address not in meta.get("members", {}):
@@ -176,9 +222,39 @@ def record(topic: str, message_id: str, sender: str, text: str) -> None:
         _write(_topic_dir(topic) / "meta.json", meta)
 
 
+def _hub_catch_up(hub, topic: str, address: str, everything: bool, peek: bool) -> dict:
+    """Catch up from the hub, resuming after this reader's last hub cursor.
+
+    The cursor is the hub's own post sequence; message ids are unique only per sending
+    machine, so they cannot mark a position. A stored position that is not a cursor
+    shows the latest messages instead.
+    """
+    with _locked():
+        meta = _meta(topic)
+        cursor = None if everything else (meta.get("members", {}).get(address) or {}).get("hub_cursor")
+    if not (isinstance(cursor, str) and cursor.isdigit()):
+        cursor = None
+    rows = [{"id": r["id"], "cursor": r.get("cursor"), "at": r.get("created") or 0, "from": r["from"],
+             "text": r["text"], "mode": r.get("mode", "push")}
+            for r in _hub_call(lambda: hub.history(topic, cursor, limit=TOPIC_HISTORY))]
+    shown = rows[-CATCH_UP:]
+    current = members(topic)
+    is_member = address in current or any(m.endswith("/" + address) for m in current)
+    if rows and not peek and is_member and rows[-1].get("cursor"):
+        with _locked():
+            _remember_member(topic, address)
+            meta = _meta(topic)
+            meta["members"][address]["hub_cursor"] = rows[-1]["cursor"]
+            _write(_topic_dir(topic) / "meta.json", meta)
+    return {"topic": topic, "messages": shown, "omitted": len(rows) - len(shown), "member": is_member}
+
+
 def catch_up(topic: str, address: str, everything: bool = False, peek: bool = False) -> dict:
     """Messages this member has not seen yet (at most CATCH_UP), oldest first; marks them seen."""
     topic = _check("topic", topic)
+    hub = _hub()
+    if hub is not None:
+        return _hub_catch_up(hub, topic, address, everything, peek)
     with _locked():
         meta = _meta(topic)
         if not meta:
@@ -197,6 +273,10 @@ def catch_up(topic: str, address: str, everything: bool = False, peek: bool = Fa
 
 
 def topics() -> list[dict]:
+    hub = _hub()
+    if hub is not None:
+        return [{"topic": row["topic"], "members": sorted(row.get("members", [])), "last": row.get("last"),
+                 "messages": None} for row in _hub_call(hub.topics)]
     rows = []
     for meta_path in sorted((_root() / "topics").glob("*/meta.json")):
         meta = _read(meta_path, {})

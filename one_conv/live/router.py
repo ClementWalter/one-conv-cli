@@ -10,7 +10,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import boat, claude, codex, cursor, omp, team
+from . import boat, claude, codex, cursor, hubclient, omp, team
 from .model import LiveSession, envelope, is_session_id, live_home, parse_address
 
 try:
@@ -272,6 +272,13 @@ def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, 
     """Record the message on the topic, then deliver it to each member but the sender."""
     topic = team._check("topic", topic)
     sender_label = sender.address if sender else origin
+    try:
+        hub = hubclient.configured()
+    except hubclient.HubRefused as error:
+        raise LiveError(str(error)) from error
+    if hub is not None:
+        return _post_topic(hub, topic, text, sender_label, "none" if fyi else reply, message_id,
+                           "fyi" if fyi else "push")
     team.record(topic, message_id, sender_label, text)
     deliveries = []
     for member in team.members(topic):
@@ -283,6 +290,28 @@ def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, 
             # A member that cannot be reached now still finds the message when it catches up.
             deliveries.append({"to": member, "status": f"not delivered: {error}"})
     return {"topic": topic, "id": message_id, "from": sender_label, "deliveries": deliveries}
+
+
+def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id: str,
+                mode: str = "push") -> dict:
+    """Post once; the hub records the message and fans it out to every member on every machine.
+
+    An unreachable hub leaves the message in the bridge's outbox under the same id, so the
+    bridge's later post cannot deliver it twice.
+    """
+    # mode is the delivery mode (wake the receiver or not), kept apart from the reply policy.
+    message = {"id": message_id, "to": f"#{topic}", "from": sender, "topic": topic,
+               "mode": mode, "reply": reply, "text": text}
+    try:
+        receipt = hub.post(message)
+    except hubclient.HubUnavailable as error:
+        hubclient.queue(message)
+        return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
+                "deliveries": [{"to": f"#{topic}", "status": f"queued for the hub: {error}"}]}
+    except hubclient.HubRefused as error:
+        raise LiveError(str(error)) from error
+    return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
+            "deliveries": [{"to": row["to"], "status": row["status"]} for row in receipt.get("recipients", [])]}
 
 
 def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,

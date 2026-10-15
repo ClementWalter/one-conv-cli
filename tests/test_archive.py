@@ -54,6 +54,8 @@ def fixture_env(tmp_path):
         "CODEX_HOME": str(tmp_path / "codex"), "CURSOR_USER_DIR": str(tmp_path / "cursor"),
         "CURSOR_CLI_HOME": str(tmp_path / "cursor-cli"), "OMP_HOME": str(tmp_path / "omp"),
         "ONE_CONV_CORPUS": str(tmp_path / "corpus"), "ONE_CONV_CLOUD_CACHE": str(tmp_path / "cloud"),
+        # Without this, sync reads the developer's own saved ChatGPT conversations.
+        "ONE_CONV_CHATGPT_CACHE": str(tmp_path / "chatgpt"), "AGENT_CONV_CHATGPT_CACHE": str(tmp_path / "chatgpt"),
         "ONE_CONV_STATE_DIR": str(tmp_path / "state"), "AGENT_CONV_STATE_DIR": str(tmp_path / "state")}
     return env
 
@@ -652,6 +654,66 @@ def test_freeing_deletes_only_verified_files_and_restore_brings_them_back(tmp_pa
     assert {item: item.read_bytes() for item in originals} == originals and path.stat().st_mtime == old
     for args, expected in zip(commands, baseline):
         assert run(env, "bin/one-conv", "local", *args, "--source", source, "--json") == expected
+
+
+@pytest.fixture
+def old_synced_claude(tmp_path, archive):
+    """A Claude session older than the free cutoff, already captured in the archive."""
+    _, _, url = archive
+    env = fixture_env(tmp_path)
+    env["ONE_CONV_LIVE_DIR"] = str(tmp_path / "live")
+    path = write_claude(env)
+    old = time.time() - 100 * 86400
+    os.utime(path, (old, old))
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    return env, path
+
+
+def free_claude(env):
+    return run(env, "scripts/archive-sync.py", "--source", "claude", "--free-older-than", "30", success=False)
+
+
+def test_free_keeps_a_session_registered_as_running(old_synced_claude):
+    env, path = old_synced_claude
+    holder = subprocess.Popen(["sleep", "60"])
+    try:
+        sessions = Path(env["CLAUDE_CONFIG_DIR"]) / "sessions"
+        sessions.mkdir()
+        (sessions / f"{holder.pid}.json").write_text(json.dumps(
+            {"pid": holder.pid, "sessionId": "session-one", "cwd": "/example/ancestry", "status": "idle"}))
+        free_claude(env)
+    finally:
+        holder.kill()
+    assert path.exists()
+
+
+def test_free_reports_why_a_running_session_was_kept(old_synced_claude):
+    env, _ = old_synced_claude
+    holder = subprocess.Popen(["sleep", "60"])
+    try:
+        sessions = Path(env["CLAUDE_CONFIG_DIR"]) / "sessions"
+        sessions.mkdir()
+        (sessions / f"{holder.pid}.json").write_text(json.dumps(
+            {"pid": holder.pid, "sessionId": "session-one", "cwd": "/example/ancestry", "status": "idle"}))
+        result = free_claude(env)
+    finally:
+        holder.kill()
+    assert "its session is running (claude:session-one)" in result.stderr
+
+
+@pytest.mark.skipif(shutil.which("lsof") is None, reason="needs lsof to see open files")
+def test_free_keeps_a_transcript_another_process_holds_open(old_synced_claude):
+    env, path = old_synced_claude
+    with path.open():
+        free_claude(env)
+    assert path.exists()
+
+
+def test_free_still_frees_an_idle_unopened_session(old_synced_claude):
+    env, path = old_synced_claude
+    free_claude(env)
+    assert not path.exists()
 
 
 def test_a_freed_conversation_written_again_does_not_replace_its_archive(tmp_path, archive):

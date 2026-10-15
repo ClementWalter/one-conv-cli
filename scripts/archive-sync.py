@@ -14,7 +14,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -145,9 +147,29 @@ def acquire_lock(path):
     return False
 
 
+def running_reason(handle, paths):
+    """Why a conversation is still in use, or None. A running agent rewrites or appends to its
+    transcript, so freeing it would lose turns and break the agent's own session."""
+    from one_conv.live import router
+    for session in router.list_all(handle.source):
+        if handle.uuid == session.id or handle.uuid.endswith(session.id):
+            return f"its session is running ({session.address})"
+    lsof = shutil.which("lsof")
+    if lsof:
+        # An idle agent can hold its transcript open without registering as live.
+        holders = subprocess.run([lsof, "-t", "--", *map(str, paths)], capture_output=True, text=True, check=False)
+        if holders.stdout.strip():
+            return f"a process has its files open (pid {holders.stdout.split()[0]})"
+    return None
+
+
 def free(reader, client, handle, archived):
-    """Delete a conversation's native files only if the archive holds exactly these bytes; return the bytes freed."""
+    """Delete a conversation's native files only if the archive holds exactly these bytes and no
+    agent is using them; return the bytes freed."""
     paths = source_paths(reader, handle)
+    reason = running_reason(handle, paths)
+    if reason:
+        raise ArchiveError(reason)
     before = fingerprint(paths)
     manifest = client.read_conversation(archived["key"], archived["revision"])
     originals = manifest["originals"]

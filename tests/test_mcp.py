@@ -153,3 +153,20 @@ def test_stdio_send_message_names_codex_caller_from_tool_meta(tmp_path):
     asyncio.run(send())
     [message] = (live / "inbox" / "omp" / "o1").glob("*.json")
     assert 'from="codex:t-123"' in json.loads(message.read_text())["text"]
+
+
+def test_stdio_send_message_fyi_leaves_notice(tmp_path):
+    live = tmp_path / "live"
+    (live / "omp").mkdir(parents=True)
+    (live / "omp" / "o1.json").write_text(json.dumps({"pid": os.getpid(), "sessionId": "o1", "cwd": "/work"}))
+
+    async def send():
+        parameters = StdioServerParameters(
+            command=sys.executable, args=["-O", str(mcp_server.LAUNCHER), "mcp"],
+            env={**os.environ, "ONE_CONV_LIVE_DIR": str(live), "CODEX_HOME": str(tmp_path / "codex")})
+        async with Client(parameters) as client:
+            return await client.call_tool("send_message", {"to": "omp:o1", "text": "merged", "fyi": True},
+                                          meta={"threadId": "t-123"})
+
+    asyncio.run(send())
+    assert json.loads((live / "fyi" / "omp-o1.jsonl").read_text())["from"] == "codex:t-123"

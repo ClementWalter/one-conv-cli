@@ -41,8 +41,11 @@ def build_live_group(launcher: list[str]) -> click.Group:
     @click.option("--stdin", "from_stdin", is_flag=True, help="Read the message from stdin.")
     @click.option("--from", "sender", help="Sender address; detected from the calling agent by default.")
     @click.option("--yes", is_flag=True, help="Actually send. Without it, prints the resolved delivery.")
+    @click.option("--fyi", is_flag=True,
+                  help="Leave a notice for the target's `local feed` instead of waking it; no reply expected.")
+    @click.option("--no-reply", is_flag=True, help="Push, but mark the message as needing no reply.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the delivery receipt as JSON.")
-    def send_command(target, message, from_stdin, sender, yes, as_json):
+    def send_command(target, message, from_stdin, sender, fyi, no_reply, yes, as_json):
         """Send MESSAGE into the running session TARGET (an address, id prefix, title or cwd).
 
         The message arrives as a new user turn wrapped with the sender's address, so the
@@ -59,10 +62,11 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 session = router.resolve(target, exclude=me)
                 click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
                 click.echo(f"  to:       {session.address}  {session.title or session.cwd}")
-                click.echo(f"  delivery: {session.delivery} ({session.status or 'unknown'})")
+                click.echo(f"  delivery: {'fyi (feed inbox)' if fyi else session.delivery} ({session.status or 'unknown'})")
                 click.echo(f"  from:     {me.address if me else origin}")
                 return
-            receipt = router.send(target, message, me, origin)
+            receipt = router.send(target, message, me, origin, fyi=fyi,
+                                  reply="none" if no_reply else "expected")
         except (router.LiveError, RuntimeError, OSError) as error:
             raise click.ClickException(str(error)) from None
         click.echo(json.dumps(receipt) if as_json else f"{receipt['status']}: {receipt['to']}")

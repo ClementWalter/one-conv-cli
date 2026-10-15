@@ -134,6 +134,24 @@ def test_envelope_attribute_cannot_inject_from():
     assert 'from="user"' not in envelope("hi", sender)
 
 
+def test_envelope_without_reply_is_marked():
+    assert 'reply="none"' in envelope("done", LiveSession("codex", "t1"), reply="none")
+
+
+def test_envelope_without_reply_says_not_to_answer():
+    assert envelope("done", LiveSession("codex", "t1"), reply="none").endswith(
+        "No reply expected. Do not reply to this message.")
+
+
+def test_envelope_without_reply_drops_reply_instruction():
+    assert "send_message" not in envelope("done", LiveSession("codex", "t1"), reply="none")
+
+
+def test_envelope_rejects_unknown_reply_mode():
+    with pytest.raises(ValueError):
+        envelope("hi", None, reply="maybe")
+
+
 def test_envelope_without_known_sender_id_has_no_reply_line():
     assert "send_message" not in envelope("hi", LiveSession("cursor", "?unknown"))
 
@@ -385,6 +403,82 @@ def test_failed_delivery_records_no_pair(homes, monkeypatch):
     with pytest.raises(OSError):
         router.send("omp:o1", "ping", LiveSession("claude", "c1"))
     assert not (homes / "live" / "peers.json").exists()
+
+
+def _fyi_rows(homes, address="omp:o1"):
+    return [json.loads(line) for line in router.fyi_inbox(address).read_text().splitlines()]
+
+
+def test_fyi_leaves_notice_in_feed_inbox(homes):
+    _omp_record(homes, os.getpid())
+    router.send("omp:o1", "merged", LiveSession("claude", "c1"), fyi=True)
+    assert [(r["from"], r["to"]) for r in _fyi_rows(homes)] == [("claude:c1", "omp:o1")]
+
+
+@pytest.mark.parametrize("adapter", [claude, codex, omp, cursor])
+def test_fyi_calls_no_harness_adapter(homes, monkeypatch, adapter):
+    _omp_record(homes, os.getpid())
+
+    def woken(session, text):
+        raise AssertionError("fyi must not deliver a turn")
+
+    monkeypatch.setattr(adapter, "deliver", woken)
+    assert router.send("omp:o1", "merged", LiveSession("claude", "c1"), fyi=True)["delivery"] == "fyi"
+
+
+def test_fyi_receipt_says_stored_not_read(homes):
+    _omp_record(homes, os.getpid())
+    assert router.send("omp:o1", "merged", LiveSession("claude", "c1"), fyi=True)["status"] == "stored FYI"
+
+
+def test_push_without_reply_carries_no_reply_invitation(homes):
+    _omp_record(homes, os.getpid())
+    router.send("omp:o1", "fixed", LiveSession("claude", "c1"), reply="none")
+    [message] = (homes / "live" / "inbox" / "omp" / "o1").glob("*.json")
+    assert "send_message" not in json.loads(message.read_text())["text"]
+
+
+def test_fyi_notice_expects_no_reply(homes):
+    _omp_record(homes, os.getpid())
+    router.send("omp:o1", "merged", LiveSession("claude", "c1"), fyi=True)
+    assert 'reply="none"' in _fyi_rows(homes)[0]["text"]
+
+
+def test_fyi_prunes_notices_past_the_keep_window(homes):
+    _omp_record(homes, os.getpid())
+    router.fyi_inbox("omp:o1").parent.mkdir(parents=True)
+    router.fyi_inbox("omp:o1").write_text(json.dumps({"id": "old", "at": 1.0, "text": "x"}) + "\n")
+    router.send("omp:o1", "merged", LiveSession("claude", "c1"), fyi=True)
+    assert "old" not in [r["id"] for r in _fyi_rows(homes)]
+
+
+def test_fyi_time_never_goes_backwards(homes):
+    _omp_record(homes, os.getpid())
+    router.fyi_inbox("omp:o1").parent.mkdir(parents=True)
+    future = 4_000_000_000.0
+    router.fyi_inbox("omp:o1").write_text(json.dumps({"id": "ahead", "at": future, "text": "x"}) + "\n")
+    router.send("omp:o1", "merged", LiveSession("claude", "c1"), fyi=True)
+    assert _fyi_rows(homes)[-1]["at"] == future
+
+
+def test_fyi_inbox_rejects_path_like_address():
+    with pytest.raises(router.LiveError):
+        router.fyi_inbox("cursor:../../escape")
+
+
+def test_push_without_reply_is_marked(homes):
+    _omp_record(homes, os.getpid())
+    router.send("omp:o1", "fixed", LiveSession("claude", "c1"), reply="none")
+    [message] = (homes / "live" / "inbox" / "omp" / "o1").glob("*.json")
+    assert "No reply expected" in json.loads(message.read_text())["text"]
+
+
+def test_cli_fyi_flag_leaves_notice(homes, monkeypatch):
+    monkeypatch.setattr(router, "_process", lambda pid: (1, "zsh"))
+    # Registered under another live pid, so this test process is not taken for the omp session.
+    _omp_record(homes, os.getppid())
+    CliRunner().invoke(build_live_group(["one-conv"]), ["send", "omp:o1", "merged", "--fyi", "--yes"])
+    assert len(_fyi_rows(homes)) == 1
 
 
 def test_send_stops_a_runaway_pair(homes):

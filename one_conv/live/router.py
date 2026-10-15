@@ -5,6 +5,7 @@ import logging
 import os
 import subprocess
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -21,6 +22,8 @@ ADAPTERS = {"claude": claude, "codex": codex, "omp": omp, "cursor": cursor}
 # Two agents told to reply to each other would otherwise relay forever.
 RATE_LIMIT = 10
 RATE_WINDOW_SECONDS = 300
+# Notices sent with --fyi stay readable by `local feed` this long.
+FYI_KEEP_SECONDS = 7 * 24 * 3600
 
 
 class LiveError(Exception):
@@ -164,15 +167,55 @@ def _record_peers(sender: str, target: str) -> None:
         os.replace(partial, path)
 
 
-def send(target: str, text: str, sender: LiveSession | None, origin: str = "unknown") -> dict:
+def fyi_inbox(address: str) -> Path:
+    """Append-only JSONL of notices for `address`, read by `local feed`; only senders prune it."""
+    harness, ident = parse_address(address)
+    if harness is None or not is_session_id(ident):
+        raise LiveError(f"{address!r} is not a session address.")
+    return live_home() / "fyi" / f"{harness}-{ident}.jsonl"
+
+
+def _append_fyi(target: str, sender: str, text: str) -> None:
+    """Add one notice and drop those older than FYI_KEEP_SECONDS.
+
+    It takes its own lock: the caller already holds `sent.lock`, and a second flock on
+    that file from this process would wait on itself.
+    """
+    path = fyi_inbox(target)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with (path.parent / ".fyi.lock").open("a") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        now = time.time()
+        try:
+            rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        except FileNotFoundError:
+            rows = []
+        # Never decreasing `at` lets a reader resume after the last entry it saw.
+        at = max([now, *(r.get("at", 0) for r in rows)])
+        kept = [r for r in rows if now - r.get("at", 0) < FYI_KEEP_SECONDS]
+        kept.append({"id": uuid.uuid4().hex, "at": at, "from": sender, "to": target, "text": text})
+        partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        partial.write_text("".join(json.dumps(r) + "\n" for r in kept))
+        os.replace(partial, path)
+
+
+def send(target: str, text: str, sender: LiveSession | None, origin: str = "unknown",
+         fyi: bool = False, reply: str = "expected") -> dict:
+    """Push a user turn into `target`, or with `fyi` leave a notice that never wakes it."""
     session = resolve(target, exclude=sender)
     if sender is not None and session.address == sender.address:
         raise LiveError(f"{session.address} is the sending session itself.")
     sender_label = sender.address if sender else origin
+    wrapped = envelope(text, sender, origin, "none" if fyi else reply)
     with _rate_slot(sender_label, session.address):
-        status = ADAPTERS[session.harness].deliver(session, envelope(text, sender, origin))
+        if fyi:
+            _append_fyi(session.address, sender_label, wrapped)
+            status, delivery = "stored FYI", "fyi"
+        else:
+            status, delivery = ADAPTERS[session.harness].deliver(session, wrapped), session.delivery
     receipt = {"to": session.address, "title": session.title, "cwd": session.cwd,
-               "delivery": session.delivery, "status": status, "from": sender_label}
+               "delivery": delivery, "status": status, "from": sender_label}
     # Only two identified sessions form a pair; "user", "unknown" and "?unknown" ids do not.
     if sender is not None and not sender.id.startswith("?"):
         try:

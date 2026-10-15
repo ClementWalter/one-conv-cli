@@ -300,9 +300,8 @@ def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str
     message = {"id": message_id, "to": target, "from": sender, "reply": "none" if fyi else reply,
                "mode": "fyi" if fyi else "push", "text": text, **({"topic": topic} if topic else {})}
     try:
-        receipt = hub.post(message)
+        receipt = hubclient.post_durably(hub, message)
     except hubclient.HubUnavailable as error:
-        hubclient.queue(message)
         return {"to": target, "id": message_id, "from": sender, "via": "hub", "delivery": "hub",
                 "status": f"queued for the hub: {error}"}
     except hubclient.HubRefused as error:
@@ -348,9 +347,8 @@ def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id:
     message = {"id": message_id, "to": f"#{topic}", "from": sender, "topic": topic,
                "mode": mode, "reply": reply, "text": text}
     try:
-        receipt = hub.post(message)
+        receipt = hubclient.post_durably(hub, message)
     except hubclient.HubUnavailable as error:
-        hubclient.queue(message)
         return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
                 "deliveries": [{"to": f"#{topic}", "status": f"queued for the hub: {error}"}]}
     except hubclient.HubRefused as error:

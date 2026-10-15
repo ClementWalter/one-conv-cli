@@ -7,6 +7,7 @@ import json
 import os
 import socket
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -149,6 +150,14 @@ def test_a_session_not_live_here_is_refused(hub, box, monkeypatch):
     assert outcome(hub, message) == "refused"
 
 
+def test_an_adapter_that_cannot_confirm_is_unconfirmed(hub, box, monkeypatch):
+    unknown = "unconfirmed: box prompt exited 1 without Boat accepting or refusing it. Do not resend"
+    monkeypatch.setitem(router.ADAPTERS, "omp", SimpleNamespace(deliver=lambda s, text: unknown))
+    message = post(hub)
+    box.step(wait=0)
+    assert outcome(hub, message) == "unconfirmed"
+
+
 def test_an_adapter_failure_is_unconfirmed(hub, box, monkeypatch):
     def fail(session, text):
         raise RuntimeError("socket closed mid-write")
@@ -217,6 +226,78 @@ def test_a_send_while_the_hub_is_down_is_queued(sending, monkeypatch):
     monkeypatch.setenv("ONE_CONV_HUB_URL", "http://127.0.0.1:9")
     receipt = router.send("mac/claude:aaa", "later", SESSION)
     assert receipt["status"].startswith("queued for the hub")
+
+
+def test_a_post_cut_off_after_the_hub_stored_it_stays_in_the_outbox(sending, monkeypatch):
+    real_post = hubclient.HubClient.post
+
+    def post_then_die(client, message):
+        real_post(client, message)
+        raise KeyboardInterrupt  # The sender is killed before it reads the hub's answer.
+    monkeypatch.setattr(hubclient.HubClient, "post", post_then_die)
+    with pytest.raises(KeyboardInterrupt):
+        router.send("mac/claude:aaa", "exactly once", SESSION)
+    assert len(list(hubclient.outbox().glob("*.json"))) == 1
+
+
+def test_resuming_a_cut_off_post_does_not_deliver_it_twice(sending, monkeypatch):
+    real_post = hubclient.HubClient.post
+
+    def post_then_die(client, message):
+        real_post(client, message)
+        raise KeyboardInterrupt
+    monkeypatch.setattr(hubclient.HubClient, "post", post_then_die)
+    with pytest.raises(KeyboardInterrupt):
+        router.send("mac/claude:aaa", "exactly once", SESSION)
+    monkeypatch.setattr(hubclient.HubClient, "post", real_post)
+    bridge.Bridge(hubclient.HubClient(sending.url, sending.box_token, "box"), "box",
+                  bridge.Ingress(bridge.bridge_dir() / "ingress.db")).drain_outbox()
+    assert len(sending.mac.request("GET", "/v1/inbox?wait=0")["messages"]) == 1
+
+
+def test_a_posted_send_leaves_nothing_in_the_outbox(sending):
+    router.send("mac/claude:aaa", "hello mac", SESSION)
+    assert list(hubclient.outbox().glob("*.json")) == []
+
+
+@pytest.fixture
+def stale_forward(hub, delivered, monkeypatch):
+    """hub.json naming an ssh forward whose process is gone, and another program now on its port."""
+    finished = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True,
+                              text=True, check=True)
+    squatter = socket.socket()
+    squatter.bind(("127.0.0.1", 0))
+    squatter.listen()
+    squatter.settimeout(0.3)
+    bridge._write_private(bridge.bridge_dir() / "hub.json", {
+        "url": f"http://127.0.0.1:{squatter.getsockname()[1]}", "node": "box", "token": hub.box_token,
+        "tunnel_pid": int(finished.stdout)})
+    yield squatter
+    squatter.close()
+
+
+def test_a_send_through_a_dead_forward_is_queued(stale_forward):
+    assert router.send("mac/claude:aaa", "secret", SESSION)["status"].startswith("queued for the hub")
+
+
+def test_a_send_through_a_dead_forward_never_reaches_the_port(stale_forward):
+    router.send("mac/claude:aaa", "secret", SESSION)
+    with pytest.raises(TimeoutError):
+        stale_forward.accept()
+
+
+def test_a_send_through_the_live_forward_reaches_the_hub(hub, delivered, tmp_path, monkeypatch):
+    fake_ssh(tmp_path, monkeypatch, FAKE_SSH)
+    forward = tunnel.Tunnel("hub-box", int(hub.url.rsplit(":", 1)[1]))
+    url = forward.open(seconds=10)
+    try:
+        bridge._write_private(bridge.bridge_dir() / "hub.json", {
+            "url": url, "node": "box", "token": hub.box_token, "tunnel_pid": forward.process.pid})
+        hubclient.HubClient(url, hub.box_token).request("PUT", "/v1/sessions", {"sessions": [{"address": "omp:worker-1"}]})
+        router.send("mac/claude:aaa", "through ssh", SESSION)
+    finally:
+        forward.close()
+    assert hub.mac.request("GET", "/v1/inbox?wait=0")["messages"][0]["text"] == "through ssh"
 
 
 def test_a_send_to_another_machine_without_a_hub_is_refused(delivered):

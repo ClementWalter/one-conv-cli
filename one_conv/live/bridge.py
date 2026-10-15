@@ -144,6 +144,10 @@ class RemoteSender:
         return self.address
 
 
+# Adapter results that say the outcome is not known yet; the sender must not read them as accepted.
+UNKNOWN_RESULTS = ("pending", "unconfirmed")
+
+
 class _AdapterFailed(Exception):
     pass
 
@@ -179,7 +183,9 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None) -> tup
     try:
         with router._rate_slot(sender_route, target):
             try:
-                return "accepted", router.ADAPTERS[harness].deliver(session, wrapped)
+                detail = router.ADAPTERS[harness].deliver(session, wrapped)
+                # Boat reports a send it could not confirm as pending/unconfirmed rather than raising.
+                return ("unconfirmed" if detail.startswith(UNKNOWN_RESULTS) else "accepted"), detail
             except Exception as error:
                 raise _AdapterFailed(error) from error
     except _AdapterFailed as failure:
@@ -291,7 +297,8 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None) 
                     logger.error("this token belongs to node %r, not %r", answered, node)
                     return 1
                 # The CLI posts through the same URL; while the bridge is down it fails and queues.
-                _write_private(bridge_dir() / "hub.json", {"url": url, "node": node, "token": token})
+                _write_private(bridge_dir() / "hub.json", {"url": url, "node": node, "token": token,
+                                                           **({"tunnel_pid": forward.process.pid} if forward else {})})
                 bridge = Bridge(client, node, ingress)
                 _report(url=url, connected=time.time(), last_error=None)
                 backoff = 1.0

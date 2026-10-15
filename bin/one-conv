@@ -187,6 +187,7 @@ class SessionHandle:
     composer_id: str | None = None
     unread_native: bool | None = None  # cursor's own hasUnreadMessages flag
     title_hint: str | None = None  # cursor stores a real title; others derive one
+    archive: dict | None = None  # remote locator and summary; source remains the provider
 
 
 def _session_files(project_dir: Path) -> list[Path]:
@@ -2119,8 +2120,9 @@ def _append_log_turn(mouth: str, role: str, text: str, machine: str | None = Non
     return path
 
 
-def _iter_all_projects(sources: tuple[str, ...]):
-    if "claude" in sources:
+def _native_projects(sources: tuple[str, ...]):
+    # A machine reading only archived Claude history has no projects directory; that is not an error then.
+    if "claude" in sources and (PROJECTS_DIR.is_dir() or not os.environ.get("ONE_CONV_ARCHIVE_URL")):
         yield from _claude_iter_projects()
     if "codex" in sources:
         yield from _codex_iter_projects()
@@ -2135,6 +2137,55 @@ def _iter_all_projects(sources: tuple[str, ...]):
     if "corpus" in sources:
         yield from _corpus_iter_projects()
     yield from _cloud_projects(sources)
+
+
+def _archive_state():
+    """Archive metadata for this command, listed once; None when no archive is usable."""
+    from one_conv.archive import ArchiveError, configured_client
+    context = click.get_current_context(silent=True)
+    if context is None:
+        return None
+    if "archive" not in context.meta:
+        try:
+            client = configured_client()
+            rows = list(client.list_conversations()) if client else []
+            projects = {}
+            for row in rows:
+                projects.setdefault((row["source"], row["cwd"]), []).append(row)
+            context.meta["archive"] = ({"client": client, "rows": rows, "projects": projects, "manifests": {}, "fields": {}}
+                                       if client else None)
+        except ArchiveError as error:
+            log.warning("%s Showing native history only.", error)
+            context.meta["archive"] = None
+    return context.meta["archive"]
+
+
+def _archive_field(handle, field):
+    """One field of the listed revision; reads never transfer original records."""
+    from one_conv.archive import ArchiveError
+    state = _archive_state()
+    client, key, revision = state["client"], handle.archive["key"], handle.archive["revision"]
+    try:
+        if key not in state["manifests"]:
+            state["manifests"][key] = client.read_conversation(key, revision)
+        if (key, field) not in state["fields"]:
+            state["fields"][key, field] = client.read_field(state["manifests"][key], field)
+    except ArchiveError as error:
+        raise click.ClickException(str(error)) from error
+    return state["fields"][key, field]
+
+
+def _iter_all_projects(sources: tuple[str, ...]):
+    seen = set()
+    for project in _native_projects(sources):
+        seen.add((project.source, project.cwd))
+        yield project
+    archive = _archive_state()
+    for row in archive["rows"] if archive else ():
+        identity = row["source"], row["cwd"]
+        if row["source"] in sources and identity not in seen:
+            seen.add(identity)
+            yield ProjectHandle(source=row["source"], cwd=row["cwd"], key="archive:" + row["key"])
 
 
 def _cloud_documents():
@@ -2171,7 +2222,9 @@ def _cloud_sessions(project):
     return sorted(handles, key=lambda row: row.mtime, reverse=True)
 
 
-def _project_sessions(project: ProjectHandle) -> list[SessionHandle]:
+def _native_project_sessions(project: ProjectHandle) -> list[SessionHandle]:
+    if project.key.startswith("archive:"):
+        return []
     if project.key.startswith("cloud:"):
         return _cloud_sessions(project)
     if project.source == "claude":
@@ -2191,7 +2244,46 @@ def _project_sessions(project: ProjectHandle) -> list[SessionHandle]:
     return []
 
 
+def _record_locator(handle: SessionHandle) -> str:
+    """Which of a session's native records a handle reads; Codex subagent rollouts share their
+    parent's session ID. File names stay the same across machines and when Codex archives a session."""
+    if handle.archive:
+        return handle.archive["locator"]
+    return handle.path.name if handle.path else handle.uuid
+
+
+def _record_identity(handle: SessionHandle) -> tuple[str, str, str, str]:
+    return handle.source, handle.project_cwd, handle.uuid, _record_locator(handle)
+
+
+def _recency_order(handle: SessionHandle) -> tuple[float, tuple[str, str, str, str]]:
+    # Providers stamp some conversations with identical times; the identity keeps their order the same
+    # whether a conversation is read from native files or from the archive.
+    return handle.mtime, _record_identity(handle)
+
+
+def _project_sessions(project: ProjectHandle) -> list[SessionHandle]:
+    native = _native_project_sessions(project)
+    archive = _archive_state()
+    rows = archive["projects"].get((project.source, project.cwd), ()) if archive else ()
+    if not rows:
+        return native
+    # Machines or reset state directories can upload one record under several origins; show its newest copy.
+    by_record = {_record_identity(h): h for h in native}
+    for row in rows:
+        handle = SessionHandle(source=row["source"], uuid=row["session"],
+            project_cwd=row["cwd"], mtime=row["mtime"], title_hint=row["summary"]["title"],
+            unread_native=row["unread_native"], archive=row)
+        existing = by_record.get(_record_identity(handle))
+        if not existing or existing.mtime < handle.mtime:
+            by_record[_record_identity(handle)] = handle
+    return sorted(by_record.values(), key=_recency_order, reverse=True)
+
+
 def _handle_iter_turns(handle: SessionHandle, include_subagents: bool) -> list[Turn]:
+    if handle.archive:
+        rows = _archive_field(handle, "turns_with_subagents") if include_subagents else None
+        return [Turn(**row) for row in (rows if rows is not None else _archive_field(handle, "turns"))]
     if handle.source in CLOUD_SOURCES or (handle.source == "chatgpt" and handle.path.parent.parent == Path(os.environ.get("ONE_CONV_CLOUD_CACHE", str(Path.home() / ".cache/one-conv-cli/cloud")))):
         rows = json.loads(handle.path.read_text()).get("turns", [])
         return [Turn(ts=row.get("ts") or "", role=row.get("role") or "user",
@@ -2219,6 +2311,8 @@ def _handle_iter_turns(handle: SessionHandle, include_subagents: bool) -> list[T
 
 
 def _handle_token_total(handle: SessionHandle) -> int | None:
+    if handle.archive:
+        return handle.archive["summary"]["tokens"]
     if handle.source == "claude":
         return _claude_session_tokens(handle.path)
     if handle.source == "codex":
@@ -2292,6 +2386,8 @@ def _handle_mark_read(handle: SessionHandle, state: dict) -> None:
 
 
 def _handle_summary(handle: SessionHandle, read_state: dict) -> dict:
+    if handle.archive:
+        return {**handle.archive["summary"], "unread": _handle_is_unread(handle, read_state)}
     turns = _handle_drop_noise(handle, _handle_iter_turns(handle, include_subagents=False))
     return {
         "uuid": handle.uuid,
@@ -2308,7 +2404,7 @@ def _handle_summary(handle: SessionHandle, read_state: dict) -> dict:
 
 def _project_summary_handle(project: ProjectHandle, read_state: dict) -> dict:
     sessions = _project_sessions(project)
-    last_mtime = sessions[0].mtime if sessions else 0
+    last_mtime = max((h.mtime for h in sessions), default=0)  # Some providers list sessions unsorted.
     return {
         "source": project.source,
         "cwd": project.cwd,
@@ -2333,8 +2429,7 @@ def _resolve_projects(query: str, match: int, sources: tuple[str, ...]) -> list[
         raise click.ClickException(f"No project matches {query!r}.")
 
     def _recency(p: ProjectHandle) -> float:
-        sessions = _project_sessions(p)
-        return sessions[0].mtime if sessions else 0
+        return max((h.mtime for h in _project_sessions(p)), default=0)
 
     candidates.sort(key=_recency, reverse=True)
 
@@ -2360,11 +2455,14 @@ def _resolve_projects(query: str, match: int, sources: tuple[str, ...]) -> list[
 
 
 def _all_sessions_for(projects: list[ProjectHandle]) -> list[SessionHandle]:
-    sessions: list[SessionHandle] = []
+    # Two project directories can resolve to one cwd; each merges that cwd's archived copies.
+    newest: dict[tuple[str, str, str, str], SessionHandle] = {}
     for p in projects:
-        sessions.extend(_project_sessions(p))
-    sessions.sort(key=lambda h: h.mtime, reverse=True)
-    return sessions
+        for h in _project_sessions(p):
+            identity = _record_identity(h)
+            if identity not in newest or h.mtime > newest[identity].mtime:
+                newest[identity] = h
+    return sorted(newest.values(), key=_recency_order, reverse=True)
 
 
 def _pick_session_handle(handles: list[SessionHandle], session_uuid: str | None, nth: int) -> SessionHandle:
@@ -2560,7 +2658,9 @@ def chats(source_filter: str | None, limit: int, as_json: bool, conversations: b
                          for account in _chatgpt_cached_accounts()}
         # Labels are presentation metadata; account IDs remain stable cache keys.
         for handle, row in zip(handles, rows):
-            if handle.path and handle.path.suffix == ".json":
+            if handle.archive:
+                row["account_label"] = handle.archive["account_label"]
+            elif handle.path and handle.path.suffix == ".json":
                 try:
                     row["account_label"] = json.loads(handle.path.read_text()).get("account_label")
                 except (OSError, ValueError, AttributeError):
@@ -2899,17 +2999,33 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
     needle = text.lower()
     needle_bytes = text.encode("utf-8")
     sessions = _sessions_for_scope(project_query, sources)
+    archive = _archive_state()
+    candidates = set()
+    if archive and any(h.archive for h in sessions):
+        from one_conv.archive import ArchiveError
+        try:  # Copies are merged on the full listing; only matching archived ones are read.
+            candidates = {row["key"] for row in archive["client"].list_conversations(query=text)}
+        except ArchiveError as error:
+            log.warning("%s Archived conversations were not searched.", error)
     cursor_ids = _cursor_composer_ids_matching(text) if "cursor" in sources else None
 
     results = []
     for h in sessions:
-        if h.source in ("claude", "codex", "omp"):
+        if not h.archive and h.source in ("claude", "codex", "omp") and text.isascii():
+            # bytes.lower() folds only ASCII, so non-ASCII queries skip this prefilter.
             with h.path.open("rb") as f:
                 if needle_bytes.lower() not in f.read().lower():
                     continue
-        elif h.source == "cursor" and cursor_ids is not None and h.composer_id not in cursor_ids:
+        elif not h.archive and h.source == "cursor" and cursor_ids is not None and h.composer_id not in cursor_ids:
             continue
-        for turn in _handle_iter_turns(h, include_subagents=False):
+        if h.archive and h.archive["key"] not in candidates:
+            continue
+        try:
+            turns = _handle_iter_turns(h, include_subagents=False)
+        except click.ClickException as error:  # One unreadable archived conversation must not hide the rest.
+            log.warning("%s: %s", h.uuid, error.message)
+            continue
+        for turn in turns:
             rendered = _render_turn(turn, raw=False)
             if not rendered or needle not in rendered.lower():
                 continue
@@ -3013,7 +3129,7 @@ def find(text: str, source_filter: str | None, limit: int, as_json: bool) -> Non
     state = _load_read_state()
     results = []
     for h in _sessions_for_scope(None, sources):
-        if h.source in ("claude", "codex", "omp"):
+        if not h.archive and h.source in ("claude", "codex", "omp"):
             # Cheap prefilter: a title always comes from early in the file,
             # so a raw-byte substring check on the first chunk skips most
             # files without a full parse.

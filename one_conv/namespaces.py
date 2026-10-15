@@ -81,7 +81,7 @@ def _reader(command, sources, path):
                         name = next(name for name, product in CLOUD_PRODUCTS.items() if product == sources[0])
                         context.invoke(_pull(sync, name, sources[0]))
             message = ("Live refresh completed. Showing saved history, including older cached conversations and other accounts."
-                       if refresh else "Saved history only; no network request. Run a product reader with --refresh or use pull for fresh data.")
+                       if refresh else "Saved history only (including configured archives). Run a product reader with --refresh or use pull for fresh provider data.")
             click.echo(message, err=True)
             return callback(**kwargs)
 

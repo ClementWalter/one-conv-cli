@@ -103,8 +103,9 @@ def load_turns(thread: Thread, positions: dict) -> list:
     """
     try:
         turns = thread.load()
-    except OSError as error:
-        raise Unavailable(str(error)) from error
+    # Any backend failure (archive HTTP error, SQLite error) is this thread's alone, never the whole feed's.
+    except Exception as error:
+        raise Unavailable(f"{type(error).__name__}: {error}") from error
     if not turns and any(p.get("count", 0) for p in positions.values()):
         raise Unavailable("transcript returned no turns after having some")
     return turns

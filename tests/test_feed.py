@@ -148,6 +148,15 @@ def _unreadable_thread() -> feed.Thread:
                        render=lambda turn: turn.text)
 
 
+def test_backend_error_on_one_thread_still_shows_the_others(state):
+    def load():
+        raise RuntimeError("archive chunk returned HTTP 404")
+    broken = feed.Thread("claude:broken-0000", "broken", "/work", "", load=load,
+                         visible=lambda rows: rows, render=lambda turn: turn.text)
+    result = feed.digest(state, {"claude:broken-0000": broken, PEER: stub_thread(conversation(4))}, 1500, peek=False)
+    assert [t["address"] for t in result["threads"]] == [PEER]
+
+
 def test_unreadable_transcript_keeps_positions(state):
     feed.digest(state, {PEER: stub_thread(conversation(4))}, 1500, peek=False)
     before = json.dumps(state.positions(PEER))

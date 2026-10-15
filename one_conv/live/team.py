@@ -222,7 +222,7 @@ def record(topic: str, message_id: str, sender: str, text: str) -> None:
         _write(_topic_dir(topic) / "meta.json", meta)
 
 
-def _hub_catch_up(hub, topic: str, address: str, everything: bool, peek: bool) -> dict:
+def _hub_catch_up(hub, topic: str, address: str, everything: bool, peek: bool, limit: int = CATCH_UP) -> dict:
     """Catch up from the hub, resuming after this reader's last hub cursor.
 
     The cursor is the hub's own post sequence; message ids are unique only per sending
@@ -237,7 +237,7 @@ def _hub_catch_up(hub, topic: str, address: str, everything: bool, peek: bool) -
     rows = [{"id": r["id"], "cursor": r.get("cursor"), "at": r.get("created") or 0, "from": r["from"],
              "text": r["text"], "mode": r.get("mode", "push")}
             for r in _hub_call(lambda: hub.history(topic, cursor, limit=TOPIC_HISTORY))]
-    shown = rows[-CATCH_UP:]
+    shown = rows[-limit:]
     current = members(topic)
     is_member = address in current or any(m.endswith("/" + address) for m in current)
     if rows and not peek and is_member and rows[-1].get("cursor"):
@@ -249,12 +249,13 @@ def _hub_catch_up(hub, topic: str, address: str, everything: bool, peek: bool) -
     return {"topic": topic, "messages": shown, "omitted": len(rows) - len(shown), "member": is_member}
 
 
-def catch_up(topic: str, address: str, everything: bool = False, peek: bool = False) -> dict:
-    """Messages this member has not seen yet (at most CATCH_UP), oldest first; marks them seen."""
+def catch_up(topic: str, address: str, everything: bool = False, peek: bool = False,
+             limit: int = CATCH_UP) -> dict:
+    """Messages this member has not seen yet (at most `limit`), oldest first; marks them seen."""
     topic = _check("topic", topic)
     hub = _hub()
     if hub is not None:
-        return _hub_catch_up(hub, topic, address, everything, peek)
+        return _hub_catch_up(hub, topic, address, everything, peek, limit)
     with _locked():
         meta = _meta(topic)
         if not meta:
@@ -264,7 +265,7 @@ def catch_up(topic: str, address: str, everything: bool = False, peek: bool = Fa
         ids = [r["id"] for r in rows]
         start = 0 if everything or seen not in ids else ids.index(seen) + 1
         unseen = rows[start:]
-        shown = unseen[-CATCH_UP:]
+        shown = unseen[-limit:]
         if not peek and address in meta.get("members", {}) and rows:
             meta["members"][address]["seen"] = rows[-1]["id"]
             _write(_topic_dir(topic) / "meta.json", meta)

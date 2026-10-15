@@ -285,3 +285,45 @@ def test_token_override_without_any_hub_url_is_refused(tmp_path, monkeypatch):
     monkeypatch.setenv("ONE_CONV_HUB_TOKEN", "new")
     with pytest.raises(hubclient.HubRefused, match="no hub URL"):
         hubclient.configured()
+
+
+def test_topic_post_is_in_the_outbox_before_the_request(hub, monkeypatch):
+    seen = []
+    real_post = hubclient.HubClient.post
+
+    def watching(self, message):
+        seen.append((hubclient.outbox() / f"{message['id']}.json").exists())
+        return real_post(self, message)
+
+    monkeypatch.setattr(hubclient.HubClient, "post", watching)
+    _, url, box = hub
+    as_box(url, box).join("release", BOX_SESSION)
+    router.send("#release", "go", LiveSession("claude", "c1"))
+    assert seen == [True]
+
+
+def test_answered_topic_post_leaves_the_outbox_empty(hub):
+    _, url, box = hub
+    as_box(url, box).join("release", BOX_SESSION)
+    router.send("#release", "go", LiveSession("claude", "c1"))
+    assert list(hubclient.outbox().glob("*.json")) == []
+
+
+def test_crash_during_the_post_leaves_it_queued_under_its_id(hub, monkeypatch):
+    def killed(self, message):
+        raise SystemExit("process killed mid-request")
+
+    monkeypatch.setattr(hubclient.HubClient, "post", killed)
+    with pytest.raises(SystemExit):
+        router.send("#release", "go", LiveSession("claude", "c1"), message_id="7" * 32)
+    assert (hubclient.outbox() / f"{'7' * 32}.json").exists()
+
+
+def test_refused_topic_post_is_not_left_to_retry(hub, monkeypatch):
+    def refused(self, message):
+        raise hubclient.HubRefused(400, "bad request")
+
+    monkeypatch.setattr(hubclient.HubClient, "post", refused)
+    with pytest.raises(router.LiveError):
+        router.send("#release", "go", LiveSession("claude", "c1"))
+    assert list(hubclient.outbox().glob("*.json")) == []

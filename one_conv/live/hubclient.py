@@ -132,6 +132,26 @@ def outbox() -> Path:
     return live_home() / "bridge" / "outbox"
 
 
+def submit(hub: HubClient, message: dict) -> dict | None:
+    """Post a message so that a crash at any point can neither lose it nor post it twice.
+
+    The message is written to the outbox before any network I/O and removed once the hub
+    has answered, accepted or refused. If the process dies in between, the bridge reposts
+    the outbox file under the same id and the hub returns the original receipt. Returns
+    None while the hub is unreachable (the message stays queued); a refusal is raised.
+    """
+    path = queue(message)
+    try:
+        receipt = hub.post(message)
+    except HubUnavailable:
+        return None
+    except HubRefused:
+        path.unlink(missing_ok=True)
+        raise
+    path.unlink(missing_ok=True)
+    return receipt
+
+
 def queue(message: dict) -> Path:
     """Leave a message for the bridge to post once the hub is reachable; its id makes retries safe."""
     outbox().mkdir(parents=True, exist_ok=True)

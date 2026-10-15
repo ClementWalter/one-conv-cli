@@ -3752,7 +3752,7 @@ def _feed_inbox_path(reader: str) -> Path | None:
     from one_conv.live import router
     try:
         return router.fyi_inbox(reader)
-    except ValueError:  # a reader address that cannot name an inbox file has no FYI messages
+    except router.LiveError:  # a reader address that cannot name an inbox file has no FYI messages
         return None
 
 

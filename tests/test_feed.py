@@ -424,6 +424,43 @@ def test_cursor_agent_store_is_always_parsed(tmp_path, monkeypatch):
     assert launcher._feed_stamp(handle) == ""
 
 
+@pytest.fixture
+def live_claude_target(cli_env, tmp_path):
+    """A running Claude Code session record owned by a process outside the sender's ancestry."""
+    process = subprocess.Popen(["sleep", "60"])
+    session_id = "bbbb2222-0000-4000-8000-000000000001"
+    sessions = tmp_path / "claude" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / f"{process.pid}.json").write_text(json.dumps(
+        {"pid": process.pid, "sessionId": session_id, "cwd": "/work/app", "name": "target",
+         "status": "idle", "messagingSocketPath": str(tmp_path / "no-socket.sock")}))
+    yield f"claude:{session_id}"
+    process.kill()
+
+
+def send_fyi(env: dict, target: str, text: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(CLI), "live", "send", target, text, "--fyi", "--yes", "--json"],
+                          capture_output=True, text=True, env=env, check=False)
+
+
+def test_cli_fyi_send_reports_stored_not_delivered(cli_env, live_claude_target):
+    assert json.loads(send_fyi(cli_env, live_claude_target, "merged, nothing to do").stdout)["status"] == "stored FYI"
+
+
+def test_cli_fyi_reaches_the_readers_feed(cli_env, live_claude_target):
+    send_fyi(cli_env, live_claude_target, "merged, nothing to do")
+    result = subprocess.run([sys.executable, str(CLI), "local", "feed", "--as", live_claude_target],
+                            capture_output=True, text=True, env=cli_env, check=False)
+    assert "merged, nothing to do" in result.stdout
+
+
+def test_cli_fyi_full_inbox_returns_the_body(cli_env, live_claude_target):
+    send_fyi(cli_env, live_claude_target, "merged, nothing to do")
+    result = subprocess.run([sys.executable, str(CLI), "local", "feed", "--as", live_claude_target,
+                             "--full", "inbox", "--json"], capture_output=True, text=True, env=cli_env, check=False)
+    assert [m["body"] for m in json.loads(result.stdout)["inbox"]] == ["merged, nothing to do"]
+
+
 def test_cli_follow_unknown_address_fails(cli_env):
     assert run_feed(cli_env, "--follow", "claude:does-not-exist").returncode == 1
 

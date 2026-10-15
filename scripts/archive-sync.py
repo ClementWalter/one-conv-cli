@@ -7,24 +7,37 @@
 
 import argparse
 import base64
-from dataclasses import asdict
-from datetime import datetime
 import importlib.machinery
 import importlib.util
 import json
 import os
-from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 import uuid
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from one_conv.archive import (SYNC_LOCK, SYNC_STALE_SECONDS, SYNC_STATE, ArchiveError, configured_client,
-                              conversation_key, digest, encode, pack, read_json, revision, split, write_json)
+from one_conv.archive import (
+    SYNC_LOCK,
+    SYNC_STALE_SECONDS,
+    SYNC_STATE,
+    ArchiveError,
+    configured_client,
+    conversation_key,
+    digest,
+    encode,
+    pack,
+    read_json,
+    revision,
+    split,
+    write_json,
+)
 
 # Captures re-run when the reader or this capture code changes, even if sources did not.
 CAPTURE_VERSION = digest((ROOT / "bin/one-conv").read_bytes() + Path(__file__).read_bytes())
@@ -57,15 +70,49 @@ def source_paths(reader, handle):
     paths = [handle.path] if handle.path else []
     if handle.source == "claude":
         # The session folder holds subagent transcripts, full tool outputs, workflows and the title.
-        paths.extend(sorted(p for p in (handle.path.parent / handle.uuid).rglob("*") if p.is_file()))
+        paths.extend(session_files(handle.path.parent / handle.uuid))
     if handle.source == "cursor-cli":
         paths.append(handle.path.parent / "meta.json")
     return paths
 
 
+def session_files(folder):
+    """Regular files under a session folder; symlinks are skipped so a capture never reads outside it."""
+    files = []
+    for directory, _, names in os.walk(folder, followlinks=False):
+        for name in names:
+            path = Path(directory) / name
+            if not path.is_symlink() and path.is_file():
+                files.append(path)
+    return sorted(files)
+
+
+def source_stamp(paths):
+    """Size and time of every source file, write-ahead logs included, as one comparable value."""
+    return digest(encode(fingerprint(paths)))
+
+
+def load_stamps(reader):
+    try:
+        stamps = json.loads((reader.STATE_DIR / "archive-stamps.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return stamps if isinstance(stamps, dict) else {}
+
+
+def save_stamps(reader, stamps):
+    path = reader.STATE_DIR / "archive-stamps.json"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    partial.write_text(json.dumps(stamps, sort_keys=True))
+    os.replace(partial, path)
+
+
 def fingerprint(paths):
     files = [p for path in paths for p in (path, Path(str(path) + "-wal"))]
-    return [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in files if p.exists()]
+    # Reading a checkpointed SQLite store creates an empty -wal; it holds no data, so it counts as absent.
+    return [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in files
+            if p.exists() and not (p.name.endswith("-wal") and p.stat().st_size == 0)]
 
 
 def original_records(reader, handle, paths):
@@ -126,6 +173,8 @@ def capture(reader, handle, origin):
 
 
 FREEABLE_SOURCES = ("claude", "codex", "omp")  # One file or folder per conversation; never a shared database.
+# What one conversation can raise without stopping the others: unreadable, malformed or archive-side errors.
+SYNC_ERRORS = (ArchiveError, OSError, ValueError, LookupError, TypeError, AttributeError, sqlite3.Error)
 
 
 def history_roots(reader, source):
@@ -312,6 +361,7 @@ def sync(reader, client, origin, args, lock):
     print(f"{datetime.now():%Y-%m-%d %H:%M:%S} sync of {len(handles)} conversations", file=sys.stderr)
     result = {"uploaded": 0, "unchanged": 0}
     failures = []
+    stamps = load_stamps(reader)
     for key, handle in keyed:
         lock.touch()
         try:
@@ -322,22 +372,30 @@ def sync(reader, client, origin, args, lock):
                                        f"written again since. Move it away, run `uv run scripts/archive-sync.py --restore "
                                        f"{handle.uuid}`, then add back what the moved file holds.")
             archived = existing.get(key)
-            if archived and archived["mtime"] == handle.mtime and archived["capture_version"] == CAPTURE_VERSION:
+            # The listed time covers only the main file; the stamp also covers a Cursor CLI
+            # write-ahead log and every file in a Claude session folder.
+            stamp = source_stamp(source_paths(reader, handle))
+            if (archived and archived["mtime"] == handle.mtime and archived["capture_version"] == CAPTURE_VERSION
+                    and stamps.get(key) == stamp):
                 result["unchanged"] += 1  # Avoid re-reading and re-encoding unchanged history.
                 continue
             manifest, chunks = pack(capture(reader, handle, origin))
             head = revision(manifest)
             if archived and archived["revision"] == head:
+                stamps[key] = stamp
                 result["unchanged"] += 1
                 continue
             receipt = client.put(manifest, chunks, archived["revision"] if archived else None)
             if receipt != {"key": key, "revision": head}:
                 raise ArchiveError("Archive acknowledgement does not match the uploaded capture")
             existing[key] = {"key": key, "revision": head, "mtime": handle.mtime}
+            stamps[key] = stamp
             result["uploaded"] += 1
-        except Exception as error:  # One unreadable conversation must not stop the others.
+        # One unreadable or malformed conversation must not stop the others.
+        except SYNC_ERRORS + (reader.click.ClickException,) as error:
             failures.append(f"{handle.source}/{handle.uuid}: {type(error).__name__}: {error}")
             print(failures[-1], file=sys.stderr)
+    save_stamps(reader, stamps)
     if args.free_older_than:
         result.update(free_older(reader, client, keyed, existing, time.time() - args.free_older_than * 86400, lock))
     if failures:
@@ -354,7 +412,7 @@ def free_older(reader, client, keyed, existing, cutoff, lock):
         lock.touch()
         try:
             result["freed_bytes"] += free(reader, client, handle, archived)
-        except Exception as error:  # Keeping a conversation is safe; report why and continue.
+        except SYNC_ERRORS + (reader.click.ClickException,) as error:  # Keeping one is safe; report and go on.
             result["kept"] += 1
             print(f"{handle.source}/{handle.uuid}: kept: {error}", file=sys.stderr)
             continue

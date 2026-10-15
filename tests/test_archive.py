@@ -259,7 +259,16 @@ def test_copies_from_two_installations_show_the_newest(tmp_path, archive):
         assert thread["turns"][-1]["text"] == "An additional message"
 
 
-def test_sync_skips_captures_whose_source_time_is_unchanged(tmp_path, archive):
+def test_sync_skips_captures_whose_sources_are_untouched(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 0, "unchanged": 1}
+
+
+def test_sync_recaptures_a_rewrite_that_kept_the_modification_time(tmp_path, archive):
     _, client, url = archive
     env = fixture_env(tmp_path)
     path = write_claude(env)
@@ -267,9 +276,84 @@ def test_sync_skips_captures_whose_source_time_is_unchanged(tmp_path, archive):
     run(env, "scripts/archive-sync.py", "--source", "claude")
     archived = path.stat().st_mtime_ns
     write_claude(env, extra=True)
-    os.utime(path, ns=(archived, archived))  # Same modification time: the file is not re-read.
-    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 0, "unchanged": 1}
-    assert len(client.read_capture(list(client.list_conversations())[0]["key"])["turns"]) == 2
+    os.utime(path, ns=(archived, archived))
+    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 1, "unchanged": 0}
+
+
+def test_sync_recaptures_a_claude_sidecar_change_under_an_unchanged_transcript(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    sidecar = path.parent / "session-one" / "tool-results" / "result.txt"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text("first output")
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    archived = path.stat().st_mtime_ns
+    sidecar.write_text("second, longer output")
+    os.utime(path, ns=(archived, archived))
+    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 1, "unchanged": 0}
+
+
+def test_sync_recaptures_cursor_cli_turns_held_in_the_write_ahead_log(tmp_path, archive):
+    from test_cursor_cli import CHAT_ID, _write_chat
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    _write_chat(Path(env["CURSOR_CLI_HOME"]))
+    store = next(Path(env["CURSOR_CLI_HOME"]).rglob(f"{CHAT_ID}/store.db"))
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "cursor-cli")
+    writer = sqlite3.connect(store)
+    try:
+        # The open connection keeps the committed turn in store.db-wal; store.db and meta.json stay as they were.
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("INSERT INTO blobs VALUES (?, ?)", ("f" * 64, json.dumps(
+            {"role": "assistant", "id": "msg_3", "content": [{"type": "text", "text": "Later reply."}]}).encode()))
+        writer.commit()
+        result = run(env, "scripts/archive-sync.py", "--source", "cursor-cli")
+    finally:
+        writer.close()
+    assert result == {"uploaded": 1, "unchanged": 0}
+
+
+def test_first_capture_of_a_checkpointed_cursor_cli_store_succeeds(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    from test_cursor_cli import _write_chat
+    _write_chat(Path(env["CURSOR_CLI_HOME"]))
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    assert run(env, "scripts/archive-sync.py", "--source", "cursor-cli") == {"uploaded": 1, "unchanged": 0}
+
+
+def test_capture_skips_symlinks_inside_a_claude_session_folder(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("not part of any conversation")
+    folder = path.parent / "session-one"
+    folder.mkdir()
+    (folder / "linked.txt").symlink_to(outside)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    originals = client.read_conversation(list(client.list_conversations())[0]["key"])["originals"]
+    assert not any("linked.txt" in name for name in originals)
+
+
+def test_capture_skips_symlinked_directories_inside_a_claude_session_folder(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("not part of any conversation")
+    folder = path.parent / "session-one"
+    folder.mkdir()
+    (folder / "linked-dir").symlink_to(outside, target_is_directory=True)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    originals = client.read_conversation(list(client.list_conversations())[0]["key"])["originals"]
+    assert not any("secret.txt" in name for name in originals)
 
 
 def test_unavailable_archive_warns_and_keeps_native_results(tmp_path):
@@ -622,11 +706,11 @@ def test_freeing_deletes_only_verified_files_and_restore_brings_them_back(tmp_pa
         (folder / "tool-results").mkdir(parents=True)
         (folder / "tool-results" / "output.txt").write_text("complete tool output")
         files = [path, folder / "tool-results" / "output.txt"]
-        unsynced, unsynced_text = folder / "tool-results" / "later.txt", "a file the archive has not captured"
     else:
         path, session, project = write_codex(env), "rollout-fixture", "codex-fixture"
         files = [path]
-        unsynced, unsynced_text = path, path.read_text() + "\n" + json.dumps({"type": "event_msg", "payload": {"type": "unsynced"}})
+    # Same size and exact time, different bytes: the sync's stamp cannot see it, so only free's byte check can.
+    tampered = files[-1]
     for item in files:
         os.utime(item, (old, old))
     originals = {item: item.read_bytes() for item in files}
@@ -634,16 +718,16 @@ def test_freeing_deletes_only_verified_files_and_restore_brings_them_back(tmp_pa
     baseline = [run(env, "bin/one-conv", "local", *args, "--source", source, "--json") for args in commands]
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
     run(env, "scripts/archive-sync.py", "--source", source)
-    unsynced.write_text(unsynced_text)
-    os.utime(unsynced, (old, old))  # Unchanged modification time: the sync skips it, so the archive lacks these bytes.
+    times = tampered.stat()
+    # One letter changed inside the text, so the transcript still parses and keeps its size.
+    tampered.write_bytes(originals[tampered].replace(b"Quartz", b"Quarts") if source == "codex"
+                         else bytes(b ^ 1 for b in originals[tampered]))
+    os.utime(tampered, ns=(times.st_atime_ns, times.st_mtime_ns))
     result = run(env, "scripts/archive-sync.py", "--source", source, "--free-older-than", "30", success=False)
     assert result.returncode == 0 and json.loads(result.stdout)["kept"] == 1 and "differ from the archived capture" in result.stderr
     assert all(item.exists() for item in files)
-    if source == "claude":
-        unsynced.unlink()
-    else:
-        path.write_bytes(originals[path])
-        os.utime(path, (old, old))
+    tampered.write_bytes(originals[tampered])
+    os.utime(tampered, ns=(times.st_atime_ns, times.st_mtime_ns))
     result = run(env, "scripts/archive-sync.py", "--source", source, "--free-older-than", "30")
     assert result["freed"] == 1 and result["freed_bytes"] == sum(map(len, originals.values()))
     assert not any(item.exists() for item in files) and not path.with_suffix("").exists()

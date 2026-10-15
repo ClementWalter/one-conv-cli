@@ -110,6 +110,19 @@ def read_inside(root, path):
         return stream.read()
 
 
+def read_source(handle, path):
+    """Bytes of one source file, with files of a Claude session folder read through read_inside.
+
+    The folder is its expected path, whatever is there now: a folder replaced by a symlink
+    after enumeration must make the read refuse, not route its files to an unguarded read.
+    """
+    if handle.source == "claude":
+        folder = handle.path.parent / handle.uuid
+        if folder in path.parents:
+            return read_inside(folder, path)
+    return path.read_bytes()
+
+
 def source_stamp(reader, handle, paths):
     """One comparable value that changes whenever the conversation's sources do.
 
@@ -165,16 +178,13 @@ def original_records(reader, handle, paths):
         finally:
             conn.close()
     result = {}
-    folder = session_folder(handle) if handle.source == "claude" else None
     for path in paths:
-        if folder is not None and folder in path.parents:
-            data = read_inside(folder, path)
-        elif path.suffix == ".db":
+        if path.suffix == ".db":
             with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as source, sqlite3.connect(":memory:") as snapshot:
                 source.backup(snapshot)
                 data = snapshot.serialize()
         else:
-            data = path.read_bytes()
+            data = read_source(handle, path)
         result[str(path)] = data
     return result
 

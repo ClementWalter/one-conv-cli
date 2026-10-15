@@ -347,6 +347,48 @@ def test_capture_skips_a_session_folder_that_is_itself_a_symlink(tmp_path, archi
     assert not any("secret.txt" in name for name in originals)
 
 
+def test_capture_refuses_a_session_folder_swapped_for_a_symlink_after_enumeration(tmp_path, monkeypatch):
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    folder = path.parent / "session-one"
+    folder.mkdir()
+    (folder / "result.txt").write_text("own tool output")
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    (outside / "result.txt").write_text("EXTERNAL-SENTINEL")
+    for name in ("CLAUDE_CONFIG_DIR", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects(("claude",)) for h in reader._native_project_sessions(p))
+    enumerate_sources = sync.fingerprint
+
+    def swap_after_enumeration(paths):
+        stamp = enumerate_sources(paths)
+        if folder.is_dir() and not folder.is_symlink():
+            (folder / "result.txt").unlink()
+            folder.rmdir()
+            folder.symlink_to(outside, target_is_directory=True)
+        return stamp
+
+    monkeypatch.setattr(sync, "fingerprint", swap_after_enumeration)
+    with pytest.raises(OSError):
+        sync.capture(reader, handle, "origin")
+
+
+def test_read_source_refuses_a_swapped_session_folder(tmp_path):
+    sync = load_sync_script()
+    transcript = tmp_path / "session-one.jsonl"
+    transcript.write_text("{}")
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    (outside / "result.txt").write_text("EXTERNAL-SENTINEL")
+    (tmp_path / "session-one").symlink_to(outside, target_is_directory=True)
+    handle = type("Handle", (), {"source": "claude", "path": transcript, "uuid": "session-one"})()
+    with pytest.raises(OSError):
+        sync.read_source(handle, tmp_path / "session-one" / "result.txt")
+
+
 def test_read_refuses_a_file_swapped_for_a_symlink_before_the_read(tmp_path):
     sync = load_sync_script()
     root = tmp_path / "session-one"

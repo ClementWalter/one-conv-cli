@@ -273,12 +273,23 @@ class PinnedFiles:
     following symlinks. Verifying, measuring, deleting and tidying all act on those same
     directories, so a folder replaced by a symlink in between cannot redirect any of them."""
 
-    DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    @staticmethod
+    def supported():
+        """Whether this system can open folders without following symlinks and act relative to them.
+
+        Checked when freeing, not at import: syncing and help never need these capabilities.
+        """
+        return (hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
+                and all(call in os.supports_dir_fd for call in (os.open, os.stat, os.unlink, os.rmdir)))
 
     def __init__(self, base, paths):
         self.base, self.descriptors = base, {}
+        if not self.supported():
+            # Without no-follow folder operations a swapped folder could redirect a deletion; never fall back.
+            raise ArchiveError("freeing needs no-follow folder operations, which this system lacks")
+        self.directory = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         try:
-            self.descriptors[()] = os.open(base, self.DIRECTORY)
+            self.descriptors[()] = os.open(base, self.directory)
             for path in paths:
                 self._directory(path.relative_to(base).parts[:-1])
         except (OSError, ValueError) as error:
@@ -288,7 +299,7 @@ class PinnedFiles:
     def _directory(self, parts):
         if parts not in self.descriptors:
             parent = self._directory(parts[:-1])
-            self.descriptors[parts] = os.open(parts[-1], self.DIRECTORY, dir_fd=parent)
+            self.descriptors[parts] = os.open(parts[-1], self.directory, dir_fd=parent)
         return self.descriptors[parts]
 
     def _locate(self, path):

@@ -1157,6 +1157,27 @@ def free_racing_a_folder_swap(monkeypatch, tmp_path):
     return result, base, outside
 
 
+@pytest.fixture
+def without_nofollow_folders(monkeypatch):
+    """This interpreter as a system without O_DIRECTORY/O_NOFOLLOW would look (Windows, for one)."""
+    monkeypatch.delattr(os, "O_DIRECTORY", raising=False)
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    loader = importlib.machinery.SourceFileLoader("archive_sync_portable", str(ROOT / "scripts" / "archive-sync.py"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    monkeypatch.setitem(sys.modules, loader.name, module)
+    loader.exec_module(module)
+    return module
+
+
+def test_sync_script_imports_without_nofollow_folder_operations(without_nofollow_folders):
+    assert callable(without_nofollow_folders.main)
+
+
+def test_free_refuses_clearly_without_nofollow_folder_operations(without_nofollow_folders, tmp_path):
+    with pytest.raises(ArchiveError, match="no-follow folder operations"):
+        without_nofollow_folders.PinnedFiles(tmp_path, [])
+
+
 def test_free_racing_a_folder_swap_leaves_the_outside_file(free_racing_a_folder_swap):
     _, _, outside = free_racing_a_folder_swap
     assert (outside / "tool-results" / "output.txt").read_text() == "an unrelated file outside history"

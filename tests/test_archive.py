@@ -973,6 +973,14 @@ def test_a_listing_row_missing_a_required_field_is_invalid(field):
     assert not valid_row(without(field))
 
 
+@pytest.mark.parametrize("field, value", [("turns", 10 ** 1000), ("tokens", 10 ** 1000), ("turns", -1), ("tokens", True)])
+def test_a_listing_row_with_an_unusable_count_is_invalid(field, value):
+    from one_conv.archive import valid_row
+    row = complete_row()
+    row["summary"][field] = value
+    assert not valid_row(row)
+
+
 def test_damaged_listing_cache_still_lists_its_complete_rows(tmp_path):
     env = fixture_env(tmp_path)
     env.update(ONE_CONV_ARCHIVE_URL="http://127.0.0.1:1", ONE_CONV_ARCHIVE_TOKEN="t", ONE_CONV_ARCHIVE_SYNC_MINUTES="0")
@@ -1070,6 +1078,32 @@ def test_free_leaves_folders_behind_a_symlinked_session_folder(old_synced_claude
     path.with_suffix("").symlink_to(outside.parent, target_is_directory=True)
     free_claude(env)
     assert outside.is_dir()
+
+
+class StubArchive:
+    """Just enough of ArchiveClient for free() to reach its byte check."""
+
+    def read_conversation(self, key, revision):
+        return {"originals": {}}
+
+
+def test_free_refuses_when_the_guarded_reader_refuses(monkeypatch, tmp_path):
+    """Free reads through capture's read_source, so a folder swapped between listing and reading refuses."""
+    loader = importlib.machinery.SourceFileLoader("archive_sync_free", str(ROOT / "scripts" / "archive-sync.py"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    monkeypatch.setitem(sys.modules, loader.name, module)
+    loader.exec_module(module)
+    transcript = tmp_path / "s1.jsonl"
+    transcript.write_text("{}\n")
+    monkeypatch.setattr(module, "source_paths", lambda reader, handle: [transcript])
+    monkeypatch.setattr(module, "running_reason", lambda handle, paths: None)
+
+    def refuse(handle, path):
+        raise ArchiveError("swapped folder refused")
+
+    monkeypatch.setattr(module, "read_source", refuse)
+    with pytest.raises(ArchiveError, match="swapped folder refused"):
+        module.free(None, StubArchive(), object(), {"key": "k", "revision": "r"})
 
 
 def test_free_still_frees_an_idle_unopened_session(old_synced_claude):

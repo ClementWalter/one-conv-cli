@@ -70,8 +70,13 @@ def sync_record(raw):
     }
 
 
+# Counts above this cannot be real and overflow the formatters' float arithmetic.
+_LARGEST_COUNT = 10 ** 15
+
+
 def _is_int(value):
-    return isinstance(value, int) and not isinstance(value, bool)
+    """A plain, non-negative count small enough for every formatter."""
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < _LARGEST_COUNT
 
 
 def _present(mapping, field, check):

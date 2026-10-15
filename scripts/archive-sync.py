@@ -276,13 +276,9 @@ def free(reader, client, handle, archived):
     before = fingerprint(paths)
     manifest = client.read_conversation(archived["key"], archived["revision"])
     originals = manifest["originals"]
+    # Read exactly as capture does, so a session folder swapped for a symlink refuses here too.
+    parts = {path: [name for name, _ in split(read_source(handle, path))] for path in paths}
     folder = session_folder(handle) if handle.source == "claude" else None
-
-    def read(path):
-        # Same rule as capture: a session-folder file swapped for a symlink is refused, never followed.
-        return read_inside(folder, path) if folder is not None and folder in path.parents else path.read_bytes()
-
-    parts = {path: [name for name, _ in split(read(path))] for path in paths}
     if any(originals.get(str(path)) != names for path, names in parts.items()):
         raise ArchiveError("its files differ from the archived capture")
     if client.request("chunks/missing", {"digests": [name for names in parts.values() for name in names]})["missing"]:

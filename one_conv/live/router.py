@@ -273,11 +273,8 @@ def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, 
     except hubclient.HubRefused as error:
         raise LiveError(str(error)) from error
     if hub is not None:
-        if fyi:
-            # The hub does not keep a delivery mode yet, so a notice would arrive as a push.
-            raise LiveError("--fyi to a topic is not supported through the hub yet; send it as a push "
-                            "with --no-reply, or to each member directly")
-        return _post_topic(hub, topic, text, sender_label, reply, message_id)
+        return _post_topic(hub, topic, text, sender_label, "none" if fyi else reply, message_id,
+                           "fyi" if fyi else "push")
     team.record(topic, message_id, sender_label, text)
     deliveries = []
     for member in team.members(topic):
@@ -291,7 +288,8 @@ def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, 
     return {"topic": topic, "id": message_id, "from": sender_label, "deliveries": deliveries}
 
 
-def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id: str) -> dict:
+def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id: str,
+                mode: str = "push") -> dict:
     """Post once; the hub records the message and fans it out to every member on every machine.
 
     An unreachable hub leaves the message in the bridge's outbox under the same id, so the
@@ -299,7 +297,7 @@ def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id:
     """
     # mode is the delivery mode (wake the receiver or not), kept apart from the reply policy.
     message = {"id": message_id, "to": f"#{topic}", "from": sender, "topic": topic,
-               "mode": "push", "reply": reply, "text": text}
+               "mode": mode, "reply": reply, "text": text}
     try:
         receipt = hub.post(message)
     except hubclient.HubUnavailable as error:

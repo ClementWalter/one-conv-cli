@@ -206,9 +206,49 @@ def test_topic_post_carries_a_push_delivery_mode(capture_server, tmp_path, monke
     assert json.loads(seen[-1]["body"])["mode"] == "push"
 
 
-def test_fyi_to_a_hub_topic_is_refused_until_the_hub_keeps_a_mode(hub):
-    with pytest.raises(router.LiveError, match="not supported through the hub"):
-        router.send("#release", "merged", LiveSession("claude", "c1"), fyi=True)
+def test_fyi_to_a_hub_topic_posts_mode_fyi(hub):
+    state, url, box = hub
+    as_box(url, box).join("release", BOX_SESSION)
+    router.send("#release", "merged", LiveSession("claude", "c1"), fyi=True)
+    assert [m["mode"] for m in state.inbox("box", 0)] == ["fyi"]
+
+
+def test_fyi_to_a_hub_topic_expects_no_reply(hub):
+    state, url, box = hub
+    as_box(url, box).join("release", BOX_SESSION)
+    router.send("#release", "merged", LiveSession("claude", "c1"), fyi=True)
+    assert [m["reply"] for m in state.inbox("box", 0)] == ["none"]
+
+
+def test_no_reply_push_to_a_hub_topic_stays_a_push(hub):
+    state, url, box = hub
+    as_box(url, box).join("release", BOX_SESSION)
+    router.send("#release", "fixed", LiveSession("claude", "c1"), reply="none")
+    assert [m["mode"] for m in state.inbox("box", 0)] == ["push"]
+
+
+def test_queued_fyi_keeps_its_mode(tmp_path, monkeypatch):
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    monkeypatch.setenv("ONE_CONV_HUB_URL", f"http://127.0.0.1:{port}")
+    monkeypatch.setenv("ONE_CONV_HUB_TOKEN", "t")
+    router.send("#release", "later", LiveSession("claude", "c1"), fyi=True, message_id="9" * 32)
+    assert json.loads((hubclient.outbox() / f"{'9' * 32}.json").read_text())["mode"] == "fyi"
+
+
+def test_catch_up_pages_past_two_nodes_sharing_a_message_id(hub):
+    """Client ids are unique only per node, so the position must be the hub's cursor."""
+    _, url, box = hub
+    team.join("release", MAC_SESSION)
+    as_box(url, box).join("release", BOX_SESSION)
+    router.send("#release", "mac says", LiveSession("claude", "c2"), message_id="1" * 32)
+    as_box(url, box).post({"id": "1" * 32, "to": "#release", "from": BOX_SESSION, "text": "box says"})
+    team.catch_up("release", MAC_SESSION)
+    as_box(url, box).post({"id": "2" * 32, "to": "#release", "from": BOX_SESSION, "text": "third"})
+    assert [m["text"] for m in team.catch_up("release", MAC_SESSION)["messages"]] == ["third"]
 
 
 def _bridge_config(tmp_path, monkeypatch, **config):

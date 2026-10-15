@@ -223,18 +223,28 @@ def record(topic: str, message_id: str, sender: str, text: str) -> None:
 
 
 def _hub_catch_up(hub, topic: str, address: str, everything: bool, peek: bool) -> dict:
+    """Catch up from the hub, resuming after this reader's last hub cursor.
+
+    The cursor is the hub's own post sequence; message ids are unique only per sending
+    machine, so they cannot mark a position. A stored position that is not a cursor
+    shows the latest messages instead.
+    """
     with _locked():
         meta = _meta(topic)
-        seen = None if everything else (meta.get("members", {}).get(address) or {}).get("seen")
-    rows = [{"id": r["id"], "at": r.get("created") or 0, "from": r["from"], "text": r["text"]}
-            for r in _hub_call(lambda: hub.history(topic, seen, limit=TOPIC_HISTORY))]
+        cursor = None if everything else (meta.get("members", {}).get(address) or {}).get("hub_cursor")
+    if not (isinstance(cursor, str) and cursor.isdigit()):
+        cursor = None
+    rows = [{"id": r["id"], "cursor": r.get("cursor"), "at": r.get("created") or 0, "from": r["from"],
+             "text": r["text"], "mode": r.get("mode", "push")}
+            for r in _hub_call(lambda: hub.history(topic, cursor, limit=TOPIC_HISTORY))]
     shown = rows[-CATCH_UP:]
-    is_member = address in members(topic) or any(m.endswith("/" + address) for m in members(topic))
-    if rows and not peek and is_member:
+    current = members(topic)
+    is_member = address in current or any(m.endswith("/" + address) for m in current)
+    if rows and not peek and is_member and rows[-1].get("cursor"):
         with _locked():
             _remember_member(topic, address)
             meta = _meta(topic)
-            meta["members"][address]["seen"] = rows[-1]["id"]
+            meta["members"][address]["hub_cursor"] = rows[-1]["cursor"]
             _write(_topic_dir(topic) / "meta.json", meta)
     return {"topic": topic, "messages": shown, "omitted": len(rows) - len(shown), "member": is_member}
 

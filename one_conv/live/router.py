@@ -31,8 +31,10 @@ FYI_MAX_SKEW_SECONDS = 3600
 
 def _valid_fyi_time(at: object, now: float) -> bool:
     """A finite epoch time not far in the future; later notices are stamped no earlier than it."""
-    return (isinstance(at, (int, float)) and not isinstance(at, bool) and math.isfinite(at)
-            and 0 < at <= now + FYI_MAX_SKEW_SECONDS)
+    # The range test comes first: it rejects NaN and infinities, and math.isfinite would
+    # raise on an integer too large for a float.
+    return (isinstance(at, (int, float)) and not isinstance(at, bool)
+            and 0 < at <= now + FYI_MAX_SKEW_SECONDS and math.isfinite(at))
 
 
 class LiveError(Exception):

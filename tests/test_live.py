@@ -467,7 +467,8 @@ def test_fyi_time_never_goes_backwards(homes):
     assert _fyi_rows(homes)[-1]["at"] == ahead
 
 
-@pytest.mark.parametrize("bad_time", ["Infinity", "-Infinity", "NaN", "4000000000.0", "-5", "true"])
+@pytest.mark.parametrize("bad_time", ["Infinity", "-Infinity", "NaN", "4000000000.0", "-5", "true",
+                                      "1" + "0" * 1000])
 def test_fyi_drops_rows_with_unusable_time(homes, bad_time):
     _omp_record(homes, os.getpid())
     router.fyi_inbox("omp:o1").parent.mkdir(parents=True)

@@ -572,6 +572,33 @@ def test_omp_title_comes_from_the_captured_transcript(tmp_path, monkeypatch):
     assert sync.capture(reader, stale, "origin")["summary"]["title"] == reader._omp_session_meta(path)["title"]
 
 
+@pytest.mark.parametrize("source", ["codex", "omp"])
+def test_capture_refuses_a_session_whose_cwd_differs_from_the_listing(tmp_path, monkeypatch, source):
+    """A cwd read at discovery through a swapped file no longer matches the captured bytes, so capture refuses."""
+    env = fixture_env(tmp_path)
+    (write_codex if source == "codex" else write_omp_transcript)(env)
+    for name in ("CODEX_HOME", "OMP_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects((source,)) for h in reader._native_project_sessions(p))
+    listed_elsewhere = dataclasses.replace(handle, project_cwd="/somewhere/else")
+    with pytest.raises(ArchiveError, match="metadata changed between listing and capture"):
+        sync.capture(reader, listed_elsewhere, "origin")
+
+
+def test_capture_refuses_a_session_whose_id_differs_from_the_listing(tmp_path, monkeypatch):
+    env = fixture_env(tmp_path)
+    write_omp_transcript(env)
+    for name in ("OMP_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects(("omp",)) for h in reader._native_project_sessions(p))
+    with pytest.raises(ArchiveError, match="metadata changed between listing and capture"):
+        sync.capture(reader, dataclasses.replace(handle, uuid="another-session"), "origin")
+
+
 def test_read_regular_refuses_without_nofollow_opens(tmp_path, monkeypatch):
     sync = load_sync_script()
     monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)

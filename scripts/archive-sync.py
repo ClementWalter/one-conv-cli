@@ -229,17 +229,35 @@ def snapshot_store(path):
 PROTECTED_SOURCES = ("claude", "codex", "omp", "cursor-cli")
 
 
-def captured_title(reader, source, copy):
-    """The title discovery would give, read again from the private copy instead of the live files."""
-    if source == "cursor-cli":
+def captured_identity(reader, handle, copy):
+    """(session id, cwd, title) as discovery would read them, but from the private copy.
+
+    None for a field the copy does not determine: a Claude Code project's cwd comes from its
+    folder name, and Claude Code and Codex titles come from the turns, already parsed from the copy.
+    """
+    if handle.source == "cursor-cli":
         try:
             meta = json.loads((copy.parent / "meta.json").read_text())
         except (OSError, ValueError):
-            return None
-        return (meta.get("title") or None) if isinstance(meta, dict) else None
-    if source == "omp":
-        return reader._omp_session_meta(copy).get("title") or None
-    return None  # Claude Code and Codex titles come from the turns, which are parsed from the copy.
+            meta = {}
+        meta = meta if isinstance(meta, dict) else {}
+        return handle.uuid, meta.get("cwd"), meta.get("title") or None
+    if handle.source == "omp":
+        meta = reader._omp_session_meta(copy)
+        return meta.get("session_id") or copy.stem, meta.get("cwd"), meta.get("title") or None
+    if handle.source == "codex":
+        meta = reader._codex_session_meta(copy)
+        return meta.get("session_id") or copy.stem, meta.get("cwd"), None
+    return handle.uuid, None, None
+
+
+def rebuilt_handle(reader, handle, copy):
+    """`handle` pointed at the copy, with everything discovery read from the live files read again
+    from the copy. A session id or cwd that no longer matches the listing is refused, not relabelled."""
+    session, cwd, title = captured_identity(reader, handle, copy)
+    if session != handle.uuid or (cwd is not None and cwd != handle.project_cwd):
+        raise ArchiveError(f"{handle.uuid}: its metadata changed between listing and capture; retry")
+    return dataclasses.replace(handle, path=copy, title_hint=title)
 
 
 @contextmanager
@@ -247,8 +265,8 @@ def captured_copy(reader, handle, paths, originals):
     """`handle` pointed at a private copy of its captured bytes, laid out as on disk.
 
     The reader opens files by path; parsing the copy means turns, summary and title come from the
-    same bytes as the archived originals, whatever replaces the real paths meanwhile. The title hint
-    found at discovery is replaced too: it was read from the live files, possibly through a link.
+    same bytes as the archived originals, whatever replaces the real paths meanwhile. What discovery
+    read from the live files (session id, cwd, title) is read again from the copy too.
     """
     if handle.source not in PROTECTED_SOURCES or handle.path is None:
         yield handle
@@ -260,8 +278,7 @@ def captured_copy(reader, handle, paths, originals):
             target = root / path.relative_to(base)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(originals[str(path)])
-        copy = root / handle.path.relative_to(base)
-        yield dataclasses.replace(handle, path=copy, title_hint=captured_title(reader, handle.source, copy))
+        yield rebuilt_handle(reader, handle, root / handle.path.relative_to(base))
 
 
 def original_records(reader, handle, paths):

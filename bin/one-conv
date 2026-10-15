@@ -2251,7 +2251,8 @@ def _archive_field(handle, field):
         if (key, field) not in state["fields"]:
             state["fields"][key, field] = client.read_field(state["manifests"][key], field)
     except ArchiveError as error:
-        raise click.ClickException(str(error)) from error
+        reason = str(error).split(";")[0]  # The upload wording after ";" does not apply to a read.
+        raise click.ClickException(f"{handle.uuid} is stored only in the archive and is unavailable: {reason}") from error
     return state["fields"][key, field]
 
 

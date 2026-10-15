@@ -609,6 +609,41 @@ def test_one_unreadable_archived_conversation_does_not_hide_other_results(tmp_pa
     assert [row["session"] for row in json.loads(result.stdout)] == ["session-one"]
 
 
+@pytest.fixture
+def one_broken_archived(tmp_path, archive):
+    """Two Claude sessions held only in the archive, the second one's turns lost (HTTP 404)."""
+    store, client, url = archive
+    env = fixture_env(tmp_path)
+    first = write_claude(env)
+    first.with_name("session-two.jsonl").write_text(first.read_text().replace("forty-two", "forty-three"))
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    broken = next(row for row in client.list_conversations() if row["session"] == "session-two")
+    with store.engine.begin() as conn:
+        conn.execute(store.chunks.delete().where(store.chunks.c.digest.in_(client.read_conversation(broken["key"])["fields"]["turns"])))
+    return {**env, "CLAUDE_CONFIG_DIR": str(tmp_path / "empty")}
+
+
+def test_listing_a_project_with_a_broken_archived_conversation_succeeds(one_broken_archived):
+    result = run(one_broken_archived, "bin/one-conv", "local", "read", "ancestry", "--source", "claude", "--json", success=False)
+    assert result.returncode == 0
+
+
+def test_listing_a_project_still_shows_the_readable_conversation(one_broken_archived):
+    result = run(one_broken_archived, "bin/one-conv", "local", "read", "ancestry", "--source", "claude", "--json", success=False)
+    assert "session-one" in [row["uuid"] for row in json.loads(result.stdout or "[]")]
+
+
+def test_chats_with_a_broken_archived_conversation_succeeds(one_broken_archived):
+    assert run(one_broken_archived, "bin/one-conv", "local", "chats", "--source", "claude", "--json", success=False).returncode == 0
+
+
+def test_reading_the_broken_archived_thread_says_it_is_unavailable(one_broken_archived):
+    result = run(one_broken_archived, "bin/one-conv", "local", "thread", "ancestry", "--source", "claude",
+                 "--session", "session-two", "--json", success=False)
+    assert result.returncode == 1 and "unavailable" in result.stderr and "Traceback" not in result.stderr
+
+
 def test_archived_cloud_conversations_keep_their_account_label(tmp_path, archive):
     _, _, url = archive
     env = fixture_env(tmp_path)

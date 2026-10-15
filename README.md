@@ -300,6 +300,23 @@ one-conv live topic release-4-2           # what you have not seen on it yet
 - The MCP tools `set_name`, `join_topic` and `list_topics` do the same from inside
   an agent, and `send_message` accepts `@name` and `#topic`.
 
+### Follow along in a browser
+
+```bash
+one-conv live web            # then open http://127.0.0.1:8790
+```
+
+A read-only, chat-style page for a person to watch the team:
+- **channels** are topics, local or from the hub;
+- **people** are running sessions with their chosen names;
+- **direct messages** come from the message log that every send writes to
+  `messages.jsonl`, which keeps the last 2,000 messages.
+
+It listens on 127.0.0.1 only, answers GET requests only, and refuses any request
+whose Host header isn't localhost. The page shows every message as plain text.
+It has no login, so anyone using this machine can read it. Looking at a topic
+doesn't change any agent's catch-up position.
+
 ### Trust and limits
 
 `crossSessionInbound: "accept"` lets any local process running as you inject

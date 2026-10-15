@@ -1,6 +1,7 @@
 """Topics shared through a real local hub: membership, fan-out, dedup, catch-up, outbox, redirects."""
 
 import json
+import os
 import socket
 import threading
 
@@ -285,3 +286,194 @@ def test_token_override_without_any_hub_url_is_refused(tmp_path, monkeypatch):
     monkeypatch.setenv("ONE_CONV_HUB_TOKEN", "new")
     with pytest.raises(hubclient.HubRefused, match="no hub URL"):
         hubclient.configured()
+
+
+def test_topic_post_is_in_the_outbox_before_the_request(hub, monkeypatch):
+    seen = []
+    real_post = hubclient.HubClient.post
+
+    def watching(self, message):
+        seen.append((hubclient.outbox() / f"{message['id']}.json").exists())
+        return real_post(self, message)
+
+    monkeypatch.setattr(hubclient.HubClient, "post", watching)
+    _, url, box = hub
+    as_box(url, box).join("release", BOX_SESSION)
+    router.send("#release", "go", LiveSession("claude", "c1"))
+    assert seen == [True]
+
+
+def test_answered_topic_post_leaves_the_outbox_empty(hub):
+    _, url, box = hub
+    as_box(url, box).join("release", BOX_SESSION)
+    router.send("#release", "go", LiveSession("claude", "c1"))
+    assert list(hubclient.outbox().glob("*.json")) == []
+
+
+def test_crash_during_the_post_leaves_it_queued_under_its_id(hub, monkeypatch):
+    def killed(self, message):
+        raise SystemExit("process killed mid-request")
+
+    monkeypatch.setattr(hubclient.HubClient, "post", killed)
+    with pytest.raises(SystemExit):
+        router.send("#release", "go", LiveSession("claude", "c1"), message_id="7" * 32)
+    assert (hubclient.outbox() / f"{'7' * 32}.json").exists()
+
+
+def test_refused_topic_post_is_not_left_to_retry(hub, monkeypatch):
+    def refused(self, message):
+        raise hubclient.HubRefused(400, "bad request")
+
+    monkeypatch.setattr(hubclient.HubClient, "post", refused)
+    with pytest.raises(router.LiveError):
+        router.send("#release", "go", LiveSession("claude", "c1"))
+    assert list(hubclient.outbox().glob("*.json")) == []
+
+
+MESSAGE = {"id": "5" * 32, "to": "#release", "from": "claude:c1", "topic": "release", "mode": "push",
+           "reply": "expected", "text": "original"}
+
+
+def _stub_post(monkeypatch, outcome):
+    def post(self, message):
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(hubclient.HubClient, "post", post)
+    return hubclient.HubClient("http://127.0.0.1:9", "t")
+
+
+@pytest.mark.parametrize("outcome", [hubclient.HubRefused(500, "after commit"), hubclient.HubRefused(503, "busy"),
+                                     hubclient.HubRefused(429, "slow down"), hubclient.HubRefused(408, "timeout"),
+                                     {}, {"id": "6" * 32, "recipients": []}])
+def test_ambiguous_answer_keeps_the_message_queued(tmp_path, monkeypatch, outcome):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.submit(_stub_post(monkeypatch, outcome), dict(MESSAGE))
+    assert (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+@pytest.mark.parametrize("status", [400, 403, 409])
+def test_definitive_refusal_removes_the_queued_message(tmp_path, monkeypatch, status):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    with pytest.raises(hubclient.HubRefused):
+        hubclient.submit(_stub_post(monkeypatch, hubclient.HubRefused(status, "no")), dict(MESSAGE))
+    assert not (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+def test_receipt_for_the_id_removes_the_queued_message(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.submit(_stub_post(monkeypatch, {"id": MESSAGE["id"], "recipients": []}), dict(MESSAGE))
+    assert not (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+def test_reusing_a_pending_id_with_new_content_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.queue(dict(MESSAGE))
+    with pytest.raises(hubclient.PendingConflict):
+        hubclient.queue({**MESSAGE, "text": "changed"})
+
+
+def test_reusing_a_pending_id_keeps_the_original_content(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.queue(dict(MESSAGE))
+    with pytest.raises(hubclient.PendingConflict):
+        hubclient.queue({**MESSAGE, "text": "changed"})
+    assert json.loads((hubclient.outbox() / f"{MESSAGE['id']}.json").read_text())["text"] == "original"
+
+
+def test_requeueing_identical_pending_work_is_allowed(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.queue(dict(MESSAGE))
+    assert hubclient.queue(dict(MESSAGE)).exists()
+
+
+def _queued(tmp_path, monkeypatch, *ids):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    for message_id in ids:
+        hubclient.queue({**MESSAGE, "id": message_id})
+
+
+def test_drain_posts_queued_messages_and_empties_the_outbox(tmp_path, monkeypatch):
+    _queued(tmp_path, monkeypatch, "a" * 32, "b" * 32)
+    monkeypatch.setattr(hubclient.HubClient, "post", lambda self, m: {"id": m["id"], "recipients": []})
+    hubclient.drain(hubclient.HubClient("http://127.0.0.1:9", "t"))
+    assert list(hubclient.outbox().glob("*.json")) == []
+
+
+def test_drain_keeps_everything_queued_on_a_transient_error(tmp_path, monkeypatch):
+    _queued(tmp_path, monkeypatch, "a" * 32, "b" * 32)
+    hubclient.drain(_stub_post(monkeypatch, hubclient.HubRefused(503, "busy")))
+    assert sorted(p.stem for p in hubclient.outbox().glob("*.json")) == ["a" * 32, "b" * 32]
+
+
+def test_drain_never_moves_a_transient_failure_to_refused(tmp_path, monkeypatch):
+    _queued(tmp_path, monkeypatch, "a" * 32)
+    hubclient.drain(_stub_post(monkeypatch, hubclient.HubRefused(503, "busy")))
+    assert not (hubclient.outbox() / "refused").exists()
+
+
+def test_drain_sets_a_definitive_refusal_aside(tmp_path, monkeypatch):
+    _queued(tmp_path, monkeypatch, "a" * 32)
+    hubclient.drain(_stub_post(monkeypatch, hubclient.HubRefused(400, "bad")))
+    assert (hubclient.outbox() / "refused" / f"{'a' * 32}.json").exists()
+
+
+def test_drain_after_a_transient_error_posts_on_the_next_attempt(tmp_path, monkeypatch):
+    _queued(tmp_path, monkeypatch, "a" * 32)
+    hubclient.drain(_stub_post(monkeypatch, hubclient.HubRefused(503, "busy")))
+    monkeypatch.setattr(hubclient.HubClient, "post", lambda self, m: {"id": m["id"], "recipients": []})
+    assert hubclient.drain(hubclient.HubClient("http://127.0.0.1:9", "t"))["sent"] == ["a" * 32]
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_redirect_answer_keeps_the_message_queued(tmp_path, monkeypatch, status):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.submit(_stub_post(monkeypatch, hubclient.HubRefused(status, "moved")), dict(MESSAGE))
+    assert (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+@pytest.mark.parametrize("rows", [[{}], [None], [{"to": "box/omp:worker"}], [{"status": "stored"}],
+                                  [{"to": 1, "status": "stored"}]])
+def test_receipt_with_malformed_recipients_keeps_the_message_queued(tmp_path, monkeypatch, rows):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.submit(_stub_post(monkeypatch, {"id": MESSAGE["id"], "recipients": rows}), dict(MESSAGE))
+    assert (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+def test_receipt_with_complete_recipients_is_accepted(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    receipt = {"id": MESSAGE["id"], "recipients": [{"to": "box/omp:worker", "status": "stored"}]}
+    hubclient.submit(_stub_post(monkeypatch, receipt), dict(MESSAGE))
+    assert not (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+def test_drain_survives_a_file_removed_while_it_lists_the_outbox(tmp_path, monkeypatch):
+    _queued(tmp_path, monkeypatch, "a" * 32, "b" * 32)
+    real_stat = type(hubclient.outbox()).stat
+    gone = hubclient.outbox() / f"{'a' * 32}.json"
+
+    def stat(self, *args, **kwargs):
+        if self == gone and os.path.exists(self):
+            os.unlink(self)  # A concurrent submit() got its receipt and removed the file.
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(gone), "stat", stat)
+    monkeypatch.setattr(hubclient.HubClient, "post", lambda self, m: {"id": m["id"], "recipients": []})
+    assert hubclient.drain(hubclient.HubClient("http://127.0.0.1:9", "t"))["sent"] == ["b" * 32]
+
+
+def test_rejected_token_keeps_the_message_for_the_rotated_one(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.submit(_stub_post(monkeypatch, hubclient.HubRefused(401, "bad token")), dict(MESSAGE))
+    assert (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+def test_queued_message_is_readable_only_by_its_owner(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    old = os.umask(0o022)
+    try:
+        path = hubclient.queue(dict(MESSAGE))
+    finally:
+        os.umask(old)
+    assert path.stat().st_mode & 0o777 == 0o600

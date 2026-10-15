@@ -221,26 +221,11 @@ class Bridge:
         return count
 
     def drain_outbox(self) -> int:
-        """Post messages queued while the hub was unreachable, oldest first, under their own ids."""
-        sent = 0
-        paths = sorted(hubclient.outbox().glob("*.json"), key=lambda p: p.stat().st_mtime) \
-            if hubclient.outbox().is_dir() else []
-        for path in paths:
-            try:
-                message = json.loads(path.read_text())
-            except (OSError, ValueError):
-                continue
-            try:
-                hubclient.post_queued(self.client, message, path)
-            except hubclient.HubRefused as error:
-                # Only a terminal refusal reaches here; it is set aside for a person to look at.
-                refused = hubclient.outbox() / "refused"
-                refused.mkdir(exist_ok=True)
-                _write_private(refused / path.name, {**message, "error": str(error)})
-                path.unlink(missing_ok=True)
-                logger.warning("the hub refused queued message %s: %s", path.stem, error)
-            sent += 1
-        return sent
+        """Post what live send queued, under hubclient.drain's policy; returns how many left the outbox."""
+        result = hubclient.drain(self.client)
+        for row in result["refused"]:
+            logger.warning("the hub refused queued message %s: %s", row["id"], row["error"])
+        return len(result["sent"]) + len(result["refused"])
 
     def handle(self, item: dict) -> str:
         """Deliver one inbox item at most once, then ack its outcome."""

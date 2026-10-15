@@ -188,6 +188,28 @@ def build_live_group(launcher: list[str]) -> click.Group:
         click.echo(json.dumps(record) if as_json else
                    f"{record['state']}: {record['address']} (op {op})\n{record['help']}")
 
+    @live.command("web", context_settings=HELP)
+    @click.option("--port", type=click.IntRange(1024, 65535), default=8790, show_default=True,
+                  help="Port on 127.0.0.1.")
+    def web_command(port):
+        """Open a read-only page to follow topics, people and direct messages, like a chat app.
+
+        It listens on 127.0.0.1 only and has no login, so anyone who can use this machine
+        can read it.
+
+        \b
+        Example:
+          one-conv live web            # then open http://127.0.0.1:8790
+        """
+        import os
+        import shutil
+        from pathlib import Path
+        script = Path(__file__).resolve().parents[2] / "scripts" / "live-web.py"
+        uv = shutil.which("uv")
+        if uv is None:
+            raise click.ClickException("`uv` is needed to run the viewer: https://docs.astral.sh/uv/")
+        os.execv(uv, [uv, "run", "--quiet", "--script", str(script), "--port", str(port)])
+
     @live.command("whoami", context_settings=HELP, epilog=examples('one-conv live whoami'))
     def whoami_command():
         """Show which session this process is running inside, as other sessions see it."""

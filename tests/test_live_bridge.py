@@ -326,6 +326,41 @@ def test_a_send_whose_answer_is_not_a_receipt_stays_queued(sending, monkeypatch)
     assert len(list(hubclient.outbox().glob("*.json"))) == 1
 
 
+@pytest.mark.parametrize("rows", [[{}], [None], [{"to": "mac/claude:aaa"}], [{"to": 1, "status": "stored"}]])
+def test_a_send_whose_receipt_rows_are_malformed_stays_queued(sending, monkeypatch, rows):
+    answering(monkeypatch, lambda client, message, real_post: {"id": message["id"], "recipients": rows})
+    router.send("mac/claude:aaa", "keep me", SESSION)
+    assert len(list(hubclient.outbox().glob("*.json"))) == 1
+
+
+def test_a_receipt_with_no_recipients_clears_the_record(sending, monkeypatch):
+    answering(monkeypatch, lambda client, message, real_post: {"id": message["id"], "recipients": []})
+    router.send("mac/claude:aaa", "nobody else is there", SESSION)
+    assert list(hubclient.outbox().glob("*.json")) == []
+
+
+@pytest.fixture
+def removed_under_the_drain(hub, box, monkeypatch):
+    """Two queued messages; a concurrent send removes the first just as the drain looks at it."""
+    first, second = queued("first"), queued("second")
+    vanishing = hubclient.outbox() / f"{first['id']}.json"
+    real_stat = Path.stat
+
+    def stat(path, *args, **kwargs):
+        if path == vanishing and os.path.exists(path):  # Path.exists would call this stat again.
+            path.unlink()  # The sender got its receipt and removed its record.
+        return real_stat(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "stat", stat)
+    box.drain_outbox()
+    monkeypatch.setattr(Path, "stat", real_stat)
+    return second
+
+
+def test_a_drain_survives_a_record_removed_under_it(hub, removed_under_the_drain):
+    texts = [m["text"] for m in hub.mac.request("GET", "/v1/inbox?wait=0")["messages"]]
+    assert texts == ["second"]
+
+
 @pytest.fixture
 def stored_then_failed(sending, monkeypatch):
     """A send the hub stored but answered 500, then resumed by the bridge's drain."""
@@ -355,20 +390,20 @@ def conflicting_resend(sending):
     """A message posted, then the same id posted with other text."""
     client = hubclient.HubClient(sending.url, sending.box_token, "box")
     message = {"id": uuid.uuid4().hex, "to": "mac/claude:aaa", "from": "omp:worker-1", "text": "original"}
-    hubclient.post_durably(client, message)
+    hubclient.submit(client, message)
     return client, {**message, "text": "changed"}
 
 
 def test_a_conflicting_resend_is_refused(conflicting_resend):
     client, changed = conflicting_resend
     with pytest.raises(hubclient.HubRefused):
-        hubclient.post_durably(client, changed)
+        hubclient.submit(client, changed)
 
 
 def test_a_conflicting_resend_leaves_nothing_queued(conflicting_resend):
     client, changed = conflicting_resend
     with pytest.raises(hubclient.HubRefused):
-        hubclient.post_durably(client, changed)
+        hubclient.submit(client, changed)
     assert list(hubclient.outbox().glob("*.json")) == []
 
 
@@ -380,12 +415,12 @@ def pending(delivered):
 
 
 def test_queuing_a_pending_id_with_other_content_is_refused(pending):
-    with pytest.raises(hubclient.HubRefused, match="already queued with different content"):
+    with pytest.raises(hubclient.PendingConflict, match="already waiting with different content"):
         hubclient.queue({**pending, "text": "changed"})
 
 
 def test_queuing_a_pending_id_with_other_content_keeps_the_first(pending):
-    with pytest.raises(hubclient.HubRefused):
+    with pytest.raises(hubclient.PendingConflict):
         hubclient.queue({**pending, "text": "changed"})
     assert json.loads((hubclient.outbox() / f"{pending['id']}.json").read_text())["text"] == "original"
 
@@ -401,8 +436,7 @@ def test_the_outbox_record_is_readable_only_by_its_user(pending):
 def test_draining_keeps_a_message_the_hub_answers_503(hub, box, monkeypatch):
     queued()
     answering(monkeypatch, refuse(503))
-    with pytest.raises(hubclient.HubUnavailable):
-        box.drain_outbox()
+    box.drain_outbox()
     assert len(list(hubclient.outbox().glob("*.json"))) == 1
 
 

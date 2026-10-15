@@ -353,7 +353,7 @@ def test_ambiguous_answer_keeps_the_message_queued(tmp_path, monkeypatch, outcom
     assert (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
 
 
-@pytest.mark.parametrize("status", [400, 409, 401])
+@pytest.mark.parametrize("status", [400, 403, 409])
 def test_definitive_refusal_removes_the_queued_message(tmp_path, monkeypatch, status):
     monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
     with pytest.raises(hubclient.HubRefused):
@@ -461,3 +461,19 @@ def test_drain_survives_a_file_removed_while_it_lists_the_outbox(tmp_path, monke
     monkeypatch.setattr(type(gone), "stat", stat)
     monkeypatch.setattr(hubclient.HubClient, "post", lambda self, m: {"id": m["id"], "recipients": []})
     assert hubclient.drain(hubclient.HubClient("http://127.0.0.1:9", "t"))["sent"] == ["b" * 32]
+
+
+def test_rejected_token_keeps_the_message_for_the_rotated_one(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.submit(_stub_post(monkeypatch, hubclient.HubRefused(401, "bad token")), dict(MESSAGE))
+    assert (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+def test_queued_message_is_readable_only_by_its_owner(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    old = os.umask(0o022)
+    try:
+        path = hubclient.queue(dict(MESSAGE))
+    finally:
+        os.umask(old)
+    assert path.stat().st_mode & 0o777 == 0o600

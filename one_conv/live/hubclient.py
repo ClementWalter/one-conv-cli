@@ -137,8 +137,9 @@ def outbox() -> Path:
     return live_home() / "bridge" / "outbox"
 
 
-# Statuses that say nothing final about the message: it stays queued under its id.
-RETRYABLE = {408, 425, 429}
+# Statuses that say nothing final about the message: it stays queued under its id. A rejected
+# token (401) is about the credential, so the message waits for the rotated one.
+RETRYABLE = {401, 408, 425, 429}
 
 
 def _receipt_for(receipt, message_id: str) -> bool:
@@ -154,7 +155,7 @@ def submit(hub: HubClient, message: dict) -> dict | None:
     """Post a message so that a crash or an ambiguous answer can neither lose it nor double it.
 
     The message is written to the outbox before any network I/O. It is removed only on a
-    receipt for this id, or on a definitive refusal (a 4xx other than 408/425/429), which
+    receipt for this id, or on a definitive refusal (a 4xx other than 401/408/425/429), which
     is raised. An unreachable hub, a 5xx, a rate limit or an unreadable receipt leaves it
     queued under the same id for the bridge to repost, and returns None.
     """
@@ -249,6 +250,7 @@ def queue(message: dict) -> Path:
             raise PendingConflict(f"message {message['id']} is already waiting with different content; "
                                   "use a new id for a new message")
         partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        partial.write_text(json.dumps(message))
+        with os.fdopen(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+            handle.write(json.dumps(message))
         os.replace(partial, path)
     return path

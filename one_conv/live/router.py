@@ -294,18 +294,18 @@ def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str
                  message_id: str) -> dict:
     """Post a direct message to a session on another machine; the hub hands it to that machine's bridge.
 
-    An unreachable hub leaves it in the bridge's outbox under the same id, so a later post
-    cannot deliver it twice.
+    The message sits in the bridge's outbox from before the request until the hub answers,
+    so a crash or an unreachable hub leaves it for the bridge to repost under the same id.
     """
     message = {"id": message_id, "to": target, "from": sender, "reply": "none" if fyi else reply,
                "mode": "fyi" if fyi else "push", "text": text, **({"topic": topic} if topic else {})}
     try:
-        receipt = hubclient.post_durably(hub, message)
-    except hubclient.HubUnavailable as error:
-        return {"to": target, "id": message_id, "from": sender, "via": "hub", "delivery": "hub",
-                "status": f"queued for the hub: {error}"}
-    except hubclient.HubRefused as error:
+        receipt = hubclient.submit(hub, message)
+    except (hubclient.HubRefused, hubclient.PendingConflict) as error:
         raise LiveError(str(error)) from error
+    if receipt is None:
+        return {"to": target, "id": message_id, "from": sender, "via": "hub", "delivery": "hub",
+                "status": "queued for the hub: no receipt yet, the bridge will resend it under the same id"}
     row = (receipt.get("recipients") or [{}])[0]
     return {"to": row.get("to", target), "id": message_id, "from": sender, "via": "hub", "delivery": "hub",
             "status": "stored on the hub" if row.get("status") == "stored" else row.get("status", "stored")}
@@ -340,19 +340,20 @@ def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id:
                 mode: str = "push") -> dict:
     """Post once; the hub records the message and fans it out to every member on every machine.
 
-    An unreachable hub leaves the message in the bridge's outbox under the same id, so the
-    bridge's later post cannot deliver it twice.
+    The message sits in the bridge's outbox from before the request until the hub answers,
+    so a crash or an unreachable hub leaves it for the bridge to repost under the same id.
     """
     # mode is the delivery mode (wake the receiver or not), kept apart from the reply policy.
     message = {"id": message_id, "to": f"#{topic}", "from": sender, "topic": topic,
                "mode": mode, "reply": reply, "text": text}
     try:
-        receipt = hubclient.post_durably(hub, message)
-    except hubclient.HubUnavailable as error:
-        return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
-                "deliveries": [{"to": f"#{topic}", "status": f"queued for the hub: {error}"}]}
-    except hubclient.HubRefused as error:
+        receipt = hubclient.submit(hub, message)
+    except (hubclient.HubRefused, hubclient.PendingConflict) as error:
         raise LiveError(str(error)) from error
+    if receipt is None:
+        return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
+                "deliveries": [{"to": f"#{topic}", "status": "queued for the hub: no receipt yet, the bridge "
+                                                             "will resend it under the same id"}]}
     return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
             "deliveries": [{"to": row["to"], "status": row["status"]} for row in receipt.get("recipients", [])]}
 

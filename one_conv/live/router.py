@@ -10,7 +10,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import claude, codex, cursor, omp
+from . import boat, claude, codex, cursor, omp
 from .model import LiveSession, envelope, is_session_id, live_home, parse_address
 
 try:
@@ -19,7 +19,9 @@ except ImportError:  # Windows has no flock; the rate log is then updated unlock
     fcntl = None
 
 logger = logging.getLogger(__name__)
-ADAPTERS = {"claude": claude, "codex": codex, "omp": omp, "cursor": cursor}
+ADAPTERS = {"claude": claude, "codex": codex, "omp": omp, "cursor": cursor, "boat": boat}
+# Listing Boat calls a remote API per sandbox, so it runs only when Boat is asked for by name.
+ON_REQUEST = {"boat"}
 # Two agents told to reply to each other would otherwise relay forever.
 RATE_LIMIT = 10
 RATE_WINDOW_SECONDS = 300
@@ -44,11 +46,11 @@ class LiveError(Exception):
 def list_all(harness: str | None = None) -> list[LiveSession]:
     sessions = []
     for name, adapter in ADAPTERS.items():
-        if harness and harness != name:
+        if (harness and harness != name) or (not harness and name in ON_REQUEST):
             continue
         try:
             sessions += adapter.list_sessions()
-        except (OSError, subprocess.SubprocessError) as error:
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
             # One broken harness must not hide the others' sessions.
             logger.warning("%s: cannot list live sessions: %s", name, error)
     return sessions
@@ -229,6 +231,11 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
     if sender is not None and session.address == sender.address:
         raise LiveError(f"{session.address} is the sending session itself.")
     sender_label = sender.address if sender else origin
+    if fyi and session.harness == "boat":
+        raise LiveError("--fyi cannot reach a Boat conversation: a sandbox has no inbox on this "
+                        "machine's feed. Push it once the conversation is idle, or skip it.")
+    if session.harness == "boat" and reply == "expected":
+        reply = "inline"
     wrapped = envelope(text, sender, origin, "none" if fyi else reply)
     with _rate_slot(sender_label, session.address):
         if fyi:

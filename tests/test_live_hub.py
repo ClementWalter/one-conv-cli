@@ -96,6 +96,12 @@ def test_a_name_given_to_two_sessions_is_refused(two_nodes):
     assert call(url, "/v1/sessions", mac, "PUT", {"sessions": sessions})[0] == 409
 
 
+def test_two_unnamed_sessions_publish(two_nodes):
+    _, url, mac, _ = two_nodes
+    sessions = [{"address": "claude:aaa"}, {"address": "claude:ccc"}]
+    assert call(url, "/v1/sessions", mac, "PUT", {"sessions": sessions})[1] == {"published": 2}
+
+
 def test_a_publishing_node_is_listed_online(two_nodes):
     _, url, mac, _ = two_nodes
     assert all(s["online"] for s in call(url, "/v1/sessions", mac)[1]["sessions"])

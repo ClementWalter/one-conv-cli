@@ -1,10 +1,17 @@
 """The live hub: routes messages between agents on different machines.
 
 Each machine runs one bridge (`one-conv live serve`) that authenticates with its own node
-token, publishes its live sessions, and long-polls for messages addressed to them. A message
-is stored once per recipient, keyed by its client-generated id and that recipient, so a
-retried send never doubles while a topic post can reuse one id for every member. The hub
-records the outcome each receiving bridge reports. Only token hashes are stored.
+token, publishes its live sessions, and long-polls for deliveries addressed to them.
+
+A message is a post, kept once under (sending node, client-generated id) with a hash of its
+payload, so a retry returns the first receipt and a different payload under the same id is a
+conflict. A post becomes one delivery per recipient, each with its own delivery id, which
+the receiving bridge acknowledges with an outcome. Topic history is read from posts, so a
+post is kept even when no other member is there yet.
+
+A node token vouches for the sessions its bridge publishes, not for each process on that
+machine. Only token hashes are stored. Delivery is at least once to the bridge; the bridge's
+ingress log is what keeps a retried delivery from prompting an agent twice.
 """
 
 import hashlib
@@ -20,20 +27,28 @@ from contextlib import contextmanager
 NODE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 TOPIC = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 MESSAGE_ID = re.compile(r"[0-9a-f]{32}")
-OUTCOMES = ("delivered", "unconfirmed", "failed")
+# What the receiving bridge reports: the adapter accepted it (not that the agent read it),
+# the adapter refused it, or the bridge cannot tell (it crashed between claiming and reporting).
+OUTCOMES = ("accepted", "refused", "unconfirmed")
 MAX_TEXT = 200_000
 MAX_WAIT = 30.0
+# A node that has not published or polled for this long is listed as offline.
+LEASE_SECONDS = 60.0
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tokens (node TEXT PRIMARY KEY, hash TEXT NOT NULL, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS nodes (node TEXT PRIMARY KEY, seen REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (node TEXT NOT NULL, address TEXT NOT NULL, name TEXT, title TEXT, cwd TEXT,
     status TEXT, updated REAL NOT NULL, PRIMARY KEY (node, address));
 CREATE TABLE IF NOT EXISTS members (topic TEXT NOT NULL, node TEXT NOT NULL, address TEXT NOT NULL,
     joined REAL NOT NULL, PRIMARY KEY (topic, node, address));
-CREATE TABLE IF NOT EXISTS messages (id TEXT NOT NULL, to_node TEXT NOT NULL, to_address TEXT NOT NULL,
-    from_node TEXT NOT NULL, sender TEXT NOT NULL, topic TEXT, reply TEXT NOT NULL, text TEXT NOT NULL,
-    created REAL NOT NULL, taken REAL, outcome TEXT, outcome_at REAL, PRIMARY KEY (id, to_node, to_address));
-CREATE INDEX IF NOT EXISTS pending ON messages (to_node, outcome, created);
-CREATE INDEX IF NOT EXISTS by_topic ON messages (topic, created);
+CREATE TABLE IF NOT EXISTS posts (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_node TEXT NOT NULL, id TEXT NOT NULL,
+    digest TEXT NOT NULL, target TEXT NOT NULL, sender TEXT NOT NULL, topic TEXT, reply TEXT NOT NULL,
+    text TEXT NOT NULL, created REAL NOT NULL, UNIQUE (from_node, id));
+CREATE INDEX IF NOT EXISTS by_topic ON posts (topic, seq);
+CREATE TABLE IF NOT EXISTS deliveries (delivery TEXT PRIMARY KEY, post INTEGER NOT NULL REFERENCES posts (seq),
+    to_node TEXT NOT NULL, to_address TEXT NOT NULL, taken REAL, outcome TEXT, outcome_at REAL,
+    UNIQUE (post, to_node, to_address));
+CREATE INDEX IF NOT EXISTS pending ON deliveries (to_node, outcome, post);
 """
 
 
@@ -87,6 +102,8 @@ class Hub:
         with self.lock, self._db() as db:
             removed = db.execute("DELETE FROM tokens WHERE node = ?", (node,)).rowcount
             db.execute("DELETE FROM sessions WHERE node = ?", (node,))
+            db.execute("DELETE FROM members WHERE node = ?", (node,))
+            db.execute("DELETE FROM nodes WHERE node = ?", (node,))
         return bool(removed)
 
     def node_for(self, token: str | None) -> str:
@@ -101,34 +118,45 @@ class Hub:
                 return node
         raise HubError(401, "unknown or revoked token")
 
+    def _seen(self, db, node: str) -> None:
+        db.execute("INSERT OR REPLACE INTO nodes VALUES (?, ?)", (node, time.time()))
+
     def publish(self, node: str, sessions) -> int:
-        """Replace this node's published sessions; a name taken by another node is refused."""
+        """Replace this node's published sessions and renew its lease; a name already taken is refused."""
         if not isinstance(sessions, list):
             raise HubError(400, "sessions must be a list")
-        rows = []
+        rows, names = [], set()
         for item in sessions:
             if not isinstance(item, dict) or not isinstance(item.get("address"), str) or "/" in item["address"]:
                 raise HubError(400, "each session needs a local address like claude:<id>")
             name = item.get("name")
             if name is not None and (not isinstance(name, str) or not NODE.fullmatch(name)):
                 raise HubError(400, f"a name is lowercase letters, digits and dashes: {name!r}")
+            if name in names:
+                raise HubError(409, f"@{name} is given to two sessions")
+            names.add(name)
             rows.append((node, item["address"], name, str(item.get("title") or ""), str(item.get("cwd") or ""),
                          str(item.get("status") or ""), time.time()))
         with self.lock, self._db() as db:
-            for _, _, name, *_ in rows:
-                if name and db.execute("SELECT 1 FROM sessions WHERE name = ? AND node != ?", (name, node)).fetchone():
+            for name in names - {None}:
+                if db.execute("SELECT 1 FROM sessions WHERE name = ? AND node != ?", (name, node)).fetchone():
                     raise HubError(409, f"@{name} is already used on another node")
             db.execute("DELETE FROM sessions WHERE node = ?", (node,))
             db.executemany("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+            self._seen(db, node)
         return len(rows)
 
     def directory(self) -> list[dict]:
+        """Every published session, with whether its node's bridge is still renewing its lease."""
+        now = time.time()
         with self._db() as db:
-            rows = db.execute("SELECT node, address, name, title, cwd, status, updated FROM sessions "
+            seen = dict(db.execute("SELECT node, seen FROM nodes"))
+            rows = db.execute("SELECT node, address, name, title, cwd, status FROM sessions "
                               "ORDER BY node, address").fetchall()
         return [{"address": f"{node}/{address}", "node": node, "local": address, "name": name, "title": title,
-                 "cwd": cwd, "status": status, "updated": updated}
-                for node, address, name, title, cwd, status, updated in rows]
+                 "cwd": cwd, "status": status, "seen": seen.get(node),
+                 "online": now - seen.get(node, 0.0) <= LEASE_SECONDS}
+                for node, address, name, title, cwd, status in rows]
 
     def _published(self, db, node: str, address: str) -> bool:
         return db.execute("SELECT 1 FROM sessions WHERE node = ? AND address = ?", (node, address)).fetchone() is not None
@@ -137,7 +165,8 @@ class Hub:
         """Where a message goes: one session, a named one, or every member of a topic but the sender."""
         if target.startswith("#"):
             topic = target[1:]
-            members = db.execute("SELECT node, address FROM members WHERE topic = ?", (topic,)).fetchall()
+            members = db.execute("SELECT node, address FROM members WHERE topic = ? ORDER BY joined",
+                                 (topic,)).fetchall()
             if not members:
                 raise HubError(404, f"#{topic} has no members")
             return [(n, a) for n, a in members if (n, a) != (from_node, sender)]
@@ -151,8 +180,14 @@ class Hub:
             raise HubError(404, f"{target} is not a published session")
         return [(node, address)]
 
+    def _receipt(self, db, seq: int, msg_id: str, duplicate: bool) -> dict:
+        rows = db.execute("SELECT delivery, to_node, to_address, outcome FROM deliveries WHERE post = ? "
+                          "ORDER BY rowid", (seq,)).fetchall()
+        return {"id": msg_id, "duplicate": duplicate,
+                "recipients": [{"to": f"{n}/{a}", "delivery": d, "status": o or "stored"} for d, n, a, o in rows]}
+
     def send(self, node: str, message: dict) -> dict:
-        """Store a message once per recipient; a repeated id returns the first receipt unchanged."""
+        """Store a post and one delivery per recipient; a retry of the same post returns its first receipt."""
         msg_id, sender, text = message.get("id"), message.get("from"), message.get("text")
         if not isinstance(msg_id, str) or not MESSAGE_ID.fullmatch(msg_id):
             raise HubError(400, "id must be 32 lowercase hex characters, chosen by the sender")
@@ -161,66 +196,76 @@ class Hub:
         reply = message.get("reply", "expected")
         if reply not in ("expected", "none", "inline"):
             raise HubError(400, "reply must be expected, none or inline")
-        target = message.get("to") or ""
+        target = message.get("to")
+        if not isinstance(target, str) or not target:
+            raise HubError(400, "to must be NODE/harness:id, @name or #topic")
         topic = target[1:] if target.startswith("#") else message.get("topic")
         if topic is not None and (not isinstance(topic, str) or not TOPIC.fullmatch(topic)):
             raise HubError(400, "a topic is lowercase letters, digits and dashes")
+        digest = hashlib.sha256(json.dumps([target, sender, topic, reply, text]).encode()).hexdigest()
         with self.lock, self._db() as db:
-            existing = db.execute("SELECT from_node, to_node, to_address, outcome FROM messages WHERE id = ?",
-                                  (msg_id,)).fetchall()
+            existing = db.execute("SELECT seq, digest FROM posts WHERE from_node = ? AND id = ?",
+                                  (node, msg_id)).fetchone()
             if existing:
-                if any(row[0] != node for row in existing):
-                    raise HubError(409, "that message id belongs to another node")
-                return {"id": msg_id, "duplicate": True,
-                        "recipients": [{"to": f"{n}/{a}", "status": o or "stored"} for _, n, a, o in existing]}
+                if existing[1] != digest:
+                    raise HubError(409, "this id was already used for a different message; send it under a new id")
+                return self._receipt(db, existing[0], msg_id, True)
             # A sender is this node's own session or the person at its terminal, never another node's agent.
             if not isinstance(sender, str) or (not self._published(db, node, sender) and sender not in ("user", "unknown")):
                 raise HubError(403, "from must be a session this node published, or user/unknown")
             recipients = self._recipients(db, target, node, sender)
-            now = time.time()
-            db.executemany("INSERT INTO messages (id, to_node, to_address, from_node, sender, topic, reply, text,"
-                           " created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                           [(msg_id, n, a, node, sender, topic, reply, text, now) for n, a in recipients])
-        return {"id": msg_id, "duplicate": False,
-                "recipients": [{"to": f"{n}/{a}", "status": "stored"} for n, a in recipients]}
+            seq = db.execute("INSERT INTO posts (from_node, id, digest, target, sender, topic, reply, text, created)"
+                             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             (node, msg_id, digest, target, sender, topic, reply, text, time.time())).lastrowid
+            db.executemany("INSERT INTO deliveries (delivery, post, to_node, to_address) VALUES (?, ?, ?, ?)",
+                           [(secrets.token_hex(16), seq, n, a) for n, a in recipients])
+            return self._receipt(db, seq, msg_id, False)
 
     def inbox(self, node: str, wait: float) -> list[dict]:
-        """Messages for this node without an outcome yet, waiting up to `wait` seconds for one."""
+        """Deliveries for this node without an outcome yet, waiting up to `wait` seconds for one.
+
+        A delivery stays here until acknowledged, so one handed out before a lost response is
+        handed out again; the bridge recognises it by its delivery id.
+        """
         deadline = time.monotonic() + max(0.0, min(wait, MAX_WAIT))
         while True:
             with self.lock, self._db() as db:
-                rows = db.execute("SELECT id, to_address, from_node, sender, topic, reply, text, created FROM messages"
-                                  " WHERE to_node = ? AND outcome IS NULL ORDER BY created LIMIT 50", (node,)).fetchall()
+                self._seen(db, node)
+                rows = db.execute(
+                    "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.topic, p.reply, p.text, p.created"
+                    " FROM deliveries d JOIN posts p ON p.seq = d.post WHERE d.to_node = ? AND d.outcome IS NULL"
+                    " ORDER BY d.post LIMIT 50", (node,)).fetchall()
                 if rows:
-                    db.executemany("UPDATE messages SET taken = ? WHERE id = ? AND to_node = ? AND to_address = ?",
-                                   [(time.time(), r[0], node, r[1]) for r in rows])
+                    db.executemany("UPDATE deliveries SET taken = ? WHERE delivery = ?",
+                                   [(time.time(), r[0]) for r in rows])
             if rows or time.monotonic() >= deadline:
-                return [{"id": i, "to": a, "from": f"{fn}/{s}", "topic": t, "reply": r, "text": x, "created": c}
-                        for i, a, fn, s, t, r, x, c in rows]
+                return [{"delivery": d, "id": i, "to": a, "from": f"{fn}/{s}", "topic": t, "reply": r, "text": x,
+                         "created": c} for d, i, a, fn, s, t, r, x, c in rows]
             time.sleep(0.25)
 
-    def ack(self, node: str, msg_id: str, to_address: str, outcome: str) -> dict:
-        """Record what the receiving node's bridge did for one recipient; only that node can report it."""
+    def ack(self, node: str, delivery: str, outcome: str) -> dict:
+        """Record the outcome of one of this node's deliveries; the first outcome reported stands."""
         if outcome not in OUTCOMES:
             raise HubError(400, f"outcome must be one of {', '.join(OUTCOMES)}")
         with self.lock, self._db() as db:
-            row = db.execute("SELECT outcome FROM messages WHERE id = ? AND to_node = ? AND to_address = ?",
-                             (msg_id, node, to_address)).fetchone()
+            row = db.execute("SELECT outcome FROM deliveries WHERE delivery = ? AND to_node = ?",
+                             (delivery, node)).fetchone()
             if row is None:
-                raise HubError(404, "no such message for this node")
-            db.execute("UPDATE messages SET outcome = ?, outcome_at = ? WHERE id = ? AND to_node = ? AND to_address = ?"
-                       " AND outcome IS NULL", (outcome, time.time(), msg_id, node, to_address))
-        return {"id": msg_id, "to": f"{node}/{to_address}", "outcome": row[0] or outcome}
+                raise HubError(404, "no such delivery for this node")
+            db.execute("UPDATE deliveries SET outcome = ?, outcome_at = ? WHERE delivery = ? AND outcome IS NULL",
+                       (outcome, time.time(), delivery))
+        return {"delivery": delivery, "outcome": row[0] or outcome}
 
     def status(self, node: str, msg_id: str) -> dict:
-        """A message's outcome per recipient, readable by the node that sent it or one that received it."""
+        """The outcome per recipient of a message this node sent; other nodes cannot read it."""
         with self._db() as db:
-            rows = db.execute("SELECT from_node, to_node, to_address, outcome, outcome_at FROM messages WHERE id = ?",
-                              (msg_id,)).fetchall()
-        if not rows or all(node not in (r[0], r[1]) for r in rows):
-            raise HubError(404, "no such message")
-        return {"id": msg_id, "recipients": [{"to": f"{t}/{a}", "outcome": o or "stored", "outcome_at": at}
-                                             for _, t, a, o, at in rows]}
+            post = db.execute("SELECT seq FROM posts WHERE from_node = ? AND id = ?", (node, msg_id)).fetchone()
+            if post is None:
+                raise HubError(404, "no such message from this node")
+            rows = db.execute("SELECT delivery, to_node, to_address, outcome, outcome_at FROM deliveries"
+                              " WHERE post = ? ORDER BY rowid", (post[0],)).fetchall()
+        return {"id": msg_id, "recipients": [{"to": f"{n}/{a}", "delivery": d, "outcome": o or "stored",
+                                              "outcome_at": at} for d, n, a, o, at in rows]}
 
     def join(self, node: str, topic: str, address: str) -> dict:
         """Add one of this node's sessions to a topic; only that node can add its own sessions."""
@@ -241,7 +286,7 @@ class Hub:
     def topics(self) -> list[dict]:
         with self._db() as db:
             members = db.execute("SELECT topic, node, address FROM members ORDER BY topic, joined").fetchall()
-            last = dict(db.execute("SELECT topic, MAX(created) FROM messages WHERE topic IS NOT NULL GROUP BY topic"))
+            last = dict(db.execute("SELECT topic, MAX(created) FROM posts WHERE topic IS NOT NULL GROUP BY topic"))
         listing: dict[str, dict] = {}
         for topic, node, address in members:
             listing.setdefault(topic, {"topic": topic, "members": [], "last": last.get(topic)})["members"].append(
@@ -249,17 +294,15 @@ class Hub:
         return list(listing.values())
 
     def history(self, topic: str, after: str | None, limit: int = 100) -> list[dict]:
-        """A topic's messages once each, oldest first, after the message `after` if given."""
+        """A topic's posts, oldest first, after the post with id `after` if given."""
         with self._db() as db:
-            since = 0.0
+            since = 0
             if after:
-                row = db.execute("SELECT MIN(created) FROM messages WHERE id = ? AND topic = ?", (after, topic)).fetchone()
-                since = row[0] if row and row[0] is not None else 0.0
-            rows = db.execute("SELECT id, from_node, sender, text, MIN(created) FROM messages WHERE topic = ?"
-                              " GROUP BY id HAVING MIN(created) > ? OR (? = 0.0) ORDER BY MIN(created) LIMIT ?",
-                              (topic, since, since, max(1, min(limit, 500)))).fetchall()
-        return [{"id": i, "from": f"{fn}/{s}", "text": x, "created": c} for i, fn, s, x, c in rows
-                if i != after]
+                row = db.execute("SELECT MIN(seq) FROM posts WHERE topic = ? AND id = ?", (topic, after)).fetchone()
+                since = row[0] or 0
+            rows = db.execute("SELECT id, from_node, sender, reply, text, created FROM posts WHERE topic = ? AND seq > ?"
+                              " ORDER BY seq LIMIT ?", (topic, since, max(1, min(limit, 500)))).fetchall()
+        return [{"id": i, "from": f"{fn}/{s}", "reply": r, "text": x, "created": c} for i, fn, s, r, x, c in rows]
 
 
 def application(hub: Hub):
@@ -310,7 +353,7 @@ def application(hub: Hub):
         return await handle(request, lambda node, body, req: {"messages": hub.inbox(node, wait_param(req))})
 
     async def acks(request):
-        return await handle(request, lambda node, body, _: hub.ack(node, str(body.get("id")), str(body.get("to")),
+        return await handle(request, lambda node, body, _: hub.ack(node, str(body.get("delivery")),
                                                                     str(body.get("outcome"))))
 
     async def topics(request):

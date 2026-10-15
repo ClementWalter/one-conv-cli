@@ -2,6 +2,7 @@
 
 import json
 import socket
+import sqlite3
 import threading
 import uuid
 from urllib.error import HTTPError
@@ -89,6 +90,25 @@ def test_the_directory_lists_sessions_by_node(two_nodes):
     assert [s["address"] for s in call(url, "/v1/sessions", mac)[1]["sessions"]] == ["box/claude:bbb", "mac/claude:aaa"]
 
 
+def test_a_name_given_to_two_sessions_is_refused(two_nodes):
+    _, url, mac, _ = two_nodes
+    sessions = [{"address": "claude:aaa", "name": "lead"}, {"address": "claude:ccc", "name": "lead"}]
+    assert call(url, "/v1/sessions", mac, "PUT", {"sessions": sessions})[0] == 409
+
+
+def test_a_publishing_node_is_listed_online(two_nodes):
+    _, url, mac, _ = two_nodes
+    assert all(s["online"] for s in call(url, "/v1/sessions", mac)[1]["sessions"])
+
+
+def test_a_node_that_stopped_renewing_is_listed_offline(two_nodes):
+    state, url, mac, _ = two_nodes
+    with sqlite3.connect(state.path) as db:
+        db.execute("UPDATE nodes SET seen = 0 WHERE node = 'box'")
+    rows = call(url, "/v1/sessions", mac)[1]["sessions"]
+    assert {s["node"]: s["online"] for s in rows} == {"box": False, "mac": True}
+
+
 def test_a_name_used_on_another_node_is_refused(two_nodes):
     _, url, mac, _ = two_nodes
     assert call(url, "/v1/sessions", mac, "PUT", {"sessions": [{"address": "claude:aaa", "name": "worker"}]})[0] == 409
@@ -126,34 +146,86 @@ def test_a_retried_message_id_reports_a_duplicate(two_nodes):
     assert call(url, "/v1/messages", mac, "POST", sent)[1]["duplicate"] is True
 
 
-def test_another_node_cannot_reuse_a_message_id(two_nodes):
-    _, url, mac, box = two_nodes
+def test_a_lost_response_is_answered_by_the_original_receipt(two_nodes):
+    _, url, mac, _ = two_nodes
     sent = message("box/claude:bbb")
-    call(url, "/v1/messages", mac, "POST", sent)
-    assert call(url, "/v1/messages", box, "POST", {**sent, "from": "claude:bbb", "to": "mac/claude:aaa"})[0] == 409
+    first = call(url, "/v1/messages", mac, "POST", sent)[1]
+    retry = call(url, "/v1/messages", mac, "POST", sent)[1]
+    assert retry["recipients"] == first["recipients"]
 
 
-def test_an_acknowledged_message_leaves_the_inbox(two_nodes):
-    _, url, mac, box = two_nodes
-    sent = message("box/claude:bbb")
-    call(url, "/v1/messages", mac, "POST", sent)
-    call(url, "/v1/acks", box, "POST", {"id": sent["id"], "to": "claude:bbb", "outcome": "delivered"})
-    assert call(url, "/v1/inbox?wait=0", box)[1]["messages"] == []
-
-
-def test_only_the_receiving_node_reports_an_outcome(two_nodes):
+def test_a_reused_id_with_a_different_payload_is_a_conflict(two_nodes):
     _, url, mac, _ = two_nodes
     sent = message("box/claude:bbb")
     call(url, "/v1/messages", mac, "POST", sent)
-    assert call(url, "/v1/acks", mac, "POST", {"id": sent["id"], "to": "claude:bbb", "outcome": "delivered"})[0] == 404
+    assert call(url, "/v1/messages", mac, "POST", {**sent, "text": "something else"})[0] == 409
+
+
+@pytest.fixture
+def same_id_both_ways(two_nodes):
+    """mac and box each send a message under the same id."""
+    _, url, mac, box = two_nodes
+    sent = message("box/claude:bbb", text="from mac")
+    call(url, "/v1/messages", mac, "POST", sent)
+    call(url, "/v1/messages", box, "POST", {**sent, "from": "claude:bbb", "to": "mac/claude:aaa", "text": "from box"})
+    return url, mac, box, sent["id"]
+
+
+def test_another_nodes_message_under_the_same_id_is_delivered(same_id_both_ways):
+    url, mac, _, _ = same_id_both_ways
+    assert [m["text"] for m in call(url, "/v1/inbox?wait=0", mac)[1]["messages"]] == ["from box"]
+
+
+def test_another_nodes_message_under_the_same_id_keeps_its_own_status(same_id_both_ways):
+    url, _, box, msg_id = same_id_both_ways
+    assert [r["to"] for r in call(url, f"/v1/messages/{msg_id}", box)[1]["recipients"]] == ["mac/claude:aaa"]
+
+
+def delivery_of(url, token):
+    return call(url, "/v1/inbox?wait=0", token)[1]["messages"][0]["delivery"]
+
+
+def test_an_acknowledged_delivery_leaves_the_inbox(two_nodes):
+    _, url, mac, box = two_nodes
+    call(url, "/v1/messages", mac, "POST", message("box/claude:bbb"))
+    call(url, "/v1/acks", box, "POST", {"delivery": delivery_of(url, box), "outcome": "accepted"})
+    assert call(url, "/v1/inbox?wait=0", box)[1]["messages"] == []
+
+
+def test_an_unacknowledged_delivery_is_handed_out_again(two_nodes):
+    _, url, mac, box = two_nodes
+    call(url, "/v1/messages", mac, "POST", message("box/claude:bbb"))
+    first = delivery_of(url, box)
+    assert delivery_of(url, box) == first
+
+
+def test_only_the_receiving_node_reports_an_outcome(two_nodes):
+    _, url, mac, box = two_nodes
+    call(url, "/v1/messages", mac, "POST", message("box/claude:bbb"))
+    assert call(url, "/v1/acks", mac, "POST", {"delivery": delivery_of(url, box), "outcome": "accepted"})[0] == 404
+
+
+def test_the_first_reported_outcome_stands(two_nodes):
+    _, url, mac, box = two_nodes
+    call(url, "/v1/messages", mac, "POST", message("box/claude:bbb"))
+    delivery = delivery_of(url, box)
+    call(url, "/v1/acks", box, "POST", {"delivery": delivery, "outcome": "unconfirmed"})
+    assert call(url, "/v1/acks", box, "POST", {"delivery": delivery, "outcome": "accepted"})[1]["outcome"] == "unconfirmed"
 
 
 def test_the_sender_reads_the_reported_outcome(two_nodes):
     _, url, mac, box = two_nodes
     sent = message("box/claude:bbb")
     call(url, "/v1/messages", mac, "POST", sent)
-    call(url, "/v1/acks", box, "POST", {"id": sent["id"], "to": "claude:bbb", "outcome": "unconfirmed"})
-    assert call(url, f"/v1/messages/{sent['id']}", mac)[1]["recipients"][0]["outcome"] == "unconfirmed"
+    call(url, "/v1/acks", box, "POST", {"delivery": delivery_of(url, box), "outcome": "refused"})
+    assert call(url, f"/v1/messages/{sent['id']}", mac)[1]["recipients"][0]["outcome"] == "refused"
+
+
+def test_another_node_cannot_read_a_messages_status(two_nodes):
+    _, url, mac, box = two_nodes
+    sent = message("box/claude:bbb")
+    call(url, "/v1/messages", mac, "POST", sent)
+    assert call(url, f"/v1/messages/{sent['id']}", box)[0] == 404
 
 
 def test_a_long_poll_returns_a_message_sent_while_waiting(two_nodes):
@@ -175,6 +247,24 @@ def test_a_topic_post_reaches_the_other_members(topic):
     _, url, mac, box = topic
     call(url, "/v1/messages", mac, "POST", message("#release", text="tag it"))
     assert [m["topic"] for m in call(url, "/v1/inbox?wait=0", box)[1]["messages"]] == ["release"]
+
+
+def test_a_topic_post_reaches_every_member_under_one_id(topic):
+    state, url, mac, box = topic
+    third = state.add_token("third")
+    call(url, "/v1/sessions", third, "PUT", {"sessions": [{"address": "codex:ccc"}]})
+    call(url, "/v1/topics/release/members/codex:ccc", third, "PUT")
+    call(url, "/v1/messages", mac, "POST", message("#release"))
+    inboxes = [call(url, "/v1/inbox?wait=0", token)[1]["messages"] for token in (box, third)]
+    assert [len(messages) for messages in inboxes] == [1, 1]
+
+
+def test_a_topic_post_with_no_one_else_there_is_kept_for_later_members(two_nodes):
+    _, url, mac, box = two_nodes
+    call(url, "/v1/topics/release/members/claude:bbb", box, "PUT")
+    call(url, "/v1/messages", box, "POST", message("#release", sender="claude:bbb", text="early"))
+    call(url, "/v1/topics/release/members/claude:aaa", mac, "PUT")
+    assert [m["text"] for m in call(url, "/v1/topics/release/messages", mac)[1]["messages"]] == ["early"]
 
 
 def test_a_topic_post_skips_its_sender(topic):

@@ -184,3 +184,64 @@ def test_bridge_config_file_is_read(tmp_path, monkeypatch):
     (tmp_path / "live" / "bridge").mkdir(parents=True)
     (tmp_path / "live" / "bridge" / "hub.json").write_text(json.dumps({"url": "http://127.0.0.1:9", "token": "t", "node": "mac"}))
     assert hubclient.configured().node == "mac"
+
+
+def test_environment_proxy_never_receives_the_hub_request(hub, capture_server, monkeypatch):
+    _, url, box = hub
+    proxy, seen = capture_server
+    for name in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("http_proxy", proxy)
+    monkeypatch.setenv("HTTP_PROXY", proxy)
+    as_box(url, box).join("release", BOX_SESSION)
+    assert seen == []
+
+
+def test_topic_post_carries_a_push_delivery_mode(capture_server, tmp_path, monkeypatch):
+    target, seen = capture_server
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    monkeypatch.setenv("ONE_CONV_HUB_URL", target)
+    monkeypatch.setenv("ONE_CONV_HUB_TOKEN", "t")
+    router.send("#release", "go", LiveSession("claude", "c1"))
+    assert json.loads(seen[-1]["body"])["mode"] == "push"
+
+
+def test_fyi_to_a_hub_topic_is_refused_until_the_hub_keeps_a_mode(hub):
+    with pytest.raises(router.LiveError, match="not supported through the hub"):
+        router.send("#release", "merged", LiveSession("claude", "c1"), fyi=True)
+
+
+def _bridge_config(tmp_path, monkeypatch, **config):
+    for name in ("ONE_CONV_HUB_URL", "ONE_CONV_HUB_TOKEN", "ONE_CONV_HUB_NODE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    (tmp_path / "live" / "bridge").mkdir(parents=True)
+    (tmp_path / "live" / "bridge" / "hub.json").write_text(json.dumps(config))
+
+
+def test_url_override_without_a_token_is_refused(tmp_path, monkeypatch):
+    _bridge_config(tmp_path, monkeypatch, url="http://127.0.0.1:9", token="old", node="mac")
+    monkeypatch.setenv("ONE_CONV_HUB_URL", "https://other.example")
+    with pytest.raises(hubclient.HubRefused, match="without ONE_CONV_HUB_TOKEN"):
+        hubclient.configured()
+
+
+def test_token_override_rotates_the_configured_hubs_token(tmp_path, monkeypatch):
+    _bridge_config(tmp_path, monkeypatch, url="http://127.0.0.1:9", token="old", node="mac")
+    monkeypatch.setenv("ONE_CONV_HUB_TOKEN", "new")
+    assert hubclient.configured().token == "new"
+
+
+def test_token_override_keeps_the_configured_url(tmp_path, monkeypatch):
+    _bridge_config(tmp_path, monkeypatch, url="http://127.0.0.1:9", token="old", node="mac")
+    monkeypatch.setenv("ONE_CONV_HUB_TOKEN", "new")
+    assert hubclient.configured().url == "http://127.0.0.1:9"
+
+
+def test_token_override_without_any_hub_url_is_refused(tmp_path, monkeypatch):
+    for name in ("ONE_CONV_HUB_URL", "ONE_CONV_HUB_NODE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    monkeypatch.setenv("ONE_CONV_HUB_TOKEN", "new")
+    with pytest.raises(hubclient.HubRefused, match="no hub URL"):
+        hubclient.configured()

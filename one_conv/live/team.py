@@ -134,6 +134,13 @@ def _messages(topic: str) -> list[dict]:
     return rows
 
 
+def _hub():
+    try:
+        return hubclient.configured()
+    except hubclient.HubRefused as error:
+        raise TeamError(str(error)) from None
+
+
 def _hub_call(work):
     try:
         return work()
@@ -147,7 +154,7 @@ def _hub_call(work):
 
 def members(topic: str) -> list[str]:
     topic = _check("topic", topic)
-    hub = hubclient.configured()
+    hub = _hub()
     if hub is not None:
         rows = _hub_call(hub.topics)
         return sorted(next((row["members"] for row in rows if row.get("topic") == topic), []))
@@ -164,7 +171,7 @@ def _remember_member(topic: str, address: str) -> None:
 
 def join(topic: str, address: str) -> str:
     topic = _check("topic", topic)
-    hub = hubclient.configured()
+    hub = _hub()
     if hub is not None:
         _hub_call(lambda: hub.join(topic, address))
         with _locked():
@@ -181,7 +188,7 @@ def join(topic: str, address: str) -> str:
 
 def leave(topic: str, address: str) -> str:
     topic = _check("topic", topic)
-    hub = hubclient.configured()
+    hub = _hub()
     if hub is not None:
         result = _hub_call(lambda: hub.leave(topic, address))
         if not result.get("removed"):
@@ -235,7 +242,7 @@ def _hub_catch_up(hub, topic: str, address: str, everything: bool, peek: bool) -
 def catch_up(topic: str, address: str, everything: bool = False, peek: bool = False) -> dict:
     """Messages this member has not seen yet (at most CATCH_UP), oldest first; marks them seen."""
     topic = _check("topic", topic)
-    hub = hubclient.configured()
+    hub = _hub()
     if hub is not None:
         return _hub_catch_up(hub, topic, address, everything, peek)
     with _locked():
@@ -256,7 +263,7 @@ def catch_up(topic: str, address: str, everything: bool = False, peek: bool = Fa
 
 
 def topics() -> list[dict]:
-    hub = hubclient.configured()
+    hub = _hub()
     if hub is not None:
         return [{"topic": row["topic"], "members": sorted(row.get("members", [])), "last": row.get("last"),
                  "messages": None} for row in _hub_call(hub.topics)]

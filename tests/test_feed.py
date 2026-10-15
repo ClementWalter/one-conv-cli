@@ -275,6 +275,44 @@ def test_inbox_after_pruning_resumes_by_time(state, inbox):
     assert [m["body"] for m in feed.inbox_full(state, inbox, peek=False)] == ["note 3", "note 4"]
 
 
+def test_digest_messages_carry_a_bounded_excerpt(state, inbox):
+    inbox.write_text(json.dumps({"id": "big", "at": 1000.0, "from": PEER, "text": "x" * 100_000}) + "\n")
+    message = feed.inbox_digest(state, inbox, 80, peek=False)["messages"][0]
+    assert len(json.dumps(message)) < 400
+
+
+def test_unreadable_inbox_is_reported_unavailable(state, tmp_path):
+    directory = tmp_path / "inbox.jsonl"
+    directory.mkdir()
+    assert feed.inbox_digest(state, directory, 1500, peek=False)["unavailable"] is True
+
+
+def test_unreadable_inbox_keeps_positions(state, inbox):
+    fyi(inbox, 2)
+    feed.inbox_full(state, inbox, peek=False)
+    before = json.dumps(state.data["inbox"])
+    inbox.unlink()
+    inbox.mkdir()
+    feed.inbox_digest(state, inbox, 1500, peek=False)
+    assert json.dumps(state.data["inbox"]) == before
+
+
+def test_full_on_unreadable_inbox_raises_unavailable(state, inbox):
+    inbox.mkdir()
+    with pytest.raises(feed.Unavailable):
+        feed.inbox_full(state, inbox, peek=False)
+
+
+@pytest.mark.parametrize("bad", [
+    {"id": "b", "at": float("inf"), "text": "t"}, {"id": "b", "at": 1e100, "text": "t"},
+    {"id": "b", "at": 1000.0, "text": None}, {"id": "b", "at": True, "text": "t"},
+    {"id": 7, "at": 1000.0, "text": "t"}, {"id": "b", "at": 1000.0, "text": "t", "from": 3}])
+def test_malformed_row_does_not_hide_a_later_valid_one(state, inbox, bad):
+    inbox.write_text(json.dumps(bad) + "\n")
+    fyi(inbox, 1, at=2000.0)
+    assert [m["excerpt"] for m in feed.inbox_digest(state, inbox, 1500, peek=False)["messages"]] == ["note 0"]
+
+
 def test_missing_inbox_is_empty(state, tmp_path):
     assert feed.inbox_digest(state, tmp_path / "absent.jsonl", 1500, peek=False)["lines"] == []
 

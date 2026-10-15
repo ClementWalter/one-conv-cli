@@ -9,6 +9,7 @@ The view is the same linear transcript `local thread` reads, abandoned omp branc
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from collections.abc import Callable, Sequence
@@ -283,19 +284,41 @@ def message_body(text: str) -> str:
     return (match.group(1) if match else text).strip()
 
 
+# Year 3000: later or non-finite times cannot be formatted, and no real notice carries one.
+_LATEST_AT = 32_503_680_000
+# A digest carries this much of an FYI body; --full inbox carries all of it.
+EXCERPT_CHARS = 200
+
+
+def _valid_entry(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    at = entry.get("at")
+    return (isinstance(entry.get("id"), str) and bool(entry["id"])
+            and isinstance(at, (int, float)) and not isinstance(at, bool)
+            and math.isfinite(at) and 0 <= at < _LATEST_AT
+            and isinstance(entry.get("text"), str)
+            and isinstance(entry.get("from", ""), str))
+
+
 def read_inbox(path: Path | None) -> list[dict]:
-    """FYI entries in send order; malformed lines are skipped, a missing file is empty."""
-    try:
-        lines = path.read_text().splitlines() if path else []
-    except OSError:
+    """FYI entries in send order. A never-created inbox is empty; malformed lines and rows are
+    skipped so later notices still show; any other read failure raises Unavailable."""
+    if path is None:
         return []
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError) as error:
+        raise Unavailable(f"FYI inbox unreadable: {type(error).__name__}: {error}") from error
     entries = []
     for line in lines:
         try:
             entry = json.loads(line)
         except ValueError:
             continue
-        if isinstance(entry, dict) and entry.get("id") and isinstance(entry.get("at"), (int, float)):
+        if _valid_entry(entry):
             entries.append(entry)
     return entries
 
@@ -320,9 +343,17 @@ def _when(at: float) -> str:
 
 
 def inbox_digest(state: FeedState, path: Path | None, max_chars: int, peek: bool) -> dict:
-    """One line per unseen FYI message; only lines actually shown move `notified`."""
+    """One line per unseen FYI message; only lines actually shown move `notified`.
+
+    Messages carry a bounded excerpt, never the full body, so a digest stays small however
+    long a notice is. An unreadable inbox is reported unavailable with positions untouched.
+    """
     positions = state.data.setdefault("inbox", {})
-    entries = read_inbox(path)
+    try:
+        entries = read_inbox(path)
+    except Unavailable as error:
+        logger.warning("%s", error)
+        return {"lines": [], "messages": [], "omitted": 0, "used": 0, "unavailable": True}
     pending = unseen(entries, positions.get("notified"))
     lines, shown, used = [], [], 0
     for entry in pending:
@@ -341,17 +372,23 @@ def inbox_digest(state: FeedState, path: Path | None, max_chars: int, peek: bool
             before = entries.index(shown[0])
             positions["read"] = _mark(entries[before - 1] if before else None)
         positions["notified"] = _mark(shown[-1])
-    return {"lines": lines, "messages": [{**e, "body": message_body(e.get("text", ""))} for e in shown],
-            "omitted": len(pending) - len(shown), "used": used}
+    messages = [{"id": e["id"], "at": e["at"], "from": e.get("from", "unknown"),
+                 "excerpt": _first_line(message_body(e["text"]), EXCERPT_CHARS)} for e in shown]
+    return {"lines": lines, "messages": messages, "omitted": len(pending) - len(shown), "used": used,
+            "unavailable": False}
 
 
 def inbox_full(state: FeedState, path: Path | None, peek: bool) -> list[dict]:
-    """Every FYI message past `read`; reading moves both positions to the last one."""
+    """Every FYI message past `read`; reading moves both positions to the last one.
+
+    Raises Unavailable when the inbox exists but cannot be read; positions stay untouched.
+    """
     positions = state.data.setdefault("inbox", {})
     pending = unseen(read_inbox(path), positions.get("read"))
     if pending and not peek:
         positions["read"] = positions["notified"] = _mark(pending[-1])
-    return [{**e, "body": message_body(e.get("text", ""))} for e in pending]
+    return [{"id": e["id"], "at": e["at"], "from": e.get("from", "unknown"), "body": message_body(e["text"])}
+            for e in pending]
 
 
 def build_feed_command(find_threads: Callable[[list[str]], tuple[dict[str, Thread], list[str]]],
@@ -433,7 +470,10 @@ def build_feed_command(find_threads: Callable[[list[str]], tuple[dict[str, Threa
                         click.echo(f"{row['address']}  {'followed' if row['explicit'] else 'live-message partner'}")
                 return
             if full_address == "inbox":
-                messages = inbox_full(state, inbox_path(reader), peek)
+                try:
+                    messages = inbox_full(state, inbox_path(reader), peek)
+                except Unavailable as error:
+                    raise click.ClickException(f"{error}; position kept.") from None
                 if as_json:
                     click.echo(json.dumps({"reader": reader, "inbox": messages,
                                            "positions": state.data.get("inbox", {})}, ensure_ascii=False))
@@ -474,6 +514,8 @@ def build_feed_command(find_threads: Callable[[list[str]], tuple[dict[str, Threa
                     click.echo(line)
             if inbox["omitted"]:
                 click.echo(f"+{inbox['omitted']} more FYI message(s); run feed again or --full inbox.")
+            if inbox["unavailable"]:
+                click.echo("FYI inbox unavailable for now; position kept", err=True)
             if result["omitted"]:
                 click.echo(f"+{len(result['omitted'])} more thread(s) with news; run feed again.")
             for address in [*missing, *result["unavailable"]]:

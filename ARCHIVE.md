@@ -45,8 +45,10 @@ token, commands warn on stderr and show native history only.
   Claude session folder, a Cursor CLI store's write-ahead log, and, for Cursor IDE,
   that conversation's own database rows. Stamps live in `archive-stamps.json` in the
   state directory.
-- Files in a Claude session folder are read without following symlinks, and a
-  symlinked file or folder is skipped, so a capture never reads outside history.
+- Inside a Claude session folder, a file or subfolder that is already a symlink is
+  skipped, and one replaced by a symlink during capture makes the read refuse. This
+  covers the session folder only: a conversation's main transcript is read at its
+  path, and a symlink there is followed.
 - Each native record is archived separately, even when records share a session ID
   (Codex subagent rollouts share their parent's).
 - Each upload names the revision it replaces, so concurrent captures are rejected.

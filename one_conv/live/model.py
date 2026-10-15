@@ -97,6 +97,7 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
         attrs += ' reply="none"'
         footer = "\nNo reply expected. Do not reply to this message."
     elif reply == "inline":
+        attrs += ' reply="inline"'
         footer = "\nAnswer in this conversation; the sender reads your reply back from here."
     elif sender is not None and not sender.id.startswith("?"):
         footer = f'\nTo reply, call the one-conv send_message tool with to="{_attr(sender.address)}".'

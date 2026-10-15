@@ -11,8 +11,9 @@ import json
 import subprocess
 import time
 import uuid
+from pathlib import Path
 
-from .model import LiveSession, live_home
+from .model import LiveSession, live_home, pid_alive
 
 # `box prompt` blocks until the agent's turn ends; this long is spent waiting for Boat to accept it.
 ACCEPT_SECONDS = 45
@@ -20,8 +21,11 @@ ACCEPT_SECONDS = 45
 
 def _box(*args: str, timeout: int = 60) -> list[dict]:
     """Run a read-only `box` command and parse its JSON or JSONL stdout."""
-    result = subprocess.run(["box", *args, "--json", "--no-update"], check=False,
-                            capture_output=True, text=True, timeout=timeout)
+    try:
+        result = subprocess.run(["box", *args, "--json", "--no-update"], check=False,
+                                capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"box {args[0]} gave no answer within {timeout}s; try again later") from error
     if result.returncode:
         raise RuntimeError(f"box {args[0]} failed: {result.stderr.strip()[-300:]}")
     rows = []
@@ -73,26 +77,68 @@ def _accepted(log_path) -> str | None:
     return None
 
 
+def _operations() -> Path:
+    return live_home() / "boat" / "ops"
+
+
+def operation_state(record: dict) -> str:
+    """"accepted", "refused: <reason>", "pending" while box still runs, or "unconfirmed"."""
+    state = _accepted(Path(record["log"]))
+    if state == "accepted":
+        return "accepted"
+    if state is not None:
+        return f"refused: {state}"
+    return "pending" if pid_alive(record.get("pid")) else "unconfirmed"
+
+
+def operation(op: str) -> dict:
+    try:
+        record = json.loads((_operations() / f"{op}.json").read_text())
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"no Boat send operation {op!r}") from error
+    return {**record, "state": operation_state(record)}
+
+
+def _pending_for(address: str) -> str | None:
+    for path in sorted(_operations().glob("*.json")) if _operations().is_dir() else []:
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if record.get("address") == address and operation_state(record) == "pending":
+            return record["op"]
+    return None
+
+
 def deliver(session: LiveSession, text: str) -> str:
     """Prompt an idle conversation; the idle state is read just before, not held.
 
     A turn that starts between that read and Boat accepting the prompt would receive the
     message mid-turn as a normal prompt; Boat offers no conditional prompt to close this.
+    A prompt Boat has not confirmed in time is reported as pending, not failed: the
+    detached `box prompt` may still deliver it, so resending could deliver it twice.
     """
     if session.status != "idle":
         raise RuntimeError(f"{session.address} is running a turn. Boat can only steer a busy "
                            "conversation, which would present this message as the user's own "
                            "instruction; send it again once the turn has ended.")
+    earlier = _pending_for(session.address)
+    if earlier:
+        raise RuntimeError(f"An earlier message to {session.address} is still pending (op {earlier}). "
+                           f"Check it with `one-conv live status {earlier}` before sending again.")
     sandbox, conversation = split(session.id)
-    logs = live_home() / "boat"
-    logs.mkdir(parents=True, exist_ok=True)
-    log_path = logs / f"{conversation}-{uuid.uuid4().hex[:8]}.jsonl"
+    op = uuid.uuid4().hex[:12]
+    _operations().mkdir(parents=True, exist_ok=True)
+    log_path = _operations() / f"{op}.log.jsonl"
     with log_path.open("w") as log:
         # The text is one argv element: Boat delivers it byte for byte, and it starts with
         # "<one-conv-message", so it cannot be read as an option.
         process = subprocess.Popen(
             ["box", "prompt", sandbox, "--resume", conversation, "--json", "--no-update", text],
             stdout=log, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
+    record = {"op": op, "address": session.address, "pid": process.pid, "log": str(log_path),
+              "started": time.time()}
+    (_operations() / f"{op}.json").write_text(json.dumps(record))
     deadline = time.monotonic() + ACCEPT_SECONDS
     while time.monotonic() < deadline:
         state = _accepted(log_path)
@@ -101,9 +147,10 @@ def deliver(session: LiveSession, text: str) -> str:
         if state is not None:
             raise RuntimeError(f"Boat refused the prompt: {state}")
         if process.poll() is not None:
-            raise RuntimeError(f"box prompt exited {process.returncode} before accepting; see {log_path}")
-        time.sleep(0.5)
-    raise RuntimeError(f"Boat did not confirm the prompt within {ACCEPT_SECONDS}s; see {log_path}")
+            raise RuntimeError(f"box prompt exited {process.returncode} before accepting (op {op}); see {log_path}")
+        time.sleep(0.2)
+    return (f"pending: Boat has not confirmed the prompt yet (op {op}). Do not resend; "
+            f"check it with `one-conv live status {op}`")
 
 
 def pull(ident: str) -> list[dict]:

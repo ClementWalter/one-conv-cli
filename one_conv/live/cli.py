@@ -98,6 +98,18 @@ def build_live_group(launcher: list[str]) -> click.Group:
         for turn in turns:
             click.echo(f"\n[{turn['ts']}] {turn['role']}:\n{turn['text']}")
 
+    @live.command("status", context_settings=HELP)
+    @click.argument("op")
+    @click.option("--json", "as_json", is_flag=True, help="Emit the operation as JSON.")
+    def status_command(op, as_json):
+        """Show whether a pending Boat send was accepted, refused, or is still waiting."""
+        from . import boat
+        try:
+            record = boat.operation(op)
+        except RuntimeError as error:
+            raise click.ClickException(str(error)) from None
+        click.echo(json.dumps(record) if as_json else f"{record['state']}: {record['address']} (op {op})")
+
     @live.command("whoami", context_settings=HELP)
     def whoami_command():
         """Show which session this process is running inside, as other sessions see it."""

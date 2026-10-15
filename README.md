@@ -289,6 +289,10 @@ one-conv live pull boat:bx_ab12/2ab1…      # read the agent's answers back
   in that moment receives the message as an ordinary prompt.
 - The remote agent cannot message this machine, so the envelope asks it to answer
   in its own conversation, and `live pull` reads that back with `box events`.
+- If Boat has not confirmed a prompt within 45 seconds, the send reports
+  `pending` with an operation id instead of failing, because the prompt may still
+  arrive. Do not resend: `one-conv live status OP` shows whether it was accepted,
+  and another send to that conversation is refused while it is still pending.
 - `--fyi` cannot reach a sandbox. Boat is listed only when asked for by name
   (`--harness boat` or a `boat:` address), since listing calls Boat's API.
 

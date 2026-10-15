@@ -3,7 +3,9 @@
 import json
 import os
 import stat
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -33,6 +35,8 @@ elif command == "prompt":
     if mode == "refuse":
         print(json.dumps({"code": "provider_not_configured", "error": "Codex is not set up", "event": "error", "status": 409}))
         sys.exit(1)
+    import time
+    time.sleep(float(os.environ.get("BOX_STUB_DELAY", "0")))
     print(json.dumps({"event": "chat", "final": True, "data": {"conversationId": args[3], "type": "prompt",
           "timestamp": 1, "data": {"prompt": args[-1], "status": "finished"}}}), flush=True)
 elif command == "events":
@@ -150,3 +154,71 @@ def test_malformed_boat_address_is_rejected(ident):
 def test_inline_envelope_names_where_to_answer():
     assert envelope("hi", LiveSession("claude", "c1"), reply="inline").endswith(
         "Answer in this conversation; the sender reads your reply back from here.")
+
+
+@pytest.fixture
+def slow_box(box, monkeypatch):
+    """Boat echoes the prompt only after the send has stopped waiting for it."""
+    monkeypatch.setenv("BOX_STUB_DELAY", "1.5")
+    monkeypatch.setattr(boat, "ACCEPT_SECONDS", 0.3)
+    return box
+
+
+def _op(status: str) -> str:
+    return status.split("(op ")[1].split(")")[0]
+
+
+def test_unconfirmed_prompt_is_pending_not_failed(slow_box):
+    status = boat.deliver(LiveSession("boat", f"{SANDBOX}/{IDLE}", status="idle"), "<one-conv-message>hi</one-conv-message>")
+    assert status.startswith("pending:")
+
+
+def test_pending_prompt_says_not_to_resend(slow_box):
+    status = boat.deliver(LiveSession("boat", f"{SANDBOX}/{IDLE}", status="idle"), "<one-conv-message>hi</one-conv-message>")
+    assert "Do not resend" in status
+
+
+def test_second_send_while_first_is_pending_is_refused(slow_box):
+    target = LiveSession("boat", f"{SANDBOX}/{IDLE}", status="idle")
+    boat.deliver(target, "<one-conv-message>hi</one-conv-message>")
+    with pytest.raises(RuntimeError, match="still pending"):
+        boat.deliver(target, "<one-conv-message>hi</one-conv-message>")
+
+
+def test_second_send_while_first_is_pending_starts_no_prompt(slow_box):
+    target = LiveSession("boat", f"{SANDBOX}/{IDLE}", status="idle")
+    boat.deliver(target, "<one-conv-message>hi</one-conv-message>")
+    with pytest.raises(RuntimeError):
+        boat.deliver(target, "<one-conv-message>hi</one-conv-message>")
+    assert [c[0] for c in calls(slow_box)].count("prompt") == 1
+
+
+def test_pending_prompt_later_reads_as_accepted(slow_box):
+    op = _op(boat.deliver(LiveSession("boat", f"{SANDBOX}/{IDLE}", status="idle"), "<one-conv-message>hi</one-conv-message>"))
+    deadline = time.monotonic() + 10
+    while boat.operation(op)["state"] == "pending" and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert boat.operation(op)["state"] == "accepted"
+
+
+def test_pending_send_uses_a_rate_slot(slow_box):
+    router.send(f"boat:{SANDBOX}/{IDLE}", "status?", LiveSession("claude", "c1"))
+    assert (Path(os.environ["ONE_CONV_LIVE_DIR"]) / "sent.jsonl").exists()
+
+
+def test_unknown_operation_is_reported(box):
+    with pytest.raises(RuntimeError, match="no Boat send operation"):
+        boat.operation("missing")
+
+
+def test_pull_timeout_is_an_actionable_error(box, monkeypatch):
+    def slow(*args, **kwargs):
+        raise subprocess.TimeoutExpired("box", 120)
+
+    monkeypatch.setattr(subprocess, "run", slow)
+    with pytest.raises(RuntimeError, match="no answer within"):
+        boat.pull(f"{SANDBOX}/{IDLE}")
+
+
+def test_inline_envelope_carries_the_reply_attribute():
+    assert 'reply="inline"' in envelope("hi", LiveSession("claude", "c1"), reply="inline")

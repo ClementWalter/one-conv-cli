@@ -237,6 +237,10 @@ def test_omp_skips_exited_session(homes, dead_pid):
     assert omp.list_sessions() == []
 
 
+def test_omp_extension_send_tool_offers_no_reply(homes):
+    assert '"--no-reply"' in omp.render_extension(["one-conv"])
+
+
 def test_omp_extension_points_at_live_dir(homes):
     assert json.dumps(str(homes / "live")) in omp.render_extension(["one-conv"])
 

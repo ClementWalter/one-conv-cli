@@ -247,7 +247,7 @@ One `live send` reaches any of these, and defaults to a dry run until `--yes`:
 | --- | --- |
 | `claude:<id>`, `codex:<id>`, `omp:<id>`, `cursor:<id>` | a session on this machine; a unique id prefix or a substring of its title or folder works too |
 | `boat:<sandbox>/<conversation>` | an agent in a Boat sandbox |
-| `NODE/claude:<id>` (any harness) | a session on another machine, through a hub (see [Working across machines](#working-across-machines)) |
+| `NODE/claude:<full id>` (also `codex`, `omp`, `cursor`) | a session on another machine, through a hub (see [Working across machines](#working-across-machines)); the id must be complete, and Boat conversations keep their own route |
 | `@name` | the agent on this machine that chose that name |
 | `#topic` | every member of the topic but you |
 
@@ -292,7 +292,8 @@ one-conv live topic release-4-2           # what you have not seen on it yet
 - Sending to `#topic` records the message on the topic and delivers it to every
   member but the sender, each through its own harness; the result lists one
   status per member, and a member that is not reachable now catches up later.
-  Sending makes you a member. `--topic` files a direct message under a topic too.
+  On one machine, sending makes you a member; through a hub, `join` first, since
+  posting to a hub topic does not. `--topic` files a direct message under a topic too.
 - Each member keeps a read position, so `join` and `topic` show what is new to
   that reader, at most 20 messages, labelled as history rather than new requests.
   A topic keeps its last 500 messages.
@@ -346,12 +347,12 @@ app-server for a few minutes, but `live ls` no longer lists it.
 Agents on different machines reach each other through a hub. Each machine runs
 one bridge, `live serve`, which only connects out: nothing listens on the
 machines themselves. Agents never need to know where another one runs beyond its
-address, `NODE/harness:id`, or its `@name`.
+address, `NODE/harness:id` with the full id, as `live serve` publishes it.
 
 On the machine that hosts the hub (the hub binds to localhost by default):
 
 ```bash
-uv run scripts/live-hub.py token add laptop --db hub.db > laptop.token   # one token per machine
+(umask 077; uv run scripts/live-hub.py token add laptop --db hub.db > laptop.token)   # one per machine, private
 uv run scripts/live-hub.py serve --db hub.db                             # 127.0.0.1:8789
 ```
 
@@ -359,14 +360,14 @@ On each machine, with the token issued to it:
 
 ```bash
 one-conv live serve --hub ssh://me@hub-box --node laptop --token-stdin < laptop.token
-one-conv live serve --hub https://hub.example.com --node ci-runner      # behind a TLS proxy
+one-conv live serve --hub https://hub.example.com --node ci-runner --token-stdin < ci-runner.token
 one-conv live serve --status
-one-conv live send ci-runner/codex:019a 'rerun the flaky test' --yes
+one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes
 ```
 
 - `ssh://` opens `ssh -N -L` to the hub's port, non-interactively and only to a
   host whose key is already known; `https://` verifies the certificate; plain
-  `http://` is accepted only to 127.0.0.1. The token travels only in a request
+  `http://` is accepted only to a loopback address (127.0.0.1, ::1). The token travels only in a request
   header, no redirect is followed, and no proxy from the environment is used.
   Through `ssh://`, `live send` uses the forwarded port only while the bridge's
   own ssh process holds it; once the bridge has stopped, sends are queued instead.
@@ -379,8 +380,9 @@ one-conv live send ci-runner/codex:019a 'rerun the flaky test' --yes
 - Each message is recorded on the receiving machine before its harness is
   called. A message the hub hands out again is not delivered again. If the
   bridge stopped in the middle of a delivery, the sender sees `unconfirmed`
-  rather than a second prompt. The outcome the sender can read is what the
-  harness did (`accepted`, `refused` or `unconfirmed`), not whether the agent
+  rather than a second prompt. `live status ID`, with the id the send printed,
+  shows per recipient what its harness did (`accepted`, `refused` or
+  `unconfirmed`, or `stored` until it is handed over), not whether the agent
   has read it yet.
 - A machine's token vouches for the sessions its bridge publishes, not for each
   process on that machine. `token revoke NODE` cuts one machine off.

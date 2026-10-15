@@ -1,16 +1,19 @@
 """`one-conv live`: list running agent sessions and message them while they run."""
 
 import json
+import re
 import sys
 import time
 
 import click
 
-from . import cursor, router, team
+from . import cursor, hubclient, router, team
 from . import install as installer
 from .model import HARNESSES
 
 HELP = {"help_option_names": ["-h", "--help"]}
+# The id the sender chose for a message sent through the hub.
+HUB_MESSAGE_ID = re.compile(r"[0-9a-f]{32}")
 
 
 def examples(*lines: str) -> str:
@@ -22,15 +25,15 @@ def build_live_group(launcher: list[str]) -> click.Group:
     @click.group("live", context_settings=HELP,
                  epilog="\b\nTargets:\n  claude:<id> codex:<id> omp:<id> cursor:<id>  a session address (or id prefix)\n"
                         "  boat:<sandbox>/<conversation>              an agent in a Boat sandbox\n"
-                        "  NODE/claude:<id>                           a session on another machine (live serve)\n"
-                        "  @name                                      an agent by the name it chose\n"
+                        "  NODE/claude:<full id>                      a session on another machine (live serve)\n"
+                        "  @name                                      the agent on this machine that chose the name\n"
                         "  #topic                                     every member of a topic\n"
                         "\b\nExamples:\n  one-conv live name reviewer\n  one-conv live join release-4-2\n"
                         "  one-conv live send '#release-4-2' 'tests pass on main' --yes\n"
                         "  one-conv live send @builder 'can you take the migration?' --yes\n"
                         "  one-conv live spawn codex 'review the diff on this branch' --yes\n"
                         "  one-conv live serve --hub ssh://me@hub-box --node laptop --token-stdin < token\n"
-                        "  one-conv live send ci-runner/codex:019a 'rerun the flaky test' --yes\n"
+                        "  one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes\n"
                         "  one-conv live topics")
     def live():
         """Work with running agents as a team: name yourself, join topics, message anyone.
@@ -79,7 +82,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
           one-conv live send @reviewer 'PR #20 is ready' --yes
           one-conv live send '#release-4-2' 'blocked on the migration' --yes
           one-conv live send codex:019a 'rerun the suite' --topic release-4-2 --yes
-          one-conv live send ci-runner/codex:019a 'rerun the flaky test' --yes
+          one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes
           one-conv live send @reviewer 'build is green' --fyi --yes
           one-conv live send codex:019a --stdin --yes < findings.md
         """
@@ -115,6 +118,8 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 click.echo(f"  {row['status']}: {row['to']}")
         else:
             click.echo(f"{receipt['status']}: {receipt['to']}")
+        if receipt.get("via") == "hub" and not as_json:
+            click.echo(f"  follow it with: one-conv live status {receipt['id']}")
         if receipt.get("warning") and not as_json:
             click.echo(f"warning: {receipt['warning']}", err=True)
 
@@ -143,13 +148,38 @@ def build_live_group(launcher: list[str]) -> click.Group:
         for turn in turns:
             click.echo(f"\n[{turn['ts']}] {turn['role']}:\n{turn['text']}")
 
-    @live.command("status", context_settings=HELP, epilog=examples('one-conv live status op_7f3a', 'one-conv live status op_7f3a --resolve'))
+    @live.command("status", context_settings=HELP, epilog=examples(
+        "one-conv live status 0123456789ab                       # a Boat send's OP",
+        "one-conv live status 0123456789ab --resolve",
+        "one-conv live status 9f2c41d07a5e4b1c8d3e6f7a8b9c0d1e   # a message sent through the hub"))
     @click.argument("op")
     @click.option("--resolve", is_flag=True,
-                  help="Mark an unconfirmed send as checked, allowing another send to that conversation.")
+                  help="Mark an unconfirmed Boat send as checked, allowing another send to that conversation.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the operation as JSON.")
     def status_command(op, resolve, as_json):
-        """Show whether a Boat send was accepted, refused, is still waiting, or is unconfirmed."""
+        """Show what became of a send that left this machine without a final answer.
+
+        OP is either the 12-character operation id a pending or unconfirmed Boat send
+        prints, or the 32-character id of a message sent through the hub, whose outcome
+        per recipient is what that machine's harness did (accepted, refused,
+        unconfirmed), or stored while it has not been handed over yet.
+        """
+        if HUB_MESSAGE_ID.fullmatch(op):
+            if resolve:
+                raise click.UsageError("--resolve applies to Boat operations only.")
+            try:
+                hub = hubclient.configured()
+                if hub is None:
+                    raise click.ClickException("No hub is configured on this machine (`one-conv live serve`).")
+                record = hub.request("GET", f"/v1/messages/{op}")
+            except (hubclient.HubUnavailable, hubclient.HubRefused) as error:
+                raise click.ClickException(str(error)) from None
+            if as_json:
+                click.echo(json.dumps(record))
+                return
+            for row in record.get("recipients", []):
+                click.echo(f"{row['outcome']}: {row['to']}")
+            return
         from . import boat
         try:
             record = boat.resolve_operation(op) if resolve else boat.operation(op)
@@ -178,7 +208,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
         harness = address.partition(":")[0]
         return any(s.address == address for s in router.list_all(harness))
 
-    @live.command("name", context_settings=HELP, epilog=examples('one-conv live name reviewer', 'one-conv live name builder --as codex:019a', 'one-conv live name lead --replace'))
+    @live.command("name", context_settings=HELP, epilog=examples('one-conv live name reviewer', 'one-conv live name builder --as codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03', 'one-conv live name lead --replace'))
     @click.argument("name")
     @click.option("--as", "as_address", help="Session to name; defaults to the calling agent.")
     @click.option("--replace", is_flag=True, help="Take a name whose holder is no longer running.")
@@ -216,7 +246,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             who = f"@{name} {row['from']}" if name else row["from"]
             click.echo(f"\n[{time.strftime('%Y-%m-%d %H:%M', time.localtime(row['at']))}] {who}:\n{row['text']}")
 
-    @live.command("join", context_settings=HELP, epilog=examples('one-conv live join release-4-2', 'one-conv live join release-4-2 --as codex:019a'))
+    @live.command("join", context_settings=HELP, epilog=examples('one-conv live join release-4-2', 'one-conv live join release-4-2 --as codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03'))
     @click.argument("topic")
     @click.option("--as", "as_address", help="Session that joins; defaults to the calling agent.")
     def join_command(topic, as_address):

@@ -86,7 +86,8 @@ def add_spawn_commands(live: click.Group) -> None:
         for row in rows:
             click.echo(f"{row['address'] or '(not registered)'}  {row['harness']:<7}  {row['tmux']}  {row['cwd']}")
 
-    @live.command("stop", context_settings=HELP, epilog=examples('one-conv live stop codex:019a', 'one-conv live stop oneconv-codex-1a2b3c4d'))
+    @live.command("stop", context_settings=HELP, epilog=examples('one-conv live stop codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03   # the full address `live spawned` shows',
+                                                                 'one-conv live stop oneconv-codex-1a2b3c4d'))
     @click.argument("target")
     def stop_command(target):
         """End a spawned agent, by its address or tmux session name."""

@@ -611,3 +611,26 @@ def test_a_second_bridge_on_the_same_machine_is_refused(hub, delivered):
         import fcntl
         fcntl.flock(handle, fcntl.LOCK_EX)
         assert bridge.serve(hub.url, "box", hub.box_token, stopping=lambda: False) == 1
+
+
+@pytest.fixture
+def sent_to_mac(sending):
+    """A message from this machine to mac, as `live status` will look it up."""
+    return router.send("mac/claude:aaa", "status me", SESSION)["id"]
+
+
+def live_status(*args):
+    from click.testing import CliRunner
+
+    from one_conv.live.cli import build_live_group
+    return CliRunner().invoke(build_live_group(["one-conv"]), ["status", *args]).output
+
+
+def test_live_status_shows_a_hub_message_stored_until_handed_over(sent_to_mac):
+    assert live_status(sent_to_mac) == "stored: mac/claude:aaa\n"
+
+
+def test_live_status_shows_what_the_receiving_harness_did(sending, sent_to_mac):
+    delivery = sending.mac.request("GET", "/v1/inbox?wait=0")["messages"][0]["delivery"]
+    sending.mac.request("POST", "/v1/acks", {"delivery": delivery, "outcome": "accepted"})
+    assert live_status(sent_to_mac) == "accepted: mac/claude:aaa\n"

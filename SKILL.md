@@ -179,9 +179,13 @@ These agents can modify files or use tools, so preserve the user's action scope.
 `claude:<id>`, `codex:<id>`, `omp:<id>`, `cursor:<id>` and
 `boat:<sandbox>/<conversation>`. `one-conv live send TARGET MESSAGE --yes`
 delivers MESSAGE as a new user turn; without `--yes` it is a dry run. TARGET is an
-address, id prefix, title/cwd substring, `@name` or `#topic` (every member). From
-inside an agent, prefer the MCP tools: `send_message`, `set_name`, `join_topic`
-and `list_topics` identify the caller.
+address, id prefix, title/cwd substring, `@name` of an agent on this machine,
+`#topic` (every member), or `NODE/harness:<full id>` for an agent on another
+machine when `one-conv live serve` connects this one to a hub. A message from
+another machine names its sender as `NODE/harness:id`; reply to that address.
+`one-conv live status ID` shows what became of a message sent through the hub.
+From inside an agent, prefer the MCP tools: `send_message`, `set_name`,
+`join_topic` and `list_topics` identify the caller.
 
 Work as a team. Give yourself a name (`set_name`) when you expect to be addressed,
 and put multi-agent work on a topic: `join_topic` subscribes you and returns what

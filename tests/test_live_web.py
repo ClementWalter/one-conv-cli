@@ -170,3 +170,13 @@ def test_page_script_parses(tmp_path):
     script = tmp_path / "app.js"
     script.write_text(web.SCRIPT)
     assert subprocess.run(["node", "--check", str(script)], capture_output=True, check=False).returncode == 0
+
+
+def test_fyi_is_logged_as_expecting_no_reply(homes):
+    _omp(homes, "o1")
+    router.send("omp:o1", "merged", LiveSession("claude", "c1"), fyi=True)
+    assert web.log()[-1]["reply"] == "none"
+
+
+def test_page_marks_fyi_rows():
+    assert 'row.mode === "fyi"' in web.SCRIPT

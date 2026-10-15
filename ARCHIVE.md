@@ -55,6 +55,11 @@ token, commands warn on stderr and show native history only.
   following symlinks, and the turns, title and token count are parsed from a
   private copy of those bytes, so everything archived comes from the same read. A
   system without no-follow file opens cannot archive these sources.
+- The session id, working directory and title shown in listings are read again
+  from that copy. If the session id or working directory no longer matches the
+  listing, or the copy does not hold the directory, that conversation fails and
+  is retried on the next sync. A Claude Code project directory is accepted when it
+  matches the project folder's name or appears in the captured transcript.
 - Each native record is archived separately, even when records share a session ID
   (Codex subagent rollouts share their parent's).
 - Each upload names the revision it replaces, so concurrent captures are rejected.

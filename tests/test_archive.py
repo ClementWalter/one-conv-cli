@@ -587,6 +587,56 @@ def test_capture_refuses_a_session_whose_cwd_differs_from_the_listing(tmp_path, 
         sync.capture(reader, listed_elsewhere, "origin")
 
 
+def claude_handle(tmp_path, monkeypatch, project_cwd=None):
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    for name in ("CLAUDE_CONFIG_DIR", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects(("claude",)) for h in reader._native_project_sessions(p))
+    return sync, reader, dataclasses.replace(handle, project_cwd=project_cwd) if project_cwd else handle
+
+
+def test_capture_keeps_a_claude_cwd_its_transcript_holds(tmp_path, monkeypatch):
+    sync, reader, handle = claude_handle(tmp_path, monkeypatch)
+    assert sync.capture(reader, handle, "origin")["cwd"] == "/example/ancestry"
+
+
+def test_capture_refuses_a_claude_cwd_neither_folder_nor_transcript_backs(tmp_path, monkeypatch):
+    sync, reader, handle = claude_handle(tmp_path, monkeypatch, project_cwd="/SECRET_/ancestry")
+    with pytest.raises(ArchiveError, match="metadata changed between listing and capture"):
+        sync.capture(reader, handle, "origin")
+
+
+def test_capture_keeps_a_claude_cwd_its_project_folder_name_encodes(tmp_path, monkeypatch):
+    """A worktree session's transcript may never mention the folder's cwd; the folder name pins it."""
+    sync, reader, handle = claude_handle(tmp_path, monkeypatch)
+    worktree = handle.path.parent.parent / reader._encode_path("/example/ancestry/worktree")
+    worktree.mkdir()
+    moved = worktree / handle.path.name
+    handle.path.rename(moved)
+    relocated = dataclasses.replace(handle, path=moved, project_cwd="/example/ancestry/worktree")
+    assert sync.capture(reader, relocated, "origin")["cwd"] == "/example/ancestry/worktree"
+
+
+def test_capture_refuses_a_cursor_cli_chat_whose_captured_meta_has_no_cwd(tmp_path, monkeypatch):
+    from test_cursor_cli import CHAT_ID, _write_chat
+    env = fixture_env(tmp_path)
+    _write_chat(Path(env["CURSOR_CLI_HOME"]))
+    for name in ("CURSOR_CLI_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects(("cursor-cli",)) for h in reader._native_project_sessions(p))
+    meta = next(Path(env["CURSOR_CLI_HOME"]).glob(f"**/{CHAT_ID}/meta.json"))
+    content = json.loads(meta.read_text())
+    content.pop("cwd")
+    meta.write_text(json.dumps(content))
+    with pytest.raises(ArchiveError, match="metadata changed between listing and capture"):
+        sync.capture(reader, handle, "origin")
+
+
 def test_capture_refuses_a_session_whose_id_differs_from_the_listing(tmp_path, monkeypatch):
     env = fixture_env(tmp_path)
     write_omp_transcript(env)

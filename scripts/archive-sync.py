@@ -251,11 +251,34 @@ def captured_identity(reader, handle, copy):
     return handle.uuid, None, None
 
 
+def claude_cwd_confirmed(reader, handle, copy):
+    """Whether the listed Claude Code project cwd is backed by the folder name or the captured bytes.
+
+    The listing prefers a cwd that re-encodes to the project folder's name (how worktree sessions
+    resolve), which the folder itself pins; otherwise it fell back to a transcript's cwd, which must
+    then appear among the captured transcript's own cwd values.
+    """
+    if reader._encode_path(handle.project_cwd) == handle.path.parent.name:
+        return True
+    seen = set()
+    for line in copy.read_text(errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and isinstance(event.get("cwd"), str):
+            seen.add(event["cwd"])
+    return handle.project_cwd in seen
+
+
 def rebuilt_handle(reader, handle, copy):
     """`handle` pointed at the copy, with everything discovery read from the live files read again
-    from the copy. A session id or cwd that no longer matches the listing is refused, not relabelled."""
+    from the copy. A session id or cwd that no longer matches the listing, or that the copy does not
+    hold, is refused rather than relabelled or kept from the listing."""
     session, cwd, title = captured_identity(reader, handle, copy)
-    if session != handle.uuid or (cwd is not None and cwd != handle.project_cwd):
+    confirmed = (claude_cwd_confirmed(reader, handle, copy) if handle.source == "claude"
+                 else cwd == handle.project_cwd)
+    if session != handle.uuid or not confirmed:
         raise ArchiveError(f"{handle.uuid}: its metadata changed between listing and capture; retry")
     return dataclasses.replace(handle, path=copy, title_hint=title)
 

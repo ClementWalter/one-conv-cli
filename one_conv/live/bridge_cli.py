@@ -23,11 +23,11 @@ def add_bridge_commands(live: click.Group) -> None:
     @live.command("serve", context_settings=HELP,
                   epilog="\b\nExamples:\n"
                          "  one-conv live serve --hub ssh://me@hub-box --node laptop --token-stdin < token\n"
-                         "  one-conv live serve --hub https://hub.example.com --node ci-runner\n"
+                         "  one-conv live serve --hub https://hub.example.com --node ci-runner --token-stdin < ci-runner.token\n"
                          "  one-conv live serve            # again, with the last settings\n"
                          "  one-conv live serve --status\n"
                          "  one-conv live serve --stop")
-    @click.option("--hub", help="https://HOST, http://127.0.0.1:PORT, or ssh://[user@]HOST to tunnel to it.")
+    @click.option("--hub", help="https://HOST, http://127.0.0.1:PORT (loopback only), or ssh://[user@]HOST to tunnel to it.")
     @click.option("--node", help="This machine's name on the hub, as its token was issued (a-z, 0-9, -).")
     @click.option("--hub-port", type=int, help="The hub's port on an ssh host.  [default: 8789]")
     @click.option("--token-stdin", is_flag=True, help="Read this node's token from stdin and remember it (mode 600).")
@@ -39,8 +39,8 @@ def add_bridge_commands(live: click.Group) -> None:
 
         The bridge publishes the sessions running here, delivers messages the hub holds for
         them through their usual adapters, and posts what `live send` queued while the hub
-        was unreachable. It only connects out: nothing listens on this machine. Run one per
-        machine, in the foreground or under tmux; its token comes from `live-hub.py token add`.
+        was unreachable. No inbound network access is required. Run one per machine, in
+        the foreground or under tmux; its token comes from `live-hub.py token add`.
         """
         if show_status:
             state = bridge.status()

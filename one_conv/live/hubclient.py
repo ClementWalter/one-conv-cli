@@ -14,6 +14,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -141,27 +142,75 @@ def outbox() -> Path:
     return live_home() / "bridge" / "outbox"
 
 
-def post_durably(client: HubClient, message: dict) -> dict:
-    """Post `message`, with its outbox record written first so a crash mid-post leaves it to resume.
+def is_terminal(error: HubRefused) -> bool:
+    """Whether the hub would refuse this exact message again (malformed, forged or a conflicting id).
 
-    The record goes once the hub has answered either way; on HubUnavailable it stays, and the
-    bridge posts it under the same id, which the hub answers with the first receipt.
+    A 5xx, a rate limit, a timeout or a rejected token says nothing final about the message.
     """
-    path = queue(message)
+    return 400 <= error.status < 500 and error.status not in (401, 408, 425, 429)
+
+
+def post_queued(client: HubClient, message: dict, path: Path) -> dict:
+    """Post a message already in the outbox; its record goes only once the hub gave a receipt for its id.
+
+    A terminal refusal is raised with the record left for the caller to drop or set aside;
+    any other failure, or an answer that is not a receipt, raises HubUnavailable and keeps it.
+    """
     try:
         receipt = client.post(message)
-    except HubRefused:
-        path.unlink(missing_ok=True)
-        raise
+    except HubRefused as error:
+        if is_terminal(error):
+            raise
+        raise HubUnavailable(f"the hub answered {error.status}; the message stays queued") from None
+    if not (isinstance(receipt, dict) and receipt.get("id") == message.get("id")
+            and isinstance(receipt.get("recipients"), list)):
+        raise HubUnavailable("the hub's answer is not a receipt for this message; it stays queued")
     path.unlink(missing_ok=True)
     return receipt
 
 
+def post_durably(client: HubClient, message: dict) -> dict:
+    """Post `message`, with its outbox record written first so a crash mid-post leaves it to resume.
+
+    On HubUnavailable the record stays, and the bridge posts it under the same id, which the
+    hub answers with the first receipt.
+    """
+    path = queue(message)
+    try:
+        return post_queued(client, message, path)
+    except HubRefused:
+        path.unlink(missing_ok=True)
+        raise
+
+
 def queue(message: dict) -> Path:
-    """Leave a message for the bridge to post once the hub is reachable; its id makes retries safe."""
+    """Leave a message for the bridge to post; an id already queued keeps its first content.
+
+    The record is created with link(), which fails if it exists, so concurrent writers of one
+    id cannot replace each other's text.
+    """
     outbox().mkdir(parents=True, exist_ok=True)
     path = outbox() / f"{message['id']}.json"
-    partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    partial.write_text(json.dumps(message))
-    os.replace(partial, path)
-    return path
+    partial = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(message, handle)
+    try:
+        for _ in range(3):
+            try:
+                os.link(partial, path)
+                return path
+            except FileExistsError:
+                try:
+                    existing = json.loads(path.read_text())
+                except FileNotFoundError:
+                    continue  # Posted and removed meanwhile: queue this one afresh.
+                except (OSError, ValueError):
+                    existing = None
+                if existing == message:
+                    return path
+                raise HubRefused(409, f"message {message['id']} is already queued with different content; "
+                                      "send it under a new id") from None
+        raise HubUnavailable(f"could not queue message {message['id']}")
+    finally:
+        partial.unlink(missing_ok=True)

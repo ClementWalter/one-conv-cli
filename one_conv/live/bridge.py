@@ -231,13 +231,14 @@ class Bridge:
             except (OSError, ValueError):
                 continue
             try:
-                self.client.post(message)
+                hubclient.post_queued(self.client, message, path)
             except hubclient.HubRefused as error:
+                # Only a terminal refusal reaches here; it is set aside for a person to look at.
                 refused = hubclient.outbox() / "refused"
                 refused.mkdir(exist_ok=True)
                 _write_private(refused / path.name, {**message, "error": str(error)})
+                path.unlink(missing_ok=True)
                 logger.warning("the hub refused queued message %s: %s", path.stem, error)
-            path.unlink(missing_ok=True)
             sent += 1
         return sent
 

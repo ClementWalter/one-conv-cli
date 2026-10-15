@@ -300,6 +300,118 @@ def test_a_send_through_the_live_forward_reaches_the_hub(hub, delivered, tmp_pat
     assert hub.mac.request("GET", "/v1/inbox?wait=0")["messages"][0]["text"] == "through ssh"
 
 
+def answering(monkeypatch, answer):
+    """HubClient.post runs `answer(client, message, real_post)` instead of only posting."""
+    real_post = hubclient.HubClient.post
+    monkeypatch.setattr(hubclient.HubClient, "post", lambda client, message: answer(client, message, real_post))
+
+
+def refuse(status):
+    def answer(client, message, real_post):
+        raise hubclient.HubRefused(status, "injected")
+    return answer
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 429, 401])
+def test_a_send_answered_with_a_retryable_status_stays_queued(sending, monkeypatch, status):
+    answering(monkeypatch, refuse(status))
+    router.send("mac/claude:aaa", "keep me", SESSION)
+    assert len(list(hubclient.outbox().glob("*.json"))) == 1
+
+
+def test_a_send_whose_answer_is_not_a_receipt_stays_queued(sending, monkeypatch):
+    answering(monkeypatch, lambda client, message, real_post: {})
+    router.send("mac/claude:aaa", "keep me", SESSION)
+    assert len(list(hubclient.outbox().glob("*.json"))) == 1
+
+
+@pytest.fixture
+def stored_then_failed(sending, monkeypatch):
+    """A send the hub stored but answered 500, then resumed by the bridge's drain."""
+    real_post = hubclient.HubClient.post
+
+    def store_then_fail(client, message, _):
+        real_post(client, message)
+        raise hubclient.HubRefused(500, "injected after commit")
+    answering(monkeypatch, store_then_fail)
+    router.send("mac/claude:aaa", "exactly once", SESSION)
+    monkeypatch.setattr(hubclient.HubClient, "post", real_post)
+    bridge.Bridge(hubclient.HubClient(sending.url, sending.box_token, "box"), "box",
+                  bridge.Ingress(bridge.bridge_dir() / "ingress.db")).drain_outbox()
+    return sending
+
+
+def test_a_send_answered_500_after_the_hub_stored_it_is_delivered_once(stored_then_failed):
+    assert len(stored_then_failed.mac.request("GET", "/v1/inbox?wait=0")["messages"]) == 1
+
+
+def test_a_send_answered_500_after_the_hub_stored_it_is_resumed_from_the_outbox(stored_then_failed):
+    assert list(hubclient.outbox().glob("*.json")) == []
+
+
+@pytest.fixture
+def conflicting_resend(sending):
+    """A message posted, then the same id posted with other text."""
+    client = hubclient.HubClient(sending.url, sending.box_token, "box")
+    message = {"id": uuid.uuid4().hex, "to": "mac/claude:aaa", "from": "omp:worker-1", "text": "original"}
+    hubclient.post_durably(client, message)
+    return client, {**message, "text": "changed"}
+
+
+def test_a_conflicting_resend_is_refused(conflicting_resend):
+    client, changed = conflicting_resend
+    with pytest.raises(hubclient.HubRefused):
+        hubclient.post_durably(client, changed)
+
+
+def test_a_conflicting_resend_leaves_nothing_queued(conflicting_resend):
+    client, changed = conflicting_resend
+    with pytest.raises(hubclient.HubRefused):
+        hubclient.post_durably(client, changed)
+    assert list(hubclient.outbox().glob("*.json")) == []
+
+
+@pytest.fixture
+def pending(delivered):
+    message = {"id": uuid.uuid4().hex, "to": "mac/claude:aaa", "from": "omp:worker-1", "text": "original"}
+    hubclient.queue(message)
+    return message
+
+
+def test_queuing_a_pending_id_with_other_content_is_refused(pending):
+    with pytest.raises(hubclient.HubRefused, match="already queued with different content"):
+        hubclient.queue({**pending, "text": "changed"})
+
+
+def test_queuing_a_pending_id_with_other_content_keeps_the_first(pending):
+    with pytest.raises(hubclient.HubRefused):
+        hubclient.queue({**pending, "text": "changed"})
+    assert json.loads((hubclient.outbox() / f"{pending['id']}.json").read_text())["text"] == "original"
+
+
+def test_queuing_a_pending_id_again_with_the_same_content_is_accepted(pending):
+    assert hubclient.queue(dict(pending)) == hubclient.outbox() / f"{pending['id']}.json"
+
+
+def test_the_outbox_record_is_readable_only_by_its_user(pending):
+    assert stat.S_IMODE((hubclient.outbox() / f"{pending['id']}.json").stat().st_mode) == 0o600
+
+
+def test_draining_keeps_a_message_the_hub_answers_503(hub, box, monkeypatch):
+    queued()
+    answering(monkeypatch, refuse(503))
+    with pytest.raises(hubclient.HubUnavailable):
+        box.drain_outbox()
+    assert len(list(hubclient.outbox().glob("*.json"))) == 1
+
+
+def test_draining_sets_aside_a_message_the_hub_refuses_for_good(hub, box, monkeypatch):
+    message = queued()
+    answering(monkeypatch, refuse(400))
+    box.drain_outbox()
+    assert (hubclient.outbox() / "refused" / f"{message['id']}.json").exists()
+
+
 def test_a_send_to_another_machine_without_a_hub_is_refused(delivered):
     with pytest.raises(router.LiveError, match="needs this machine's bridge"):
         router.send("mac/claude:aaa", "hello", SESSION)

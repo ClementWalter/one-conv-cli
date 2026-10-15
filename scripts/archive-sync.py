@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import sqlite3
+import stat
 import sys
 import uuid
 from dataclasses import asdict
@@ -60,14 +61,24 @@ def source_paths(reader, handle):
     paths = [handle.path] if handle.path else []
     if handle.source == "claude":
         # The session folder holds subagent transcripts, full tool outputs, workflows and the title.
-        paths.extend(session_files(handle.path.parent / handle.uuid))
+        paths.extend(session_files(session_folder(handle)))
     if handle.source == "cursor-cli":
         paths.append(handle.path.parent / "meta.json")
     return paths
 
 
+def session_folder(handle):
+    """A Claude session's folder, or None when it is missing or is itself a symlink."""
+    folder = handle.path.parent / handle.uuid
+    if folder.is_symlink() or not folder.is_dir():
+        return None
+    return folder
+
+
 def session_files(folder):
     """Regular files under a session folder; symlinks are skipped so a capture never reads outside it."""
+    if folder is None:
+        return []
     files = []
     for directory, _, names in os.walk(folder, followlinks=False):
         for name in names:
@@ -77,8 +88,38 @@ def session_files(folder):
     return sorted(files)
 
 
-def source_stamp(paths):
-    """Size and time of every source file, write-ahead logs included, as one comparable value."""
+def read_inside(root, path):
+    """Read `path` through directory descriptors that refuse symlinks at every step.
+
+    Checking for symlinks before reading is not enough: a file or folder can be swapped
+    for one between the check and the read, so the refusal happens at the open itself.
+    """
+    parts = path.relative_to(root).parts
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        handle = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+    finally:
+        os.close(descriptor)
+    with os.fdopen(handle, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ArchiveError(f"Not a regular file in a session folder: {path}")
+        return stream.read()
+
+
+def source_stamp(reader, handle, paths):
+    """One comparable value that changes whenever the conversation's sources do.
+
+    File sources use size and time of every file, write-ahead logs included. Cursor IDE
+    conversations are rows in a shared database whose file changes for every chat, so
+    their stamp is a hash of the conversation's own rows.
+    """
+    if handle.source == "cursor":
+        rows = original_records(reader, handle, paths)
+        return digest(b"".join(rows[name] for name in sorted(rows)))
     return digest(encode(fingerprint(paths)))
 
 
@@ -124,8 +165,11 @@ def original_records(reader, handle, paths):
         finally:
             conn.close()
     result = {}
+    folder = session_folder(handle) if handle.source == "claude" else None
     for path in paths:
-        if path.suffix == ".db":
+        if folder is not None and folder in path.parents:
+            data = read_inside(folder, path)
+        elif path.suffix == ".db":
             with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as source, sqlite3.connect(":memory:") as snapshot:
                 source.backup(snapshot)
                 data = snapshot.serialize()
@@ -186,22 +230,24 @@ def main():
             archived = existing.get(key)
             # The listed time covers only the main file; the stamp also covers a Cursor CLI
             # write-ahead log and every file in a Claude session folder.
-            stamp = source_stamp(source_paths(reader, handle))
+            stamp = source_stamp(reader, handle, source_paths(reader, handle))
+            # The cached stamp counts only while the archive still holds the revision it acknowledged:
+            # a rolled-back or different archive must be reconciled, not skipped.
             if (archived and archived["mtime"] == handle.mtime and archived["capture_version"] == CAPTURE_VERSION
-                    and stamps.get(key) == stamp):
+                    and stamps.get(key) == {"stamp": stamp, "revision": archived["revision"]}):
                 unchanged += 1  # Avoid re-reading and re-encoding unchanged history.
                 continue
             manifest, chunks = pack(capture(reader, handle, origin))
             digest = revision(manifest)
             if archived and archived["revision"] == digest:
-                stamps[key] = stamp
+                stamps[key] = {"stamp": stamp, "revision": digest}
                 unchanged += 1
                 continue
             receipt = client.put(manifest, chunks, archived["revision"] if archived else None)
             if receipt != {"key": key, "revision": digest}:
                 raise ArchiveError("Archive acknowledgement does not match the uploaded capture")
             existing[key] = {"revision": digest, "mtime": handle.mtime}
-            stamps[key] = stamp
+            stamps[key] = {"stamp": stamp, "revision": digest}
             uploaded += 1
         # One unreadable or malformed conversation must not stop the others.
         except (ArchiveError, OSError, ValueError, LookupError, TypeError, AttributeError,

@@ -2,6 +2,8 @@
 import base64
 import copy
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -322,6 +324,108 @@ def test_first_capture_of_a_checkpointed_cursor_cli_store_succeeds(tmp_path, arc
     _write_chat(Path(env["CURSOR_CLI_HOME"]))
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
     assert run(env, "scripts/archive-sync.py", "--source", "cursor-cli") == {"uploaded": 1, "unchanged": 0}
+
+
+def load_sync_script():
+    loader = importlib.machinery.SourceFileLoader("archive_sync_under_test", str(ROOT / "scripts/archive-sync.py"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def test_capture_skips_a_session_folder_that_is_itself_a_symlink(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("not part of any conversation")
+    (path.parent / "session-one").symlink_to(outside, target_is_directory=True)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    originals = client.read_conversation(list(client.list_conversations())[0]["key"])["originals"]
+    assert not any("secret.txt" in name for name in originals)
+
+
+def test_read_refuses_a_file_swapped_for_a_symlink_before_the_read(tmp_path):
+    sync = load_sync_script()
+    root = tmp_path / "session-one"
+    root.mkdir()
+    (tmp_path / "outside.txt").write_text("external secret payload")
+    (root / "result.txt").symlink_to(tmp_path / "outside.txt")
+    with pytest.raises(OSError):
+        sync.read_inside(root, root / "result.txt")
+
+
+def test_read_refuses_a_folder_swapped_for_a_symlink_before_the_read(tmp_path):
+    sync = load_sync_script()
+    root = tmp_path / "session-one"
+    root.mkdir()
+    outside = tmp_path / "outside-dir"
+    outside.mkdir()
+    (outside / "result.txt").write_text("external secret payload")
+    (root / "tool-results").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(OSError):
+        sync.read_inside(root, root / "tool-results" / "result.txt")
+
+
+def test_read_inside_returns_a_regular_file(tmp_path):
+    sync = load_sync_script()
+    root = tmp_path / "session-one"
+    (root / "tool-results").mkdir(parents=True)
+    (root / "tool-results" / "result.txt").write_bytes(b"tool output")
+    assert sync.read_inside(root, root / "tool-results" / "result.txt") == b"tool output"
+
+
+def write_cursor_ide(env, text):
+    path = Path(env["CURSOR_USER_DIR"]) / "globalStorage" / "state.vscdb"
+    workspace = Path(env["CURSOR_USER_DIR"]) / "workspaceStorage" / "workspace" / "workspace.json"
+    if not path.exists():
+        path.parent.mkdir(parents=True)
+        workspace.parent.mkdir(parents=True)
+        workspace.write_text(json.dumps({"folder": "file:///example/cursor-fixture"}))
+        with sqlite3.connect(path) as conn:
+            conn.execute("CREATE TABLE composerHeaders (composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, value)")
+            conn.execute("INSERT INTO composerHeaders VALUES (?, ?, ?, ?, ?, ?)",
+                ("cursor-fixture", "workspace", 1, 2, 0, json.dumps({"name": "IDE title"})))
+            conn.execute("CREATE TABLE cursorDiskKV (key, value)")
+            conn.execute("INSERT INTO cursorDiskKV VALUES (?, ?)",
+                ("composerData:cursor-fixture", json.dumps({"fullConversationHeadersOnly": [{"bubbleId": "one"}]})))
+            conn.execute("INSERT INTO cursorDiskKV VALUES (?, ?)", ("bubbleId:cursor-fixture:one", ""))
+    with sqlite3.connect(path) as conn:
+        # lastUpdatedAt stays at 2, as when Cursor rewrites a bubble without touching the header.
+        conn.execute("UPDATE cursorDiskKV SET value = ? WHERE key = ?", (json.dumps(
+            {"type": 1, "text": text, "createdAt": "2026-01-01T10:00:00Z"}), "bubbleId:cursor-fixture:one"))
+
+
+def test_sync_recaptures_a_cursor_ide_row_change_under_an_unchanged_header(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    write_cursor_ide(env, "old IDE question")
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "cursor")
+    write_cursor_ide(env, "updated IDE question")
+    assert run(env, "scripts/archive-sync.py", "--source", "cursor") == {"uploaded": 1, "unchanged": 0}
+
+
+def test_sync_reconciles_an_archive_rolled_back_to_an_older_revision(tmp_path, archive):
+    _, client, url = archive
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    sidecar = path.parent / "session-one" / "tool-results" / "result.txt"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text("old output")
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    key, old = [(row["key"], row["revision"]) for row in client.list_conversations()][0]
+    archived = path.stat().st_mtime_ns
+    sidecar.write_text("new output, longer")
+    os.utime(path, ns=(archived, archived))
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    current = list(client.list_conversations())[0]["revision"]
+    client.put(client.read_conversation(key, old), {}, current)
+    run(env, "scripts/archive-sync.py", "--source", "claude")
+    assert client.read_capture(key)["originals"][str(sidecar)] == b"new output, longer"
 
 
 def test_capture_skips_symlinks_inside_a_claude_session_folder(tmp_path, archive):

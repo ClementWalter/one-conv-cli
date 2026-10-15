@@ -54,6 +54,23 @@ def as_box(url, box):
     return hubclient.HubClient(url, box, "box")
 
 
+def test_outgoing_human_remote_direct_message_is_logged_once(hub):
+    router.send("box/claude:b1", "Please review the release.", None, origin="user")
+    rows = (router.live_home() / "messages.jsonl").read_text().splitlines()
+    assert [(json.loads(row)["from"], json.loads(row)["to"], json.loads(row)["text"]) for row in rows] == [
+        ("user", "box/claude:b1", "Please review the release.")]
+
+
+def test_remote_direct_message_keeps_its_topic_in_the_log(hub):
+    router.send("box/claude:b1", "Please review the release.", None, origin="user", topic="release")
+    assert json.loads((router.live_home() / "messages.jsonl").read_text())["topic"] == "release"
+
+
+def test_remote_direct_message_does_not_add_a_local_topic_record(hub):
+    router.send("box/claude:b1", "Please review the release.", None, origin="user", topic="release")
+    assert team._messages("release") == []
+
+
 def test_join_registers_the_member_on_the_hub(hub):
     state, _, _ = hub
     team.join("release", MAC_SESSION)

@@ -30,7 +30,7 @@ RATE_WINDOW_SECONDS = 300
 FYI_KEEP_SECONDS = 7 * 24 * 3600
 # messages.jsonl keeps this many of the latest messages, for `live web` and later reading.
 MESSAGE_LOG = 2000
-# Longer texts are cut in the log only; the delivered message is never shortened.
+# Agent-to-agent diagnostic copies are shortened; human conversations keep complete text.
 MESSAGE_LOG_TEXT = 20_000
 # Clock skew tolerated on an existing notice; anything further ahead is corrupt.
 FYI_MAX_SKEW_SECONDS = 3600
@@ -257,7 +257,11 @@ def log_message(row: dict) -> None:
     """
     path = live_home() / "messages.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    entry = {**row, "text": str(row.get("text", ""))[:MESSAGE_LOG_TEXT], "at": row.get("at") or time.time()}
+    text = str(row.get("text", ""))
+    human = any(re.fullmatch(r"(?:[a-z0-9][a-z0-9-]{0,31}/)?user", str(row.get(field, "")))
+                for field in ("from", "to"))
+    # This log is the human inbox, so its only copy must retain the full message.
+    entry = {**row, "text": text if human else text[:MESSAGE_LOG_TEXT], "at": row.get("at") or time.time()}
     with (live_home() / ".messages.lock").open("a") as lock:
         if fcntl is not None:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -272,7 +276,7 @@ def log_message(row: dict) -> None:
 
 
 def _logged(receipt: dict, text: str, topic: str | None, fyi: bool, reply: str) -> dict:
-    """Record a finished send; the message is already out, so a log failure only warns."""
+    """Record a send; harness log failures warn, while human inbox failures propagate."""
     statuses = {row["to"]: row["status"] for row in receipt.get("deliveries", [])}
     try:
         log_message({"id": receipt.get("id"), "from": receipt.get("from"),
@@ -281,6 +285,9 @@ def _logged(receipt: dict, text: str, topic: str | None, fyi: bool, reply: str) 
                      "reply": "none" if fyi else reply,
                      "status": statuses or receipt.get("status"), "text": text})
     except OSError as error:
+        if receipt.get("delivery") == "human workspace":
+            # The log is the human's inbox, so its failure means delivery is unconfirmed.
+            raise
         logger.warning("sent, but could not log the message: %s", error)
     return receipt
 
@@ -308,8 +315,9 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
             raise LiveError(f"{target} is on machine {node}; reaching it needs this machine's bridge "
                             "(`one-conv live serve --hub ...`).")
         if node != hub.node:
-            return _post_remote(hub, target, text, sender.address if sender else origin, fyi, reply, topic,
-                                message_id)
+            receipt = _post_remote(hub, target, text, sender.address if sender else origin, fyi, reply, topic,
+                                   message_id)
+            return _logged(receipt, text, topic, fyi, reply)
         target = local  # This machine's own NODE/ prefix: deliver here.
     receipt = _send_one(target, text, sender, origin, fyi, reply, topic, message_id)
     if topic is not None:
@@ -403,6 +411,10 @@ def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id:
 
 def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
               reply: str, topic: str | None, message_id: str) -> dict:
+    if target == "user":
+        # The human workspace reads the shared log and has no harness to wake.
+        return {"to": "user", "title": "You", "cwd": "", "delivery": "human workspace",
+                "status": "stored for human", "from": sender.address if sender else origin, "id": message_id}
     session = resolve(target, exclude=sender)
     if sender is not None and session.address == sender.address:
         raise LiveError(f"{session.address} is the sending session itself.")

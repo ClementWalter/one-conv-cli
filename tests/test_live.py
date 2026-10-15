@@ -113,7 +113,7 @@ def test_envelope_without_sender_is_unknown_by_default():
 
 
 def test_envelope_from_terminal_names_the_user():
-    assert envelope("hi", None, "user").startswith('<one-conv-message from="user">')
+    assert envelope("hi", None, "user").startswith('<one-conv-message from="user" kind="human">')
 
 
 def test_envelope_tells_the_receiver_how_to_reply():

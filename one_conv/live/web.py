@@ -1,21 +1,27 @@
-"""`one-conv live web`: a read-only local page for a person to follow what the agents are doing.
+"""`one-conv live web`: a local workspace to follow agents and send human messages.
 
 Channels are topics, people are running sessions with their chosen names, and direct
-messages come from the message log every send writes. The server answers GET only, only
-for a localhost Host header (so another site cannot reach it through DNS rebinding), and
-the page renders every message as text, never as markup.
+messages come from the message log every send writes. Reads never move an agent's catch-up
+position. Writes require a per-instance token and the same loopback origin; all routes
+require a localhost Host header. The page renders messages as text, never as markup.
 """
 
+import hmac
 import json
+import logging
+import secrets
+import sqlite3
 import time
 from collections import defaultdict
+from pathlib import Path
 
-from . import router, team
+from . import router, team, web_send
 from .model import live_home
 
 # The viewer is a reader of its own: it never moves an agent's catch-up position.
 VIEWER = "web-viewer"
 MESSAGES_SHOWN = 300
+logger = logging.getLogger(__name__)
 
 
 def _bridge_state() -> dict | None:
@@ -91,10 +97,13 @@ SECURITY_HEADERS = {
 
 def application(port: int):
     from starlette.applications import Starlette
+    from starlette.concurrency import run_in_threadpool
+    from starlette.requests import ClientDisconnect
     from starlette.responses import JSONResponse, Response
     from starlette.routing import Route
 
     allowed = {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"}
+    token = secrets.token_urlsafe(32)
 
     def guarded(work, media_type="application/json"):
         async def endpoint(request):
@@ -109,6 +118,53 @@ def application(port: int):
             return Response(body, media_type=media_type, headers=SECURITY_HEADERS)
         return endpoint
 
+    async def message(request):
+        host = request.headers.get("host")
+        if host not in allowed:
+            return JSONResponse({"error": "Open the workspace through its localhost address."},
+                                status_code=421, headers=SECURITY_HEADERS)
+        try:
+            if request.headers.get("origin") != f"http://{host}":
+                raise web_send.SendError("Send from the workspace's own browser tab.", 403)
+            supplied = request.headers.get("x-one-conv-token", "")
+            if not hmac.compare_digest(supplied.encode(), token.encode()):
+                raise web_send.SendError("Refresh the workspace before sending; its session token is missing or expired.",
+                                         403)
+            content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+            if content_type != "application/json" or request.headers.get("content-encoding", "identity") != "identity":
+                raise web_send.SendError("Send a JSON message using Content-Type: application/json.", 415)
+            declared = request.headers.get("content-length")
+            if declared is not None:
+                try:
+                    length = int(declared)
+                except ValueError:
+                    raise web_send.SendError("Content-Length must be a nonnegative byte count.") from None
+                if length < 0:
+                    raise web_send.SendError("Content-Length must be a nonnegative byte count.")
+                if length > web_send.BODY_LIMIT:
+                    raise web_send.SendError("This message is too large; shorten it before sending.", 413)
+            body = bytearray()
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > web_send.BODY_LIMIT:
+                    raise web_send.SendError("This message is too large; shorten it before sending.", 413)
+                body.extend(chunk)
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeError, ValueError, RecursionError):
+                raise web_send.SendError("The message must be valid UTF-8 JSON.") from None
+            status, result = await run_in_threadpool(web_send.send, payload)
+        except web_send.SendError as error:
+            return JSONResponse({"error": str(error)}, status_code=error.status, headers=SECURITY_HEADERS)
+        except ClientDisconnect:
+            return JSONResponse({"error": "The connection closed before the message was accepted."},
+                                status_code=400, headers=SECURITY_HEADERS)
+        except (OSError, sqlite3.Error):
+            logger.exception("Could not open the human message journal")
+            return JSONResponse({"error": "The message journal is unavailable. Check local disk access, "
+                                          "then retry with the same message id."},
+                                status_code=503, headers=SECURITY_HEADERS)
+        return JSONResponse(result, status_code=status, headers=SECURITY_HEADERS)
+
     return Starlette(routes=[
         Route("/", guarded(lambda request: PAGE, "text/html; charset=utf-8")),
         Route("/app.js", guarded(lambda request: SCRIPT, "text/javascript; charset=utf-8")),
@@ -116,171 +172,12 @@ def application(port: int):
         Route("/api/state", guarded(lambda request: state())),
         Route("/api/topics/{topic}", guarded(lambda request: topic_messages(request.path_params["topic"]))),
         Route("/api/direct", guarded(lambda request: direct())),
+        Route("/api/session", guarded(lambda request: {"csrf_token": token,
+              "human": {"address": "user", "name": "You", "kind": "human"}})),
+        Route("/api/messages", message, methods=["POST"]),
     ])
 
 
-PAGE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>one-conv live</title>
-<link rel="stylesheet" href="/app.css">
-</head>
-<body>
-<aside>
-  <h1>one-conv live</h1>
-  <p id="bridge" class="muted"></p>
-  <h2>Channels</h2><ul id="topics"></ul>
-  <h2>Direct messages</h2><ul id="threads"></ul>
-  <h2>People</h2><ul id="people"></ul>
-</aside>
-<main>
-  <header><h2 id="title">Pick a channel</h2><p id="subtitle" class="muted"></p></header>
-  <ol id="messages"></ol>
-</main>
-<script src="/app.js"></script>
-</body>
-</html>
-"""
-
-STYLE = """
-:root { --bg: #ffffff; --fg: #1d1c1d; --muted: #616061; --side: #3f0e40; --side-fg: #e8dfe8;
-        --active: #1164a3; --line: #e2e2e2; }
-@media (prefers-color-scheme: dark) {
-  :root { --bg: #1a1d21; --fg: #d1d2d3; --muted: #9a9b9e; --side: #19171d; --side-fg: #cfc3cf;
-          --active: #1164a3; --line: #35373b; }
-}
-* { box-sizing: border-box; }
-body { margin: 0; display: flex; height: 100vh; font: 15px/1.45 -apple-system, system-ui, sans-serif;
-       background: var(--bg); color: var(--fg); }
-aside { width: 270px; flex: none; background: var(--side); color: var(--side-fg); padding: 16px; overflow-y: auto; }
-aside h1 { font-size: 18px; margin: 0 0 4px; }
-aside h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; margin: 20px 0 6px; opacity: .8; }
-aside ul { list-style: none; margin: 0; padding: 0; }
-aside li { padding: 4px 8px; border-radius: 6px; cursor: pointer; overflow: hidden; text-overflow: ellipsis;
-           white-space: nowrap; }
-aside li:hover { background: rgba(255,255,255,.08); }
-aside li.active { background: var(--active); color: #fff; }
-aside li.person { cursor: default; }
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #8a8a8a; }
-.dot.on { background: #2bac76; }
-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-header { padding: 14px 20px; border-bottom: 1px solid var(--line); }
-header h2 { margin: 0; font-size: 17px; }
-.muted { color: var(--muted); margin: 2px 0 0; font-size: 13px; }
-aside .muted { color: var(--side-fg); opacity: .7; }
-ol { list-style: none; margin: 0; padding: 12px 20px; overflow-y: auto; flex: 1; }
-ol li { padding: 8px 0; border-bottom: 1px solid var(--line); }
-.who { font-weight: 600; }
-.when { color: var(--muted); font-size: 12px; margin-left: 8px; }
-.status { color: var(--muted); font-size: 12px; margin-left: 8px; }
-.text { white-space: pre-wrap; word-break: break-word; margin-top: 2px; }
-@media (max-width: 700px) { body { flex-direction: column; } aside { width: auto; max-height: 40vh; } }
-"""
-
-SCRIPT = r"""
-"use strict";
-let view = null;
-let names = {};
-
-function el(tag, text, cls) {
-  const node = document.createElement(tag);
-  if (text !== undefined && text !== null) node.textContent = String(text);
-  if (cls) node.className = cls;
-  return node;
-}
-function label(address) {
-  if (!address) return "unknown";
-  const tail = String(address).split("/").pop();
-  for (const [name, bound] of Object.entries(names)) {
-    if (bound === address || bound === tail) return "@" + name;
-  }
-  return String(address);
-}
-function when(seconds) {
-  return seconds ? new Date(seconds * 1000).toLocaleString() : "";
-}
-async function get(path) {
-  const response = await fetch(path, { headers: { "Accept": "application/json" } });
-  return response.json();
-}
-function select(kind, key) {
-  view = { kind, key };
-  refreshView();
-  refreshSide();
-}
-function item(list, text, active, onclick, cls) {
-  const li = el("li", text, cls);
-  if (active) li.classList.add("active");
-  if (onclick) li.addEventListener("click", onclick);
-  list.appendChild(li);
-  return li;
-}
-async function refreshSide() {
-  const state = await get("/api/state");
-  names = state.names || {};
-  const bridge = document.getElementById("bridge");
-  bridge.textContent = state.bridge ? ("bridge " + (state.bridge.connected ? "connected" : "not connected") +
-    (state.bridge.node ? " as " + state.bridge.node : "")) : "no bridge: local topics only";
-  const topics = document.getElementById("topics");
-  topics.replaceChildren();
-  for (const topic of state.topics || []) {
-    item(topics, "# " + topic.topic + "  (" + topic.members.length + ")",
-         view && view.kind === "topic" && view.key === topic.topic, () => select("topic", topic.topic));
-  }
-  if (!(state.topics || []).length) topics.appendChild(el("li", "none yet", "person"));
-  const people = document.getElementById("people");
-  people.replaceChildren();
-  for (const session of state.sessions || []) {
-    const li = item(people, "", false, null, "person");
-    li.appendChild(el("span", "", "dot" + (session.status === "idle" || session.status === "busy" ? " on" : "")));
-    li.appendChild(el("span", session.name ? "@" + session.name : (session.title || session.address)));
-    li.title = session.address + (session.status ? " (" + session.status + ")" : "");
-  }
-  const direct = await get("/api/direct");
-  const threads = document.getElementById("threads");
-  threads.replaceChildren();
-  for (const thread of direct.threads || []) {
-    const [a, b] = thread.pair.split(" ");
-    item(threads, label(a) + " / " + label(b), view && view.kind === "direct" && view.key === thread.pair,
-         () => select("direct", thread.pair));
-  }
-  if (!(direct.threads || []).length) threads.appendChild(el("li", "none yet", "person"));
-}
-function render(rows, subtitle) {
-  const list = document.getElementById("messages");
-  const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 40;
-  list.replaceChildren();
-  for (const row of rows) {
-    const li = el("li");
-    li.appendChild(el("span", label(row.from), "who"));
-    if (row.to && view.kind === "direct") li.appendChild(el("span", "to " + label(row.to), "status"));
-    li.appendChild(el("span", when(row.at), "when"));
-    if (row.mode === "fyi") li.appendChild(el("span", "FYI (did not wake the receiver)", "status"));
-    if (row.status && typeof row.status === "string") li.appendChild(el("span", row.status, "status"));
-    li.appendChild(el("div", row.text, "text"));
-    list.appendChild(li);
-  }
-  if (!rows.length) list.appendChild(el("li", "No messages yet.", "muted"));
-  document.getElementById("subtitle").textContent = subtitle || "";
-  if (atBottom) list.scrollTop = list.scrollHeight;
-}
-async function refreshView() {
-  if (!view) return;
-  if (view.kind === "topic") {
-    document.getElementById("title").textContent = "# " + view.key;
-    const data = await get("/api/topics/" + encodeURIComponent(view.key));
-    render(data.messages || [], data.error || (data.omitted ? data.omitted + " older messages not shown" : ""));
-  } else {
-    const [a, b] = view.key.split(" ");
-    document.getElementById("title").textContent = label(a) + " / " + label(b);
-    const direct = await get("/api/direct");
-    const thread = (direct.threads || []).find((t) => t.pair === view.key);
-    render(thread ? thread.messages : [], a + "  ·  " + b);
-  }
-}
-refreshSide();
-setInterval(refreshSide, 5000);
-setInterval(refreshView, 3000);
-"""
+PAGE = Path(__file__).with_name("web_assets").joinpath("index.html").read_text(encoding="utf-8")
+STYLE = Path(__file__).with_name("web_assets").joinpath("app.css").read_text(encoding="utf-8")
+SCRIPT = Path(__file__).with_name("web_assets").joinpath("app.js").read_text(encoding="utf-8")

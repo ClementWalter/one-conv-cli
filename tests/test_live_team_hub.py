@@ -1,6 +1,7 @@
 """Topics shared through a real local hub: membership, fan-out, dedup, catch-up, outbox, redirects."""
 
 import json
+import os
 import socket
 import threading
 
@@ -423,3 +424,40 @@ def test_drain_after_a_transient_error_posts_on_the_next_attempt(tmp_path, monke
     hubclient.drain(_stub_post(monkeypatch, hubclient.HubRefused(503, "busy")))
     monkeypatch.setattr(hubclient.HubClient, "post", lambda self, m: {"id": m["id"], "recipients": []})
     assert hubclient.drain(hubclient.HubClient("http://127.0.0.1:9", "t"))["sent"] == ["a" * 32]
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_redirect_answer_keeps_the_message_queued(tmp_path, monkeypatch, status):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.submit(_stub_post(monkeypatch, hubclient.HubRefused(status, "moved")), dict(MESSAGE))
+    assert (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+@pytest.mark.parametrize("rows", [[{}], [None], [{"to": "box/omp:worker"}], [{"status": "stored"}],
+                                  [{"to": 1, "status": "stored"}]])
+def test_receipt_with_malformed_recipients_keeps_the_message_queued(tmp_path, monkeypatch, rows):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    hubclient.submit(_stub_post(monkeypatch, {"id": MESSAGE["id"], "recipients": rows}), dict(MESSAGE))
+    assert (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+def test_receipt_with_complete_recipients_is_accepted(tmp_path, monkeypatch):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    receipt = {"id": MESSAGE["id"], "recipients": [{"to": "box/omp:worker", "status": "stored"}]}
+    hubclient.submit(_stub_post(monkeypatch, receipt), dict(MESSAGE))
+    assert not (hubclient.outbox() / f"{MESSAGE['id']}.json").exists()
+
+
+def test_drain_survives_a_file_removed_while_it_lists_the_outbox(tmp_path, monkeypatch):
+    _queued(tmp_path, monkeypatch, "a" * 32, "b" * 32)
+    real_stat = type(hubclient.outbox()).stat
+    gone = hubclient.outbox() / f"{'a' * 32}.json"
+
+    def stat(self, *args, **kwargs):
+        if self == gone and os.path.exists(self):
+            os.unlink(self)  # A concurrent submit() got its receipt and removed the file.
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(gone), "stat", stat)
+    monkeypatch.setattr(hubclient.HubClient, "post", lambda self, m: {"id": m["id"], "recipients": []})
+    assert hubclient.drain(hubclient.HubClient("http://127.0.0.1:9", "t"))["sent"] == ["b" * 32]

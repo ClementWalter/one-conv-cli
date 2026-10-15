@@ -142,8 +142,12 @@ RETRYABLE = {408, 425, 429}
 
 
 def _receipt_for(receipt, message_id: str) -> bool:
-    return (isinstance(receipt, dict) and receipt.get("id") == message_id
-            and isinstance(receipt.get("recipients"), list))
+    """A receipt names this id and lists recipients whose fields callers read; an empty list is valid."""
+    if not (isinstance(receipt, dict) and receipt.get("id") == message_id
+            and isinstance(receipt.get("recipients"), list)):
+        return False
+    return all(isinstance(row, dict) and isinstance(row.get("to"), str) and isinstance(row.get("status"), str)
+               for row in receipt["recipients"])
 
 
 def submit(hub: HubClient, message: dict) -> dict | None:
@@ -171,9 +175,10 @@ def _outcome(hub: HubClient, message: dict) -> tuple[str, object]:
     except HubUnavailable as error:
         return "retry", error
     except HubRefused as error:
-        if error.status >= 500 or error.status in RETRYABLE:
-            return "retry", error
-        return "refused", error
+        # Only a 4xx is the hub's verdict on this message; a redirect or 5xx may follow a commit.
+        if 400 <= error.status < 500 and error.status not in RETRYABLE:
+            return "refused", error
+        return "retry", error
     if not _receipt_for(receipt, message["id"]):
         return "retry", "the hub's answer is not a receipt for this message"
     return "sent", receipt
@@ -187,10 +192,19 @@ def drain(hub: HubClient) -> dict:
     keeps the rest queued under their ids, so the order is kept for the next attempt.
     """
     sent, refused, waiting = [], [], []
-    files = sorted(outbox().glob("*.json"), key=lambda path: (path.stat().st_mtime_ns, path.name))
+    # A sender's own submit() can remove a file at any moment, so each step tolerates its absence.
+    stamped = []
+    for path in outbox().glob("*.json"):
+        try:
+            stamped.append((path.stat().st_mtime_ns, path.name, path))
+        except FileNotFoundError:
+            continue
+    files = [path for _, _, path in sorted(stamped)]
     for index, path in enumerate(files):
         try:
             message = json.loads(path.read_text())
+        except FileNotFoundError:
+            continue
         except (OSError, ValueError):
             continue  # Unreadable files stay for a person to look at; they never block the rest.
         state, detail = _outcome(hub, message)
@@ -199,10 +213,13 @@ def drain(hub: HubClient) -> dict:
             sent.append(message["id"])
         elif state == "refused":
             (outbox() / "refused").mkdir(exist_ok=True)
-            os.replace(path, outbox() / "refused" / path.name)
+            try:
+                os.replace(path, outbox() / "refused" / path.name)
+            except FileNotFoundError:
+                pass
             refused.append({"id": message["id"], "error": str(detail)})
         else:
-            waiting = [p.stem for p in files[index:]]
+            waiting = [p.stem for p in files[index:] if p.exists()]
             break
     return {"sent": sent, "refused": refused, "waiting": waiting}
 

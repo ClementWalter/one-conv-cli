@@ -1,6 +1,5 @@
 """Versioned archive transport and capture format, shared by the client and the server."""
 
-from concurrent.futures import ThreadPoolExecutor
 import base64
 import hashlib
 import json
@@ -8,10 +7,11 @@ import math
 import os
 import re
 import tempfile
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, build_opener, HTTPRedirectHandler
-import zlib
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 CHUNK_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 16 * 1024 * 1024

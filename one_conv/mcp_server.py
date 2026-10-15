@@ -163,7 +163,8 @@ def create_server() -> MCPServer:
         me = _caller(ctx)
         try:
             joined = team.join(topic, me.address)
-            return {"members": team.members(joined), **team.catch_up(joined, me.address)}
+            # "history" marks these as already exchanged, so they are not acted on as new requests.
+            return {"members": team.members(joined), "kind": "history", **team.catch_up(joined, me.address)}
         except team.TeamError as error:
             raise ValueError(str(error)) from error
 

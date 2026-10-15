@@ -113,8 +113,21 @@ def start(harness: str, prompt: str, cwd: Path, model: str | None = None, extra:
     return spawned
 
 
+# What tmux says when the session, or its whole server, is gone; any other failure proves nothing.
+ABSENT = ("can't find session", "no server running on")
+
+
+def _state(tmux_name: str) -> str:
+    """alive, absent, or unknown when tmux could not be asked (a connection or permission error)."""
+    result = subprocess.run(["tmux", "has-session", "-t", tmux_name], capture_output=True, text=True, check=False)
+    if result.returncode == 0:
+        return "alive"
+    return "absent" if any(phrase in (result.stderr or "") for phrase in ABSENT) else "unknown"
+
+
 def _alive(tmux_name: str) -> bool:
-    return subprocess.run(["tmux", "has-session", "-t", tmux_name], capture_output=True, check=False).returncode == 0
+    """False only when tmux reports the session gone, so an unreachable server never drops an agent."""
+    return _state(tmux_name) != "absent"
 
 
 # Claude Code's first-visit question for a folder; its default answer is "No, exit".
@@ -218,8 +231,9 @@ def stop(target: str) -> dict:
     if name is None:
         raise SpawnError(f"no spawned agent matches {target!r}; see `one-conv live spawned`")
     result = subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True, text=True, check=False)
-    if _alive(name):
-        # The agent still runs: keep its record and its listing so it can be reached or stopped again.
+    # Only tmux confirming the session gone ends it; a failed kill with that confirmation means it had already ended.
+    if _state(name) != "absent":
+        # It may still run: keep its record and its listing so it can be reached or stopped again.
         raise SpawnError(f"could not end tmux session {name}: {(result.stderr or '').strip() or result.returncode}")
     row = rows.pop(name)
     _save(rows)

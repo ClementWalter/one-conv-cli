@@ -171,12 +171,40 @@ def test_stop_refuses_an_unknown_agent(homes):
         spawn.stop("codex:nobody")
 
 
-@pytest.fixture
-def unkillable(homes, monkeypatch):
-    """A spawned Codex agent whose tmux session survives kill-session."""
+def tmux_answers(monkeypatch, kill: tuple[int, str], has: tuple[int, str]) -> None:
+    """tmux kill-session and has-session each exit with this (status, stderr)."""
+    def run(argv, **kw):
+        status, stderr = kill if argv[1] == "kill-session" else has
+        return subprocess.CompletedProcess(argv, status, "", stderr)
+    monkeypatch.setattr(spawn.subprocess, "run", run)
+
+
+@pytest.mark.parametrize("stderr, state", [
+    ("can't find session: oneconv-c", "absent"),
+    ("no server running on /private/tmp/tmux-501/default", "absent"),
+    ("error connecting to /private/tmp/tmux-501/default (Permission denied)", "unknown"),
+])
+def test_a_failed_tmux_probe_is_absent_only_when_tmux_says_so(monkeypatch, stderr, state):
+    tmux_answers(monkeypatch, kill=(1, ""), has=(1, stderr))
+    assert spawn._state("oneconv-c") == state
+
+
+@pytest.fixture(params=["kill fails, session still there", "kill and probe both cannot reach the server"])
+def unkillable(homes, monkeypatch, request):
+    """A spawned Codex agent that kill-session did not end, or whose end tmux cannot confirm."""
     spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": f"codex:{THREAD}"}})
-    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "denied"))
-    monkeypatch.setattr(spawn, "_alive", lambda name: True)
+    unreachable = (1, "error connecting to /private/tmp/tmux-501/default (Permission denied)")
+    if request.param.startswith("kill fails"):
+        tmux_answers(monkeypatch, kill=(1, "denied"), has=(0, ""))
+    else:
+        tmux_answers(monkeypatch, kill=unreachable, has=unreachable)
+
+
+def test_stop_accepts_a_session_that_had_already_ended(homes, monkeypatch):
+    spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": "claude:x"}})
+    tmux_answers(monkeypatch, kill=(1, "can't find session: oneconv-c"), has=(1, "can't find session: oneconv-c"))
+    spawn.stop("claude:x")
+    assert spawn._load() == {}
 
 
 def test_stop_reports_a_session_it_could_not_end(unkillable):
@@ -208,8 +236,7 @@ def test_a_stopped_codex_thread_is_not_listed_while_its_lock_lingers(homes, monk
     old = time.time() - 60
     os.utime(path, (old, old))
     spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": f"codex:{THREAD}"}})
-    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
-    monkeypatch.setattr(spawn, "_alive", lambda name: False)
+    tmux_answers(monkeypatch, kill=(0, ""), has=(1, "can't find session: oneconv-c"))
     spawn.stop(f"codex:{THREAD}")
     assert THREAD not in [s.id for s in codex.list_sessions()]
 

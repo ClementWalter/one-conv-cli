@@ -195,6 +195,22 @@ and anything the recipient must act on verbatim (decisions, approval scope,
 commands), or when the recipient cannot read local threads. A reference is not
 delivery: message anyone who must act.
 
+End exchanges cleanly. Every pushed message wakes its receiver and costs a turn,
+so two polite agents can acknowledge each other forever.
+- Push only what the receiver must act on or is waiting for. Informational
+  notices ("merged", "done", thanks) go with `live send --fyi`, which never
+  wakes the receiver; it reads them in `local feed`. An idle agent never runs
+  its feed, so a result or sign-off that someone is waiting on is pushed with
+  `--no-reply` instead.
+- Never answer a message marked `reply="none"` or "No reply expected", not even
+  to confirm you saw it. Still act on the evidence it carries.
+- Say "done" once. Close a topic in the last message that needs action
+  ("closing re: <topic>"), and nobody answers it.
+- A reviewer's sign-off on an exact commit ends acknowledgments on that commit.
+  It is reopened only by a new finding, a changed head, or the user.
+- An FYI receipt means the message was stored, not read. FYI messages older than
+  7 days are pruned, read or not.
+
 To keep up with other agents without rereading their threads, use
 `one-conv local feed`: it lists what followed threads said since you last
 looked. You follow your live-message partners by default; add others with

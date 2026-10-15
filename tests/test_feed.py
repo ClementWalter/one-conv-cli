@@ -148,6 +148,15 @@ def _unreadable_thread() -> feed.Thread:
                        render=lambda turn: turn.text)
 
 
+def test_backend_error_on_one_thread_still_shows_the_others(state):
+    def load():
+        raise RuntimeError("archive chunk returned HTTP 404")
+    broken = feed.Thread("claude:broken-0000", "broken", "/work", "", load=load,
+                         visible=lambda rows: rows, render=lambda turn: turn.text)
+    result = feed.digest(state, {"claude:broken-0000": broken, PEER: stub_thread(conversation(4))}, 1500, peek=False)
+    assert [t["address"] for t in result["threads"]] == [PEER]
+
+
 def test_unreadable_transcript_keeps_positions(state):
     feed.digest(state, {PEER: stub_thread(conversation(4))}, 1500, peek=False)
     before = json.dumps(state.positions(PEER))
@@ -198,6 +207,121 @@ def test_match_address_needs_exact_or_unique_prefix(target, expected):
 def test_match_address_with_several_prefix_matches_is_ambiguous():
     with pytest.raises(feed.Ambiguous):
         feed.match_address("codex:0", ["codex:01a13cb5", "codex:0bbb"])
+
+
+def fyi(path: Path, n: int, start: int = 0, at: float = 1000.0) -> None:
+    with path.open("a") as handle:
+        for i in range(start, start + n):
+            handle.write(json.dumps({"id": f"m{i}", "at": at + i, "from": PEER, "to": READER,
+                                     "text": f'<one-conv-message from="{PEER}" reply="none">\nnote {i}\n'
+                                             f"</one-conv-message>\nNo reply expected."}) + "\n")
+
+
+@pytest.fixture
+def inbox(tmp_path):
+    return tmp_path / "inbox.jsonl"
+
+
+def test_message_body_strips_the_envelope():
+    assert feed.message_body('<one-conv-message from="x">\nhello\n</one-conv-message>\nNo reply expected.') == "hello"
+
+
+def test_inbox_digest_lists_each_unseen_message(state, inbox):
+    fyi(inbox, 2)
+    assert len(feed.inbox_digest(state, inbox, 1500, peek=False)["lines"]) == 2
+
+
+def test_inbox_digest_line_shows_the_body(state, inbox):
+    fyi(inbox, 1)
+    assert feed.inbox_digest(state, inbox, 1500, peek=False)["lines"][0].endswith("note 0")
+
+
+def test_repeated_inbox_digest_is_quiet(state, inbox):
+    fyi(inbox, 2)
+    feed.inbox_digest(state, inbox, 1500, peek=False)
+    assert feed.inbox_digest(state, inbox, 1500, peek=False)["lines"] == []
+
+
+def test_inbox_digest_then_full_still_returns_the_text(state, inbox):
+    fyi(inbox, 2)
+    feed.inbox_digest(state, inbox, 1500, peek=False)
+    assert [m["body"] for m in feed.inbox_full(state, inbox, peek=False)] == ["note 0", "note 1"]
+
+
+def test_inbox_full_after_append_returns_only_new(state, inbox):
+    fyi(inbox, 2)
+    feed.inbox_full(state, inbox, peek=False)
+    fyi(inbox, 1, start=2)
+    assert [m["body"] for m in feed.inbox_full(state, inbox, peek=False)] == ["note 2"]
+
+
+def test_inbox_peek_moves_nothing(state, inbox):
+    fyi(inbox, 2)
+    feed.inbox_digest(state, inbox, 1500, peek=True)
+    assert state.data.get("inbox") == {}
+
+
+def test_inbox_cap_leaves_the_rest_pending(state, inbox):
+    fyi(inbox, 3)
+    feed.inbox_digest(state, inbox, 80, peek=False)
+    assert len(feed.inbox_digest(state, inbox, 1500, peek=False)["lines"]) == 2
+
+
+def test_inbox_after_pruning_resumes_by_time(state, inbox):
+    fyi(inbox, 3)
+    feed.inbox_full(state, inbox, peek=False)
+    inbox.write_text("")
+    fyi(inbox, 2, start=3)
+    assert [m["body"] for m in feed.inbox_full(state, inbox, peek=False)] == ["note 3", "note 4"]
+
+
+def test_digest_messages_carry_a_bounded_excerpt(state, inbox):
+    inbox.write_text(json.dumps({"id": "big", "at": 1000.0, "from": PEER, "text": "x" * 100_000}) + "\n")
+    message = feed.inbox_digest(state, inbox, 80, peek=False)["messages"][0]
+    assert len(json.dumps(message)) < 400
+
+
+def test_unreadable_inbox_is_reported_unavailable(state, tmp_path):
+    directory = tmp_path / "inbox.jsonl"
+    directory.mkdir()
+    assert feed.inbox_digest(state, directory, 1500, peek=False)["unavailable"] is True
+
+
+def test_unreadable_inbox_keeps_positions(state, inbox):
+    fyi(inbox, 2)
+    feed.inbox_full(state, inbox, peek=False)
+    before = json.dumps(state.data["inbox"])
+    inbox.unlink()
+    inbox.mkdir()
+    feed.inbox_digest(state, inbox, 1500, peek=False)
+    assert json.dumps(state.data["inbox"]) == before
+
+
+def test_full_on_unreadable_inbox_raises_unavailable(state, inbox):
+    inbox.mkdir()
+    with pytest.raises(feed.Unavailable):
+        feed.inbox_full(state, inbox, peek=False)
+
+
+@pytest.mark.parametrize("bad", [
+    {"id": "b", "at": float("inf"), "text": "t"}, {"id": "b", "at": 1e100, "text": "t"},
+    {"id": "b", "at": 10 ** 1000, "text": "t"},
+    {"id": "b", "at": 1000.0, "text": None}, {"id": "b", "at": True, "text": "t"},
+    {"id": 7, "at": 1000.0, "text": "t"}, {"id": "b", "at": 1000.0, "text": "t", "from": 3}])
+def test_malformed_row_does_not_hide_a_later_valid_one(state, inbox, bad):
+    inbox.write_text(json.dumps(bad) + "\n")
+    fyi(inbox, 1, at=2000.0)
+    assert [m["excerpt"] for m in feed.inbox_digest(state, inbox, 1500, peek=False)["messages"]] == ["note 0"]
+
+
+def test_missing_inbox_is_empty(state, tmp_path):
+    assert feed.inbox_digest(state, tmp_path / "absent.jsonl", 1500, peek=False)["lines"] == []
+
+
+def test_malformed_inbox_line_is_skipped(state, inbox):
+    inbox.write_text("{\n")
+    fyi(inbox, 1)
+    assert len(feed.inbox_digest(state, inbox, 1500, peek=False)["lines"]) == 1
 
 
 def test_state_filename_never_contains_the_address(tmp_path):
@@ -346,6 +470,43 @@ def test_cursor_agent_store_is_always_parsed(tmp_path, monkeypatch):
     store.write_bytes(b"sqlite")
     handle = launcher.SessionHandle(source="cursor-cli", uuid="c1", project_cwd="/work", path=store)
     assert launcher._feed_stamp(handle) == ""
+
+
+@pytest.fixture
+def live_claude_target(cli_env, tmp_path):
+    """A running Claude Code session record owned by a process outside the sender's ancestry."""
+    process = subprocess.Popen(["sleep", "60"])
+    session_id = "bbbb2222-0000-4000-8000-000000000001"
+    sessions = tmp_path / "claude" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / f"{process.pid}.json").write_text(json.dumps(
+        {"pid": process.pid, "sessionId": session_id, "cwd": "/work/app", "name": "target",
+         "status": "idle", "messagingSocketPath": str(tmp_path / "no-socket.sock")}))
+    yield f"claude:{session_id}"
+    process.kill()
+
+
+def send_fyi(env: dict, target: str, text: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(CLI), "live", "send", target, text, "--fyi", "--yes", "--json"],
+                          capture_output=True, text=True, env=env, check=False)
+
+
+def test_cli_fyi_send_reports_stored_not_delivered(cli_env, live_claude_target):
+    assert json.loads(send_fyi(cli_env, live_claude_target, "merged, nothing to do").stdout)["status"] == "stored FYI"
+
+
+def test_cli_fyi_reaches_the_readers_feed(cli_env, live_claude_target):
+    send_fyi(cli_env, live_claude_target, "merged, nothing to do")
+    result = subprocess.run([sys.executable, str(CLI), "local", "feed", "--as", live_claude_target],
+                            capture_output=True, text=True, env=cli_env, check=False)
+    assert "merged, nothing to do" in result.stdout
+
+
+def test_cli_fyi_full_inbox_returns_the_body(cli_env, live_claude_target):
+    send_fyi(cli_env, live_claude_target, "merged, nothing to do")
+    result = subprocess.run([sys.executable, str(CLI), "local", "feed", "--as", live_claude_target,
+                             "--full", "inbox", "--json"], capture_output=True, text=True, env=cli_env, check=False)
+    assert [m["body"] for m in json.loads(result.stdout)["inbox"]] == ["merged, nothing to do"]
 
 
 def test_cli_follow_unknown_address_fails(cli_env):

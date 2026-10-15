@@ -188,9 +188,18 @@ def _append_fyi(target: str, sender: str, text: str) -> None:
             fcntl.flock(lock, fcntl.LOCK_EX)
         now = time.time()
         try:
-            rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+            lines = path.read_text().splitlines()
         except FileNotFoundError:
-            rows = []
+            lines = []
+        rows = []
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                # A corrupt line is dropped on rewrite; failing here would lose every later notice.
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
         # Never decreasing `at` lets a reader resume after the last entry it saw.
         at = max([now, *(r.get("at", 0) for r in rows)])
         kept = [r for r in rows if now - r.get("at", 0) < FYI_KEEP_SECONDS]

@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -299,10 +300,53 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
             topic = team._check("topic", topic)
     except team.TeamError as error:
         raise LiveError(str(error)) from error
+    node, local = remote_address(target)
+    if node is not None:
+        hub = hubclient.configured()
+        if hub is None:
+            raise LiveError(f"{target} is on machine {node}; reaching it needs this machine's bridge "
+                            "(`one-conv live serve --hub ...`).")
+        if node != hub.node:
+            return _post_remote(hub, target, text, sender.address if sender else origin, fyi, reply, topic,
+                                message_id)
+        target = local  # This machine's own NODE/ prefix: deliver here.
     receipt = _send_one(target, text, sender, origin, fyi, reply, topic, message_id)
     if topic is not None:
         team.record(topic, message_id, receipt["from"], text)
     return _logged(receipt, text, topic, fyi, reply)
+
+
+# A machine's name in a NODE/harness:id address, as the hub accepts it.
+NODE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+
+
+def remote_address(target: str) -> tuple[str | None, str]:
+    """Split NODE/harness:id; anything else, Boat's boat:sandbox/conversation included, is local."""
+    node, sep, local = target.partition("/")
+    if sep and NODE_NAME.fullmatch(node) and parse_address(local)[0] is not None:
+        return node, local
+    return None, target
+
+
+def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str, topic: str | None,
+                 message_id: str) -> dict:
+    """Post a direct message to a session on another machine; the hub hands it to that machine's bridge.
+
+    The message sits in the bridge's outbox from before the request until the hub answers,
+    so a crash or an unreachable hub leaves it for the bridge to repost under the same id.
+    """
+    message = {"id": message_id, "to": target, "from": sender, "reply": "none" if fyi else reply,
+               "mode": "fyi" if fyi else "push", "text": text, **({"topic": topic} if topic else {})}
+    try:
+        receipt = hubclient.submit(hub, message)
+    except (hubclient.HubRefused, hubclient.PendingConflict) as error:
+        raise LiveError(str(error)) from error
+    if receipt is None:
+        return {"to": target, "id": message_id, "from": sender, "via": "hub", "delivery": "hub",
+                "status": "queued for the hub: no receipt yet, the bridge will resend it under the same id"}
+    row = (receipt.get("recipients") or [{}])[0]
+    return {"to": row.get("to", target), "id": message_id, "from": sender, "via": "hub", "delivery": "hub",
+            "status": "stored on the hub" if row.get("status") == "stored" else row.get("status", "stored")}
 
 
 def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,

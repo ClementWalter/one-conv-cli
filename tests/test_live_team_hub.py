@@ -477,3 +477,17 @@ def test_queued_message_is_readable_only_by_its_owner(tmp_path, monkeypatch):
     finally:
         os.umask(old)
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_hub_topic_post_makes_the_sender_a_member(hub):
+    state, url, box = hub
+    as_box(url, box).join("release", BOX_SESSION)
+    router.send("#release", "go", LiveSession("claude", "c1"))
+    assert "mac/claude:c1" in state.topics()[0]["members"]
+
+
+def test_hub_topic_post_with_no_one_else_there_is_kept(hub):
+    _, url, box = hub
+    router.send("#release", "first word", LiveSession("claude", "c1"))
+    as_box(url, box).join("release", BOX_SESSION)
+    assert [m["text"] for m in as_box(url, box).history("release")] == ["first word"]

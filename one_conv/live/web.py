@@ -257,6 +257,7 @@ function render(rows, subtitle) {
     li.appendChild(el("span", label(row.from), "who"));
     if (row.to && view.kind === "direct") li.appendChild(el("span", "to " + label(row.to), "status"));
     li.appendChild(el("span", when(row.at), "when"));
+    if (row.mode === "fyi") li.appendChild(el("span", "FYI (did not wake the receiver)", "status"));
     if (row.status && typeof row.status === "string") li.appendChild(el("span", row.status, "status"));
     li.appendChild(el("div", row.text, "text"));
     list.appendChild(li);

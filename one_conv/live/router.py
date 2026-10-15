@@ -276,7 +276,8 @@ def _logged(receipt: dict, text: str, topic: str | None, fyi: bool, reply: str) 
     try:
         log_message({"id": receipt.get("id"), "from": receipt.get("from"),
                      "to": f"#{receipt['topic']}" if "deliveries" in receipt else receipt.get("to"),
-                     "topic": receipt.get("topic") or topic, "mode": "fyi" if fyi else "push", "reply": reply,
+                     "topic": receipt.get("topic") or topic, "mode": "fyi" if fyi else "push",
+                     "reply": "none" if fyi else reply,
                      "status": statuses or receipt.get("status"), "text": text})
     except OSError as error:
         logger.warning("sent, but could not log the message: %s", error)
@@ -336,7 +337,14 @@ def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id:
 
     The message sits in the bridge's outbox from before the request until the hub answers,
     so a crash or an unreachable hub leaves it for the bridge to repost under the same id.
+    The sender joins the topic first, as sending to a local topic does, so replies reach it.
     """
+    if ":" in sender:
+        try:
+            hub.join(topic, sender)
+        except (hubclient.HubRefused, hubclient.HubUnavailable) as error:
+            # The post itself reports a real problem; a failed join alone must not block it.
+            logger.info("could not join #%s before posting: %s", topic, error)
     # mode is the delivery mode (wake the receiver or not), kept apart from the reply policy.
     message = {"id": message_id, "to": f"#{topic}", "from": sender, "topic": topic,
                "mode": mode, "reply": reply, "text": text}

@@ -32,6 +32,8 @@ elif command == "conversations":
               "lastHarness": "claude-code", "lastPromptPreview": "You are a remote test agent"}}))
 elif command == "prompt":
     mode = os.environ.get("BOX_STUB_PROMPT", "accept")
+    if mode == "lost":
+        sys.exit(1)  # The prompt may have been forwarded; the acknowledgement never comes back.
     if mode == "refuse":
         print(json.dumps({"code": "provider_not_configured", "error": "Codex is not set up", "event": "error", "status": 409}))
         sys.exit(1)
@@ -181,7 +183,7 @@ def test_pending_prompt_says_not_to_resend(slow_box):
 def test_second_send_while_first_is_pending_is_refused(slow_box):
     target = LiveSession("boat", f"{SANDBOX}/{IDLE}", status="idle")
     boat.deliver(target, "<one-conv-message>hi</one-conv-message>")
-    with pytest.raises(RuntimeError, match="still pending"):
+    with pytest.raises(RuntimeError, match="no confirmed outcome"):
         boat.deliver(target, "<one-conv-message>hi</one-conv-message>")
 
 
@@ -222,3 +224,51 @@ def test_pull_timeout_is_an_actionable_error(box, monkeypatch):
 
 def test_inline_envelope_carries_the_reply_attribute():
     assert 'reply="inline"' in envelope("hi", LiveSession("claude", "c1"), reply="inline")
+
+
+@pytest.fixture
+def lost_box(box, monkeypatch):
+    monkeypatch.setenv("BOX_STUB_PROMPT", "lost")
+    return box
+
+
+def test_exit_without_acknowledgement_is_unconfirmed(lost_box):
+    status = boat.deliver(LiveSession("boat", f"{SANDBOX}/{IDLE}", status="idle"), "<one-conv-message>hi</one-conv-message>")
+    assert status.startswith("unconfirmed:")
+
+
+def test_unconfirmed_send_uses_a_rate_slot(lost_box):
+    router.send(f"boat:{SANDBOX}/{IDLE}", "status?", LiveSession("claude", "c1"))
+    assert (Path(os.environ["ONE_CONV_LIVE_DIR"]) / "sent.jsonl").exists()
+
+
+def test_unconfirmed_send_blocks_a_second_prompt(lost_box):
+    target = LiveSession("boat", f"{SANDBOX}/{IDLE}", status="idle")
+    boat.deliver(target, "<one-conv-message>hi</one-conv-message>")
+    with pytest.raises(RuntimeError, match="no confirmed outcome"):
+        boat.deliver(target, "<one-conv-message>hi</one-conv-message>")
+
+
+def test_unconfirmed_status_says_not_to_resend(lost_box):
+    op = _op(boat.deliver(LiveSession("boat", f"{SANDBOX}/{IDLE}", status="idle"), "<one-conv-message>hi</one-conv-message>"))
+    assert "Do not resend" in boat.operation(op)["help"]
+
+
+def test_resolving_an_unconfirmed_send_allows_another(lost_box):
+    target = LiveSession("boat", f"{SANDBOX}/{IDLE}", status="idle")
+    boat.resolve_operation(_op(boat.deliver(target, "<one-conv-message>hi</one-conv-message>")))
+    boat.deliver(target, "<one-conv-message>hi</one-conv-message>")
+    assert [c[0] for c in calls(lost_box)].count("prompt") == 2
+
+
+def test_only_an_unconfirmed_send_can_be_resolved(box):
+    boat.deliver(LiveSession("boat", f"{SANDBOX}/{IDLE}", status="idle"), "<one-conv-message>hi</one-conv-message>")
+    [record] = (Path(os.environ["ONE_CONV_LIVE_DIR"]) / "boat" / "ops").glob("*[0-9a-f].json")
+    with pytest.raises(RuntimeError, match="only an unconfirmed send"):
+        boat.resolve_operation(record.stem)
+
+
+@pytest.mark.parametrize("op", ["../../etc/x", "ABCDEF123456", "abc", "0123456789abcdef"])
+def test_operation_id_must_be_twelve_hex_characters(box, op):
+    with pytest.raises(RuntimeError, match="no Boat send operation"):
+        boat.operation(op)

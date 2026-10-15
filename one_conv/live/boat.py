@@ -81,31 +81,65 @@ def _operations() -> Path:
     return live_home() / "boat" / "ops"
 
 
+# What each state means for the sender; only an explicit refusal makes resending safe.
+STATE_HELP = {
+    "accepted": "Boat accepted the prompt.",
+    "pending": "box prompt is still waiting for Boat. Do not resend.",
+    "unconfirmed": ("box prompt ended without Boat accepting or refusing, so the prompt may or may "
+                    "not have arrived. Do not resend blindly: read the conversation with `one-conv "
+                    "live pull`, then run `one-conv live status OP --resolve` to allow another send."),
+    "resolved": "Marked as checked; another send to this conversation is allowed.",
+}
+OP_ID_LENGTH = 12
+
+
 def operation_state(record: dict) -> str:
-    """"accepted", "refused: <reason>", "pending" while box still runs, or "unconfirmed"."""
+    """"accepted", "refused: <reason>", "pending", "unconfirmed", or "resolved" once checked."""
     state = _accepted(Path(record["log"]))
     if state == "accepted":
         return "accepted"
     if state is not None:
         return f"refused: {state}"
+    if record.get("resolved"):
+        return "resolved"
     return "pending" if pid_alive(record.get("pid")) else "unconfirmed"
+
+
+def _operation_path(op: str) -> Path:
+    if len(op) != OP_ID_LENGTH or any(c not in "0123456789abcdef" for c in op):
+        raise RuntimeError(f"no Boat send operation {op!r}")
+    return _operations() / f"{op}.json"
 
 
 def operation(op: str) -> dict:
     try:
-        record = json.loads((_operations() / f"{op}.json").read_text())
+        record = json.loads(_operation_path(op).read_text())
     except (OSError, ValueError) as error:
         raise RuntimeError(f"no Boat send operation {op!r}") from error
-    return {**record, "state": operation_state(record)}
+    state = operation_state(record)
+    return {**record, "state": state,
+            "help": STATE_HELP.get(state, "Boat refused it; it was not delivered.").replace("OP", op)}
+
+
+def resolve_operation(op: str) -> dict:
+    """Record that an unconfirmed send was checked, so the conversation accepts new sends."""
+    record = operation(op)
+    if record["state"] != "unconfirmed":
+        raise RuntimeError(f"op {op} is {record['state']}; only an unconfirmed send needs resolving")
+    stored = json.loads(_operation_path(op).read_text())
+    stored["resolved"] = True
+    _operation_path(op).write_text(json.dumps(stored))
+    return operation(op)
 
 
 def _pending_for(address: str) -> str | None:
+    """An earlier send to `address` whose outcome is still open: pending or unconfirmed."""
     for path in sorted(_operations().glob("*.json")) if _operations().is_dir() else []:
         try:
             record = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-        if record.get("address") == address and operation_state(record) == "pending":
+        if record.get("address") == address and operation_state(record) in ("pending", "unconfirmed"):
             return record["op"]
     return None
 
@@ -124,10 +158,10 @@ def deliver(session: LiveSession, text: str) -> str:
                            "instruction; send it again once the turn has ended.")
     earlier = _pending_for(session.address)
     if earlier:
-        raise RuntimeError(f"An earlier message to {session.address} is still pending (op {earlier}). "
+        raise RuntimeError(f"An earlier message to {session.address} has no confirmed outcome (op {earlier}). "
                            f"Check it with `one-conv live status {earlier}` before sending again.")
     sandbox, conversation = split(session.id)
-    op = uuid.uuid4().hex[:12]
+    op = uuid.uuid4().hex[:OP_ID_LENGTH]
     _operations().mkdir(parents=True, exist_ok=True)
     log_path = _operations() / f"{op}.log.jsonl"
     with log_path.open("w") as log:
@@ -147,7 +181,9 @@ def deliver(session: LiveSession, text: str) -> str:
         if state is not None:
             raise RuntimeError(f"Boat refused the prompt: {state}")
         if process.poll() is not None:
-            raise RuntimeError(f"box prompt exited {process.returncode} before accepting (op {op}); see {log_path}")
+            # A local exit is not a refusal from Boat: the prompt may have been forwarded anyway.
+            return (f"unconfirmed: box prompt exited {process.returncode} without Boat accepting or "
+                    f"refusing (op {op}). Do not resend; check it with `one-conv live status {op}`")
         time.sleep(0.2)
     return (f"pending: Boat has not confirmed the prompt yet (op {op}). Do not resend; "
             f"check it with `one-conv live status {op}`")

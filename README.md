@@ -291,8 +291,11 @@ one-conv live pull boat:bx_ab12/2ab1…      # read the agent's answers back
   in its own conversation, and `live pull` reads that back with `box events`.
 - If Boat has not confirmed a prompt within 45 seconds, the send reports
   `pending` with an operation id instead of failing, because the prompt may still
-  arrive. Do not resend: `one-conv live status OP` shows whether it was accepted,
-  and another send to that conversation is refused while it is still pending.
+  arrive. The same applies when `box prompt` exits without Boat accepting or
+  refusing (`unconfirmed`): only an explicit refusal from Boat means it was not
+  delivered. Do not resend: `one-conv live status OP` shows the outcome, and
+  another send to that conversation is refused until it is accepted, refused, or
+  checked with `live pull` and marked `live status OP --resolve`.
 - `--fyi` cannot reach a sandbox. Boat is listed only when asked for by name
   (`--harness boat` or a `boat:` address), since listing calls Boat's API.
 

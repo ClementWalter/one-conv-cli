@@ -305,6 +305,7 @@ def test_full_on_unreadable_inbox_raises_unavailable(state, inbox):
 
 @pytest.mark.parametrize("bad", [
     {"id": "b", "at": float("inf"), "text": "t"}, {"id": "b", "at": 1e100, "text": "t"},
+    {"id": "b", "at": 10 ** 1000, "text": "t"},
     {"id": "b", "at": 1000.0, "text": None}, {"id": "b", "at": True, "text": "t"},
     {"id": 7, "at": 1000.0, "text": "t"}, {"id": "b", "at": 1000.0, "text": "t", "from": 3}])
 def test_malformed_row_does_not_hide_a_later_valid_one(state, inbox, bad):

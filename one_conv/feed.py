@@ -294,9 +294,10 @@ def _valid_entry(entry: Any) -> bool:
     if not isinstance(entry, dict):
         return False
     at = entry.get("at")
+    # Bounds first: a huge JSON integer overflows math.isfinite's float conversion.
     return (isinstance(entry.get("id"), str) and bool(entry["id"])
             and isinstance(at, (int, float)) and not isinstance(at, bool)
-            and math.isfinite(at) and 0 <= at < _LATEST_AT
+            and 0 <= at < _LATEST_AT and math.isfinite(at)
             and isinstance(entry.get("text"), str)
             and isinstance(entry.get("from", ""), str))
 

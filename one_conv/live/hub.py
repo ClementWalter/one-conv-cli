@@ -132,13 +132,14 @@ class Hub:
             name = item.get("name")
             if name is not None and (not isinstance(name, str) or not NODE.fullmatch(name)):
                 raise HubError(400, f"a name is lowercase letters, digits and dashes: {name!r}")
-            if name in names:
-                raise HubError(409, f"@{name} is given to two sessions")
-            names.add(name)
+            if name is not None:
+                if name in names:
+                    raise HubError(409, f"@{name} is given to two sessions")
+                names.add(name)
             rows.append((node, item["address"], name, str(item.get("title") or ""), str(item.get("cwd") or ""),
                          str(item.get("status") or ""), time.time()))
         with self.lock, self._db() as db:
-            for name in names - {None}:
+            for name in names:
                 if db.execute("SELECT 1 FROM sessions WHERE name = ? AND node != ?", (name, node)).fetchone():
                     raise HubError(409, f"@{name} is already used on another node")
             db.execute("DELETE FROM sessions WHERE node = ?", (node,))

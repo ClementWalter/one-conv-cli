@@ -1,6 +1,7 @@
 """Exercise real native readers, HTTP sync and unchanged CLI commands on isolated history."""
 import base64
 import copy
+import dataclasses
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -385,6 +386,285 @@ def test_capture_refuses_a_session_folder_swapped_for_a_symlink_after_enumeratio
     monkeypatch.setattr(sync, "fingerprint", swap_after_enumeration)
     with pytest.raises(OSError):
         sync.capture(reader, handle, "origin")
+
+
+def same_size_outside(path, outside):
+    """An outside file with a sentinel, the same size and modification time as `path`, so only a
+    symlink check can tell them apart (a size or time change would trip the capture's change check)."""
+    outside.write_text(path.read_text().replace("Quartz", "QUARTZ"))
+    times = path.stat()
+    os.utime(outside, ns=(times.st_atime_ns, times.st_mtime_ns))
+
+
+def symlinked_transcript(tmp_path, monkeypatch, source):
+    """A capture handle whose transcript is a symlink to a file outside history holding a sentinel."""
+    env = fixture_env(tmp_path)
+    path = write_claude(env) if source == "claude" else write_codex(env)
+    outside = tmp_path / "outside.jsonl"
+    same_size_outside(path, outside)
+    path.unlink()
+    path.symlink_to(outside)
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects((source,)) for h in reader._native_project_sessions(p))
+    return sync, reader, handle
+
+
+@pytest.mark.parametrize("source", ["claude", "codex"])
+def test_capture_refuses_a_transcript_that_is_a_symlink(tmp_path, monkeypatch, source):
+    sync, reader, handle = symlinked_transcript(tmp_path, monkeypatch, source)
+    with pytest.raises(ArchiveError, match="symlink or not a regular file"):
+        sync.capture(reader, handle, "origin")
+
+
+def test_capture_refuses_a_transcript_swapped_for_a_symlink_during_capture(tmp_path, monkeypatch):
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    outside = tmp_path / "outside.jsonl"
+    same_size_outside(path, outside)
+    for name in ("CLAUDE_CONFIG_DIR", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects(("claude",)) for h in reader._native_project_sessions(p))
+    enumerate_sources = sync.fingerprint
+
+    def swap_after_the_first_check(paths):
+        stamp = enumerate_sources(paths)
+        if not path.is_symlink():
+            path.unlink()
+            path.symlink_to(outside)
+        return stamp
+
+    monkeypatch.setattr(sync, "fingerprint", swap_after_the_first_check)
+    with pytest.raises(ArchiveError):
+        sync.capture(reader, handle, "origin")
+
+
+def test_capture_refuses_a_transcript_swapped_after_its_bytes_are_read(tmp_path, monkeypatch):
+    """The reader parses turns by reopening the path; a swap between the protected read and that parse is caught."""
+    env = fixture_env(tmp_path)
+    path = write_claude(env)
+    outside = tmp_path / "outside.jsonl"
+    same_size_outside(path, outside)
+    for name in ("CLAUDE_CONFIG_DIR", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects(("claude",)) for h in reader._native_project_sessions(p))
+    read_originals = sync.original_records
+
+    def swap_after_reading(*args):
+        originals = read_originals(*args)
+        if not path.is_symlink():
+            path.unlink()
+            path.symlink_to(outside)
+        return originals
+
+    monkeypatch.setattr(sync, "original_records", swap_after_reading)
+    with pytest.raises(ArchiveError):
+        sync.capture(reader, handle, "origin")
+
+
+def test_capture_refuses_a_cursor_cli_meta_file_that_is_a_symlink(tmp_path, monkeypatch):
+    from test_cursor_cli import CHAT_ID, _write_chat
+    env = fixture_env(tmp_path)
+    _write_chat(Path(env["CURSOR_CLI_HOME"]))
+    meta = next(Path(env["CURSOR_CLI_HOME"]).glob(f"**/{CHAT_ID}/meta.json"))
+    outside = tmp_path / "outside-meta.json"
+    outside.write_text(meta.read_text())
+    meta.unlink()
+    meta.symlink_to(outside)
+    for name in ("CURSOR_CLI_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects(("cursor-cli",)) for h in reader._native_project_sessions(p))
+    with pytest.raises(ArchiveError, match="symlink or not a regular file"):
+        sync.capture(reader, handle, "origin")
+
+
+def write_omp_transcript(env):
+    from test_omp import _write_session
+    return _write_session(Path(env["OMP_HOME"]))
+
+
+# Each source's transcript, one word in it, and that word uppercased: same size, so only the content differs.
+PARSER_RACE_SOURCES = {
+    "claude": (write_claude, "Quartz", "QUARTZ"),
+    "codex": (write_codex, "Quartz", "QUARTZ"),
+    "omp": (write_omp_transcript, "Widget", "WIDGET"),
+}
+
+
+@pytest.mark.parametrize("source", sorted(PARSER_RACE_SOURCES))
+def test_capture_ignores_a_transcript_swapped_and_restored_during_the_parse(tmp_path, monkeypatch, source):
+    """The reader parses a private copy of the captured bytes, so a swap made and undone while it parses changes nothing."""
+    write, word, outside_word = PARSER_RACE_SOURCES[source]
+    env = fixture_env(tmp_path)
+    path = write(env)
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text(path.read_text().replace(word, outside_word))
+    times = path.stat()
+    os.utime(outside, ns=(times.st_atime_ns, times.st_mtime_ns))
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "OMP_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects((source,)) for h in reader._native_project_sessions(p))
+    parse = reader._handle_iter_turns
+    parked = path.with_name("parked.jsonl")
+
+    def swap_parse_restore(*args, **kwargs):
+        path.rename(parked)
+        path.symlink_to(outside)
+        try:
+            return parse(*args, **kwargs)
+        finally:
+            path.unlink()
+            parked.rename(path)
+
+    monkeypatch.setattr(reader, "_handle_iter_turns", swap_parse_restore)
+    document = sync.capture(reader, handle, "origin")
+    assert not any(outside_word in json.dumps(turn) for turn in document["turns"])
+
+
+@pytest.fixture
+def cursor_cli_title_swapped_at_discovery(tmp_path, monkeypatch):
+    """A Cursor CLI chat whose meta.json was a link to an outside title only while discovery read it."""
+    from test_cursor_cli import CHAT_ID, _write_chat
+    env = fixture_env(tmp_path)
+    _write_chat(Path(env["CURSOR_CLI_HOME"]))
+    meta = next(Path(env["CURSOR_CLI_HOME"]).glob(f"**/{CHAT_ID}/meta.json"))
+    outside = tmp_path / "outside-meta.json"
+    outside.write_text(meta.read_text().replace("Fix the widget", "FIX THE WIDGET"))
+    for name in ("CURSOR_CLI_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    parked = meta.with_name("parked.json")
+    meta.rename(parked)
+    meta.symlink_to(outside)
+    try:
+        handle = next(h for p in reader._native_projects(("cursor-cli",)) for h in reader._native_project_sessions(p))
+    finally:
+        meta.unlink()
+        parked.rename(meta)
+    return sync, reader, handle
+
+
+def test_discovery_title_from_a_swapped_meta_file_is_not_archived(cursor_cli_title_swapped_at_discovery):
+    sync, reader, handle = cursor_cli_title_swapped_at_discovery
+    assert sync.capture(reader, handle, "origin")["summary"]["title"] == "Fix the widget"
+
+
+def test_omp_title_comes_from_the_captured_transcript(tmp_path, monkeypatch):
+    env = fixture_env(tmp_path)
+    path = write_omp_transcript(env)
+    for name in ("OMP_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects(("omp",)) for h in reader._native_project_sessions(p))
+    stale = dataclasses.replace(handle, title_hint="A TITLE READ FROM ELSEWHERE")
+    assert sync.capture(reader, stale, "origin")["summary"]["title"] == reader._omp_session_meta(path)["title"]
+
+
+@pytest.mark.parametrize("source", ["codex", "omp"])
+def test_capture_refuses_a_session_whose_cwd_differs_from_the_listing(tmp_path, monkeypatch, source):
+    """A cwd read at discovery through a swapped file no longer matches the captured bytes, so capture refuses."""
+    env = fixture_env(tmp_path)
+    (write_codex if source == "codex" else write_omp_transcript)(env)
+    for name in ("CODEX_HOME", "OMP_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects((source,)) for h in reader._native_project_sessions(p))
+    listed_elsewhere = dataclasses.replace(handle, project_cwd="/somewhere/else")
+    with pytest.raises(ArchiveError, match="metadata changed between listing and capture"):
+        sync.capture(reader, listed_elsewhere, "origin")
+
+
+def claude_handle(tmp_path, monkeypatch, project_cwd=None):
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    for name in ("CLAUDE_CONFIG_DIR", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects(("claude",)) for h in reader._native_project_sessions(p))
+    return sync, reader, dataclasses.replace(handle, project_cwd=project_cwd) if project_cwd else handle
+
+
+def test_capture_keeps_a_claude_cwd_its_transcript_holds(tmp_path, monkeypatch):
+    sync, reader, handle = claude_handle(tmp_path, monkeypatch)
+    assert sync.capture(reader, handle, "origin")["cwd"] == "/example/ancestry"
+
+
+def test_capture_refuses_a_claude_cwd_neither_folder_nor_transcript_backs(tmp_path, monkeypatch):
+    sync, reader, handle = claude_handle(tmp_path, monkeypatch, project_cwd="/SECRET_/ancestry")
+    with pytest.raises(ArchiveError, match="metadata changed between listing and capture"):
+        sync.capture(reader, handle, "origin")
+
+
+def test_capture_keeps_a_claude_cwd_its_project_folder_name_encodes(tmp_path, monkeypatch):
+    """A worktree session's transcript may never mention the folder's cwd; the folder name pins it."""
+    sync, reader, handle = claude_handle(tmp_path, monkeypatch)
+    worktree = handle.path.parent.parent / reader._encode_path("/example/ancestry/worktree")
+    worktree.mkdir()
+    moved = worktree / handle.path.name
+    handle.path.rename(moved)
+    relocated = dataclasses.replace(handle, path=moved, project_cwd="/example/ancestry/worktree")
+    assert sync.capture(reader, relocated, "origin")["cwd"] == "/example/ancestry/worktree"
+
+
+def test_capture_refuses_a_cursor_cli_chat_whose_captured_meta_has_no_cwd(tmp_path, monkeypatch):
+    from test_cursor_cli import CHAT_ID, _write_chat
+    env = fixture_env(tmp_path)
+    _write_chat(Path(env["CURSOR_CLI_HOME"]))
+    for name in ("CURSOR_CLI_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects(("cursor-cli",)) for h in reader._native_project_sessions(p))
+    meta = next(Path(env["CURSOR_CLI_HOME"]).glob(f"**/{CHAT_ID}/meta.json"))
+    content = json.loads(meta.read_text())
+    content.pop("cwd")
+    meta.write_text(json.dumps(content))
+    with pytest.raises(ArchiveError, match="metadata changed between listing and capture"):
+        sync.capture(reader, handle, "origin")
+
+
+def test_capture_refuses_a_session_whose_id_differs_from_the_listing(tmp_path, monkeypatch):
+    env = fixture_env(tmp_path)
+    write_omp_transcript(env)
+    for name in ("OMP_HOME", "ONE_CONV_STATE_DIR", "AGENT_CONV_STATE_DIR"):
+        monkeypatch.setenv(name, env[name])
+    sync = load_sync_script()
+    reader = sync.load_reader()
+    handle = next(h for p in reader._native_projects(("omp",)) for h in reader._native_project_sessions(p))
+    with pytest.raises(ArchiveError, match="metadata changed between listing and capture"):
+        sync.capture(reader, dataclasses.replace(handle, uuid="another-session"), "origin")
+
+
+def test_read_regular_refuses_without_nofollow_opens(tmp_path, monkeypatch):
+    sync = load_sync_script()
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    regular = tmp_path / "regular.txt"
+    regular.write_text("own text")
+    with pytest.raises(ArchiveError, match="no-follow file opens"):
+        sync.read_regular(regular)
+
+
+def test_read_regular_refuses_a_symlink(tmp_path):
+    target = tmp_path / "target.txt"
+    target.write_text("outside")
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+    with pytest.raises(ArchiveError, match="symlink or not a regular file"):
+        load_sync_script().read_regular(link)
 
 
 def test_capture_refuses_a_swapped_session_folder_for_a_db_named_sidecar(tmp_path, monkeypatch):

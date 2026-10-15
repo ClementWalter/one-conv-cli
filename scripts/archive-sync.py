@@ -7,6 +7,8 @@
 
 import argparse
 import base64
+import dataclasses
+import errno
 import importlib.machinery
 import importlib.util
 import json
@@ -16,8 +18,10 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -130,7 +134,44 @@ def read_source(handle, path):
         folder = handle.path.parent / handle.uuid
         if folder in path.parents:
             return read_inside(folder, path)
-    return path.read_bytes()
+    return read_regular(path)
+
+
+def read_regular(path):
+    """Bytes of `path` only if it is a regular file itself, not a symlink to one."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        # A pathname check before reading would leave a check-then-use race; refuse instead.
+        raise ArchiveError("archiving needs no-follow file opens, which this system lacks")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | nofollow)
+    except OSError as error:
+        if error.errno == errno.ELOOP:  # What a no-follow open of a symlink reports.
+            raise ArchiveError(f"{path} is a symlink or not a regular file; it is not archived") from error
+        raise
+    with os.fdopen(descriptor, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ArchiveError(f"Not a regular file: {path}")
+        return stream.read()
+
+
+def main_files(handle, paths):
+    """A conversation's own files outside a Claude session folder: its transcript, a Cursor CLI
+    store and that store's meta.json."""
+    folder = handle.path.parent / handle.uuid if handle.source == "claude" and handle.path else None
+    return [path for path in paths if folder is None or folder not in path.parents]
+
+
+def require_regular(paths):
+    """Refuse files that are symlinks or not regular files. The reader opens a transcript by path,
+    so a symlink there would put text from outside history into the archived turns."""
+    for path in paths:
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            continue  # A missing file fails the capture where it is read.
+        if not stat.S_ISREG(mode):
+            raise ArchiveError(f"{path} is a symlink or not a regular file; it is not archived")
 
 
 def source_stamp(reader, handle, paths):
@@ -169,6 +210,100 @@ def fingerprint(paths):
             if p.exists() and not (p.name.endswith("-wal") and p.stat().st_size == 0)]
 
 
+def snapshot_store(path):
+    """A consistent SQLite image of a Cursor CLI store, taken from no-follow copies of the store and
+    its write-ahead log in a private folder, so SQLite itself never opens a path that could be a link."""
+    with tempfile.TemporaryDirectory(prefix="one-conv-store-") as private:
+        copy = Path(private) / path.name
+        copy.write_bytes(read_regular(path))
+        try:
+            Path(str(copy) + "-wal").write_bytes(read_regular(Path(str(path) + "-wal")))
+        except FileNotFoundError:
+            pass  # A checkpointed store has no write-ahead log.
+        with sqlite3.connect(copy) as source, sqlite3.connect(":memory:") as snapshot:
+            source.backup(snapshot)
+            return snapshot.serialize()
+
+
+# Sources whose conversation is parsed again from the captured bytes; the rest read cloud caches one-conv wrote itself.
+PROTECTED_SOURCES = ("claude", "codex", "omp", "cursor-cli")
+
+
+def captured_identity(reader, handle, copy):
+    """(session id, cwd, title) as discovery would read them, but from the private copy.
+
+    None for a field the copy does not determine: a Claude Code project's cwd comes from its
+    folder name, and Claude Code and Codex titles come from the turns, already parsed from the copy.
+    """
+    if handle.source == "cursor-cli":
+        try:
+            meta = json.loads((copy.parent / "meta.json").read_text())
+        except (OSError, ValueError):
+            meta = {}
+        meta = meta if isinstance(meta, dict) else {}
+        return handle.uuid, meta.get("cwd"), meta.get("title") or None
+    if handle.source == "omp":
+        meta = reader._omp_session_meta(copy)
+        return meta.get("session_id") or copy.stem, meta.get("cwd"), meta.get("title") or None
+    if handle.source == "codex":
+        meta = reader._codex_session_meta(copy)
+        return meta.get("session_id") or copy.stem, meta.get("cwd"), None
+    return handle.uuid, None, None
+
+
+def claude_cwd_confirmed(reader, handle, copy):
+    """Whether the listed Claude Code project cwd is backed by the folder name or the captured bytes.
+
+    The listing prefers a cwd that re-encodes to the project folder's name (how worktree sessions
+    resolve), which the folder itself pins; otherwise it fell back to a transcript's cwd, which must
+    then appear among the captured transcript's own cwd values.
+    """
+    if reader._encode_path(handle.project_cwd) == handle.path.parent.name:
+        return True
+    seen = set()
+    for line in copy.read_text(errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and isinstance(event.get("cwd"), str):
+            seen.add(event["cwd"])
+    return handle.project_cwd in seen
+
+
+def rebuilt_handle(reader, handle, copy):
+    """`handle` pointed at the copy, with everything discovery read from the live files read again
+    from the copy. A session id or cwd that no longer matches the listing, or that the copy does not
+    hold, is refused rather than relabelled or kept from the listing."""
+    session, cwd, title = captured_identity(reader, handle, copy)
+    confirmed = (claude_cwd_confirmed(reader, handle, copy) if handle.source == "claude"
+                 else cwd == handle.project_cwd)
+    if session != handle.uuid or not confirmed:
+        raise ArchiveError(f"{handle.uuid}: its metadata changed between listing and capture; retry")
+    return dataclasses.replace(handle, path=copy, title_hint=title)
+
+
+@contextmanager
+def captured_copy(reader, handle, paths, originals):
+    """`handle` pointed at a private copy of its captured bytes, laid out as on disk.
+
+    The reader opens files by path; parsing the copy means turns, summary and title come from the
+    same bytes as the archived originals, whatever replaces the real paths meanwhile. What discovery
+    read from the live files (session id, cwd, title) is read again from the copy too.
+    """
+    if handle.source not in PROTECTED_SOURCES or handle.path is None:
+        yield handle
+        return
+    base = handle.path.parent
+    with tempfile.TemporaryDirectory(prefix="one-conv-capture-") as private:
+        root = Path(private)
+        for path in paths:
+            target = root / path.relative_to(base)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(originals[str(path)])
+        yield rebuilt_handle(reader, handle, root / handle.path.relative_to(base))
+
+
 def original_records(reader, handle, paths):
     if handle.source == "cursor":
         conn = reader._cursor_connect()
@@ -192,9 +327,7 @@ def original_records(reader, handle, paths):
         # Only the Cursor CLI store is a live database to snapshot; any other file, whatever its
         # name, goes through read_source so a session-folder sidecar stays inside its boundary.
         if handle.source == "cursor-cli" and path == handle.path:
-            with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as source, sqlite3.connect(":memory:") as snapshot:
-                source.backup(snapshot)
-                data = snapshot.serialize()
+            data = snapshot_store(path)
         else:
             data = read_source(handle, path)
         result[str(path)] = data
@@ -203,17 +336,20 @@ def original_records(reader, handle, paths):
 
 def capture(reader, handle, origin):
     paths = source_paths(reader, handle)
+    # Before the reader opens anything by path, and again after, to catch a swap during capture.
+    require_regular(main_files(handle, paths))
     before = fingerprint(paths)
     originals = original_records(reader, handle, paths)
     account_label = None
     if handle.source in reader.CLOUD_SOURCES or (handle.path and handle.path.suffix == ".json"):
-        cached = json.loads(handle.path.read_text()) if handle.path else {}
+        cached = json.loads(originals[str(handle.path)]) if handle.path else {}
         if cached.get("complete") is False:
             raise ArchiveError(f"Incomplete provider capture: {handle.uuid}; pull complete history first")
         account_label = cached.get("account_label")
-    turns = reader._handle_iter_turns(handle, include_subagents=False)
-    expanded = reader._handle_iter_turns(handle, include_subagents=True) if handle.source == "claude" else None
-    summary = reader._handle_summary(handle, {})
+    with captured_copy(reader, handle, paths, originals) as parsed:
+        turns = reader._handle_iter_turns(parsed, include_subagents=False)
+        expanded = reader._handle_iter_turns(parsed, include_subagents=True) if handle.source == "claude" else None
+        summary = reader._handle_summary(parsed, {})
     summary.pop("unread", None)
     document = {"origin": origin, "source": handle.source, "cwd": handle.project_cwd,
         "session": handle.uuid, "locator": reader._record_locator(handle), "mtime": handle.mtime, "capture_version": CAPTURE_VERSION,
@@ -225,6 +361,7 @@ def capture(reader, handle, origin):
     changed = original_records(reader, handle, paths) != originals if handle.source == "cursor" else fingerprint(paths) != before
     if changed:
         raise ArchiveError(f"Source changed during capture: {handle.uuid}; retry when idle")
+    require_regular(main_files(handle, paths))
     return document
 
 

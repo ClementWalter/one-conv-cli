@@ -47,8 +47,19 @@ token, commands warn on stderr and show native history only.
   state directory.
 - Inside a Claude session folder, a file or subfolder that is already a symlink is
   skipped, and one replaced by a symlink during capture makes the read refuse. This
-  covers the session folder only: a conversation's main transcript is read at its
-  path, and a symlink there is followed.
+  covers the session folder only.
+- A conversation's own files outside that folder (its transcript, a Cursor CLI
+  store and its `meta.json`) must be regular files: one that is a symlink, before
+  or during capture, makes that conversation fail instead of archiving another file.
+- For Claude Code, Codex, Oh My Pi and Cursor CLI, each file is read once without
+  following symlinks, and the turns, title and token count are parsed from a
+  private copy of those bytes, so everything archived comes from the same read. A
+  system without no-follow file opens cannot archive these sources.
+- The session id, working directory and title shown in listings are read again
+  from that copy. If the session id or working directory no longer matches the
+  listing, or the copy does not hold the directory, that conversation fails and
+  is retried on the next sync. A Claude Code project directory is accepted when it
+  matches the project folder's name or appears in the captured transcript.
 - Each native record is archived separately, even when records share a session ID
   (Codex subagent rollouts share their parent's).
 - Each upload names the revision it replaces, so concurrent captures are rejected.

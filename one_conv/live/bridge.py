@@ -292,7 +292,9 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None) 
         while not (stop_requested or stopping()):
             try:
                 url = forward.open() if forward else hub
-                client = hubclient.HubClient(url, token, node, timeout=POLL_SECONDS + 15)
+                # Every request checks the forward is still this ssh's, as the CLI's do.
+                client = hubclient.HubClient(url, token, node, timeout=POLL_SECONDS + 15,
+                                             listener_pid=forward.process.pid if forward else None)
                 answered = client.request("GET", "/v1/whoami").get("node")
                 if answered != node:
                     logger.error("this token belongs to node %r, not %r", answered, node)

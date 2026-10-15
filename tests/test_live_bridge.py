@@ -5,6 +5,7 @@ The local adapter is a stub that records what it is handed, so no agent is promp
 
 import json
 import os
+import signal
 import socket
 import stat
 import subprocess
@@ -544,6 +545,59 @@ def test_serve_writes_the_hub_config_only_its_user_can_read(hub, delivered):
     done.set()
     thread.join(timeout=15)
     assert (stat.S_IMODE(path.stat().st_mode), json.loads(path.read_text())["node"]) == (0o600, "box")
+
+
+@pytest.fixture
+def replaced_forward(hub, delivered, tmp_path, monkeypatch):
+    """A bridge whose ssh forward dies right after its first publish, mid-step, with its port retaken.
+
+    The rest of that step (directory, outbox, inbox) would go to whatever now holds the port;
+    yields that program's socket once the bridge has run on.
+    """
+    fake_ssh(tmp_path, monkeypatch, FAKE_SSH)
+    squatter = socket.socket()
+    squatter.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    real_put = hubclient.HubClient.request
+    taken = []
+
+    def request(client, method, path, body=None):
+        answer = real_put(client, method, path, body)
+        if method == "PUT" and path == "/v1/sessions" and not taken:
+            settings = json.loads((bridge.bridge_dir() / "hub.json").read_text())
+            os.kill(settings["tunnel_pid"], signal.SIGKILL)
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    squatter.bind(("127.0.0.1", int(settings["url"].rsplit(":", 1)[1])))
+                    break
+                except OSError:
+                    assert time.monotonic() < deadline
+                    time.sleep(0.02)
+            squatter.listen()
+            taken.append(True)
+        return answer
+    monkeypatch.setattr(hubclient.HubClient, "request", request)
+    queued("must not leak")
+    done = threading.Event()
+    thread = threading.Thread(target=bridge.serve, args=("ssh://hub-box", "box", hub.box_token),
+                              kwargs={"hub_port": int(hub.url.rsplit(":", 1)[1]), "stopping": done.is_set},
+                              daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 15
+    while not taken:
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    time.sleep(1)
+    done.set()
+    thread.join(timeout=15)
+    squatter.settimeout(0.3)
+    yield squatter
+    squatter.close()
+
+
+def test_the_bridge_never_talks_to_a_program_that_took_its_forward_port(replaced_forward):
+    with pytest.raises(TimeoutError):
+        replaced_forward.accept()
 
 
 def test_serve_refuses_a_token_issued_to_another_node(hub, delivered):

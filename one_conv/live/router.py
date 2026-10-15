@@ -131,6 +131,10 @@ def resolve(target: str, sessions: list[LiveSession] | None = None,
             listing = "\n".join(f"  {s.address}  {s.title or s.cwd}" for s in matches)
             raise LiveError(f"{target!r} matches several live sessions:\n{listing}")
     if harness == "codex" and is_session_id(query):
+        if codex.ended(query):
+            # A message queued now would be recorded in the thread and answered by nobody.
+            raise LiveError(f"codex:{query} was ended with `live stop`; resume it with `codex resume {query}` "
+                            "before sending to it.")
         stored = codex.stored_session(query)
         if stored:
             return stored

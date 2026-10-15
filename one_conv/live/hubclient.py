@@ -19,6 +19,11 @@ from urllib.parse import quote, urlsplit
 
 from .model import live_home
 
+try:
+    import fcntl
+except ImportError:  # Windows has no flock; the outbox is then written unlocked.
+    fcntl = None
+
 
 class HubUnavailable(Exception):
     """The hub could not be reached; nothing was acknowledged."""
@@ -132,11 +137,120 @@ def outbox() -> Path:
     return live_home() / "bridge" / "outbox"
 
 
+# Statuses that say nothing final about the message: it stays queued under its id. A rejected
+# token (401) is about the credential, so the message waits for the rotated one.
+RETRYABLE = {401, 408, 425, 429}
+
+
+def _receipt_for(receipt, message_id: str) -> bool:
+    """A receipt names this id and lists recipients whose fields callers read; an empty list is valid."""
+    if not (isinstance(receipt, dict) and receipt.get("id") == message_id
+            and isinstance(receipt.get("recipients"), list)):
+        return False
+    return all(isinstance(row, dict) and isinstance(row.get("to"), str) and isinstance(row.get("status"), str)
+               for row in receipt["recipients"])
+
+
+def submit(hub: HubClient, message: dict) -> dict | None:
+    """Post a message so that a crash or an ambiguous answer can neither lose it nor double it.
+
+    The message is written to the outbox before any network I/O. It is removed only on a
+    receipt for this id, or on a definitive refusal (a 4xx other than 401/408/425/429), which
+    is raised. An unreachable hub, a 5xx, a rate limit or an unreadable receipt leaves it
+    queued under the same id for the bridge to repost, and returns None.
+    """
+    path = queue(message)
+    state, detail = _outcome(hub, message)
+    if state == "retry":
+        return None  # The hub may or may not have stored it; only a retry under this id can tell.
+    path.unlink(missing_ok=True)
+    if state == "refused":
+        raise detail
+    return detail
+
+
+def _outcome(hub: HubClient, message: dict) -> tuple[str, object]:
+    """("sent", receipt), ("refused", error) for a definitive 4xx, or ("retry", reason)."""
+    try:
+        receipt = hub.post(message)
+    except HubUnavailable as error:
+        return "retry", error
+    except HubRefused as error:
+        # Only a 4xx is the hub's verdict on this message; a redirect or 5xx may follow a commit.
+        if 400 <= error.status < 500 and error.status not in RETRYABLE:
+            return "refused", error
+        return "retry", error
+    if not _receipt_for(receipt, message["id"]):
+        return "retry", "the hub's answer is not a receipt for this message"
+    return "sent", receipt
+
+
+def drain(hub: HubClient) -> dict:
+    """Post queued messages oldest first, under the policy submit() uses.
+
+    A receipt for the id removes the message; a definitive refusal moves it to
+    outbox/refused/ for a person to inspect; anything ambiguous stops the drain and
+    keeps the rest queued under their ids, so the order is kept for the next attempt.
+    """
+    sent, refused, waiting = [], [], []
+    # A sender's own submit() can remove a file at any moment, so each step tolerates its absence.
+    stamped = []
+    for path in outbox().glob("*.json"):
+        try:
+            stamped.append((path.stat().st_mtime_ns, path.name, path))
+        except FileNotFoundError:
+            continue
+    files = [path for _, _, path in sorted(stamped)]
+    for index, path in enumerate(files):
+        try:
+            message = json.loads(path.read_text())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            continue  # Unreadable files stay for a person to look at; they never block the rest.
+        state, detail = _outcome(hub, message)
+        if state == "sent":
+            path.unlink(missing_ok=True)
+            sent.append(message["id"])
+        elif state == "refused":
+            (outbox() / "refused").mkdir(exist_ok=True)
+            try:
+                os.replace(path, outbox() / "refused" / path.name)
+            except FileNotFoundError:
+                pass
+            refused.append({"id": message["id"], "error": str(detail)})
+        else:
+            waiting = [p.stem for p in files[index:] if p.exists()]
+            break
+    return {"sent": sent, "refused": refused, "waiting": waiting}
+
+
+class PendingConflict(Exception):
+    """A different message is already waiting under this id."""
+
+
 def queue(message: dict) -> Path:
-    """Leave a message for the bridge to post once the hub is reachable; its id makes retries safe."""
+    """Leave a message for the bridge to post once the hub is reachable; its id makes retries safe.
+
+    A message already waiting under the same id is kept: an identical one reuses it, a
+    different one raises PendingConflict, so a reused id never replaces pending work.
+    """
     outbox().mkdir(parents=True, exist_ok=True)
     path = outbox() / f"{message['id']}.json"
-    partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    partial.write_text(json.dumps(message))
-    os.replace(partial, path)
+    with (outbox() / ".lock").open("a") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        if path.exists():
+            try:
+                waiting = json.loads(path.read_text())
+            except (OSError, ValueError):
+                waiting = None
+            if waiting == message:
+                return path
+            raise PendingConflict(f"message {message['id']} is already waiting with different content; "
+                                  "use a new id for a new message")
+        partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        with os.fdopen(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+            handle.write(json.dumps(message))
+        os.replace(partial, path)
     return path

@@ -27,6 +27,10 @@ RATE_LIMIT = 10
 RATE_WINDOW_SECONDS = 300
 # Notices sent with --fyi stay readable by `local feed` this long.
 FYI_KEEP_SECONDS = 7 * 24 * 3600
+# messages.jsonl keeps this many of the latest messages, for `live web` and later reading.
+MESSAGE_LOG = 2000
+# Longer texts are cut in the log only; the delivered message is never shortened.
+MESSAGE_LOG_TEXT = 20_000
 # Clock skew tolerated on an existing notice; anything further ahead is corrupt.
 FYI_MAX_SKEW_SECONDS = 3600
 
@@ -245,6 +249,40 @@ def topic_of(target: str) -> str | None:
     return None
 
 
+def log_message(row: dict) -> None:
+    """Append one message to <live_home>/messages.jsonl, keeping the latest MESSAGE_LOG.
+
+    The bridge calls this for messages it delivers here, so the log covers both directions.
+    """
+    path = live_home() / "messages.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {**row, "text": str(row.get("text", ""))[:MESSAGE_LOG_TEXT], "at": row.get("at") or time.time()}
+    with (live_home() / ".messages.lock").open("a") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            lines = path.read_text().splitlines()
+        except FileNotFoundError:
+            lines = []
+        kept = [line for line in lines if line.strip()][-(MESSAGE_LOG - 1):]
+        partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        partial.write_text("".join(line + "\n" for line in kept) + json.dumps(entry) + "\n")
+        os.replace(partial, path)
+
+
+def _logged(receipt: dict, text: str, topic: str | None, fyi: bool, reply: str) -> dict:
+    """Record a finished send; the message is already out, so a log failure only warns."""
+    statuses = {row["to"]: row["status"] for row in receipt.get("deliveries", [])}
+    try:
+        log_message({"id": receipt.get("id"), "from": receipt.get("from"),
+                     "to": f"#{receipt['topic']}" if "deliveries" in receipt else receipt.get("to"),
+                     "topic": receipt.get("topic") or topic, "mode": "fyi" if fyi else "push", "reply": reply,
+                     "status": statuses or receipt.get("status"), "text": text})
+    except OSError as error:
+        logger.warning("sent, but could not log the message: %s", error)
+    return receipt
+
+
 def send(target: str, text: str, sender: LiveSession | None, origin: str = "unknown",
          fyi: bool = False, reply: str = "expected", topic: str | None = None,
          message_id: str | None = None) -> dict:
@@ -256,7 +294,7 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
     named = topic_of(target)
     try:
         if named is not None:
-            return _send_topic(named, text, sender, origin, fyi, reply, message_id)
+            return _logged(_send_topic(named, text, sender, origin, fyi, reply, message_id), text, None, fyi, reply)
         if topic is not None:
             topic = team._check("topic", topic)
     except team.TeamError as error:
@@ -264,7 +302,7 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
     receipt = _send_one(target, text, sender, origin, fyi, reply, topic, message_id)
     if topic is not None:
         team.record(topic, message_id, receipt["from"], text)
-    return receipt
+    return _logged(receipt, text, topic, fyi, reply)
 
 
 def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
@@ -296,20 +334,20 @@ def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id:
                 mode: str = "push") -> dict:
     """Post once; the hub records the message and fans it out to every member on every machine.
 
-    An unreachable hub leaves the message in the bridge's outbox under the same id, so the
-    bridge's later post cannot deliver it twice.
+    The message sits in the bridge's outbox from before the request until the hub answers,
+    so a crash or an unreachable hub leaves it for the bridge to repost under the same id.
     """
     # mode is the delivery mode (wake the receiver or not), kept apart from the reply policy.
     message = {"id": message_id, "to": f"#{topic}", "from": sender, "topic": topic,
                "mode": mode, "reply": reply, "text": text}
     try:
-        receipt = hub.post(message)
-    except hubclient.HubUnavailable as error:
-        hubclient.queue(message)
-        return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
-                "deliveries": [{"to": f"#{topic}", "status": f"queued for the hub: {error}"}]}
-    except hubclient.HubRefused as error:
+        receipt = hubclient.submit(hub, message)
+    except (hubclient.HubRefused, hubclient.PendingConflict) as error:
         raise LiveError(str(error)) from error
+    if receipt is None:
+        return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
+                "deliveries": [{"to": f"#{topic}", "status": "queued for the hub: no receipt yet, the bridge "
+                                                             "will resend it under the same id"}]}
     return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
             "deliveries": [{"to": row["to"], "status": row["status"]} for row in receipt.get("recipients", [])]}
 

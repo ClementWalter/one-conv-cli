@@ -292,8 +292,8 @@ one-conv live topic release-4-2           # what you have not seen on it yet
 - Sending to `#topic` records the message on the topic and delivers it to every
   member but the sender, each through its own harness; the result lists one
   status per member, and a member that is not reachable now catches up later.
-  On one machine, sending makes you a member; through a hub, `join` first, since
-  posting to a hub topic does not. `--topic` files a direct message under a topic too.
+  Sending makes you a member, locally and through a hub. `--topic` files a direct
+  message under a topic too.
 - Each member keeps a read position, so `join` and `topic` show what is new to
   that reader, at most 20 messages, labelled as history rather than new requests.
   A topic keeps its last 500 messages.

@@ -7,12 +7,13 @@ topics stay on this machine. The bearer token is sent only to the configured URL
 redirect is refused rather than followed.
 """
 
+import ipaddress
 import json
 import os
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from .model import live_home
 
@@ -34,9 +35,30 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # Following it would send the bearer token to wherever the redirect points.
 
 
+def check_url(url: str) -> str:
+    """Accept https, or plain http only to a literal loopback address such as an ssh forward.
+
+    A URL carrying user information is refused: credentials belong in the token, never in
+    an address that ends up in logs.
+    """
+    parts = urlsplit(url)
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        raise ValueError("a hub URL must not contain user information")
+    if parts.scheme == "https" and parts.hostname:
+        return url.rstrip("/")
+    if parts.scheme == "http" and parts.hostname:
+        try:
+            if ipaddress.ip_address(parts.hostname).is_loopback:
+                return url.rstrip("/")
+        except ValueError:
+            pass
+        raise ValueError("plain http is allowed only to a loopback address (127.0.0.1, ::1); use https")
+    raise ValueError(f"a hub URL is https://host or http://127.0.0.1:port, got {url!r}")
+
+
 class HubClient:
     def __init__(self, url: str, token: str, node: str | None = None, timeout: float = 15):
-        self.url, self.token, self.node, self.timeout = url.rstrip("/"), token, node, timeout
+        self.url, self.token, self.node, self.timeout = check_url(url), token, node, timeout
         self._opener = urllib.request.build_opener(_NoRedirect)
 
     def request(self, method: str, path: str, body: dict | None = None) -> dict:
@@ -90,7 +112,10 @@ def configured() -> HubClient | None:
         url, token, node = config.get("url"), config.get("token"), config.get("node")
     if not (isinstance(url, str) and isinstance(token, str) and url and token):
         return None
-    return HubClient(url, token, node if isinstance(node, str) else None)
+    try:
+        return HubClient(url, token, node if isinstance(node, str) else None)
+    except ValueError as error:
+        raise HubRefused(0, f"configured hub URL rejected: {error}") from None
 
 
 def outbox() -> Path:

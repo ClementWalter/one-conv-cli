@@ -125,17 +125,51 @@ def test_unreachable_hub_queues_the_topic_message(tmp_path, monkeypatch):
     assert json.loads((hubclient.outbox() / f"{'e' * 32}.json").read_text())["to"] == "#release"
 
 
-def test_redirect_is_refused_rather_than_followed(tmp_path):
+@pytest.fixture
+def capture_server():
+    """A second server that records every request it gets, as a redirect target."""
+    from starlette.applications import Starlette
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    seen = []
+
+    async def record(request):
+        seen.append({"auth": request.headers.get("authorization"), "body": (await request.body()).decode()})
+        return JSONResponse({})
+
+    url, stop = serve(Starlette(routes=[Route("/{path:path}", record, methods=["GET", "POST", "PUT", "DELETE"])]))
+    yield url, seen
+    stop()
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+def test_redirect_sends_neither_token_nor_body_elsewhere(capture_server, code):
     from starlette.applications import Starlette
     from starlette.responses import RedirectResponse
     from starlette.routing import Route
 
-    url, stop = serve(Starlette(routes=[Route("/v1/topics", lambda request: RedirectResponse("http://example.invalid/"))]))
+    target, seen = capture_server
+    url, stop = serve(Starlette(routes=[Route("/v1/messages", lambda request: RedirectResponse(
+        target + "/stolen", status_code=code), methods=["POST"])]))
     try:
         with pytest.raises(hubclient.HubRefused):
-            hubclient.HubClient(url, "secret").topics()
+            hubclient.HubClient(url, "secret").post({"id": "f" * 32, "to": "#t", "from": "x", "text": "private body"})
     finally:
         stop()
+    assert seen == []
+
+
+@pytest.mark.parametrize("url", ["http://hub.example.com", "http://192.168.1.4:8789", "https://user:pw@hub.example",
+                                 "https://tok@hub.example", "ftp://hub.example", "hub.example"])
+def test_unsafe_hub_url_is_rejected(url):
+    with pytest.raises(ValueError):
+        hubclient.check_url(url)
+
+
+@pytest.mark.parametrize("url", ["https://hub.example", "http://127.0.0.1:8789", "http://[::1]:8789"])
+def test_safe_hub_url_is_accepted(url):
+    assert hubclient.check_url(url) == url
 
 
 def test_no_configuration_means_no_hub(tmp_path, monkeypatch):
@@ -150,5 +184,5 @@ def test_bridge_config_file_is_read(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
     (tmp_path / "live" / "bridge").mkdir(parents=True)
-    (tmp_path / "live" / "bridge" / "hub.json").write_text(json.dumps({"url": "http://h", "token": "t", "node": "mac"}))
+    (tmp_path / "live" / "bridge" / "hub.json").write_text(json.dumps({"url": "http://127.0.0.1:9", "token": "t", "node": "mac"}))
     assert hubclient.configured().node == "mac"

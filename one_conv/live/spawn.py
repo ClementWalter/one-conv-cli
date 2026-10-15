@@ -92,9 +92,12 @@ def start(harness: str, prompt: str, cwd: Path, model: str | None = None, extra:
     it, a spawn into a folder Claude has not been trusted in stops and says so.
     """
     preflight(harness)
+    name = f"{SESSION_PREFIX}{harness}-{uuid.uuid4().hex[:8]}"
+    if harness == "codex":
+        # Codex threads carry no pid, so the spawn name in the first prompt is what identifies this one.
+        prompt = f"{prompt}\n\n(one-conv spawn {name})"
     argv = command(harness, prompt, model, extra)
     before = {s.address for s in router.list_all(harness)}
-    name = f"{SESSION_PREFIX}{harness}-{uuid.uuid4().hex[:8]}"
     result = subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", str(cwd), "-x", "200", "-y", "50",
                              "--", *argv], capture_output=True, text=True, check=False)
     if result.returncode:
@@ -118,6 +121,48 @@ def _alive(tmux_name: str) -> bool:
 TRUST_QUESTION = "Is this a project you created or one you trust?"
 
 
+def _pane_pid(tmux_name: str) -> int | None:
+    result = subprocess.run(["tmux", "display-message", "-p", "-t", tmux_name, "#{pane_pid}"], capture_output=True,
+                            text=True, check=False)
+    return int(result.stdout) if result.returncode == 0 and result.stdout.strip().isdigit() else None
+
+
+def _process_tree(root: int) -> set[int]:
+    """`root` and every process descended from it."""
+    result = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, check=False)
+    children: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0].isdigit() and fields[1].isdigit():
+            children.setdefault(int(fields[1]), []).append(int(fields[0]))
+    tree, pending = set(), [root]
+    while pending:
+        pid = pending.pop()
+        if pid not in tree:
+            tree.add(pid)
+            pending.extend(children.get(pid, ()))
+    return tree
+
+
+def _codex_rollout_mentions(thread_id: str, marker: str) -> bool:
+    for path in (codex.codex_home() / "sessions").rglob(f"rollout-*{thread_id}.jsonl"):
+        try:
+            with path.open() as handle:
+                if any(marker in line for _, line in zip(range(200), handle)):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def owned_by_spawn(session: LiveSession, tmux_name: str) -> bool:
+    """Whether `session` is the agent tmux started, not another one that registered meanwhile."""
+    if session.harness == "codex":
+        return _codex_rollout_mentions(session.id, f"(one-conv spawn {tmux_name})")
+    root = _pane_pid(tmux_name)
+    return bool(session.pid and root and session.pid in _process_tree(root))
+
+
 def _pane(tmux_name: str) -> str:
     return subprocess.run(["tmux", "capture-pane", "-p", "-t", tmux_name], capture_output=True, text=True,
                           check=False).stdout
@@ -125,7 +170,7 @@ def _pane(tmux_name: str) -> str:
 
 def wait_for_session(harness: str, cwd: Path, before: set[str], tmux_name: str, wait_seconds: float,
                      trust_folder: bool = False) -> str:
-    """The address of the session that appeared in `cwd` after the spawn; refuses if none does."""
+    """The address of the session started in tmux session `tmux_name`; refuses if it never registers."""
     deadline = time.monotonic() + wait_seconds
     resolved = str(cwd.resolve())
     answered = False
@@ -141,7 +186,8 @@ def wait_for_session(harness: str, cwd: Path, before: set[str], tmux_name: str, 
             time.sleep(0.5)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"], check=False)
             answered = True
-        fresh = [s for s in router.list_all(harness) if s.address not in before and _same_dir(s, resolved)]
+        fresh = [s for s in router.list_all(harness) if s.address not in before and _same_dir(s, resolved)
+                 and owned_by_spawn(s, tmux_name)]
         if len(fresh) == 1:
             return fresh[0].address
         time.sleep(1)
@@ -171,7 +217,10 @@ def stop(target: str) -> dict:
     name = next((n for n, row in rows.items() if target in (n, row.get("address"))), None)
     if name is None:
         raise SpawnError(f"no spawned agent matches {target!r}; see `one-conv live spawned`")
-    subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True, check=False)
+    result = subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True, text=True, check=False)
+    if _alive(name):
+        # The agent still runs: keep its record and its listing so it can be reached or stopped again.
+        raise SpawnError(f"could not end tmux session {name}: {(result.stderr or '').strip() or result.returncode}")
     row = rows.pop(name)
     _save(rows)
     harness, _, ident = (row.get("address") or "").partition(":")

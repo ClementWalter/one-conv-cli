@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -58,9 +59,10 @@ def test_preflight_needs_the_omp_extension(homes, monkeypatch):
         spawn.preflight("omp")
 
 
-def stub_tmux(monkeypatch, alive=True, pane=""):
+def stub_tmux(monkeypatch, alive=True, pane="", owned=lambda session, name: True):
     monkeypatch.setattr(spawn, "_alive", lambda name: alive)
     monkeypatch.setattr(spawn, "_pane", lambda name: pane)
+    monkeypatch.setattr(spawn, "owned_by_spawn", owned)
     sent = []
     monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: sent.append(argv))
     monkeypatch.setattr(spawn.time, "sleep", lambda seconds: None)
@@ -73,6 +75,61 @@ def test_wait_returns_the_new_session_in_that_folder(monkeypatch, tmp_path):
                 LiveSession("codex", "elsewhere", "/other")]
     monkeypatch.setattr(spawn.router, "list_all", lambda harness: sessions)
     assert spawn.wait_for_session("codex", tmp_path, {"codex:old"}, "t", 5) == "codex:new"
+
+
+def test_wait_skips_an_unrelated_agent_that_registered_first_in_that_folder(monkeypatch, tmp_path):
+    stub_tmux(monkeypatch, owned=lambda session, name: session.id == "mine")
+    sessions = [LiveSession("claude", "unrelated", str(tmp_path)), LiveSession("claude", "mine", str(tmp_path))]
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: sessions)
+    assert spawn.wait_for_session("claude", tmp_path, set(), "t", 5) == "claude:mine"
+
+
+@pytest.fixture
+def pane_tree(monkeypatch):
+    """A tmux pane whose process 100 started 101, which started 102; 200 runs elsewhere."""
+    monkeypatch.setattr(spawn, "_pane_pid", lambda name: 100)
+    table = "100 1\n101 100\n102 101\n200 1\n"
+    monkeypatch.setattr(spawn.subprocess, "run",
+                        lambda argv, **kw: subprocess.CompletedProcess(argv, 0, table, ""))
+
+
+def test_process_tree_holds_the_descendants(pane_tree):
+    assert spawn._process_tree(100) == {100, 101, 102}
+
+
+def test_a_session_run_by_the_pane_is_owned(pane_tree):
+    assert spawn.owned_by_spawn(LiveSession("omp", "x", pid=102), "t")
+
+
+def test_a_session_run_elsewhere_is_not_owned(pane_tree):
+    assert not spawn.owned_by_spawn(LiveSession("claude", "x", pid=200), "t")
+
+
+def rollout(homes, text: str) -> None:
+    folder = homes / "codex" / "sessions" / "2026" / "10" / "15"
+    folder.mkdir(parents=True)
+    (folder / f"rollout-2026-10-15T00-00-00-{THREAD}.jsonl").write_text(json.dumps({"text": text}) + "\n")
+
+
+def test_a_codex_thread_whose_prompt_names_the_spawn_is_owned(homes):
+    rollout(homes, "do it\n\n(one-conv spawn oneconv-codex-1)")
+    assert spawn.owned_by_spawn(LiveSession("codex", THREAD), "oneconv-codex-1")
+
+
+def test_a_codex_thread_naming_another_spawn_is_not_owned(homes):
+    rollout(homes, "do it\n\n(one-conv spawn oneconv-codex-2)")
+    assert not spawn.owned_by_spawn(LiveSession("codex", THREAD), "oneconv-codex-1")
+
+
+def test_start_names_the_spawn_in_a_codex_prompt(homes, monkeypatch):
+    monkeypatch.setattr(spawn, "preflight", lambda harness: None)
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
+    monkeypatch.setattr(spawn, "wait_for_session", lambda *args, **kw: "codex:x")
+    started = []
+    monkeypatch.setattr(spawn.subprocess, "run",
+                        lambda argv, **kw: started.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
+    spawned = spawn.start("codex", "do it", homes)
+    assert started[0][-1] == f"do it\n\n(one-conv spawn {spawned.tmux})"
 
 
 def test_wait_refuses_when_the_agent_exits(monkeypatch, tmp_path):
@@ -114,6 +171,31 @@ def test_stop_refuses_an_unknown_agent(homes):
         spawn.stop("codex:nobody")
 
 
+@pytest.fixture
+def unkillable(homes, monkeypatch):
+    """A spawned Codex agent whose tmux session survives kill-session."""
+    spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": f"codex:{THREAD}"}})
+    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "denied"))
+    monkeypatch.setattr(spawn, "_alive", lambda name: True)
+
+
+def test_stop_reports_a_session_it_could_not_end(unkillable):
+    with pytest.raises(spawn.SpawnError, match="could not end"):
+        spawn.stop(f"codex:{THREAD}")
+
+
+def test_stop_keeps_the_record_of_a_session_it_could_not_end(unkillable):
+    with pytest.raises(spawn.SpawnError):
+        spawn.stop(f"codex:{THREAD}")
+    assert "oneconv-c" in spawn._load()
+
+
+def test_stop_leaves_a_codex_thread_it_could_not_end_listed(unkillable):
+    with pytest.raises(spawn.SpawnError):
+        spawn.stop(f"codex:{THREAD}")
+    assert THREAD not in codex.stopped_threads()
+
+
 def lock(homes, thread=THREAD) -> Path:
     path = Path(homes / "codex" / "thread-writer-locks" / f"{thread}.lock")
     path.parent.mkdir(exist_ok=True)
@@ -126,7 +208,8 @@ def test_a_stopped_codex_thread_is_not_listed_while_its_lock_lingers(homes, monk
     old = time.time() - 60
     os.utime(path, (old, old))
     spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": f"codex:{THREAD}"}})
-    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: None)
+    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+    monkeypatch.setattr(spawn, "_alive", lambda name: False)
     spawn.stop(f"codex:{THREAD}")
     assert THREAD not in [s.id for s in codex.list_sessions()]
 

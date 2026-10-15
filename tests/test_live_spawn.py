@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from one_conv.live import codex, spawn
+from one_conv.live import codex, router, spawn
 from one_conv.live.model import LiveSession
 from one_conv.live.spawn_cli import introduction
 
@@ -228,3 +228,30 @@ def test_introduction_names_who_started_the_agent():
 
 def test_introduction_keeps_the_prompt():
     assert introduction("do it", None).endswith("do it")
+
+
+@pytest.fixture
+def ended_thread(homes):
+    """A Codex thread ended with `live stop`, whose rollout still exists."""
+    rollout(homes, "do it")
+    (homes / "live" / "codex-stopped.json").write_text(json.dumps({THREAD: time.time()}))
+    return homes
+
+
+def test_sending_to_an_ended_codex_thread_is_refused_while_its_lock_lingers(ended_thread):
+    path = lock(ended_thread)
+    old = time.time() - 60
+    os.utime(path, (old, old))
+    with pytest.raises(router.LiveError, match="ended with `live stop`"):
+        router.resolve(f"codex:{THREAD}")
+
+
+def test_sending_to_an_ended_codex_thread_is_refused_once_its_lock_is_gone(ended_thread):
+    with pytest.raises(router.LiveError, match="ended with `live stop`"):
+        router.resolve(f"codex:{THREAD}")
+
+
+def test_a_resumed_codex_thread_is_reachable_again(ended_thread):
+    lock(ended_thread)
+    os.utime(ended_thread / "codex" / "thread-writer-locks" / f"{THREAD}.lock", (time.time() + 5, time.time() + 5))
+    assert router.resolve(f"codex:{THREAD}").address == f"codex:{THREAD}"

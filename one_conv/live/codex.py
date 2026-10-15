@@ -68,6 +68,17 @@ def mark_stopped(thread_id: str) -> None:
     os.replace(partial, path)
 
 
+def ended(thread_id: str, stopped: dict | None = None) -> bool:
+    """Whether `live stop` ended this thread and nothing has loaded it since; a resume touches its lock."""
+    stopped = stopped_threads() if stopped is None else stopped
+    if thread_id not in stopped:
+        return False
+    try:
+        return (codex_home() / "thread-writer-locks" / f"{thread_id}.lock").stat().st_mtime <= stopped[thread_id]
+    except OSError:
+        return True
+
+
 def list_sessions() -> list[LiveSession]:
     names, stopped = _names(), stopped_threads()
     sessions = []
@@ -75,7 +86,7 @@ def list_sessions() -> list[LiveSession]:
         if not THREAD_ID.fullmatch(lock.stem):
             continue
         # A lock not touched since its thread was stopped is the app-server's leftover, not a live session.
-        if lock.stem in stopped and lock.stat().st_mtime <= stopped[lock.stem]:
+        if ended(lock.stem, stopped):
             continue
         sessions.append(LiveSession("codex", lock.stem, _cwd(lock.stem), names.get(lock.stem, ""), "loaded",
                                     None, "codex queue"))

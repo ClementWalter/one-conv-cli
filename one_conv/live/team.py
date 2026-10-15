@@ -251,7 +251,11 @@ def _hub_catch_up(hub, topic: str, address: str, everything: bool, peek: bool, l
 
 def catch_up(topic: str, address: str, everything: bool = False, peek: bool = False,
              limit: int = CATCH_UP) -> dict:
-    """Messages this member has not seen yet (at most `limit`), oldest first; marks them seen."""
+    """Messages this member has not seen yet (at most `limit`), oldest first.
+
+    They are marked seen unless `peek` is set, which is how a viewer reads without
+    moving anyone's position.
+    """
     topic = _check("topic", topic)
     hub = _hub()
     if hub is not None:

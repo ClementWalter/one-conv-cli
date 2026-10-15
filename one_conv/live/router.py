@@ -198,11 +198,12 @@ def _append_fyi(target: str, sender: str, text: str) -> None:
             except ValueError:
                 # A corrupt line is dropped on rewrite; failing here would lose every later notice.
                 continue
-            if isinstance(row, dict):
+            # Rows without a numeric time cannot be ordered or aged, so they are dropped too.
+            if isinstance(row, dict) and isinstance(row.get("at"), (int, float)):
                 rows.append(row)
         # Never decreasing `at` lets a reader resume after the last entry it saw.
-        at = max([now, *(r.get("at", 0) for r in rows)])
-        kept = [r for r in rows if now - r.get("at", 0) < FYI_KEEP_SECONDS]
+        at = max([now, *(r["at"] for r in rows)])
+        kept = [r for r in rows if now - r["at"] < FYI_KEEP_SECONDS]
         kept.append({"id": uuid.uuid4().hex, "at": at, "from": sender, "to": target, "text": text})
         partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         partial.write_text("".join(json.dumps(r) + "\n" for r in kept))

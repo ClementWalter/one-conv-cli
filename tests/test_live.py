@@ -469,6 +469,14 @@ def test_fyi_survives_a_corrupt_inbox_line(homes):
     assert [r["from"] for r in _fyi_rows(homes)] == ["claude:c1"]
 
 
+def test_fyi_survives_a_row_without_numeric_time(homes):
+    _omp_record(homes, os.getpid())
+    router.fyi_inbox("omp:o1").parent.mkdir(parents=True)
+    router.fyi_inbox("omp:o1").write_text(json.dumps({"id": "bad", "at": "soon", "text": "x"}) + "\n")
+    router.send("omp:o1", "merged", LiveSession("claude", "c1"), fyi=True)
+    assert [r["from"] for r in _fyi_rows(homes)] == ["claude:c1"]
+
+
 def test_fyi_inbox_rejects_path_like_address():
     with pytest.raises(router.LiveError):
         router.fyi_inbox("cursor:../../escape")

@@ -879,6 +879,50 @@ def test_freeing_deletes_only_verified_files_and_restore_brings_them_back(tmp_pa
         assert run(env, "bin/one-conv", "local", *args, "--source", source, "--json") == expected
 
 
+DAMAGED_SYNC_STATES = [
+    {"failed": 1, "finished": "yesterday", "failures": ["prior failure"]},
+    {"failed": 1, "finished": 0, "failures": [None]},
+    {"failed": 1, "finished": float("inf"), "failures": ["x"]},
+    {"failed": 1, "finished": 10 ** 1000, "failures": ["x"]},
+    {"failed": "many", "error": 3, "failures": "not a list"},
+    {"succeeded": "never", "requested": [], "started": {"a": 1}},
+]
+
+
+@pytest.mark.parametrize("state", DAMAGED_SYNC_STATES)
+def test_damaged_sync_state_does_not_break_an_unrelated_command(tmp_path, state):
+    env = fixture_env(tmp_path)
+    env.update(ONE_CONV_ARCHIVE_URL="http://127.0.0.1:1", ONE_CONV_ARCHIVE_TOKEN="t", ONE_CONV_ARCHIVE_SYNC_MINUTES="0")
+    state_dir = Path(env["ONE_CONV_STATE_DIR"])
+    state_dir.mkdir(parents=True)
+    # Written as raw text: json.dumps would refuse Infinity in strict mode and a 1001-digit int is valid JSON.
+    (state_dir / "archive-sync.json").write_text(json.dumps(state, allow_nan=True))
+    assert run(env, "bin/one-conv", "cloud", "providers", success=False).returncode == 0
+
+
+@pytest.mark.parametrize("cached", [
+    {"url": "http://127.0.0.1:1", "listed": "then", "rows": []},
+    {"url": "http://127.0.0.1:1", "listed": 1000.0, "rows": [{"source": "claude"}, None, 7]},
+    {"url": "http://127.0.0.1:1", "listed": 1000.0, "rows": "not a list"},
+])
+def test_damaged_listing_cache_does_not_break_local_reads(tmp_path, cached):
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL="http://127.0.0.1:1", ONE_CONV_ARCHIVE_TOKEN="t", ONE_CONV_ARCHIVE_SYNC_MINUTES="0")
+    state_dir = Path(env["ONE_CONV_STATE_DIR"])
+    state_dir.mkdir(parents=True)
+    (state_dir / "archive-listing.json").write_text(json.dumps(cached))
+    assert run(env, "bin/one-conv", "local", "chats", "--source", "claude", "--json", success=False).returncode == 0
+
+
+@pytest.mark.parametrize("value, expected", [
+    (1000, 1000.0), (1000.5, 1000.5), (-1, None), (float("inf"), None), (float("nan"), None),
+    (10 ** 1000, None), (True, None), ("1000", None), (None, None)])
+def test_timestamp_accepts_only_representable_numbers(value, expected):
+    from one_conv.archive import timestamp
+    assert timestamp(value) == expected
+
+
 @pytest.fixture
 def old_synced_claude(tmp_path, archive):
     """A Claude session older than the free cutoff, already captured in the archive."""

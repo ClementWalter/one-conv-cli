@@ -2150,7 +2150,8 @@ def _archive_state():
     When the archive is unreachable, its last listing keeps archived conversations visible;
     opening one then fails with a clear error.
     """
-    from one_conv.archive import LISTING_CACHE, ArchiveError, configured_client, configured_url, read_json, write_json
+    from one_conv.archive import (LISTING_CACHE, ArchiveError, configured_client, configured_url, listing_record,
+                                  read_json, valid_row, write_json)
     context = click.get_current_context(silent=True)
     if context is None:
         return None
@@ -2160,15 +2161,19 @@ def _archive_state():
         try:
             client = configured_client()
             if client:
-                rows = list(client.list_conversations())
+                listed = list(client.list_conversations())
+                # Readers index into these fields; a malformed row is dropped rather than crash every command.
+                rows = [row for row in listed if valid_row(row)]
+                if len(rows) < len(listed):
+                    log.warning("Ignoring %d malformed archive listing rows.", len(listed) - len(rows))
                 try:
                     write_json(cache, {"url": url, "listed": time.time(), "rows": rows})
                 except OSError as error:
                     log.warning("Could not save the archive listing for offline use: %s", error)
         except ArchiveError as error:
             offline = str(error)
-            cached = read_json(cache)
-            rows = cached.get("rows") if cached.get("url") == url and "listed" in cached else None
+            cached = listing_record(read_json(cache))
+            rows = cached["rows"] if cached["url"] == url and cached["listed"] is not None else None
             listed = (f" and the archive's listing from {datetime.fromtimestamp(cached['listed']):%Y-%m-%d %H:%M}"
                       if rows is not None else "")
             log.warning("%s Showing native history%s only.", error, listed)
@@ -2198,25 +2203,32 @@ def _archive_sync_minutes():
 
 
 def _archive_sync_health(state, minutes):
-    """Report a failing sync, or one that has not completed for a day while automatic sync is on."""
+    """Report a failing sync, or one that has not completed for a day while automatic sync is on.
+
+    `state` is a validated sync record, so a damaged state file degrades to a vaguer warning
+    instead of stopping the user's command.
+    """
     from one_conv.archive import SYNC_LOG
-    if state.get("error") or state.get("failed"):
-        detail = state.get("error") or "; ".join(state.get("failures", []))
-        finished = datetime.fromtimestamp(state.get("finished", 0)).strftime("%Y-%m-%d %H:%M")
+    if state["error"] or state["failed"]:
+        detail = state["error"] or "; ".join(state["failures"]) or "no details recorded"
+        finished = (datetime.fromtimestamp(state["finished"]).strftime("%Y-%m-%d %H:%M")
+                    if state["finished"] is not None else "an unknown time")
         log.warning("Archive sync at %s failed: %s (log: %s)", finished, detail, STATE_DIR / SYNC_LOG)
-    elif minutes > 0 and state and time.time() - (state.get("succeeded") or state.get("requested", 0)) > 86400:
+    elif minutes > 0 and (state["succeeded"] or state["requested"]) is not None \
+            and time.time() - (state["succeeded"] or state["requested"]) > 86400:
         log.warning("Archive sync has not completed in the last day (log: %s)", STATE_DIR / SYNC_LOG)
 
 
 def _archive_sync_in_background():
     """Start a sync when one is due, without waiting; the sync script itself skips if another is running."""
-    from one_conv.archive import SYNC_LOG, SYNC_STATE, configured_url, read_json, write_json
+    from one_conv.archive import SYNC_LOG, SYNC_STATE, configured_url, read_json, sync_record, write_json
     if not configured_url():
         return
     minutes, state_path = _archive_sync_minutes(), STATE_DIR / SYNC_STATE
-    state = read_json(state_path)
+    raw = read_json(state_path)
+    state = sync_record(raw)
     _archive_sync_health(state, minutes)
-    if minutes <= 0 or time.time() - state.get("started", 0) < minutes * 60:
+    if minutes <= 0 or time.time() - (state["started"] or 0) < minutes * 60:
         return
     script = Path(__file__).resolve().parents[1] / "scripts" / "archive-sync.py"
     if not script.is_file():
@@ -2227,7 +2239,7 @@ def _archive_sync_in_background():
                 else {"start_new_session": True})
     try:
         # Recorded before starting, so a sync that never runs is reported too.
-        write_json(state_path, {**state, "started": time.time(), "requested": state.get("requested", time.time())})
+        write_json(state_path, {**raw, "started": time.time(), "requested": state["requested"] or time.time()})
         output = os.open(STATE_DIR / SYNC_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
             subprocess.Popen([sys.executable, str(script), *sources], stdin=subprocess.DEVNULL, stdout=output,

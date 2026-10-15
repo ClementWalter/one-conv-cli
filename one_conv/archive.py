@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -41,6 +42,51 @@ def read_json(path):
     except (OSError, ValueError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+# Year 3000: later, non-finite or non-numeric times cannot be formatted or compared safely.
+_LATEST_TIME = 32_503_680_000
+
+
+def timestamp(value):
+    """`value` as epoch seconds, or None unless it is a plain number in a representable range."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    # Bounds first: a huge JSON integer overflows float conversion inside math.isfinite.
+    if not 0 <= value < _LATEST_TIME or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def sync_record(raw):
+    """The sync state file's fields with their expected types; anything else reads as absent."""
+    failures = raw.get("failures")
+    failed = raw.get("failed")
+    return {
+        "error": raw["error"] if isinstance(raw.get("error"), str) and raw["error"] else None,
+        "failed": failed if isinstance(failed, int) and not isinstance(failed, bool) and failed > 0 else 0,
+        "failures": [item for item in failures if isinstance(item, str)] if isinstance(failures, list) else [],
+        **{field: timestamp(raw.get(field)) for field in ("finished", "succeeded", "requested", "started")},
+    }
+
+
+def valid_row(row):
+    """Whether an archive listing row has every field the readers index into, with usable types."""
+    if not isinstance(row, dict):
+        return False
+    summary = row.get("summary")
+    return (all(isinstance(row.get(field), str) for field in ("key", "revision", "source", "cwd", "session"))
+            and timestamp(row.get("mtime")) is not None
+            and isinstance(summary, dict) and isinstance(summary.get("title"), (str, type(None)))
+            and isinstance(row.get("unread_native"), (bool, type(None))))
+
+
+def listing_record(raw):
+    """The cached listing's fields with their expected types; malformed rows are dropped."""
+    rows = raw.get("rows")
+    return {"url": raw["url"] if isinstance(raw.get("url"), str) else None,
+            "listed": timestamp(raw.get("listed")),
+            "rows": [row for row in rows if valid_row(row)] if isinstance(rows, list) else None}
 
 
 def write_json(path, value):

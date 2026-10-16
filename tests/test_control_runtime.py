@@ -174,8 +174,24 @@ def test_browser_rate_update_cannot_submit_stale_identity_fields(paired_browser,
     assert paired_browser.post("/api/providers/accounting", json={"action": "update_rate", "reference": "jack", "hourly_rate": card["hourly_rate"], "addresses": []}).status_code == 400
 
 
+@pytest.mark.parametrize("replace", [True, "true", 1, None, [], {}])
+def test_browser_registration_rejects_replacement_requests(paired_browser, card, replace):
+    assert paired_browser.post("/api/providers/accounting", json={"action": "register", "card": card, "replace": replace}).status_code == 400
+
+
+def test_browser_replacement_error_guides_old_phone_tabs(paired_browser, card):
+    response = paired_browser.post("/api/providers/accounting", json={"action": "register", "card": card, "replace": True})
+    assert "Refresh the workspace" in response.json()["error"]
+
+
 def test_node_can_publish_its_rate_card(node, card):
     assert node.post("/v1/accounting/rates", json={"card": card}).status_code == 200
+
+
+def test_node_can_still_replace_its_owned_rate_card(node, card):
+    node.post("/v1/accounting/rates", json={"card": card}).raise_for_status()
+    updated = node.post("/v1/accounting/rates", json={"card": {**card, "name": "Updated Jack"}, "replace": True})
+    assert updated.json()["card"]["name"] == "Updated Jack"
 
 
 def test_quote_of_an_unknown_rate_stays_unknown(node, card):

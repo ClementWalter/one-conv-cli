@@ -20,7 +20,7 @@ def private_output(path, value):
 
 
 def build_control_group():
-    @click.group("control", epilog="Examples:\n  one-conv live control serve --origin https://team.example --config control.json\n  one-conv live control pair --origin https://team.example --output phone.link")
+    @click.group("control", epilog="\b\nExamples:\n  one-conv live control serve --origin https://team.example --config control.json\n  one-conv live control pair --origin https://team.example --output phone.link")
     @click.option("--directory", type=click.Path(path_type=Path), default=default_directory,
                   help="Private cloud state directory; defaults to ONE_CONV_CONTROL_DIR.")
     @click.pass_context
@@ -29,7 +29,7 @@ def build_control_group():
         context.ensure_object(dict)
         context.obj["control_directory"] = directory
 
-    @control.command("serve", epilog="Examples:\n  one-conv live control serve --origin https://team.example --host 0.0.0.0 --port 8790\n  one-conv live control serve --origin https://team.example --config control.json")
+    @control.command("serve", epilog="\b\nExamples:\n  one-conv live control serve --origin https://team.example --host 0.0.0.0 --port 8790\n  one-conv live control serve --origin https://team.example --config control.json")
     @click.option("--origin", required=True, help="Exact public HTTPS origin terminating TLS in front of this service.")
     @click.option("--host", default="127.0.0.1", show_default=True)
     @click.option("--port", type=click.IntRange(1, 65535), default=8790, show_default=True)
@@ -54,7 +54,7 @@ def build_control_group():
             raise click.ClickException(str(error)) from None
         uvicorn.run(app, host=host, port=port, access_log=False, proxy_headers=False)
 
-    @control.command("pair", epilog="Examples:\n  one-conv live control pair --origin https://team.example --output phone.link")
+    @control.command("pair", epilog="\b\nExamples:\n  one-conv live control pair --origin https://team.example --output phone.link")
     @click.option("--origin", required=True)
     @click.option("--ttl", type=click.IntRange(1, 3600), default=600, show_default=True)
     @click.option("--output", type=click.Path(path_type=Path), required=True, help="New private file receiving the one-use URL.")
@@ -73,7 +73,7 @@ def build_control_group():
             raise click.ClickException(str(error)) from None
         click.echo(f"Pairing link written privately; valid for {ttl} seconds.")
 
-    @control.command("node", epilog="Examples:\n  one-conv live control node add laptop --output laptop.token\n  one-conv live control node revoke laptop")
+    @control.command("node", epilog="\b\nExamples:\n  one-conv live control node add laptop --output laptop.token\n  one-conv live control node revoke laptop")
     @click.argument("action", type=click.Choice(["add", "revoke"]))
     @click.argument("name")
     @click.option("--output", type=click.Path(path_type=Path), help="Required for add; new private file receiving the node key.")
@@ -96,7 +96,7 @@ def build_control_group():
             raise click.ClickException(str(error)) from None
         click.echo("Node credential written privately." if action == "add" else "Node credential revoked.")
 
-    @control.command("revoke-devices", epilog="Examples:\n  one-conv live control revoke-devices --yes")
+    @control.command("revoke-devices", epilog="\b\nExamples:\n  one-conv live control revoke-devices --yes")
     @click.option("--yes", is_flag=True, required=True, help="Invalidate every paired browser session.")
     @click.pass_context
     def revoke_devices(context, yes):

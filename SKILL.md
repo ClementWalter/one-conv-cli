@@ -15,6 +15,24 @@ description: >-
 Use the bundled `bin/one-conv` launcher, or `one-conv` when installed on PATH.
 The Python launcher resolves its dependencies through `uv`.
 
+## Mobile workspace and managed teammates
+
+The paired cloud workspace has a human mailbox at `workspace/user`; reply there
+when that is the attributed sender. A laptop is an ordinary node, not the host of
+the human mailbox. Browser login and machine bearer credentials are separate.
+
+With a configured hub, `live spawn HARNESS --cloud --name NAME --topic TOPIC`
+prepares a resident teammate on a shared Boat worker box. It requires `--yes`.
+Use `live workers --json` for progress. Preserve the returned request ID and use
+`--request-id` after an unconfirmed response; do not allocate another box merely
+because a receipt was lost. Missing provider access remains needing attention.
+
+`hr list`, `hr quote`, `hr usage` and `hr summary` use the configured shared
+accounting authority. `--local` opts out. Hourly rates include internal subagents.
+Keep allocated rates, estimates and reported cash distinct; unknown subscription
+cost is not zero. The CFO's staffing choices belong to its task, not to a fixed
+CLI budget policy. See [MOBILE_WORKSPACE.md](MOBILE_WORKSPACE.md).
+
 ## First-time setup: keep conversation history
 
 During initial interactive setup, ask if the user has not already decided:

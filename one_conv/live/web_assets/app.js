@@ -845,7 +845,7 @@ const jobLabels = {
   queued: "Getting started", provisioning: "Preparing workspace", bootstrapping: "Setting up tools",
   starting: "Starting teammate", registering: "Joining the team", ready: "Online",
   auth_needed: "Provider needs attention", authentication_required: "Provider needs attention", failed: "Needs attention",
-  unknown: "Checking what happened", unconfirmed: "Checking what happened", stopped: "Stopped",
+  unknown: "Outcome needs checking", unconfirmed: "Outcome needs checking", stopped: "Stopped",
   unverified: "Connection not verified",
 };
 
@@ -878,9 +878,11 @@ function renderJobs() {
       });
       item.append(button);
     }
-    if (["ready", "unverified", "auth_needed", "failed"].includes(job.status)) {
+    if (["ready", "unverified", "auth_needed", "failed"].includes(job.status) ||
+        (job.status === "unconfirmed" && job.box_id)) {
       const actions = el("div", null, "job-actions");
-      if (["auth_needed", "unverified", "failed"].includes(job.status) || (job.status === "ready" && !online)) {
+      if (["auth_needed", "unverified", "failed"].includes(job.status) ||
+          (job.status === "unconfirmed" && job.phase === "bootstrapping") || (job.status === "ready" && !online)) {
         const check = el("button", "Check again", "secondary-button");
         check.type = "button";
         check.addEventListener("click", () => workerAction("recheck", job.id));
@@ -891,6 +893,19 @@ function renderJobs() {
       stop.addEventListener("click", () => workerAction("stop", job.id));
       actions.append(stop);
       item.append(actions);
+    }
+    if (job.status === "unconfirmed" && job.phase === "creating" && !job.box_id) {
+      const form = el("form", null, "quote-form"), label = el("label", "Existing box ID from Boat");
+      const input = document.createElement("input"); input.placeholder = "bx_…"; input.required = true;
+      input.setAttribute("aria-label", "Reconcile box for " + (spec.name || "teammate")); label.append(input);
+      const button = el("button", "Use this existing box", "secondary-button"); button.type = "submit";
+      form.append(label, button, el("p", "Check Boat before continuing. This attaches a box already created; it does not create another.", "quiet-copy"));
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault(); button.disabled = true;
+        try { await post("/api/providers/workers", { action: "reconcile", id: job.id, box_id: input.value.trim() }); await refreshWorkers(); }
+        catch (error) { $("staff-feedback").textContent = error.message; button.disabled = false; }
+      });
+      item.append(form);
     }
     container.append(item);
   }

@@ -132,6 +132,14 @@ class Workers:
             job = self.manager.submit(payload["spec"], payload["id"])
             self.rate_card(job)
             return job
+        if action == "reconcile":
+            _fields(payload, ("action", "id", "box_id"))
+            if not isinstance(payload["id"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", payload["id"]):
+                raise ValueError("Choose a tracked worker ID")
+            try:
+                return self.manager.reconcile(payload["id"], payload["box_id"])
+            except KeyError:
+                raise HubError(404, "No such tracked worker") from None
         _fields(payload, ("action", "id"))
         if action not in ("stop", "recheck", "stop_pool", "resume_pool"):
             raise ValueError("Choose spawn, stop, recheck, stop_pool or resume_pool")

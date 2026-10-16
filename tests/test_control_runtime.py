@@ -135,6 +135,11 @@ def test_worker_actions_refuse_malformed_ids_before_dispatch(identifier):
         Workers(None, None).browser("POST", {"action": "stop", "id": identifier})
 
 
+def test_reconciliation_refuses_a_malformed_id_before_remote_inspection():
+    with pytest.raises(ValueError, match="tracked worker"):
+        Workers(None, None).browser("POST", {"action": "reconcile", "id": [], "box_id": "bx_example"})
+
+
 def test_pairing_cli_writes_a_private_link(tmp_path):
     path = tmp_path / "phone.link"
     CliRunner().invoke(build_control_group(), ["--directory", str(tmp_path / "state"), "pair", "--origin", ORIGIN,

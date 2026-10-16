@@ -27,7 +27,8 @@ def add_spawn_commands(live: click.Group) -> None:
     @live.command("spawn", context_settings=HELP,
                   epilog="\b\nExamples:\n  one-conv live spawn codex 'review the diff on this branch' --yes\n"
                          "  one-conv live spawn claude 'write the tests' --model sonnet --cwd ../repo --yes\n"
-                         "  one-conv live spawn omp --stdin --yes < brief.md")
+                         "  one-conv live spawn omp --stdin --yes < brief.md\n"
+                         "  one-conv live spawn codex 'review the release' --cloud --name jack --topic release --yes")
     @click.argument("harness", type=click.Choice(spawn.HARNESSES))
     @click.argument("prompt", required=False)
     @click.option("--stdin", "from_stdin", is_flag=True, help="Read the first prompt from stdin.")
@@ -50,7 +51,11 @@ def add_spawn_commands(live: click.Group) -> None:
     @click.option("--json", "as_json", is_flag=True, help="Emit the spawned agent as JSON.")
     def spawn_command(harness, prompt, from_stdin, model, cloud, name, topic, profile, request_id, cwd, extra,
                       no_intro, trust_folder, wait_seconds, yes, as_json):
-        """Start a Claude Code, Codex or Oh My Pi agent detached in tmux and print its address.
+        """Start a resident Claude Code, Codex or Oh My Pi teammate, locally or in the cloud.
+
+        With --cloud, the configured workspace prepares repositories, tools and provider
+        access in a shared worker box. --name and --topic are required. The receipt gives
+        a durable request ID; inspect its progress with live workers.
 
         The agent runs interactively, so it stays reachable with `live send` after its first
         turn, unlike `codex exec` or `claude -p`, which exit. Watch it with `tmux attach -t NAME`;

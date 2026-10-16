@@ -400,6 +400,30 @@ class WorkerManager:
         joined = any(row.get("topic") == job["spec"]["topic"] and qualified in row.get("members", []) for row in client.topics())
         return published and joined
 
+    def _inspect_pool(self, pool, job):
+        """Read tracked machine state before reuse; automatic stops invalidate every old process."""
+        info = self.boat.info(pool["box_id"])
+        machine = info.get("state") if isinstance(info, dict) else None
+        if machine not in ("running", "up", "stopped"):
+            raise Unconfirmed("tracked pool machine state is unconfirmed")
+        with self._locked():
+            state = _read(self.state_path)
+            actual = state["pools"][pool["id"]]
+            actual["status"] = "stopped" if machine == "stopped" else "available"
+            actual["checked_at"] = time.time()
+            if machine == "stopped":
+                for previous in state["jobs"].values():
+                    if previous.get("pool_id") == pool["id"] and previous["status"] in ACTIVE:
+                        previous.update(address=None, health={"registered": False, "bridge": False, "published": False,
+                                                               "joined": False, "collector": False}, updated=time.time())
+                        if previous["id"] == job["id"]:
+                            previous["restart"] = True
+                            job["restart"] = True
+                        else:
+                            previous.update(status="stopped", phase="pool-stopped")
+            self._save(state)
+            return copy.deepcopy(actual)
+
     def _provision(self, job):
         profile = self.profiles[job["spec"]["profile"]]
         check_url(self.config.get("public_hub_url", ""))
@@ -407,6 +431,9 @@ class WorkerManager:
         credentials = self.boat.credentials(profile)
         pool = self._pool(job)
         token = self._token(pool)
+        if pool["box_id"]:
+            self._update(job["id"], phase="inspecting")
+            pool = self._inspect_pool(pool, job)
         if pool["status"] == "stopped":
             self._update(job["id"], phase="resuming")
             with self._locked():
@@ -495,9 +522,10 @@ class WorkerManager:
             job = state["jobs"][id]
             recheck = job["status"] == "unconfirmed" and job.get("box_id") and job["phase"] == "bootstrapping"
             restart = job["status"] == "stopped" and job["phase"] == "pool-stopped"
-            if job["status"] not in ("auth_needed", "unverified", "failed") and not recheck and not restart:
+            ready = job["status"] == "ready" and job.get("box_id")
+            if job["status"] not in ("auth_needed", "unverified", "failed") and not recheck and not restart and not ready:
                 raise ValueError("only known safe setup or a known-box readiness check can be retried")
-            if restart:
+            if restart or ready:
                 pool = state["pools"][job["pool_id"]]
                 if pool["status"] != "available":
                     raise ValueError("resume the worker pool before rechecking its agents")

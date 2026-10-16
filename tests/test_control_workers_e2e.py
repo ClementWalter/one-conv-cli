@@ -39,7 +39,7 @@ class StubBoatHTTP:
         return self.call("bootstrap", {"box": box, "payload": payload})
 
     def info(self, box):
-        return {"id": box}
+        return {"id": box, "state": "running"}
 
     def stop_pool(self, box):
         return self.call("stop", {"box": box})

@@ -34,6 +34,7 @@ class StubBoat:
         self.lose_bootstrap = False
         self.pools_stopped = []
         self.pools_resumed = []
+        self.state = "running"
 
     def credentials(self, profile):
         return {"service_account": "private-service-account"}
@@ -45,7 +46,7 @@ class StubBoat:
         return f"bx_{self.creates}"
 
     def info(self, box):
-        return {"id": box}
+        return {"id": box, "state": self.state}
 
     def bootstrap(self, box, payload):
         self.starts.append((box, payload))
@@ -55,9 +56,11 @@ class StubBoat:
 
     def stop_pool(self, box):
         self.pools_stopped.append(box)
+        self.state = "stopped"
 
     def resume_pool(self, box):
         self.pools_resumed.append(box)
+        self.state = "running"
 
 
 @pytest.fixture
@@ -270,6 +273,36 @@ def test_rechecking_after_resume_reuses_the_tracked_box(provisioned, boat):
     pool = provisioned.list()["pools"][0]["id"]
     provisioned.stop_pool(pool)
     provisioned.resume_pool(pool)
+    provisioned.recheck("request-1")
+    provisioned.run_once()
+    assert boat.creates == 1
+
+
+def test_automatic_pool_stop_reuses_the_known_box(provisioned, boat):
+    boat.state = "stopped"
+    provisioned.recheck("request-1")
+    provisioned.run_once()
+    assert boat.creates == 1
+
+
+def test_automatic_pool_stop_resumes_the_known_box(provisioned, boat):
+    boat.state = "stopped"
+    provisioned.recheck("request-1")
+    provisioned.run_once()
+    assert boat.pools_resumed == ["bx_1"]
+
+
+def test_automatic_pool_stop_invalidates_other_old_jobs(provisioned, spec, boat):
+    provisioned.submit({**spec, "name": "builder"}, "request-2")
+    provisioned.run_once()
+    boat.state = "stopped"
+    provisioned.recheck("request-1")
+    provisioned.run_once()
+    assert provisioned.status("request-2")["status"] == "stopped"
+
+
+def test_ready_worker_recheck_does_not_create_a_second_box(provisioned, boat):
+    provisioned._update("request-1", status="ready")
     provisioned.recheck("request-1")
     provisioned.run_once()
     assert boat.creates == 1

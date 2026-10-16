@@ -33,6 +33,8 @@ DEFAULT_PROFILE = {
     "type": "default", "slots": 4, "credential_environment": "claudine",
     "environment": "base", "probe_enabled": True, "credential_refs": {},
     "billing_scope": None, "revisions": {},
+    "harness_args": {"claude": ["--dangerously-skip-permissions"],
+                     "codex": ["--dangerously-bypass-approvals-and-sandbox"], "omp": ["--approval-mode=yolo"]},
 }
 
 
@@ -111,6 +113,11 @@ def _profile(value: dict) -> dict:
     if (not isinstance(revisions, dict) or any(repo not in repos or not isinstance(revision, str)
             or not re.fullmatch(r"[0-9a-f]{40}", revision) for repo, revision in revisions.items())):
         raise ValueError("revisions must pin selected repositories to full commit hashes")
+    args = profile["harness_args"]
+    if (not isinstance(args, dict) or set(args) != {"claude", "codex", "omp"}
+            or any(not isinstance(values, list) or len(values) > 32 or any(not isinstance(arg, str) or len(arg) > 1024
+                   or "\x00" in arg or "\n" in arg for arg in values) for values in args.values())):
+        raise ValueError("harness_args must contain direct argument lists for claude, codex and omp")
     return copy.deepcopy(profile)
 
 
@@ -410,7 +417,7 @@ class WorkerManager:
                 or not self._hub_health(pool, job, health, token)):
             raise Unconfirmed("worker readiness was not confirmed by the live hub")
         self._update(job["id"], status=health["status"], phase=health["status"], health=public,
-                     address=public.get("address"), error=None)
+                     address=f"{pool['node']}/{public['address']}" if public.get("address") else None, error=None)
 
     def run_once(self):
         """Advance one queued job; a released claim is ambiguous after a controller crash."""
@@ -423,7 +430,9 @@ class WorkerManager:
                 state = _read(self.state_path)
                 for job in state["jobs"].values():
                     if job["status"] == "provisioning":
-                        job.update(status="unconfirmed", error="controller stopped during a provider operation", updated=time.time())
+                        ambiguous = job["phase"] in ("creating", "bootstrapping", "resuming", "stopping")
+                        job.update(status="unconfirmed" if ambiguous else "failed",
+                                   error="controller stopped during a provider operation", updated=time.time())
                 job = next((item for item in state["jobs"].values() if item["status"] == "queued"), None)
                 if job is not None:
                     job.update(status="provisioning", updated=time.time())

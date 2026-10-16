@@ -129,6 +129,14 @@ def test_a_worker_is_ready_only_after_real_hub_publication_and_membership(runtim
     assert manager.run_once()["status"] == "ready"
 
 
+def test_public_job_address_routes_through_its_remote_node(runtime):
+    manager, spec, _ = runtime
+    manager.submit(spec, "job-1")
+    job = manager.run_once()
+    pool = manager.list()["pools"][0]
+    assert job["address"] == f"{pool['node']}/claude:job-1"
+
+
 def test_a_claimed_publication_without_a_hub_entry_is_unconfirmed(runtime):
     manager, spec, remote = runtime
     remote["publish"] = False

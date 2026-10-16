@@ -149,12 +149,28 @@ def test_pi_auth_import_requires_an_explicit_boat_omp_request(boat_pi_auth, monk
     assert bootstrap.prepare_omp_auth(data, env) is True
 
 
-@pytest.mark.parametrize("key", ["OMP_PROFILE", "PI_CODING_AGENT_DIR", "OMP_AUTH_BROKER_URL", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"])
+@pytest.mark.parametrize("key", ["OMP_PROFILE", "PI_CODING_AGENT_DIR", "OMP_AUTH_BROKER_URL", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                                 "GROQ_API_KEY", "ZAI_API_KEY", "COPILOT_GITHUB_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS"])
 def test_explicit_native_omp_configuration_keeps_its_identity(boat_pi_auth, monkeypatch, key):
     data, env, _ = boat_pi_auth
     env[key] = "explicit-native-value"
     monkeypatch.setattr(bootstrap, "run", lambda *args, **kwargs: pytest.fail("explicit native configuration"))
     assert bootstrap.prepare_omp_auth(data, env) is True
+
+
+@pytest.mark.parametrize("args", [["--api-key", "synthetic"], ["--api-key=synthetic"]])
+def test_legacy_explicit_native_omp_key_never_imports_another_identity(boat_pi_auth, monkeypatch, args):
+    data, env, _ = boat_pi_auth
+    data["profile"]["harness_args"]["omp"] = args
+    monkeypatch.setattr(bootstrap, "run", lambda *args, **kwargs: pytest.fail("explicit native identity"))
+    assert bootstrap.prepare_omp_auth(data, env) is True
+
+
+def test_claude_code_oauth_does_not_replace_the_selected_pi_identity(boat_pi_auth, omp_import):
+    data, env, _ = boat_pi_auth
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = "synthetic-claude-token"
+    bootstrap.prepare_omp_auth(data, env)
+    assert omp_import[0]["converted"]["access_token"] == "synthetic-access"
 
 
 @pytest.mark.parametrize("source", [{"anthropic": {"type": "api_key", "key": "synthetic"}},

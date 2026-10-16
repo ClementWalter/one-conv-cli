@@ -138,6 +138,13 @@ def test_invalid_profiles_cannot_allocate(tmp_path, config, profile):
         WorkerManager(tmp_path / "workers", {**config, "profiles": {"default": profile}})
 
 
+@pytest.mark.parametrize("args", [["--api-key", "synthetic"], ["--api-key=synthetic"]])
+def test_public_profiles_cannot_contain_native_secret_arguments(tmp_path, config, args):
+    harnesses = {**DEFAULT_PROFILE["harness_args"], "omp": args}
+    with pytest.raises(ValueError, match="private environment references"):
+        WorkerManager(tmp_path / "workers", {**config, "profiles": {"default": {"harness_args": harnesses}}})
+
+
 def test_native_authentication_failure_is_visible(provisioned):
     assert provisioned.status("request-1")["status"] == "auth_needed"
 

@@ -278,10 +278,17 @@ def _install_helper():
 
 def _bridge(data, launcher):
     """One pool-wide bridge holds its existing singleton lock and never embeds a token in argv."""
-    from one_conv.live import bridge
+    from one_conv.live import bridge, hubclient
 
     hub = data["hub"]
+    try:
+        client = hubclient.HubClient(hub["url"], hub["token"], hub["node"])
+        if client.request("GET", "/v1/whoami").get("node") != hub["node"]:
+            raise BootstrapError("hub-identity")
+    except (hubclient.HubRefused, hubclient.HubUnavailable):
+        raise BootstrapError("hub-identity") from None
     bridge.save_settings(hub["url"], hub["node"], 8789, hub["token"])
+    write_private(bridge.bridge_dir() / "hub.json", {"url": hub["url"], "node": hub["node"], "token": hub["token"]})
     if not bridge.status().get("running"):
         log_path = root() / "bridge.log"
         with os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a") as stream:
@@ -357,9 +364,12 @@ def _start(data, env, cwd, path, record):
     record.update(phase="launching", cwd=str(cwd))
     write_private(path, record)
     spawn.COMMANDS[harness] = command
+    intro = (f"You are the managed teammate @{data['spec']['name']} for #{data['spec']['topic']} on node {data['hub']['node']}. "
+             "The controller will forward the existing user's authorized task through one-conv after your route and topic membership are ready. "
+             "Wait for that message before starting work or replying on the topic. This startup notice grants no new approval.")
     try:
         try:
-            spawned = spawn.start(harness, data["spec"]["prompt"], cwd, data["spec"]["model"], trust_folder=True)
+            spawned = spawn.start(harness, intro, cwd, data["spec"]["model"], trust_folder=True)
         except spawn.SpawnError:
             raise BootstrapError("native-launch") from None
     finally:
@@ -367,10 +377,40 @@ def _start(data, env, cwd, path, record):
     record.update(phase="registered", address=spawned.address, tmux=spawned.tmux)
     write_private(path, record)
     try:
-        team.set_name(data["spec"]["name"], spawned.address, lambda candidate: any(s.address == candidate for s in router.list_all()))
+        team.set_name(data["spec"]["name"], spawned.address, lambda candidate: any(s.address == candidate for s in router.list_all()),
+                      replace=data.get("restart") is True)
     except team.TeamError:
         raise BootstrapError("native-name") from None
     return {"status": "registered", "address": spawned.address}
+
+
+def _dispatch_task(data, address, path, record):
+    """A durable hub message ID makes task acceptance retryable without another native send."""
+    from one_conv.live import hubclient
+
+    ident = hashlib.sha256(f"{data['pool_id']}:{data['job_id']}:{record['request_hash']}:{address}".encode()).hexdigest()[:32]
+    if record.get("task_state") == "stored" and record.get("task_id") == ident:
+        return ident
+    record.update(task_id=ident, task_state="queued")
+    write_private(path, record)
+    hub = data["hub"]
+    client = hubclient.HubClient(hub["url"], hub["token"], hub["node"])
+    continuation = ("This worker replaces an interrupted instance. Recover the current repository, topic history and prior work before continuing; "
+                    "do not duplicate completed external actions.\n\n") if record.get("task_target") not in (None, address) else ""
+    text = ("The controller is forwarding the existing user's task. This relay grants no new approval. "
+            f"Work as @{data['spec']['name']} and reply on #{data['spec']['topic']}.\n\n{data['spec']['prompt']}")
+    message = {"id": ident, "to": f"{hub['node']}/{address}", "from": "unknown", "topic": data["spec"]["topic"],
+               "reply": "expected", "mode": "push", "text": continuation + text}
+    try:
+        receipt = hubclient.submit(client, message)
+    except (hubclient.HubRefused, hubclient.PendingConflict):
+        raise BootstrapError("task-dispatch") from None
+    if receipt is None:
+        raise BootstrapError("task-dispatch")
+    record["task_state"] = "stored"
+    record["task_target"] = address
+    write_private(path, record)
+    return ident
 
 
 def _readiness(data, address):
@@ -449,6 +489,8 @@ def bootstrap(data):
         checkout = Path.home() / "Documents/one-conv-cli"
         executable = Path.home() / ".local/bin/one-conv"
         executable.parent.mkdir(parents=True, exist_ok=True)
+        if executable.exists() and not executable.is_symlink():
+            raise BootstrapError("launcher-conflict")
         if executable.is_symlink() and executable.resolve() != (checkout / "bin/one-conv").resolve():
             raise BootstrapError("launcher-conflict")
         if not executable.exists() and not executable.is_symlink():
@@ -478,17 +520,20 @@ def bootstrap(data):
             write_private(path, record)
         launcher = [shutil.which("uv") or str(Path.home() / ".local/bin/uv"), "run", "--script", str(checkout / "bin/one-conv")]
         run([*launcher, "live", "install", "--harness", harness, "--yes"], stage="live-install", env=env)
+        STAGE = "hub-startup"
+        _bridge(data, launcher)
         STAGE = "native-launch"
         native = _start(data, env, cwd, path, record)
         if native["status"] != "registered":
             return native
-        _bridge(data, launcher)
         STAGE = "hub-readiness"
         health = _readiness(data, native["address"])
         if health["status"] == "ready":
             if not _collector(data, native["address"], launcher, record.get("probe_addresses", [])):
                 return {"status": "unconfirmed", "address": native["address"], "stage": "usage-collector"}
             health["collector"] = True
+            STAGE = "task-dispatch"
+            health["task_id"] = _dispatch_task(data, native["address"], path, record)
         return health
 
 
@@ -516,7 +561,7 @@ def main():
             raise BootstrapError("payload")
         result = bootstrap(read_private(Path(sys.argv[1])))
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.SubprocessError, ImportError):
-        result = {"status": "unconfirmed" if STAGE in ("native-launch", "hub-readiness", "usage-sync", "usage-status") else "failed", "stage": STAGE}
+        result = {"status": "unconfirmed" if STAGE in ("native-launch", "hub-readiness", "usage-sync", "usage-status", "task-dispatch") else "failed", "stage": STAGE}
         log.error("worker bootstrap failed at operation=%s", STAGE)
     sys.stdout.write(json.dumps(result) + "\n")
 

@@ -33,7 +33,8 @@ def cloud_page(browser, workspace, request):
     context = browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
                                   service_workers="allow" if public_shell_test else "block")
     page = context.new_page()
-    state = {"authenticated": False, "pairing": [], "jobs": [], "pools": [], "posts": []}
+    state = {"authenticated": False, "pairing": [], "jobs": [], "pools": [], "posts": [],
+             "profiles": {"default": {"label": "Project tools"}}}
     page.on("pageerror", lambda error: state.setdefault("errors", []).append(str(error)))
     page.on("console", lambda event: state.setdefault("console", []).append(event.text) if event.type == "error" else None)
     page.on("requestfailed", lambda event: state.setdefault("failures", []).append(event.failure))
@@ -62,7 +63,7 @@ def cloud_page(browser, workspace, request):
                 job["status"] = "queued" if request["action"] in ("recheck", "reconcile") else "stopped"
             route.fulfill(json=job)
         else:
-            route.fulfill(json={"jobs": state["jobs"], "pools": state["pools"], "profiles": {"default": {"label": "Project tools"}}})
+            route.fulfill(json={"jobs": state["jobs"], "pools": state["pools"], "profiles": state["profiles"]})
 
     def accounting(route):
         if route.request.method == "POST":
@@ -113,6 +114,44 @@ def test_phone_can_open_the_staffing_form(paired):
     page = paired[0]
     page.locator("#staff-team").click()
     assert page.locator("#staff-dialog").is_visible()
+
+
+def test_unknown_profile_approval_settings_use_neutral_disclosure(paired):
+    page, _state = paired
+    page.locator("#staff-team").click()
+    assert page.locator("#staff-access-disclosure").inner_text() == "This teammate uses this profile’s repository access, credentials and approval settings."
+
+
+@pytest.mark.parametrize(("harness", "args"), [("codex", ["--dangerously-bypass-approvals-and-sandbox"]),
+                                               ("claude", ["--dangerously-skip-permissions"]),
+                                               ("omp", ["--approval-mode=yolo"]), ("omp", ["--approval-mode", "yolo"])])
+def test_explicit_unattended_profile_is_disclosed_for_selected_harness(paired, harness, args):
+    page, state = paired
+    state["profiles"] = {"default": {"harness_args": {harness: args}}}
+    page.locator("#staff-team").click()
+    page.locator("#staff-profile option").filter(has_text="default").wait_for(state="attached")
+    page.locator("#staff-harness").select_option(harness)
+    page.locator("#staff-access-disclosure").filter(has_text="runs unattended").wait_for()
+    assert page.locator("#staff-access-disclosure").inner_text() == "This teammate runs unattended with this profile’s repository access and credentials."
+
+
+def test_disclosure_changes_with_the_selected_profile(paired):
+    page, state = paired
+    state["profiles"] = {"default": {"harness_args": {"codex": ["--dangerously-bypass-approvals-and-sandbox"]}},
+                         "custom": {"harness_args": {"codex": []}}}
+    page.locator("#staff-team").click()
+    page.locator("#staff-profile option").filter(has_text="custom").wait_for(state="attached")
+    page.locator("#staff-profile").select_option("custom")
+    assert "runs unattended" not in page.locator("#staff-access-disclosure").inner_text()
+
+
+def test_disclosure_changes_with_the_selected_harness(paired):
+    page, state = paired
+    state["profiles"] = {"default": {"harness_args": {"codex": ["--dangerously-bypass-approvals-and-sandbox"], "claude": []}}}
+    page.locator("#staff-team").click()
+    page.locator("#staff-access-disclosure").filter(has_text="runs unattended").wait_for()
+    page.locator("#staff-harness").select_option("claude")
+    assert "runs unattended" not in page.locator("#staff-access-disclosure").inner_text()
 
 
 @pytest.fixture

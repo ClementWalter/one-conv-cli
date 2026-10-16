@@ -1,13 +1,19 @@
 """Accounting clients retain hub authentication boundaries and reject ambiguous acknowledgments."""
 
 import copy
+import json
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from click.testing import CliRunner
 
-from one_conv.accounting.client import AccountingClient, configured_client
-from one_conv.accounting.model import AccountingError
+from one_conv.accounting import client
+from one_conv.accounting.client import (
+    MAX_BATCH_BYTES,
+    AccountingClient,
+    configured_client,
+)
+from one_conv.accounting.model import AccountingError, normalize_event
 from one_conv.hr_cli import build_hr_group
 from one_conv.live import hubclient
 
@@ -96,9 +102,71 @@ def test_canonical_transport_contains_no_extra_fields(event_hub, event):
         AccountingClient(event_hub).record_many([event])
 
 
-def test_events_are_bounded_per_request(event_hub, event):
+def test_events_are_bounded_per_request(event_hub, event, monkeypatch):
+    monkeypatch.setattr(client, "MAX_BATCH_BYTES", 1_000_000)
     AccountingClient(event_hub).record_many({**event, "request_id": f"resp-{index}"} for index in range(101))
     assert [len(call[2]["events"]) for call in event_hub.calls] == [100, 1]
+
+
+@pytest.fixture
+def large_events(event):
+    return [{**event, "request_id": f"large-{index}", "source_event_id": f"large-{index}",
+             "provenance": "Allocation € 🦊 " * 50, "tokens": {"input": 10, "output": 3}}
+            for index in range(100)]
+
+
+def test_batches_obey_the_encoded_byte_budget(event_hub, large_events):
+    AccountingClient(event_hub).record_many(large_events)
+    assert max(len(json.dumps(call[2]).encode()) for call in event_hub.calls) <= MAX_BATCH_BYTES
+
+
+def test_byte_bounded_batches_preserve_every_event_identity(event_hub, large_events):
+    receipts = AccountingClient(event_hub).record_many(large_events)
+    assert [receipt["event"]["event_id"] for receipt in receipts] == [normalize_event(event)["event_id"] for event in large_events]
+
+
+def test_byte_bounded_batches_preserve_unicode_provenance(event_hub, large_events):
+    receipts = AccountingClient(event_hub).record_many(large_events)
+    assert [receipt["event"]["provenance"] for receipt in receipts] == [event["provenance"] for event in large_events]
+
+
+def test_exact_encoded_budget_accepts_the_boundary(event_hub, event, monkeypatch):
+    canonical = normalize_event({**event, "worker_id": "node-a/codex:child", "parent_worker_id": "node-a/codex:parent"})
+    monkeypatch.setattr(client, "MAX_BATCH_BYTES", len(json.dumps({"events": [canonical, canonical]}).encode()))
+    AccountingClient(event_hub).record_many([event, event])
+    assert [len(call[2]["events"]) for call in event_hub.calls] == [2]
+
+
+def test_one_byte_over_the_budget_splits_a_batch(event_hub, event, monkeypatch):
+    canonical = normalize_event({**event, "worker_id": "node-a/codex:child", "parent_worker_id": "node-a/codex:parent"})
+    monkeypatch.setattr(client, "MAX_BATCH_BYTES", len(json.dumps({"events": [canonical, canonical]}).encode()) - 1)
+    AccountingClient(event_hub).record_many([event, event])
+    assert [len(call[2]["events"]) for call in event_hub.calls] == [1, 1]
+
+
+@pytest.fixture
+def oversized_event(event):
+    evidence = "🦊" * 1000
+    return {**event, "provenance": evidence, "model": "model", "provider": "provider", "wall_seconds": "1",
+            "tokens": {key: 1 for key in ("input", "output", "cached_input", "cache_write", "reasoning", "total")}}
+
+
+def test_single_oversized_event_has_an_actionable_error(event_hub, oversized_event):
+    with pytest.raises(AccountingError, match="60000-byte upload budget.*provenance metadata"):
+        AccountingClient(event_hub).record_many([oversized_event])
+
+
+def test_oversized_later_event_prevents_partial_network_import(event_hub, event, oversized_event):
+    try:
+        AccountingClient(event_hub).record_many([event, oversized_event])
+    except AccountingError:
+        pass
+    assert event_hub.calls == []
+
+
+def test_empty_import_makes_no_request(event_hub):
+    AccountingClient(event_hub).record_many([])
+    assert event_hub.calls == []
 
 
 def test_mismatched_receipt_requires_retry(hub, event):

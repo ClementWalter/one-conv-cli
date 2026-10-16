@@ -1,10 +1,34 @@
-"""Authenticated accounting transport reuses the hub's redirect and credential boundaries."""
+"""Authenticated accounting transport bounds canonical JSON beneath the cloud body limit."""
 
+import json
 from urllib.parse import urlencode
 
 from ..hr import RateError, _validate_card
 from ..live import hubclient
 from .model import AccountingError, normalize_event
+
+MAX_BATCH_BYTES = 60_000
+
+
+def _event_batches(events):
+    """Measure the HubClient JSON encoding before any request can partially import invalid input."""
+    batches, batch = [], []
+    envelope_size = len(json.dumps({"events": []}).encode())
+    body_size = envelope_size
+    for event in events:
+        event_size = len(json.dumps(event).encode())
+        if envelope_size + event_size > MAX_BATCH_BYTES:
+            raise AccountingError(f"Usage event {event['event_id']} exceeds the {MAX_BATCH_BYTES}-byte upload budget; "
+                                  "shorten its provenance metadata before retrying")
+        if batch and (len(batch) == 100 or body_size + 2 + event_size > MAX_BATCH_BYTES):
+            batches.append(batch)
+            batch, body_size = [], envelope_size
+        # Default json.dumps inserts a comma and space between adjacent array elements.
+        body_size += event_size + (2 if batch else 0)
+        batch.append(event)
+    if batch:
+        batches.append(batch)
+    return batches
 
 
 def configured_client(use_hub=None, directory=None):
@@ -80,8 +104,7 @@ class AccountingClient:
         events = [normalize_event({**event, "worker_id": self._qualified_worker(event["worker_id"]),
                                    "parent_worker_id": self._qualified_worker(event.get("parent_worker_id"))}) for event in events]
         receipts = []
-        for offset in range(0, len(events), 100):
-            batch = events[offset:offset + 100]
+        for batch in _event_batches(events):
             result = self._request("POST", "events", {"events": batch}, key="receipts")
             if not isinstance(result, list) or len(result) != len(batch):
                 raise AccountingError("Hub did not acknowledge every usage event; retry the same import")

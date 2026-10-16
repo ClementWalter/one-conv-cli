@@ -414,6 +414,10 @@ def test_all_native_probes_select_the_requested_model():
     assert bootstrap.probe_command("codex", "selected-model")[2:4] == ["--model", "selected-model"]
 
 
+def test_claude_probe_prompt_is_outside_variadic_mcp_configuration():
+    assert bootstrap.probe_command("claude", None)[-3:] == ['{"mcpServers":{}}', "--", bootstrap.PROBE]
+
+
 @pytest.mark.parametrize("harness,flag", [("claude", "--tools"), ("codex", "shell_tool"), ("omp", "--no-tools")])
 def test_readiness_probes_disable_native_tools(harness, flag):
     assert flag in bootstrap.probe_command(harness, None)

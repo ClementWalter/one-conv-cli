@@ -290,7 +290,7 @@ def probe_command(harness, model):
     options = ["--model", model] if model else []
     if harness == "claude":
         return ["claude", *options, "--print", "--output-format", "json", "--tools", "",
-                "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', PROBE]
+                "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--", PROBE]
     if harness == "codex":
         return ["codex", "exec", *options, "--sandbox", "read-only", "--skip-git-repo-check", "--json",
                 "--ignore-user-config", "--ignore-rules", "--disable", "shell_tool", "--disable", "multi_agent",

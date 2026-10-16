@@ -677,10 +677,10 @@ def bootstrap(data):
             install_omp()
         if shutil.which(harness) is None:
             return {"status": "failed", "stage": "harness-unavailable"}
-        if not prepare_omp_auth(data, env):
-            return {"status": "auth_needed", "stage": "omp-auth-import", "authenticated": False}
         if not data["profile"]["probe_enabled"]:
             return {"status": "unverified", "stage": "model-probe-disabled", "model_verified": False}
+        if not prepare_omp_auth(data, env):
+            return {"status": "auth_needed", "stage": "omp-auth-import", "authenticated": False}
         if data.get("restart"):
             record.pop("model_verified", None)
         if not record.get("model_verified") or time.time() - record.get("probe_verified_at", 0) > 300:

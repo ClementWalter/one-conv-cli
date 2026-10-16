@@ -167,13 +167,21 @@ def unit_argument(value):
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
 
 
+def unit_path(value):
+    """Scalar path settings preserve interior spaces and expand only escaped specifiers."""
+    value = str(value)
+    if not Path(value).is_absolute() or value != value.strip() or any(ord(c) < 32 for c in value):
+        raise InstallationError("service-unit")
+    return value.replace("%", "%%")
+
+
 def service_unit(python, repository, state, config, origin, home, *, user=None):
     """The service contains paths and public configuration, never credential values."""
     command = [python, "-O", "-m", "one_conv.control", "--directory", state, "serve", "--origin", origin,
                "--host", "0.0.0.0", "--port", "8790", "--config", config]
     identity = f"User={user}\n" if user else ""
     return ("[Unit]\nDescription=One Conv personal cloud workspace\nAfter=network-online.target\nWants=network-online.target\n\n"
-            f"[Service]\nType=simple\n{identity}WorkingDirectory={unit_argument(repository)}\n"
+            f"[Service]\nType=simple\n{identity}WorkingDirectory={unit_path(repository)}\n"
             f"Environment={unit_argument('HOME=' + str(home))}\n"
             f"Environment={unit_argument('PATH=' + str(home / '.local/bin') + ':/usr/local/bin:/usr/bin:/bin')}\n"
             f"ExecStart={' '.join(unit_argument(arg) for arg in command)}\n"

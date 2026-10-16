@@ -957,6 +957,24 @@ async function workerAction(action, id) {
   } catch (error) { $("staff-feedback").textContent = error.message; }
 }
 
+function staffingProfiles() {
+  return Array.isArray(model.workers.profiles) ? model.workers.profiles :
+    Object.entries(model.workers.profiles || {}).map(([id, profile]) => ({ ...profile, id }));
+}
+
+function renderStaffingDisclosure() {
+  const profile = staffingProfiles().find((item) => (item.id || item.name) === $("staff-profile").value);
+  const harness = $("staff-harness").value, args = profile?.harness_args?.[harness];
+  const bypass = { claude: "--dangerously-skip-permissions", codex: "--dangerously-bypass-approvals-and-sandbox", omp: "--approval-mode=yolo" };
+  // Only explicit bypass settings establish unattended permissions for a selected harness.
+  const unattended = Array.isArray(args) && (args.includes(bypass[harness]) || (harness === "omp" &&
+    args.some((value, index) => value === "--approval-mode" && args[index + 1] === "yolo")));
+  const disclosure = unattended ? "This teammate runs unattended with this profile’s repository access and credentials." :
+    "This teammate uses this profile’s repository access, credentials and approval settings.";
+  const content = $("staff-access-disclosure");
+  if (content.textContent !== disclosure) content.textContent = disclosure;
+}
+
 async function refreshWorkers() {
   if (!model.capabilities.workers || !model.authenticated) return;
   try {
@@ -964,8 +982,7 @@ async function refreshWorkers() {
     renderJobs();
     const picker = $("staff-profile"), selected = picker.value;
     picker.replaceChildren();
-    const profiles = Array.isArray(model.workers.profiles) ? model.workers.profiles :
-      Object.entries(model.workers.profiles || {}).map(([id, profile]) => ({ ...profile, id }));
+    const profiles = staffingProfiles();
     for (const profile of profiles) {
       const option = el("option", profile.label || profile.name || profile.id);
       option.value = profile.id || profile.name;
@@ -975,6 +992,7 @@ async function refreshWorkers() {
       const option = el("option", "Default"); option.value = "default"; picker.append(option);
     }
     if ([...picker.options].some((option) => option.value === selected)) picker.value = selected;
+    renderStaffingDisclosure();
   } catch (error) { $("staff-feedback").textContent = error.message; }
 }
 
@@ -1408,6 +1426,8 @@ $("staff-team").addEventListener("click", () => {
   refreshWorkers();
 });
 $("staff-form").addEventListener("submit", staffTeammate);
+$("staff-profile").addEventListener("change", renderStaffingDisclosure);
+$("staff-harness").addEventListener("change", renderStaffingDisclosure);
 $("show-costs").addEventListener("click", showCosts);
 for (const button of document.querySelectorAll("[data-close]")) {
   button.addEventListener("click", () => $(button.dataset.close).close());

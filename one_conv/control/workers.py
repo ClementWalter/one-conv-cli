@@ -129,8 +129,10 @@ class BoatCLI:
         self.service_account_file = Path(service_account_file) if service_account_file else None
 
     def _call(self, args, *, timeout=180):
+        delimiter = args.index("--") if "--" in args else len(args)
+        command = [self.executable, *args[:delimiter], "--json", "--no-update", *args[delimiter:]]
         try:
-            result = subprocess.run([self.executable, *args, "--json", "--no-update"],
+            result = subprocess.run(command,
                                     capture_output=True, text=True, check=False, timeout=timeout)
         except (OSError, subprocess.SubprocessError):
             raise Unconfirmed("Boat operation did not return a confirmed result") from None

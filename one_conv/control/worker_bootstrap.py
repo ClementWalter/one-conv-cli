@@ -237,13 +237,19 @@ def prepare_omp_auth(data, env):
     agent = home / ".omp/agent"
     database = agent / "agent.db"
     args = data["profile"]["harness_args"]["omp"]
+    # Claude Code's OAuth variable is not an OMP provider credential.
+    provider_env = any(value and key != "CLAUDE_CODE_OAUTH_TOKEN" and
+                       (key.endswith(("_API_KEY", "_OAUTH_TOKEN", "_ACCESS_TOKEN", "_AUTH_TOKEN"))
+                        or key in ("COPILOT_GITHUB_TOKEN", "HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "GITLAB_TOKEN",
+                                   "AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_BEARER_TOKEN_BEDROCK",
+                                   "AWS_WEB_IDENTITY_TOKEN_FILE", "GOOGLE_APPLICATION_CREDENTIALS"))
+                       for key, value in env.items())
     # Existing identities, blocks, profiles, brokers and explicit credentials retain their own resolution.
     if (omp_credential_count(database) != 0 or (agent / "auth.json").exists()
             or data["profile"]["credential_refs"]
-            or any(env.get(key) for key in ("OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR", "PI_CODING_AGENT_DIR",
-                                            "OMP_AUTH_BROKER_URL", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
-                                            "OPENAI_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "CURSOR_ACCESS_TOKEN"))
-            or any(arg in ("--profile", "--config") or arg.startswith(("--profile=", "--config=")) for arg in args)
+            or provider_env
+            or any(env.get(key) for key in ("OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR", "PI_CODING_AGENT_DIR", "OMP_AUTH_BROKER_URL"))
+            or any(arg in ("--profile", "--config", "--api-key") or arg.startswith(("--profile=", "--config=", "--api-key=")) for arg in args)
             or any((directory / name).exists() for directory in (home, home / ".omp", agent)
                    for name in (".env", "config.yml", "config.yaml"))
             or any(env.get(key) and (Path(env[key]) / "omp").exists() for key in ("XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"))):

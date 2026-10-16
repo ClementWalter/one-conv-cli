@@ -134,6 +134,8 @@ def _profile(value: dict) -> dict:
             or any(not isinstance(values, list) or len(values) > 32 or any(not isinstance(arg, str) or len(arg) > 1024
                    or "\x00" in arg or "\n" in arg for arg in values) for values in args.values())):
         raise ValueError("harness_args must contain direct argument lists for claude, codex and omp")
+    if any(arg == "--api-key" or arg.startswith("--api-key=") for values in args.values() for arg in values):
+        raise ValueError("harness credentials must use private environment references")
     return copy.deepcopy(profile)
 
 

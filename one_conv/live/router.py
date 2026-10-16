@@ -330,9 +330,9 @@ NODE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 
 
 def remote_address(target: str) -> tuple[str | None, str]:
-    """Split NODE/harness:id; anything else, Boat's boat:sandbox/conversation included, is local."""
+    """Split a remote agent or human route, keeping Boat's sandbox route local."""
     node, sep, local = target.partition("/")
-    if sep and NODE_NAME.fullmatch(node) and parse_address(local)[0] is not None:
+    if sep and NODE_NAME.fullmatch(node) and (local == "user" or parse_address(local)[0] is not None):
         return node, local
     return None, target
 

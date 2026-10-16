@@ -111,8 +111,8 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
     elif reply == "inline":
         attrs += ' reply="inline"'
         footer = "\nAnswer in this conversation; the sender reads your reply back from here."
-    elif human and address == "user":
-        footer = '\nA human sent this message. To reply, call the one-conv send_message tool with to="user"'
+    elif human and address in ("user", "workspace/user"):
+        footer = f'\nA human sent this message. To reply, call the one-conv send_message tool with to="{_attr(address)}"'
         footer += f', or to="#{_attr(topic)}" to answer everyone on the topic.' if topic else "."
     elif human and topic:
         footer = f'\nA human sent this message. To reply, call the one-conv send_message tool with to="#{_attr(topic)}".'

@@ -10,6 +10,7 @@ import pytest
 from one_conv.control.workers import (
     DEFAULT_PROFILE,
     BoatCLI,
+    PreflightRefused,
     Unconfirmed,
     WorkerError,
     WorkerManager,
@@ -306,6 +307,35 @@ def test_ready_worker_recheck_does_not_create_a_second_box(provisioned, boat):
     provisioned.recheck("request-1")
     provisioned.run_once()
     assert boat.creates == 1
+
+
+def test_ready_worker_setup_failure_keeps_its_active_reservation(provisioned, boat):
+    provisioned._update("request-1", status="ready", address="worker-node/claude:existing")
+    boat.health = {"status": "failed", "stage": "github-vault"}
+    provisioned.recheck("request-1")
+    provisioned.run_once()
+    assert provisioned.status("request-1")["status"] == "unconfirmed"
+
+
+def test_ready_worker_setup_failure_preserves_its_known_address(provisioned, boat):
+    provisioned._update("request-1", status="ready", address="worker-node/claude:existing")
+    boat.health = {"status": "failed", "stage": "github-vault"}
+    provisioned.recheck("request-1")
+    provisioned.run_once()
+    assert provisioned.status("request-1")["address"] == "worker-node/claude:existing"
+
+
+def test_failed_preflight_does_not_free_an_existing_native_name(provisioned, spec, boat):
+    provisioned._update("request-1", status="ready", address="worker-node/claude:existing")
+
+    def refuse(profile):
+        raise PreflightRefused("unsafe environment")
+
+    boat.preflight = refuse
+    provisioned.recheck("request-1")
+    provisioned.run_once()
+    with pytest.raises(ValueError, match="active job"):
+        provisioned.submit(spec, "request-2")
 
 
 def test_ten_resident_slots_can_be_configured(tmp_path, config):

@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -178,6 +179,34 @@ def test_pi_auth_source_symlinks_are_refused(boat_pi_auth):
     source.rename(target)
     source.symlink_to(target)
     assert bootstrap.prepare_omp_auth(data, env) is False
+
+
+@pytest.mark.parametrize("source_kind", ["pi", "service-account"])
+def test_private_credential_fifos_are_rejected_without_blocking(worker_home, source_kind):
+    path = worker_home / ".pi/agent/auth.json"
+    path.parent.mkdir(parents=True)
+    os.mkfifo(path, 0o600)
+    script = """
+import os
+import sys
+from pathlib import Path
+from one_conv.control.worker_bootstrap import prepare_omp_auth
+from one_conv.control.workers import BoatCLI, WorkerError
+if sys.argv[1] == 'pi':
+    data = {'spec': {'harness': 'omp'}, 'profile': {'boat_agent_credentials': True,
+            'harness_args': {'omp': []}, 'credential_refs': {}}}
+    result = prepare_omp_auth(data, {'HOME': str(Path.home()), 'PATH': os.environ['PATH']})
+else:
+    try:
+        BoatCLI(service_account_file=Path.home()/'.pi/agent/auth.json').credentials({})
+        result = True
+    except WorkerError:
+        result = False
+raise SystemExit(0 if result is False else 1)
+"""
+    result = subprocess.run([sys.executable, "-O", "-c", script, source_kind], check=False,
+                            capture_output=True, text=True, timeout=3)
+    assert result.returncode == 0
 
 
 def test_omp_import_receipt_needs_a_real_native_credential(boat_pi_auth, monkeypatch):

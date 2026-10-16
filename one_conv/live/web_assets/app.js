@@ -1029,10 +1029,10 @@ async function showCosts() {
         editor.addEventListener("submit", async (event) => {
           event.preventDefault(); save.disabled = true;
           try {
-            await post("/api/providers/accounting", { action: "register", replace: true, card: {
-              ...card, hourly_rate: { ...rate, amount: amount.value === "" ? null : amount.value,
+            await post("/api/providers/accounting", { action: "update_rate", reference: card.cost_center_id,
+              hourly_rate: { ...rate, amount: amount.value === "" ? null : amount.value,
                 basis: "allocated", provenance: "Human planning allocation in the workspace" },
-            }});
+            });
             await showCosts();
           } catch (error) { result.textContent = error.message; save.disabled = false; }
         });

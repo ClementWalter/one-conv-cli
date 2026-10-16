@@ -110,3 +110,21 @@ def test_phone_can_set_an_explicit_planning_rate(staffed_phone, entered, expecte
         page.get_by_role("button", name="Save rate", exact=True).click()
     response.value.finished()
     assert app.state.accounting.rates.show("jack")["hourly_rate"]["amount"] == expected
+
+
+def test_rate_edit_preserves_a_worker_registered_after_the_dialog_opened(staffed_phone):
+    page, app = staffed_phone
+    page.get_by_role("button", name="Close add teammate").click()
+    page.get_by_role("button", name="Team costs").click()
+    page.get_by_role("button", name="Set planning rate").wait_for()
+    card = app.state.accounting.rates.show("jack")
+    card.pop("updated_at")
+    card["addresses"] = ["worker-test/codex:late"]
+    app.state.accounting.rates.register(card, replace=True)
+    page.get_by_role("button", name="Set planning rate").click()
+    page.get_by_role("spinbutton", name="Hourly rate for jack").fill("5")
+    with page.expect_response("**/api/providers/accounting") as response:
+        page.get_by_role("button", name="Save rate", exact=True).click()
+    response.value.finished()
+    saved = app.state.accounting.rates.show("jack")
+    assert (saved["addresses"], saved["hourly_rate"]["amount"]) == (["worker-test/codex:late"], "5")

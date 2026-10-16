@@ -28,8 +28,9 @@ def build_hr_group():
     def group():
         """Manage hourly rates, import actual usage and estimate the cost of an ask.
 
-        Rates include internal subagents. Cards are local, explicit planning inputs;
-        they do not meter providers, synchronize machines or automate staffing.
+        Rates include internal subagents. A configured hub shares cards and usage
+        evidence; --local keeps a separate registry. Staffing decisions stay with
+        the team, and a planning quote is not a provider invoice.
         """
 
     @group.command("register", epilog=("Examples (illustrative rates):\n"

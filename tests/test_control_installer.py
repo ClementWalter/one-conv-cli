@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -179,6 +180,31 @@ def test_unit_contains_no_credential(installed, payload):
 
 def test_unit_escapes_specifiers():
     assert installer.unit_argument('/home/a%u/"repo"') == '"/home/a%%u/\\"repo\\""'
+
+
+def test_working_directory_is_an_absolute_scalar_path(installed):
+    content = (installed[0] / ".config/systemd/user" / installer.UNIT).read_text()
+    assert f"WorkingDirectory={installed[0]}/Documents/one-conv-cli\n" in content
+
+
+def test_scalar_path_preserves_spaces_and_escapes_specifiers():
+    assert installer.unit_path("/home/a%u/repo with spaces") == "/home/a%%u/repo with spaces"
+
+
+@pytest.mark.parametrize("value", ["relative/repo", "/home/a\nrepo", "/home/a/repo "])
+def test_scalar_path_rejects_ambiguous_values(value):
+    with pytest.raises(installer.InstallationError, match="service-unit"):
+        installer.unit_path(value)
+
+
+@pytest.mark.skipif(shutil.which("systemd-analyze") is None, reason="systemd parser is unavailable")
+def test_generated_unit_passes_the_real_systemd_parser(tmp_path):
+    work = tmp_path / "repository with spaces"
+    work.mkdir()
+    unit = tmp_path / "oneconv-installer-review.service"
+    unit.write_text(installer.service_unit(sys.executable, work, tmp_path, tmp_path / "config", "https://example.test", tmp_path))
+    result = subprocess.run(["systemd-analyze", "verify", str(unit)], capture_output=True, text=True, check=False)
+    assert result.returncode == 0
 
 
 def test_unit_rejects_control_characters():

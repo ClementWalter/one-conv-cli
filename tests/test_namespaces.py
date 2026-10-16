@@ -28,7 +28,21 @@ def app(monkeypatch):
 def test_root_lists_only_namespaces(app):
     result = CliRunner().invoke(app.cli, ["--help"])
     commands = result.output.split("Commands:\n")[1].split("\n\n")[0]
-    assert [line.strip().split()[0] for line in commands.splitlines()] == ["cloud", "local", "live", "tune", "mcp"]
+    assert [line.strip().split()[0] for line in commands.splitlines()] == ["cloud", "local", "live", "hr", "tune", "mcp"]
+
+
+def test_hr_root_entry_never_starts_history_sync(app, monkeypatch):
+    calls = []
+    monkeypatch.setattr(app, "_archive_sync_in_background", lambda: calls.append("sync"))
+    CliRunner().invoke(app.cli, ["hr", "list", "--json"])
+    assert calls == []
+
+
+def test_local_entry_retains_history_sync(app, monkeypatch):
+    calls = []
+    monkeypatch.setattr(app, "_archive_sync_in_background", lambda: calls.append("sync"))
+    CliRunner().invoke(app.cli, ["local", "--help"])
+    assert calls == ["sync"]
 
 
 @pytest.fixture

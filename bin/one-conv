@@ -2726,7 +2726,9 @@ from one_conv.namespaces import NamespaceRoot, install as install_namespaces, se
              epilog="\b\nExamples:\n  one-conv cloud --help\n  one-conv local --help\n\nLegacy top-level commands remain available as compatibility aliases.")
 def cli() -> None:
     """Read conversation history from cloud products or local agent tools."""
-    _archive_sync_in_background()
+    # Local accounting must not trigger unrelated history exports.
+    if click.get_current_context().invoked_subcommand != "hr":
+        _archive_sync_in_background()
 
 
 _SOURCE_OPTION = click.option(
@@ -3996,6 +3998,11 @@ from one_conv.live.cli import build_live_group  # noqa: E402
 _UV = shutil.which("uv")
 cli.add_command(build_live_group([_UV, "run", "--quiet", "--script", str(Path(__file__).resolve())] if _UV
                                  else [sys.executable, "-O", str(Path(__file__).resolve())]))
+
+
+from one_conv.hr_cli import build_hr_group  # noqa: E402
+
+cli.add_command(build_hr_group())
 
 
 @cli.command("mcp")

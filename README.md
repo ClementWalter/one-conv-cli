@@ -7,6 +7,7 @@ into a local history, or read sessions already saved by your coding tools.
 | --- | --- |
 | `cloud` | ChatGPT, Claude Chat, Codex cloud, Cowork cloud |
 | `local` | Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi, shared corpus files |
+| `hr` | Local agent rate cards and expected ask costs |
 
 Cloud conversations are addressed by ID or title. Local sessions are grouped
 by the project where the agent ran.
@@ -26,6 +27,47 @@ as a skill in your agent runtime to give it the same launcher and usage guide.
 Local history readers use files on your machine. Browser-session discovery and
 login currently target macOS. Initial Keychain setup requires Apple's
 command-line developer tools to build the native credential helper.
+
+## Agent hourly rates and ask estimates
+
+`hr` stores an hourly rate for each stable agent cost center, including that
+agent's internal subagents. Display names are labels; `@aliases` and agent addresses are references;
+renaming an agent or changing its session does not change its cost center ID.
+Stored addresses are not checked against live sessions.
+
+Register a rate with its currency, source and definition of a metered hour.
+These amounts are illustrative examples, not measured provider prices:
+
+```bash
+one-conv hr register jack --name Jack --alias jack --address codex:example-session \
+  --hourly-rate 12 --currency USD --basis allocated \
+  --provenance 'Example subscription allocation' --metering-basis 'Occupied work hour including tools'
+one-conv hr register john --name John --alias john --unknown-rate --currency USD \
+  --basis quoted --provenance 'Not measured' --metering-basis 'Occupied work hour including tools'
+one-conv hr list --json
+one-conv hr show @jack --json
+one-conv hr quote jack --minutes 15 --json
+```
+
+The example Jack quote is `3.00000000 USD`, calculated as `12 × 15 / 60`.
+John's quote has `expected_cost.amount: null` and status `unknown`; an explicitly
+zero rate yields a known zero estimate. Quotes retain currency, provenance,
+metering basis and rate basis (`observed`, `allocated` or `quoted`). They are
+planning estimates, not invoices or incremental cash charges. They neither
+contact agents nor choose staffing. No currency conversion occurs. Costs round
+to eight decimal places; rate inputs allow up to 18 digits and eight decimal
+places, bounded at one billion per hour. Estimated minutes are bounded at one
+year (`525600`).
+
+Identical registration retries return the existing card. To change a card, repeat
+`register` with the same ID and `--replace`; this replaces the whole card,
+including its aliases and addresses. References cannot belong to two cost centers.
+
+Cards are local to this machine in `hr/rates.sqlite3` under the live state
+directory (`ONE_CONV_LIVE_DIR`). `ONE_CONV_HR_DIR` overrides the HR directory.
+The registry starts empty. Distributed synchronization, UI and MCP exposure,
+provider usage ingestion and reconciliation with actual charges are pending;
+the CFO can use the CLI output to make staffing decisions freely.
 
 ## Connect a cloud account
 

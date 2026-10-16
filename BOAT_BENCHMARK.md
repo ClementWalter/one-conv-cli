@@ -63,6 +63,27 @@ The repository allowlist does not narrow the existing token's GitHub authority.
 This test verifies credentials and selected clones, not the full future worker
 image, every skill/tool dependency, or a production credential rotation service.
 
+## Cloud workspace validation
+
+The mobile rollout used a small persistent controller and one default worker
+box. Managed Claude and Codex requests shared that worker box, with separate
+worktrees, the selected skills and cloud GitHub access. Claude authenticated but
+reported its account spend limit; Codex was not logged in. No successful model
+answer or active-model packing measurement is claimed for this rollout.
+
+A WebKit phone viewport paired over public HTTPS, sent a human message through
+an ordinary Mac node to Oh My Pi, and received its reply in the cloud inbox.
+Worker preparation also ran with that Mac bridge disconnected. The phone
+controls resumed the tracked worker box and stopped it again; the worker box
+was left stopped pending provider access.
+
+The controller recovered after a real stop and resume without a remote command
+to start the app. Its paired browser session, message history, rate cards,
+worker records, cloud credentials and numeric usage ledger survived. A real
+native-history import stored 2,283 events without transcript text; all of their
+subscription cash costs remained unknown. These are functional checks, not a
+physical-iPhone test or a measure of concurrent model capacity.
+
 ## Reproduction
 
 The Python helpers and their tests are committed in

@@ -157,6 +157,19 @@ def test_omp_failed_download_leaves_no_staging_executable(omp_release, worker_ho
     assert list((worker_home / ".local/bin").iterdir()) == []
 
 
+def test_failed_omp_fetch_has_an_accurate_public_operation(omp_release, monkeypatch, capsys):
+    def failed(*args, **kwargs):
+        raise OSError("private network diagnostics")
+
+    monkeypatch.setattr(bootstrap.sys, "argv", ["helper", "payload.json"])
+    monkeypatch.setattr(bootstrap, "read_private", lambda path: {})
+    monkeypatch.setattr(bootstrap, "bootstrap", lambda data: bootstrap.install_omp())
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", failed)
+    monkeypatch.setattr(bootstrap, "STAGE", "worktree-check")
+    bootstrap.main()
+    assert json.loads(capsys.readouterr().out) == {"status": "failed", "stage": "omp-install"}
+
+
 def test_omp_verification_receives_no_provider_credentials(omp_release, monkeypatch):
     calls = []
     monkeypatch.setenv("ANTHROPIC_API_KEY", "private-provider-token")

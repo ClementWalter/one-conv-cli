@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+from copy import deepcopy
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
@@ -72,7 +73,7 @@ def normalize_event(event):
     """Whitelist accounting fields so transcript text and credentials never enter the ledger."""
     required = {"billing_scope", "source", "source_event_id", "cost_center_id", "worker_id", "timestamp", "provenance"}
     optional = {"schema_version", "event_id", "coverage", "request_id", "model", "provider", "parent_worker_id", "node_id",
-                "wall_seconds", "tokens", "quota_usage", *MONEY_FIELDS}
+                "wall_seconds", "tokens", "quota_usage", "field_provenance", *MONEY_FIELDS}
     if not isinstance(event, dict) or required - set(event) or set(event) - required - optional:
         raise AccountingError("Usage event has missing or unsupported fields")
     if type(event.get("schema_version", 1)) is not int or event.get("schema_version", 1) != 1:
@@ -117,12 +118,54 @@ def normalize_event(event):
         "tokens": "reported" if all(result["tokens"][key] is not None for key in ("input", "output")) else "partial",
         "wall_time": "reported" if result["wall_seconds"] is not None else "unknown",
     }
+    known = {key: result[key] for key in ("model", "provider", "wall_seconds", "parent_worker_id")}
+    known.update({f"tokens.{key}": value for key, value in result["tokens"].items()})
+    known.update({key: result[key]["amount"] for key in (*MONEY_FIELDS, "quota_usage")})
+    supplied = event.get("field_provenance", {})
+    if not isinstance(supplied, dict) or set(supplied) - {key for key, value in known.items() if value is not None}:
+        raise AccountingError("field_provenance must refer only to known accounting fields")
+    result["field_provenance"] = {}
+    for key, value in known.items():
+        if value is None:
+            continue
+        observation = supplied.get(key, {
+            "source": result[key]["source"] if key in (*MONEY_FIELDS, "quota_usage") else result["source"],
+            "source_event_id": result["source_event_id"], "provenance": result["provenance"],
+        })
+        if not isinstance(observation, dict) or set(observation) != {"source", "source_event_id", "provenance"}:
+            raise AccountingError("Each field provenance requires source, source_event_id and provenance")
+        result["field_provenance"][key] = {name: text(item, "field provenance") for name, item in observation.items()}
     return result
 
 
-def comparable(event):
-    """Copied source observations of the same financial facts do not create another charge."""
-    result = {key: value for key, value in event.items() if key not in {"source", "source_event_id", "provenance", "coverage"}}
-    for field in (*MONEY_FIELDS, "quota_usage"):
-        result[field] = {key: value for key, value in event[field].items() if key != "source"}
-    return result
+def enrich_event(saved, incoming):
+    """Fill unknown evidence without changing known facts, ownership, identity or node attribution."""
+    immutable = ("event_id", "billing_scope", "request_id", "cost_center_id", "worker_id", "node_id", "timestamp")
+    if any(saved[key] != incoming[key] for key in immutable):
+        raise AccountingConflict("Usage identity already has different ownership, node or immutable facts")
+    result = deepcopy(saved)
+    filled = set()
+
+    def fill(path, old, new):
+        if old is not None and new is not None and old != new:
+            raise AccountingConflict(f"Usage identity has conflicting known {path}")
+        if old is None and new is not None:
+            filled.add(path)
+            return new
+        return old
+
+    for key in ("model", "provider", "wall_seconds", "parent_worker_id"):
+        result[key] = fill(key, saved[key], incoming[key])
+    for key in TOKEN_FIELDS:
+        result["tokens"][key] = fill(f"tokens.{key}", saved["tokens"][key], incoming["tokens"][key])
+    for key in (*MONEY_FIELDS, "quota_usage"):
+        old, new = saved[key], incoming[key]
+        unit = "unit" if key == "quota_usage" else "currency"
+        amount = fill(key, old["amount"], new["amount"])
+        denomination = fill(f"{key}.{unit}", old[unit], new[unit])
+        result[key] = {"amount": amount, unit: denomination,
+                       "source": new["source"] if old["amount"] is None and new["amount"] is not None else old["source"] or new["source"]}
+    for key in filled:
+        if key in incoming["field_provenance"]:
+            result["field_provenance"][key] = incoming["field_provenance"][key]
+    return normalize_event(result), result != saved

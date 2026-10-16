@@ -11,6 +11,7 @@ from .adapters import parse_events, read_rows
 from .client import configured_client
 from .ledger import Ledger
 from .model import AccountingError
+from .watcher import sync_mapping, watch_mapping
 
 
 def _directory(value):
@@ -53,6 +54,7 @@ def install_usage_commands(group):
             raise click.ClickException(str(error)) from error
         report = {"recorded": sum(receipt["status"] == "recorded" for receipt in receipts),
                   "duplicates": sum(receipt["status"] == "duplicate" for receipt in receipts),
+                  "enriched": sum(receipt.get("enriched", False) for receipt in receipts),
                   "coverage": parsed["coverage"]}
         click.echo(json.dumps(report) if as_json else f"Recorded {report['recorded']}; duplicates {report['duplicates']}. {report['coverage']['notice']}")
 
@@ -89,3 +91,36 @@ def install_usage_commands(group):
         except (AccountingError, OSError) as error:
             raise click.ClickException(str(error)) from error
         click.echo(json.dumps(result, indent=None if as_json else 2))
+
+    @group.command("sync", epilog="Examples:\n  one-conv hr sync --mapping workers.json --hub --json\n  one-conv hr sync --mapping workers.json --local --json")
+    @click.option("--mapping", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path),
+                  help="Private ownership JSON with explicit history paths and native-address owners.")
+    @directory_option
+    @mode_option
+    @click.option("--json", "as_json", is_flag=True, help="Emit import counts and coverage.")
+    def sync(mapping, directory, use_hub, as_json):
+        """Read only configured native histories and upload mapped workers' numeric metadata once."""
+        try:
+            sink = configured_client(use_hub, directory) or Ledger(_directory(directory))
+            report = sync_mapping(mapping, sink)
+        except (AccountingError, OSError, UnicodeError) as error:
+            raise click.ClickException(str(error)) from error
+        click.echo(json.dumps(report, indent=None if as_json else 2))
+
+    @group.command("watch", epilog=("Examples:\n  one-conv hr watch --mapping workers.json --hub --interval 5 --max-backoff 60 --json\n"
+                   "  one-conv hr watch --mapping workers.json --local --iterations 1 --json"))
+    @click.option("--mapping", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path))
+    @click.option("--interval", default=5.0, show_default=True, type=click.FloatRange(0.1, 60))
+    @click.option("--max-backoff", default=60.0, show_default=True, type=click.FloatRange(0.1, 60))
+    @click.option("--iterations", default=0, show_default=True, type=click.IntRange(0), help="Pass count; 0 watches until stopped.")
+    @directory_option
+    @mode_option
+    @click.option("--json", "as_json", is_flag=True, help="Emit one JSON report per bounded pass.")
+    def watch(mapping, interval, max_backoff, iterations, directory, use_hub, as_json):
+        """Poll mapped histories with bounded error backoff; no transcript text is transferred."""
+        try:
+            sink_factory = lambda: configured_client(use_hub, directory) or Ledger(_directory(directory))
+            for report in watch_mapping(mapping, sink_factory, interval=interval, max_backoff=max_backoff, iterations=iterations):
+                click.echo(json.dumps(report, indent=None if as_json else 2))
+        except (AccountingError, OSError, UnicodeError) as error:
+            raise click.ClickException(str(error)) from error

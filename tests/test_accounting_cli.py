@@ -119,6 +119,13 @@ def test_public_cli_missing_cost_is_unknown(public_cli, arguments, source_file, 
     assert json.loads(public_cli("summary", "--cost-center", "jack", "--json").stdout)["cash_cost"]["unknown_events"] == 1
 
 
+def test_public_cli_reports_later_cash_enrichment(public_cli, arguments, source_file, response):
+    source_file.write_text(json.dumps({**response, "usage": {"prompt_tokens": 100, "completion_tokens": 10}}) + "\n")
+    public_cli(*arguments)
+    source_file.write_text(json.dumps(response) + "\n")
+    assert json.loads(public_cli(*arguments).stdout)["enriched"] == 1
+
+
 def test_explicit_directory_is_reusable(public_cli, arguments, tmp_path):
     directory = tmp_path / "server-owned"
     public_cli(*arguments, "--directory", str(directory))

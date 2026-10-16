@@ -5,7 +5,7 @@ import json
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from .model import AccountingError, normalize_event, text
+from .model import AccountingError, enrich_event, normalize_event, text, timestamp
 
 CODEX_FIELDS = {"input": "input_tokens", "output": "output_tokens", "cached_input": "cached_input_tokens",
                 "cache_write": "cache_write_input_tokens", "reasoning": "reasoning_output_tokens", "total": "total_tokens"}
@@ -173,11 +173,14 @@ def _openrouter(rows, context):
                           cache_write=(usage.get("prompt_tokens_details") or {}).get("cache_write_tokens"),
                           reasoning=(usage.get("completion_tokens_details") or {}).get("reasoning_tokens"))
         meta = metadata[request]
-        events[request] = _base(context, request, meta.get("created_at") or meta.get("created"), request_id=request,
-                                provider=meta.get("provider_name") or meta.get("provider"),
-                                model=meta.get("model"), tokens=tokens,
-                                cash_cost={"amount": _raw_decimal(amount), "currency": "USD" if amount is not None else None,
-                                           "source": "openrouter total_cost" if generation else "openrouter usage.cost"})
+        created = datetime.fromisoformat(timestamp(_stamp(meta.get("created_at") or meta.get("created")))).replace(microsecond=0).isoformat()
+        event = normalize_event(_base(context, request, created, request_id=request,
+                                      provider=meta.get("provider_name") or meta.get("provider"),
+                                      model=meta.get("model"), tokens=tokens,
+                                      cash_cost={"amount": _raw_decimal(amount), "currency": "USD" if amount is not None else None,
+                                                 "source": "openrouter total_cost" if generation else "openrouter usage.cost"}))
+        # Joined response and generation evidence must preserve every known accounting fact.
+        events[request] = enrich_event(events[request], event)[0] if request in events else event
     return list(events.values())
 
 
@@ -211,7 +214,7 @@ def parse_events(source, rows, *, cost_center_id, billing_scope, worker_id=None,
     }}
 
 
-def read_rows(stream):
+def read_rows(stream, *, tolerate_incomplete_final=False):
     """Read bounded JSONL or SSE records, preserving numeric decimals before normalization."""
     for number in range(100001):
         line = stream.readline(4 * 1024 * 1024 + 1)
@@ -219,12 +222,17 @@ def read_rows(stream):
             return
         if number == 100000 or len(line) > 4 * 1024 * 1024:
             raise AccountingError("Import exceeds 100000 records or 4 MiB per record; split the input")
+        complete_line = line.endswith("\n")
         line = line.strip()
         if not line or line.startswith(":") or line == "data: [DONE]":
             continue
         line = line.removeprefix("data: ")
         try:
             row = json.loads(line, parse_float=Decimal)
+        except json.JSONDecodeError as error:
+            if tolerate_incomplete_final and not complete_line:
+                return
+            raise AccountingError(f"Invalid JSON usage record at line {number + 1}") from error
         except (ValueError, RecursionError) as error:
             raise AccountingError(f"Invalid JSON usage record at line {number + 1}") from error
         if not isinstance(row, dict):

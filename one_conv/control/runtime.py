@@ -192,7 +192,8 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
 
     async def agent_workers(request):
         try:
-            node = await run_in_threadpool(app.state.hub.authenticated_node, request)
+            authenticate = app.state.store.staffing_node if request.method == "POST" else app.state.hub.authenticated_node
+            node = await run_in_threadpool(authenticate, request)
             if workers is None:
                 raise HubError(404, "Cloud worker provisioning is not enabled")
             payload = await bounded_json(request) if request.method == "POST" else dict(request.query_params)

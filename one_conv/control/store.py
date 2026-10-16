@@ -1,7 +1,9 @@
 """Persist the personal workspace independently of any operator laptop or relay."""
 
+import hashlib
 import os
 import re
+import secrets
 import sqlite3
 import time
 from collections import defaultdict
@@ -9,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ..live.hub import MESSAGE_ID, TOPIC, Hub, HubError, split_address
+from ..live.hub import NODE as PEER_NODE
 
 NODE = "workspace"
 HUMAN = "workspace/user"
@@ -83,7 +86,75 @@ class ControlStore:
             with private_database(path):
                 pass
         self.hub = hub
+        with self.hub._db() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS staffing_grants "
+                       "(node TEXT PRIMARY KEY, token_hash TEXT NOT NULL, granted REAL NOT NULL)")
         self.refresh_human()
+
+    @staticmethod
+    def _operator_node(node):
+        if not isinstance(node, str) or not PEER_NODE.fullmatch(node) or node == NODE:
+            raise HubError(400, "Choose a lowercase node name using letters, digits and dashes; workspace is reserved")
+
+    def add_node(self, node: str, *, staffing=False) -> str:
+        """Replacing a credential removes its delegation unless the operator explicitly grants it."""
+        self._operator_node(node)
+        if type(staffing) is not bool:
+            raise ValueError("staffing must be a boolean")
+        token = secrets.token_urlsafe(32)
+        digest, now = hashlib.sha256(token.encode()).hexdigest(), time.time()
+        with self.hub.lock, self.hub._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT OR REPLACE INTO tokens VALUES (?, ?, ?)", (node, digest, now))
+            db.execute("DELETE FROM staffing_grants WHERE node = ?", (node,))
+            if staffing:
+                db.execute("INSERT INTO staffing_grants VALUES (?, ?, ?)", (node, digest, now))
+        return token
+
+    def revoke_node(self, node: str) -> bool:
+        """Remove authority and published routes together so reused identities start unprivileged."""
+        self._operator_node(node)
+        with self.hub.lock, self.hub._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            removed = db.execute("DELETE FROM tokens WHERE node = ?", (node,)).rowcount
+            db.execute("DELETE FROM staffing_grants WHERE node = ?", (node,))
+            db.execute("DELETE FROM sessions WHERE node = ?", (node,))
+            db.execute("DELETE FROM members WHERE node = ?", (node,))
+            db.execute("DELETE FROM nodes WHERE node = ?", (node,))
+        return bool(removed)
+
+    def grant_staffing(self, node: str):
+        """Only the operator can delegate staffing to the currently active credential."""
+        self._operator_node(node)
+        with self.hub.lock, self.hub._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT hash FROM tokens WHERE node = ?", (node,)).fetchone()
+            if row is None:
+                raise HubError(404, "No active node credential has that name")
+            db.execute("INSERT OR REPLACE INTO staffing_grants VALUES (?, ?, ?)", (node, row[0], time.time()))
+
+    def revoke_staffing(self, node: str):
+        """Revoke staffing without interrupting this credential's messaging or accounting."""
+        self._operator_node(node)
+        with self.hub.lock, self.hub._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if db.execute("SELECT 1 FROM tokens WHERE node = ?", (node,)).fetchone() is None:
+                raise HubError(404, "No active node credential has that name")
+            db.execute("DELETE FROM staffing_grants WHERE node = ?", (node,))
+
+    def staffing_node(self, request) -> str:
+        """A request must present the exact active credential generation delegated by the operator."""
+        node = self.hub.authenticated_node(request)
+        token = request.headers.getlist("authorization")[0].partition(" ")[2]
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        # One snapshot prevents an old authenticated request borrowing a replacement token's grant.
+        with self.hub._db() as db:
+            granted = db.execute("SELECT 1 FROM tokens AS t JOIN staffing_grants AS g "
+                                 "ON g.node = t.node AND g.token_hash = t.hash "
+                                 "WHERE t.node = ? AND t.hash = ?", (node, digest)).fetchone()
+        if granted is None:
+            raise HubError(403, "Node staffing authority is required; ask the workspace operator to grant it")
+        return node
 
     def refresh_human(self):
         """A cloud human has a published return route without a local bridge."""

@@ -41,7 +41,10 @@ but is not a running teammate.
 Choose **+ Teammate**, then a name, harness, model, channel, repository profile
 and first task. Preparation continues after the phone closes. A lost response
 is retried under the same job ID. A provider create with an unknown outcome is
-held for reconciliation rather than creating a second box.
+held for reconciliation. Further requests for that profile can use an existing
+box with free slots, but wait before allocating another box. Canceling a waiting
+request does not cancel the original uncertain creation. Inspect Boat and use
+the original request's **Use this existing box** form to attach its sandbox.
 
 Configured agents can use the same managed pool:
 
@@ -54,6 +57,9 @@ The receipt includes the durable request ID. Use it with `--request-id` after an
 unconfirmed response. `live workers --stop ID --yes` stops one teammate while
 leaving others in its box running. The phone also offers **Stop box** and
 **Resume box**. Resumed agents must pass readiness again.
+After the box resumes, choose **Check again** on each preserved teammate to
+restart it under the same request and box. A teammate stopped individually
+stays stopped; add a new teammate to replace it.
 
 Profiles select GitHub repositories, pinned revisions, skills, provider
 credentials, unattended harness flags and resident slots. Each agent gets its

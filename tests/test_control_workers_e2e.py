@@ -274,3 +274,54 @@ raise SystemExit(3)
     result = subprocess.run([sys.executable, "-O", "-c", script], check=False, capture_output=True, text=True,
                             env={**os.environ, "HOME": str(tmp_path), "RELEASE_URL": invalid_omp_release}, timeout=10)
     assert (result.returncode, list((tmp_path / ".local/bin").iterdir())) == (0, [])
+
+
+@pytest.fixture
+def selected_skill_submodule(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    source = tmp_path / "skill-source"
+    checkout = tmp_path / "Documents/claudine"
+    repository = tmp_path / "Documents/one-conv-cli"
+    env = {**os.environ, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow",
+           "GIT_CONFIG_VALUE_0": "always"}
+
+    def git(path, *args):
+        return subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                               "-C", str(path), *args], capture_output=True, text=True, check=True, env=env)
+
+    source.mkdir()
+    target = source / "cli-for-agent/skills/cli-for-agents"
+    target.mkdir(parents=True)
+    (target / "SKILL.md").write_text("Selected portable skill.\n")
+    git(source, "init", "-q")
+    git(source, "add", ".")
+    git(source, "commit", "-qm", "fixture")
+    checkout.mkdir(parents=True)
+    git(checkout, "init", "-q")
+    git(checkout, "submodule", "add", "--", str(source), "external/cursor-plugins")
+    git(checkout, "submodule", "add", "--", str(source), "external/unselected")
+    skills = checkout / ".claude/skills"
+    skills.mkdir(parents=True)
+    (skills / "cli-for-agents").symlink_to("../../external/cursor-plugins/cli-for-agent/skills/cli-for-agents")
+    git(checkout, "add", ".")
+    git(checkout, "commit", "-qm", "fixture")
+    git(checkout, "submodule", "deinit", "--force", "--all")
+    repository.mkdir()
+    git(repository, "init", "-q")
+    (repository / "README.md").write_text("Isolated worker checkout.\n")
+    git(repository, "add", ".")
+    git(repository, "commit", "-qm", "fixture")
+    data = {"job_id": "skill-worker", "profile": {"work_repository": "ClementWalter/one-conv-cli",
+                                                   "skills": ["cli-for-agents"]}}
+    bootstrap.worktree(data, env)
+    return checkout, tmp_path / "Documents/workers/skill-worker"
+
+
+def test_real_git_initializes_the_selected_skill_submodule(selected_skill_submodule):
+    _, worktree = selected_skill_submodule
+    assert (worktree / ".claude/skills/cli-for-agents/SKILL.md").read_text() == "Selected portable skill.\n"
+
+
+def test_real_git_preserves_unselected_submodules_as_uninitialized(selected_skill_submodule):
+    checkout, _ = selected_skill_submodule
+    assert list((checkout / "external/unselected").iterdir()) == []

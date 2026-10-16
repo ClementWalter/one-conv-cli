@@ -135,6 +135,33 @@ class BoatCLI:
         self.executable = executable
         self.service_account_file = Path(service_account_file) if service_account_file else None
 
+    @staticmethod
+    def _receipt(output, operation):
+        """Accept complete JSON or creation events ending in one consistent ready receipt."""
+        if len(output) > 2_000_000 or len(output.encode()) > 2_000_000:
+            raise Unconfirmed("Boat operation returned an oversized result")
+        try:
+            single = json.loads(output)
+        except ValueError:
+            single = None
+        if isinstance(single, dict) and "event" not in single:
+            return single
+        try:
+            lines = output.splitlines()
+            if operation != "new" or len(lines) > 128:
+                raise ValueError
+            rows = [single] if isinstance(single, dict) else [json.loads(line) for line in lines if line.strip()]
+            if not rows or any(not isinstance(row, dict) or row.get("event") not in ("created", "state", "ready")
+                               or not isinstance(row.get("id"), str) or not BOX.fullmatch(row["id"]) for row in rows):
+                raise ValueError
+            if (rows[-1].get("event") != "ready" or rows[-1].get("state") != "ready"
+                    or any(row["id"] != rows[-1]["id"] or row["event"] == "ready" for row in rows[:-1])
+                    or any(row["event"] == "created" for row in rows[1:])):
+                raise ValueError
+            return rows[-1]
+        except (ValueError, TypeError):
+            raise Unconfirmed("Boat operation returned no complete identifiable result") from None
+
     def _call(self, args, *, timeout=180):
         delimiter = args.index("--") if "--" in args else len(args)
         command = [self.executable, *args[:delimiter], "--json", "--no-update", *args[delimiter:]]
@@ -145,10 +172,7 @@ class BoatCLI:
             raise Unconfirmed("Boat operation did not return a confirmed result") from None
         if result.returncode:
             raise Unconfirmed("Boat operation did not return a confirmed result")
-        try:
-            return json.loads(result.stdout)
-        except ValueError:
-            raise Unconfirmed("Boat operation returned an unreadable result") from None
+        return self._receipt(result.stdout, args[0])
 
     def credentials(self, profile):
         """Read only the service account from a cloud environment, before allocating compute."""

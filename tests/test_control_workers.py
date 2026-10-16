@@ -455,6 +455,70 @@ def test_boat_exec_flags_precede_the_remote_command_delimiter(monkeypatch):
 
 
 @pytest.fixture
+def boat_creation_events():
+    return [{"event": "created", "id": "bx_fixture", "ttlSeconds": 3600},
+            {"event": "state", "id": "bx_fixture", "state": "provisioning"},
+            {"event": "state", "id": "bx_fixture", "state": "ready"},
+            {"event": "ready", "id": "bx_fixture", "state": "ready"}]
+
+
+def test_boat_create_accepts_a_complete_jsonl_receipt(monkeypatch, boat_creation_events):
+    output = "\n".join(json.dumps(row) for row in boat_creation_events)
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, output, ""))
+    assert BoatCLI().create(DEFAULT_PROFILE, "pool-id") == "bx_fixture"
+
+
+@pytest.mark.parametrize("output", ['{"id":"bx_fixture"}', '{"sandbox":{"id":"bx_fixture"}}',
+                                   '{\n"event":"ready",\n"id":"bx_fixture",\n"state":"ready"\n}'])
+def test_boat_create_preserves_complete_single_json_receipts(monkeypatch, output):
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, output, ""))
+    assert BoatCLI().create(DEFAULT_PROFILE, "pool-id") == "bx_fixture"
+
+
+@pytest.mark.parametrize("count", [1, 2, 3])
+def test_boat_creation_requires_the_terminal_ready_event(boat_creation_events, count):
+    output = "\n".join(json.dumps(row) for row in boat_creation_events[:count])
+    with pytest.raises(Unconfirmed):
+        BoatCLI._receipt(output, "new")
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+def test_boat_creation_requires_consistent_ids(boat_creation_events, index):
+    boat_creation_events[index]["id"] = "bx_different"
+    output = "\n".join(json.dumps(row) for row in boat_creation_events)
+    with pytest.raises(Unconfirmed):
+        BoatCLI._receipt(output, "new")
+
+
+@pytest.mark.parametrize("suffix", ['\n{"event":', '\n{"event":"error","id":"bx_fixture"}', '\nprivate non-json'])
+def test_boat_creation_rejects_malformed_or_failed_trailers(boat_creation_events, suffix):
+    output = "\n".join(json.dumps(row) for row in boat_creation_events) + suffix
+    with pytest.raises(Unconfirmed):
+        BoatCLI._receipt(output, "new")
+
+
+@pytest.mark.parametrize("field,value", [("event", "state"), ("state", "provisioning"), ("id", "../invalid")])
+def test_boat_creation_rejects_invalid_terminal_receipts(boat_creation_events, field, value):
+    boat_creation_events[-1][field] = value
+    output = "\n".join(json.dumps(row) for row in boat_creation_events)
+    with pytest.raises(Unconfirmed):
+        BoatCLI._receipt(output, "new")
+
+
+@pytest.mark.parametrize("output", ['{"id":"bx_fixture","padding":"' + "x" * 2_000_000 + '"}',
+                                   "\n".join('{"event":"state","id":"bx_fixture"}' for _ in range(129))])
+def test_boat_receipts_are_bounded_before_parsing(output):
+    with pytest.raises(Unconfirmed):
+        BoatCLI._receipt(output, "new")
+
+
+def test_non_creation_operations_do_not_accept_progress_streams(boat_creation_events):
+    output = "\n".join(json.dumps(row) for row in boat_creation_events)
+    with pytest.raises(Unconfirmed):
+        BoatCLI._receipt(output, "exec")
+
+
+@pytest.fixture
 def agent_environment(monkeypatch):
     boat = BoatCLI()
     raw = {"environment": {"safeForThirdParties": False, "proxyAiCredentials": False,

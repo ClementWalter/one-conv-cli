@@ -373,6 +373,31 @@ def test_cloud_bootstrap_reads_only_requested_vault_fields(worker_home, monkeypa
     assert [argv[2] for argv in calls if argv[:2] == ["op", "read"]] == [bootstrap.GITHUB_REF]
 
 
+def test_only_the_selected_skills_tracked_submodule_is_initialized(worker_home, monkeypatch, payload):
+    payload["profile"]["skills"] = ["cli-for-agents"]
+    checkout = worker_home / "Documents/claudine"
+    skills = checkout / ".claude/skills"
+    skills.mkdir(parents=True)
+    (skills / "cli-for-agents").symlink_to("../../external/cursor-plugins/cli-for-agent/skills/cli-for-agents")
+    selected = checkout / "external/cursor-plugins/cli-for-agent/skills/cli-for-agents"
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if "ls-files" in argv:
+            output = "160000 " + "a" * 40 + " 0\texternal/cursor-plugins\x00" + "160000 " + "b" * 40 + " 0\texternal/other\x00"
+        else:
+            output = ""
+        if "submodule" in argv:
+            selected.mkdir(parents=True)
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    monkeypatch.setattr(bootstrap, "run", run)
+    bootstrap.worktree(payload, {})
+    assert [argv for argv in calls if "submodule" in argv] == [["git", "-C", str(checkout), "submodule", "update",
+                                                             "--init", "--depth", "1", "--", "external/cursor-plugins"]]
+
+
 def test_provider_failures_do_not_expose_diagnostics(monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args, 1, "private-token", "private-token"))
     with pytest.raises(bootstrap.BootstrapError, match="^github-login$"):

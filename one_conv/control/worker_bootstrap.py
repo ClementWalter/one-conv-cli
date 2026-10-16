@@ -258,7 +258,20 @@ def worktree(data, env):
             stage="worktree-create", env=env)
     run(["git", "-C", str(destination), "rev-parse", "--verify", "HEAD"], stage="worktree-check", env=env)
     for name in data["profile"]["skills"]:
-        target = Path.home() / "Documents/claudine/.claude/skills" / name
+        checkout = Path.home() / "Documents/claudine"
+        target = checkout / ".claude/skills" / name
+        if not target.is_dir():
+            try:
+                relative = target.resolve().relative_to(checkout.resolve())
+            except ValueError:
+                raise BootstrapError("skill-unavailable") from None
+            index = run(["git", "-C", str(checkout), "ls-files", "--stage", "-z"], stage="skill-submodule-index", env=env)
+            for entry in index.stdout.split("\x00"):
+                metadata, separator, tracked = entry.partition("\t")
+                if (separator and metadata.startswith("160000 ")
+                        and (Path(tracked) == relative or Path(tracked) in relative.parents)):
+                    run(["git", "-C", str(checkout), "submodule", "update", "--init", "--depth", "1", "--", tracked],
+                        stage="skill-submodule", env=env)
         if not target.is_dir():
             raise BootstrapError("skill-unavailable")
         for skills in (destination / ".claude/skills", Path.home() / ".codex/skills", Path.home() / ".omp/agent/skills"):

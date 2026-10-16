@@ -112,8 +112,12 @@ into the denominator. Rate cards are not changed automatically.
 
 The SQLite ledger deduplicates by billing scope and provider request/generation
 ID, or by stable native source identity when no request ID is available. Repeated
-imports return duplicate counts. Conflicting facts for an existing identity
-reject the whole batch instead of silently overwriting charges. Importers handle
+imports return duplicate counts. Later provider evidence can fill unknown cost,
+tokens, model or provider fields; receipts report `enriched: true` for the same
+identity. Known values and node/owner attribution cannot be overwritten. Per-field
+provenance retains the evidence that established each value. Conflicting known
+facts reject the whole batch. OpenRouter creation timestamps use whole seconds
+so completion and later generation metadata can join. Importers handle
 current Codex response records, legacy cumulative-counter snapshots, and repeated
 Claude content blocks without adding the same usage twice. Malformed records
 fail visibly. Inputs are bounded at 100000 records and 4 MiB per record.
@@ -128,6 +132,44 @@ events in bounded, idempotent batches; workers and parents are qualified with
 the configured node. The authority derives bearer node identity and enforces
 ownership. UI and MCP can use the same authority separately. No model API request
 or transcript scan occurs implicitly.
+
+For automatic worker metering, a worker bootstrap supplies a private ownership
+mapping. Only its explicit native history paths are scanned. Relative paths are
+resolved beside this JSON file; this is an illustrative mapping:
+
+```json
+{
+  "schema_version": 1,
+  "histories": [
+    {"source": "codex", "path": "history", "billing_scope": "native-account"}
+  ],
+  "owners": {
+    "codex:SESSION": {"cost_center_id": "jack", "worker_id": "node/codex:SESSION"}
+  }
+}
+```
+
+Each history requires `source` (`codex`, `claude` or `omp`), `path` (a directory or
+file) and a stable `billing_scope`. Owners can override `billing_scope` or provide
+`parent_worker_id`. Unmapped sessions are counted and skipped; native Codex and
+Claude children inherit their mapped parent's cost center with distinct worker
+IDs. Keep retired worker/probe mappings for late usage. No subscription quota or
+cash charge is inferred from native token counts.
+
+```bash
+one-conv hr sync --mapping workers.json --hub --json
+one-conv hr watch --mapping workers.json --hub --interval 5 --max-backoff 60 --json
+```
+
+`sync` runs once; `watch` reloads mappings and hub credentials each pass. Use
+`--iterations 1` for a bounded check or `--local` for an isolated local ledger.
+Polling defaults to five seconds; failures back off up to sixty seconds and retry
+the same identities. Each pass bounds file count, event count and scan time;
+oversized inputs fail visibly. Incomplete final writes wait for the next pass.
+Only finalized Claude responses are imported automatically. The watcher reports
+coverage and transfers canonical accounting metadata, never transcript content.
+The reusable entrypoints are `sync_mapping(mapping_path, sink)` and
+`watch_mapping(mapping_path, sink_factory, ...)` in `one_conv.accounting.watcher`.
 
 ## Connect a cloud account
 

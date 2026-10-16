@@ -6,9 +6,8 @@ from contextlib import closing
 from pathlib import Path
 
 from .model import (
-    AccountingConflict,
     AccountingError,
-    comparable,
+    enrich_event,
     normalize_event,
     timestamp,
 )
@@ -46,9 +45,10 @@ class Ledger:
                         saved = self._decode(existing[2], event["event_id"])
                         if saved["cost_center_id"] != existing[0] or saved["timestamp"] != existing[1]:
                             raise AccountingError("Ledger ownership or timestamp mismatch")
-                        if comparable(saved) != comparable(event):
-                            raise AccountingConflict(f"Usage identity {event['event_id']} has conflicting facts; no batch changes saved")
-                        receipts.append({"status": "duplicate", "event": saved})
+                        merged, enriched = enrich_event(saved, event)
+                        if enriched:
+                            connection.execute("UPDATE usage SET payload=? WHERE event_id=?", (json.dumps(merged, sort_keys=True), event["event_id"]))
+                        receipts.append({"status": "duplicate", "event": merged, "enriched": enriched})
                     else:
                         connection.execute("INSERT INTO usage VALUES (?, ?, ?, ?)",
                                            (event["event_id"], event["cost_center_id"], event["timestamp"], json.dumps(event, sort_keys=True)))

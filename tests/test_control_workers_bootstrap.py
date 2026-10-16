@@ -456,6 +456,17 @@ def test_disabling_a_probe_is_unverified(worker_home, monkeypatch, payload):
     assert bootstrap.bootstrap(payload)["status"] == "unverified"
 
 
+def test_disabled_omp_probes_preserve_unverified_without_importing_auth(worker_home, monkeypatch, payload):
+    payload["spec"]["harness"] = "omp"
+    payload["profile"]["probe_enabled"] = False
+    payload["profile"]["boat_agent_credentials"] = True
+    monkeypatch.setattr(bootstrap, "prepare_repositories", lambda data: {})
+    monkeypatch.setattr(bootstrap, "worktree", lambda data, env: worker_home)
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda command: command)
+    monkeypatch.setattr(bootstrap, "prepare_omp_auth", lambda *args: pytest.fail("disabled probes remain unverified"))
+    assert bootstrap.bootstrap(payload)["status"] == "unverified"
+
+
 def test_a_rejected_model_is_auth_needed(worker_home, monkeypatch, payload):
     monkeypatch.setattr(bootstrap, "prepare_repositories", lambda data: {})
     monkeypatch.setattr(bootstrap, "worktree", lambda data, env: worker_home)

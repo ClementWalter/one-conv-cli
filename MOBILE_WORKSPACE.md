@@ -69,6 +69,12 @@ Boat administration credentials while allowing agent credentials. An explicit
 vault-key profile can instead use `--no-env`. Missing login, model access or
 quota leaves the job needing attention on the same box.
 
+For a fresh OMP worker, the native-credentials profile can import its selected
+Boat Pi Anthropic OAuth identity through OMP's official local importer. Existing
+OMP credentials and explicit provider configuration take precedence. This does
+not select another account when a provider rejects a request. Codex still needs
+a configured ChatGPT or API login, and provider spend limits remain in force.
+
 The benchmark established ten **idle** resident agents on a default 4-vCPU,
 8-GB box, plus concurrent local tool workloads. It did not establish ten active
 model turns. Profiles start with four resident slots and support up to ten.

@@ -156,6 +156,8 @@ def install_op():
 
 def install_omp():
     """Verify a bounded official ELF download before atomically exposing the executable."""
+    global STAGE
+    STAGE = "omp-install"
     release = OMP_RELEASES.get(platform.machine()) if platform.system() == "Linux" else None
     if release is None:
         raise BootstrapError("omp-architecture")

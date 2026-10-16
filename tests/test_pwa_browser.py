@@ -153,6 +153,32 @@ def test_phone_layout_has_no_horizontal_overflow(paired):
     assert paired[0].evaluate("document.documentElement.scrollWidth <= window.innerWidth")
 
 
+@pytest.fixture
+def usage_costs(paired):
+    page = paired[0]
+    page.route("**/api/providers/accounting", lambda route: route.fulfill(json={
+        "cards": [], "events": [{"cost_center_id": "jack", "model": "example-model",
+                                   "timestamp": "2026-10-16T12:00:00Z", "tokens": {"total": 400},
+                                   "cash_cost": {"amount": None}, "allocated_cost": {"amount": None},
+                                   "estimated_cost": {"amount": "0.000000001", "currency": "USD"}}],
+    }))
+    page.get_by_role("button", name="Team costs").click()
+    page.locator(".usage-row").wait_for()
+    return page.locator(".usage-row")
+
+
+def test_usage_shows_the_answer_token_count(usage_costs):
+    assert "400 tokens" in usage_costs.inner_text()
+
+
+def test_usage_keeps_unknown_cash_separate_from_estimates(usage_costs):
+    assert "Cash not reported" in usage_costs.inner_text()
+
+
+def test_a_tiny_answer_estimate_is_not_rounded_to_zero(usage_costs):
+    assert "< 0.00000001 USD estimated" in usage_costs.inner_text()
+
+
 def test_phone_staffing_form_has_no_horizontal_overflow(paired, tmp_path):
     page = paired[0]
     page.locator("#staff-team").click()

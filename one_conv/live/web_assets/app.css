@@ -171,6 +171,7 @@ body {
 .rate-card h3 { font-size: 15px; margin: 0 0 13px; }
 .rate-amount { display: inline-block; font-size: 23px; font-weight: 650; letter-spacing: -0.7px; }
 .rate-basis { display: inline-block; margin-left: 10px; border-radius: 5px; background: var(--selected); color: var(--selected-text); padding: 4px 7px; font-size: 10px; }
+.text-button { border: 0; background: transparent; color: var(--selected-text); padding: 0; font: inherit; font-size: 12px; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
 .quote-form { display: flex; align-items: center; gap: 12px; margin-top: 17px; }
 .quote-form label { font-size: 11px; color: var(--muted); }
 .quote-form input { display: inline-block; width: 70px; padding: 7px; margin-left: 6px; }

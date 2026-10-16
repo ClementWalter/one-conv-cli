@@ -1046,10 +1046,18 @@ async function showCosts() {
     if (!events.length) content.append(el("p", "No usage records yet. A subscription does not become a zero-dollar answer.", "quiet-copy"));
     for (const record of events.slice(0, 30)) {
       const item = el("article", null, "usage-row");
-      const cash = record.cash_cost || {}, allocated = record.allocated_cost || {};
-      item.append(el("strong", record.model || record.worker_id || "Agent"),
-        el("span", money(cash.amount, cash.currency || "USD") + " cash"),
-        el("small", allocated.amount == null ? "Allocation not measured" : money(allocated.amount, allocated.currency) + " allocated"));
+      const cash = record.cash_cost || {}, allocated = record.allocated_cost || {}, estimate = record.estimated_cost || {};
+      const owner = (data.cards || []).find(card => card.cost_center_id === record.cost_center_id);
+      const name = owner?.name || record.cost_center_id || "Teammate";
+      const total = record.tokens?.total;
+      const date = new Date(record.timestamp);
+      const details = [Number.isFinite(total) ? total.toLocaleString() + " tokens" : "Token total not reported"];
+      if (Number.isFinite(date.getTime())) details.push(date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }));
+      item.append(el("strong", name + (record.model ? " · " + record.model : "")),
+        el("small", details.join(" · ")),
+        el("span", cash.amount == null ? "Cash not reported" : money(cash.amount, cash.currency) + " reported cash"));
+      if (estimate.amount != null) item.append(el("small", money(estimate.amount, estimate.currency) + " estimated"));
+      if (allocated.amount != null) item.append(el("small", money(allocated.amount, allocated.currency) + " allocated"));
       content.append(item);
     }
   } catch (error) { content.replaceChildren(el("p", error.message, "quiet-copy")); }

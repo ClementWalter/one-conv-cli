@@ -24,6 +24,7 @@ def payload():
 @pytest.fixture
 def worker_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     return tmp_path
 
 
@@ -123,7 +124,7 @@ def test_secrets_and_prompt_are_direct_native_arguments(worker_home, monkeypatch
     calls = []
     monkeypatch.setattr(os, "execvpe", lambda executable, args, env: calls.append((executable, args, env)))
     bootstrap.run_native(path)
-    assert calls[0][1] == ["claude", "--model", "selected-model", prompt]
+    assert calls[0][1] == ["claude", "--model", "selected-model", "--", prompt]
 
 
 def test_native_secret_payload_disappears_before_exec(worker_home, monkeypatch):
@@ -170,6 +171,41 @@ def test_bootstrap_state_is_private(worker_home):
 
 def test_all_native_probes_select_the_requested_model():
     assert bootstrap.probe_command("codex", "selected-model")[2:4] == ["--model", "selected-model"]
+
+
+@pytest.mark.parametrize("harness,flag", [("claude", "--tools"), ("codex", "shell_tool"), ("omp", "--no-tools")])
+def test_readiness_probes_disable_native_tools(harness, flag):
+    assert flag in bootstrap.probe_command(harness, None)
+
+
+@pytest.mark.parametrize("harness,output,expected", [
+    ("claude", '{"type":"result","session_id":"probe-session"}', "claude:probe-session"),
+    ("codex", '{"type":"thread.created","thread_id":"probe-thread"}', "codex:probe-thread"),
+    ("omp", '{"type":"session","id":"probe-session"}', "omp:probe-session"),
+])
+def test_probe_sessions_keep_explicit_native_accounting_identity(harness, output, expected):
+    assert bootstrap.probe_session(harness, output) == expected
+
+
+@pytest.mark.parametrize("relative", ["Documents/workers/job-1/.claude/skills/review", ".codex/skills/review", ".omp/agent/skills/review"])
+def test_selected_skills_are_linked_into_native_discovery(worker_home, monkeypatch, payload, relative):
+    skill = worker_home / "Documents/claudine/.claude/skills/review"
+    skill.mkdir(parents=True)
+    payload["profile"]["skills"] = ["review"]
+    monkeypatch.setattr(bootstrap, "run", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "valid", ""))
+    bootstrap.worktree(payload, {})
+    assert (worker_home / relative).resolve() == skill.resolve()
+
+
+def test_native_launcher_uses_profile_unattended_flags(worker_home, monkeypatch):
+    bootstrap.write_private(bootstrap.root() / "credentials.json", {"GH_TOKEN": "private-gh-token"})
+    path = worker_home / "run.json"
+    bootstrap.write_private(path, {"harness": "claude", "model": None, "prompt": "task",
+                                   "args": ["--dangerously-skip-permissions"]})
+    calls = []
+    monkeypatch.setattr(os, "execvpe", lambda executable, args, env: calls.append(args))
+    bootstrap.run_native(path)
+    assert calls[0] == ["claude", "--dangerously-skip-permissions", "--", "task"]
 
 
 @pytest.fixture

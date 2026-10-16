@@ -116,6 +116,11 @@ def validate_payload(data):
     if not isinstance(revisions, dict) or any(repo not in repos or not isinstance(revision, str)
             or not re.fullmatch(r"[0-9a-f]{40}", revision) for repo, revision in revisions.items()):
         raise BootstrapError("payload")
+    args = profile.get("harness_args")
+    if (not isinstance(args, dict) or set(args) != {"claude", "codex", "omp"}
+            or any(not isinstance(values, list) or len(values) > 32 or any(not isinstance(arg, str) or len(arg) > 1024
+                   or "\x00" in arg or "\n" in arg for arg in values) for values in args.values())):
+        raise BootstrapError("payload")
     model = spec.get("model")
     if model is not None and (not isinstance(model, str) or not model or model.startswith("-") or "\x00" in model):
         raise BootstrapError("payload")
@@ -192,18 +197,18 @@ def worktree(data, env):
         run(["git", "-C", str(source), "worktree", "add", "-b", f"workers/{data['job_id']}", str(destination), "HEAD"],
             stage="worktree-create", env=env)
     run(["git", "-C", str(destination), "rev-parse", "--verify", "HEAD"], stage="worktree-check", env=env)
-    skills = destination / ".claude/skills"
     for name in data["profile"]["skills"]:
         target = Path.home() / "Documents/claudine/.claude/skills" / name
         if not target.is_dir():
             raise BootstrapError("skill-unavailable")
-        skills.mkdir(parents=True, exist_ok=True)
-        link = skills / name
-        if link.is_symlink() and link.resolve() == target.resolve():
-            continue
-        if link.exists() or link.is_symlink():
-            raise BootstrapError("skill-conflict")
-        link.symlink_to(target, target_is_directory=True)
+        for skills in (destination / ".claude/skills", Path.home() / ".codex/skills", Path.home() / ".omp/agent/skills"):
+            skills.mkdir(parents=True, exist_ok=True)
+            link = skills / name
+            if link.is_symlink() and link.resolve() == target.resolve():
+                continue
+            if link.exists() or link.is_symlink():
+                raise BootstrapError("skill-conflict")
+            link.symlink_to(target, target_is_directory=True)
     return destination
 
 
@@ -211,10 +216,14 @@ def probe_command(harness, model):
     """Use a tiny native answer to verify provider access and the selected model."""
     options = ["--model", model] if model else []
     if harness == "claude":
-        return ["claude", *options, "--print", "--output-format", "json", PROBE]
+        return ["claude", *options, "--print", "--output-format", "json", "--tools", "",
+                "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', PROBE]
     if harness == "codex":
-        return ["codex", "exec", *options, "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check", "--json", PROBE]
-    return ["omp", *([f"--model={model}"] if model else []), "--print", "--mode=json", PROBE]
+        return ["codex", "exec", *options, "--sandbox", "read-only", "--skip-git-repo-check", "--json",
+                "--ignore-user-config", "--ignore-rules", "--disable", "shell_tool", "--disable", "multi_agent",
+                "--disable", "apps", "--disable", "plugins", "-c", 'web_search="disabled"', PROBE]
+    return ["omp", *([f"--model={model}"] if model else []), "--print", "--mode=json", "--no-tools",
+            "--no-extensions", "--no-skills", "--no-rules", PROBE]
 
 
 def probe_answer(harness, output):
@@ -241,6 +250,23 @@ def probe_answer(harness, output):
     return False
 
 
+def probe_session(harness, output):
+    """Read only native session identifiers from the probe's structured stream."""
+    for line in output.splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        ident = row.get("session_id") if harness == "claude" else (
+            row.get("thread_id") if harness == "codex" and row.get("type") == "thread.created" else
+            row.get("id") if harness == "omp" and row.get("type") == "session" else None)
+        if isinstance(ident, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", ident):
+            return f"{harness}:{ident}"
+    return None
+
+
 def _install_helper():
     target = Path.home() / ".local/lib/one-conv/worker_bootstrap.py"
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -263,7 +289,7 @@ def _bridge(data, launcher):
                              stdin=subprocess.DEVNULL, start_new_session=True)
 
 
-def _collector(data, address, launcher):
+def _collector(data, address, launcher, probe_addresses=()):
     """Keep one pool-wide numeric usage collector with an atomically refreshed owner map."""
     mapping_path = root() / "usage-map.json"
     mapping = json.loads(mapping_path.read_text()) if mapping_path.exists() else {"schema_version": 1, "histories": [], "owners": {}}
@@ -274,8 +300,9 @@ def _collector(data, address, launcher):
     entry = {"source": harness, "path": str(histories[harness]), "billing_scope": scope}
     if entry not in mapping["histories"]:
         mapping["histories"].append(entry)
-    mapping["owners"][address] = {"cost_center_id": data["spec"]["name"],
-                                  "worker_id": f"{data['hub']['node']}/{address}", "billing_scope": scope}
+    for owner in (address, *probe_addresses):
+        mapping["owners"][owner] = {"cost_center_id": data["spec"]["name"],
+                                    "worker_id": f"{data['hub']['node']}/{owner}", "billing_scope": scope}
     write_private(mapping_path, mapping)
     hub = data["hub"]
     env = {**os.environ, "ONE_CONV_HUB_URL": hub["url"], "ONE_CONV_HUB_NODE": hub["node"],
@@ -321,7 +348,8 @@ def _start(data, env, cwd, path, record):
     run_path = root() / f"{data['job_id']}.run.json"
 
     def command(prompt, model):
-        write_private(run_path, {"harness": data["spec"]["harness"], "model": model, "prompt": prompt})
+        write_private(run_path, {"harness": data["spec"]["harness"], "model": model, "prompt": prompt,
+                                 "args": data["profile"]["harness_args"][data["spec"]["harness"]]})
         return [sys.executable, str(helper), "run", str(run_path)]
 
     harness = data["spec"]["harness"]
@@ -385,10 +413,11 @@ def stop_worker(data, path, record):
         elif rows:
             return {"status": "unconfirmed", "stage": "worker-stop"}
     if target:
-        try:
-            spawn.stop(target)
-        except spawn.SpawnError:
-            return {"status": "unconfirmed", "stage": "worker-stop"}
+        if spawn._state(target) != "absent":
+            try:
+                spawn.stop(target)
+            except spawn.SpawnError:
+                return {"status": "unconfirmed", "stage": "worker-stop"}
     elif record.get("phase") == "launching":
         return {"status": "unconfirmed", "stage": "worker-stop"}
     record.update(phase="stopped")
@@ -418,6 +447,15 @@ def bootstrap(data):
         write_private(path, record)
         env = prepare_repositories(data)
         checkout = Path.home() / "Documents/one-conv-cli"
+        executable = Path.home() / ".local/bin/one-conv"
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        if executable.is_symlink() and executable.resolve() != (checkout / "bin/one-conv").resolve():
+            raise BootstrapError("launcher-conflict")
+        if not executable.exists() and not executable.is_symlink():
+            executable.symlink_to(checkout / "bin/one-conv")
+        native_path = str(executable.parent) + os.pathsep + os.environ.get("PATH", "")
+        os.environ["PATH"] = native_path
+        env["PATH"] = native_path
         sys.path.insert(0, str(checkout))
         cwd = worktree(data, env)
         harness = data["spec"]["harness"]
@@ -430,6 +468,10 @@ def bootstrap(data):
         if not record.get("model_verified") or time.time() - record.get("probe_verified_at", 0) > 300:
             result = run(probe_command(harness, data["spec"]["model"]), stage="model-probe", env=env,
                          cwd=cwd, timeout=120, check=False)
+            probe = probe_session(harness, result.stdout)
+            if probe:
+                record["probe_addresses"] = list(dict.fromkeys([*record.get("probe_addresses", []), probe]))
+                write_private(path, record)
             if result.returncode or not probe_answer(harness, result.stdout):
                 return {"status": "auth_needed", "stage": "model-probe", "authenticated": False}
             record.update(model_verified=True, probe_verified_at=time.time())
@@ -444,7 +486,7 @@ def bootstrap(data):
         STAGE = "hub-readiness"
         health = _readiness(data, native["address"])
         if health["status"] == "ready":
-            if not _collector(data, native["address"], launcher):
+            if not _collector(data, native["address"], launcher, record.get("probe_addresses", [])):
                 return {"status": "unconfirmed", "address": native["address"], "stage": "usage-collector"}
             health["collector"] = True
         return health
@@ -458,8 +500,8 @@ def run_native(path):
     harness, model = data["harness"], data["model"]
     if harness not in ("claude", "codex", "omp"):
         raise BootstrapError("native-harness")
-    args = [harness, *([f"--model={model}"] if harness == "omp" and model else
-                      ["--model", model] if model else []), data["prompt"]]
+    args = [harness, *data.get("args", []), *([f"--model={model}"] if harness == "omp" and model else
+                      ["--model", model] if model else []), "--", data["prompt"]]
     os.execvpe(harness, args, env)
 
 

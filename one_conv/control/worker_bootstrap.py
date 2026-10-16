@@ -244,8 +244,8 @@ def prepare_omp_auth(data, env):
                                    "AWS_PROFILE", "AWS_ACCESS_KEY_ID", "AWS_BEARER_TOKEN_BEDROCK",
                                    "AWS_WEB_IDENTITY_TOKEN_FILE", "GOOGLE_APPLICATION_CREDENTIALS"))
                        for key, value in env.items())
-    # Existing identities, blocks, profiles, brokers and explicit credentials retain their own resolution.
-    if (omp_credential_count(database) != 0 or (agent / "auth.json").exists()
+    # Explicit identities, profiles and brokers retain their own resolution.
+    if ((agent / "auth.json").exists()
             or data["profile"]["credential_refs"]
             or provider_env
             or any(env.get(key) for key in ("OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR", "PI_CODING_AGENT_DIR", "OMP_AUTH_BROKER_URL"))
@@ -253,6 +253,12 @@ def prepare_omp_auth(data, env):
             or any((directory / name).exists() for directory in (home, home / ".omp", agent)
                    for name in (".env", "config.yml", "config.yaml"))
             or any(env.get(key) and (Path(env[key]) / "omp").exists() for key in ("XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"))):
+        return True
+    count = omp_credential_count(database)
+    # Unknown native state cannot authorize an import or a model probe.
+    if count is None:
+        return False
+    if count > 0:
         return True
     try:
         descriptor = os.open(home / ".pi/agent/auth.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)

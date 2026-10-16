@@ -128,6 +128,105 @@ def test_omp_import_recheck_never_reimports_an_existing_identity(boat_pi_auth, o
     assert len(omp_import) == 1
 
 
+@pytest.fixture(params=["corrupt", "symlink", "dangling-symlink", "directory", "fifo", "unreadable"])
+def unknown_omp_database(worker_home, monkeypatch, request):
+    database = worker_home / ".omp/agent/agent.db"
+    database.parent.mkdir(parents=True)
+    if request.param == "corrupt":
+        database.write_bytes(b"invalid sqlite database")
+    elif request.param in ("symlink", "dangling-symlink"):
+        target = database.with_name("other.db")
+        if request.param == "symlink":
+            with sqlite3.connect(target) as store:
+                store.execute("CREATE TABLE auth_credentials(provider TEXT)")
+        database.symlink_to(target)
+    elif request.param == "directory":
+        database.mkdir()
+    elif request.param == "fifo":
+        os.mkfifo(database, 0o600)
+    else:
+        database.touch()
+
+        def unreadable(*args, **kwargs):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        monkeypatch.setattr(bootstrap.sqlite3, "connect", unreadable)
+    return database
+
+
+def test_unknown_native_omp_auth_requires_attention(boat_pi_auth, unknown_omp_database, monkeypatch):
+    data, env, _ = boat_pi_auth
+    monkeypatch.setattr(bootstrap, "run", lambda *args, **kwargs: pytest.fail("unknown native identities cannot be replaced"))
+    assert bootstrap.prepare_omp_auth(data, env) is False
+
+
+def test_unknown_omp_auth_stops_bootstrap_before_import_or_probe(boat_pi_auth, unknown_omp_database, worker_home, monkeypatch):
+    data, env, _ = boat_pi_auth
+    monkeypatch.setattr(bootstrap, "prepare_repositories", lambda data: env)
+    monkeypatch.setattr(bootstrap, "worktree", lambda data, env: worker_home)
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda command: command)
+    monkeypatch.setattr(bootstrap, "run", lambda *args, **kwargs: pytest.fail("unknown auth cannot import or probe"))
+    assert bootstrap.bootstrap(data) == {"status": "auth_needed", "stage": "omp-auth-import", "authenticated": False}
+
+
+@pytest.mark.parametrize("explicit", ["profile", "provider-env", "credential-ref", "config", "legacy-auth", "xdg"])
+def test_explicit_omp_resolution_does_not_inspect_default_database(boat_pi_auth, worker_home, monkeypatch, explicit):
+    data, env, _ = boat_pi_auth
+    if explicit == "profile":
+        data["profile"]["harness_args"]["omp"] = ["--profile=selected"]
+    elif explicit == "provider-env":
+        env["GROQ_API_KEY"] = "selected-native-provider"
+    elif explicit == "credential-ref":
+        data["profile"]["credential_refs"] = {"ANTHROPIC_API_KEY": "op://selected/provider/token"}
+    elif explicit == "config":
+        (worker_home / "config.yml").write_text("profile: selected\n")
+    elif explicit == "legacy-auth":
+        bootstrap.write_private(worker_home / ".omp/agent/auth.json", {})
+    else:
+        env["XDG_STATE_HOME"] = str(worker_home / "selected")
+        (Path(env["XDG_STATE_HOME"]) / "omp").mkdir(parents=True)
+    monkeypatch.setattr(bootstrap, "omp_credential_count", lambda *args, **kwargs: pytest.fail("explicit configuration owns auth resolution"))
+    monkeypatch.setattr(bootstrap, "run", lambda *args, **kwargs: pytest.fail("explicit configuration cannot import another identity"))
+    assert bootstrap.prepare_omp_auth(data, env) is True
+
+
+@pytest.fixture
+def empty_readonly_omp_database(worker_home):
+    database = worker_home / ".omp/agent/agent.db"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as store:
+        store.execute("CREATE TABLE native_settings(value TEXT)")
+    database.chmod(0o444)
+    return database
+
+
+def test_native_omp_database_without_auth_table_is_known_empty(empty_readonly_omp_database):
+    assert bootstrap.omp_credential_count(empty_readonly_omp_database) == 0
+
+
+def test_native_omp_auth_inspection_never_initializes_missing_tables(empty_readonly_omp_database):
+    before = empty_readonly_omp_database.read_bytes()
+    bootstrap.omp_credential_count(empty_readonly_omp_database)
+    assert empty_readonly_omp_database.read_bytes() == before
+
+
+def test_native_omp_database_fifo_is_bounded_without_a_writer(boat_pi_auth, worker_home):
+    database = worker_home / ".omp/agent/agent.db"
+    database.parent.mkdir(parents=True)
+    os.mkfifo(database, 0o600)
+    script = """
+import os
+from one_conv.control.worker_bootstrap import prepare_omp_auth
+data = {'spec': {'harness': 'omp'}, 'profile': {'boat_agent_credentials': True,
+        'harness_args': {'omp': []}, 'credential_refs': {}}}
+result = prepare_omp_auth(data, {'HOME': os.environ['HOME'], 'PATH': os.environ['PATH']})
+raise SystemExit(0 if result is False else 1)
+"""
+    result = subprocess.run([sys.executable, "-O", "-c", script], check=False,
+                            capture_output=True, text=True, timeout=3)
+    assert result.returncode == 0
+
+
 @pytest.mark.parametrize("provider,disabled", [("anthropic", None), ("anthropic", "spend_limit"), ("openai-codex", None)])
 def test_existing_native_omp_identities_are_preserved(boat_pi_auth, worker_home, monkeypatch, provider, disabled):
     data, env, _ = boat_pi_auth

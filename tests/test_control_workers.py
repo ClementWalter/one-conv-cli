@@ -369,6 +369,39 @@ def test_explicit_stop_confirms_an_already_archived_pool(provisioned, boat):
     assert provisioned.status("request-1")["status"] == "stopped"
 
 
+@pytest.fixture
+def resumed_after_ambiguous_stop(provisioned, boat):
+    provisioned._update("request-1", status="ready", address="worker-node/claude:existing")
+
+    def stop(box):
+        raise Unconfirmed("stop outcome is unconfirmed")
+
+    boat.stop_pool = stop
+    pool = provisioned.list()["pools"][0]["id"]
+    provisioned.stop_pool(pool)
+    provisioned.resume_pool(pool)
+    return provisioned, boat
+
+
+def test_recheck_can_recover_after_an_ambiguous_stop(resumed_after_ambiguous_stop):
+    manager, _ = resumed_after_ambiguous_stop
+    assert manager.recheck("request-1")["status"] == "queued"
+
+
+def test_ambiguous_stop_recovery_never_creates_a_replacement(resumed_after_ambiguous_stop):
+    manager, boat = resumed_after_ambiguous_stop
+    manager.recheck("request-1")
+    manager.run_once()
+    assert boat.creates == 1
+
+
+def test_ambiguous_stop_recovery_preserves_the_native_claim(resumed_after_ambiguous_stop):
+    manager, boat = resumed_after_ambiguous_stop
+    manager.recheck("request-1")
+    manager.run_once()
+    assert (boat.starts[-1][0], boat.starts[-1][1]["job_id"], boat.starts[-1][1]["restart"]) == ("bx_1", "request-1", False)
+
+
 def test_automatic_pool_stop_invalidates_other_old_jobs(provisioned, spec, boat):
     provisioned.submit({**spec, "name": "builder"}, "request-2")
     provisioned.run_once()

@@ -577,7 +577,7 @@ class WorkerManager:
             state = _read(self.state_path)
             job = state["jobs"][id]
             recheck = (job["status"] == "unconfirmed" and job.get("box_id")
-                       and job["phase"] in ("bootstrapping", "preflight", "inspecting", "resuming", "unconfirmed"))
+                       and job["phase"] in ("bootstrapping", "preflight", "inspecting", "resuming", "unconfirmed", "pool-unconfirmed"))
             restart = job["status"] == "stopped" and job["phase"] == "pool-stopped"
             ready = job["status"] == "ready" and job.get("box_id")
             if job["status"] not in ("auth_needed", "unverified", "failed") and not recheck and not restart and not ready:

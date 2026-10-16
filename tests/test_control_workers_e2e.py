@@ -42,7 +42,7 @@ class StubBoatHTTP:
         return self.call("bootstrap", {"box": box, "payload": payload})
 
     def info(self, box):
-        return {"id": box, "state": "running"}
+        return self.call("info", {"box": box})
 
     def stop_pool(self, box):
         return self.call("stop", {"box": box})
@@ -69,7 +69,7 @@ def loopback_hub(tmp_path):
 
 @pytest.fixture
 def provider(loopback_hub):
-    remote = {"created": 0, "publish": True, "join": True, "verified": True, "sessions": {}}
+    remote = {"created": 0, "publish": True, "join": True, "verified": True, "sessions": {}, "machine_state": "idle"}
 
     class Handler(BaseHTTPRequestHandler):
         """Only fixed test health is returned; request bodies stay out of server logs."""
@@ -83,7 +83,10 @@ def provider(loopback_hub):
                 response = {"service_account": "test-service-account"}
             elif self.path == "/create":
                 remote["created"] += 1
+                remote["machine_state"] = "idle"
                 response = {"id": f"bx_{remote['created']}"}
+            elif self.path == "/info":
+                response = {"id": body["box"], "state": remote["machine_state"]}
             elif self.path == "/bootstrap":
                 data = body["payload"]
                 if data["operation"] == "stop":
@@ -101,7 +104,8 @@ def provider(loopback_hub):
                                 "model_verified": remote["verified"], "bridge": True, "published": True, "joined": True,
                                 "collector": True, "task_id": "a" * 32}
             else:
-                response = {"status": "stopped" if self.path == "/stop" else "running"}
+                remote["machine_state"] = "archived" if self.path == "/stop" else "idle"
+                response = {"state": remote["machine_state"]}
             encoded = json.dumps(response).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

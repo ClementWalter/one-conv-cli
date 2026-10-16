@@ -343,6 +343,18 @@ def _start(data, env, cwd, path, record):
         if not any(session.address == address for session in router.list_all(data["spec"]["harness"])):
             if not data.get("restart"):
                 return {"status": "unconfirmed", "stage": "native-session-lost"}
+            previous = record.get("tmux")
+            if previous:
+                state = spawn._state(previous)
+                if state == "unknown":
+                    return {"status": "unconfirmed", "stage": "native-session-lost"}
+                if state == "alive":
+                    try:
+                        spawn.stop(previous)
+                    except spawn.SpawnError:
+                        return {"status": "unconfirmed", "stage": "native-session-lost"}
+                    if spawn._state(previous) != "absent":
+                        return {"status": "unconfirmed", "stage": "native-session-lost"}
             record.pop("address", None)
             record.pop("tmux", None)
         else:

@@ -318,3 +318,17 @@ def test_real_entrypoint_consumes_an_invalid_secret_envelope(payload_file):
     payload_file.write_text('{"boat_token":"fixture-private-key"}')
     result = subprocess.run([sys.executable, "-O", installer.__file__, str(payload_file)], capture_output=True, text=True, check=False)
     assert (result.returncode, payload_file.exists(), "fixture-private-key" in result.stderr) == (1, False, False)
+
+
+def test_standalone_success_receipt_uses_only_stdout():
+    source = (
+        "import importlib.util,sys; "
+        "spec=importlib.util.spec_from_file_location('installer',sys.argv[1]); "
+        "module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); "
+        "module.install=lambda path:{'healthy':True,'unit':'one-conv-control.service'}; "
+        "raise SystemExit(module.main(['fixture-payload']))"
+    )
+    result = subprocess.run([sys.executable, "-O", "-c", source, installer.__file__],
+                            capture_output=True, text=True, check=False)
+    assert (result.returncode, result.stdout, result.stderr) == (
+        0, '{"healthy": true, "unit": "one-conv-control.service"}\n', "")

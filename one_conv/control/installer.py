@@ -294,7 +294,7 @@ def main(argv=None):
     except (OSError, ValueError):
         log.error("Cloud installation is not confirmed (stage=installation); provider diagnostics are withheld.")
         return 1
-    log.info("%s", json.dumps(result, sort_keys=True))
+    sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")
     return 0
 
 

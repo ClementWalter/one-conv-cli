@@ -51,6 +51,15 @@ class PreflightRefused(WorkerError):
     """A verified unsafe configuration prevented sandbox allocation."""
 
 
+def machine_status(state):
+    """Normalize Boat's documented API states and stopped CLI label."""
+    if state in ("ready", "idle", "running"):
+        return "available"
+    if state in ("archived", "stopped"):
+        return "stopped"
+    return None
+
+
 def private_json(path: Path, value: dict) -> None:
     """Atomically replace private state and flush it before an external effect."""
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -148,15 +157,16 @@ class BoatCLI:
             return single
         try:
             lines = output.splitlines()
-            if operation != "new" or len(lines) > 128:
+            if operation not in ("new", "resume") or len(lines) > 128:
                 raise ValueError
             rows = [single] if isinstance(single, dict) else [json.loads(line) for line in lines if line.strip()]
-            if not rows or any(not isinstance(row, dict) or row.get("event") not in ("created", "state", "ready")
+            initial = "created" if operation == "new" else "accepted"
+            if not rows or any(not isinstance(row, dict) or row.get("event") not in (initial, "state", "ready")
                                or not isinstance(row.get("id"), str) or not BOX.fullmatch(row["id"]) for row in rows):
                 raise ValueError
-            if (rows[-1].get("event") != "ready" or rows[-1].get("state") != "ready"
+            if (rows[-1].get("event") != "ready" or machine_status(rows[-1].get("state")) != "available"
                     or any(row["id"] != rows[-1]["id"] or row["event"] == "ready" for row in rows[:-1])
-                    or any(row["event"] == "created" for row in rows[1:])):
+                    or any(row["event"] == initial for row in rows[1:])):
                 raise ValueError
             return rows[-1]
         except (ValueError, TypeError):
@@ -237,22 +247,36 @@ class BoatCLI:
             raise Unconfirmed("Boat created no identifiable sandbox receipt")
         return box
 
-    def info(self, box):
-        result = self._call(["info", box])
+    def info(self, box, *, timeout=180):
+        result = self._call(["info", box], timeout=timeout)
         row = result.get("sandbox", result) if isinstance(result, dict) else {}
         if row.get("id") != box:
             raise WorkerError("Boat did not confirm the selected sandbox")
         return row
 
+    def _transition(self, box, operation, wanted):
+        """Confirm a known machine after one action; missing acknowledgements never repeat it."""
+        try:
+            self._call([operation, box])
+        except Unconfirmed:
+            pass  # A read of the tracked machine can confirm an ambiguous acknowledgement.
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            state = self.info(box, timeout=max(1, remaining)).get("state")
+            if machine_status(state) == wanted:
+                return
+            if state not in ("ready", "idle", "running", "archived", "stopped", "archiving", "stopping",
+                             "provisioning", "provisioned", "starting", "cloning"):
+                break
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+        raise Unconfirmed("Boat pool transition is not confirmed")
+
     def stop_pool(self, box):
-        self._call(["stop", box])
-        if self.info(box).get("state") != "stopped":
-            raise Unconfirmed("Boat pool stop is not confirmed")
+        self._transition(box, "stop", "stopped")
 
     def resume_pool(self, box):
-        self._call(["resume", box])
-        if self.info(box).get("state") not in ("running", "up"):
-            raise Unconfirmed("Boat pool resume is not confirmed")
+        self._transition(box, "resume", "available")
 
     def _exec(self, box, command):
         """Only fixed helper code and controller-generated hexadecimal paths cross Boat's shell."""
@@ -424,23 +448,25 @@ class WorkerManager:
         joined = any(row.get("topic") == job["spec"]["topic"] and qualified in row.get("members", []) for row in client.topics())
         return published and joined
 
-    def _inspect_pool(self, pool, job):
+    def _inspect_pool(self, pool, job=None):
         """Read tracked machine state before reuse; automatic stops invalidate every old process."""
         info = self.boat.info(pool["box_id"])
         machine = info.get("state") if isinstance(info, dict) else None
-        if machine not in ("running", "up", "stopped"):
+        status = machine_status(machine)
+        if status is None:
             raise Unconfirmed("tracked pool machine state is unconfirmed")
         with self._locked():
             state = _read(self.state_path)
             actual = state["pools"][pool["id"]]
-            actual["status"] = "stopped" if machine == "stopped" else "available"
+            actual["status"] = status
+            actual["provider_state"] = machine
             actual["checked_at"] = time.time()
-            if machine == "stopped":
+            if status == "stopped":
                 for previous in state["jobs"].values():
                     if previous.get("pool_id") == pool["id"] and previous["status"] in ACTIVE:
                         previous.update(address=None, health={"registered": False, "bridge": False, "published": False,
                                                                "joined": False, "collector": False}, updated=time.time())
-                        if previous["id"] == job["id"]:
+                        if job is not None and previous["id"] == job["id"]:
                             previous["restart"] = True
                             job["restart"] = True
                             job["address"] = None
@@ -618,6 +644,17 @@ class WorkerManager:
                 state = _read(self.state_path)
                 if pool_id not in state["pools"] or not state["pools"][pool_id].get("box_id"):
                     raise ValueError("pool has no tracked sandbox")
+                pool = copy.deepcopy(state["pools"][pool_id])
+            try:
+                pool = self._inspect_pool(pool)
+            except WorkerError:
+                with self._locked():
+                    state = _read(self.state_path)
+                    state["pools"][pool_id]["status"] = "unconfirmed"
+                    self._save(state)
+                raise
+            with self._locked():
+                state = _read(self.state_path)
                 pool = state["pools"][pool_id]
                 if pool["status"] == ("available" if resume else "stopped"):
                     return copy.deepcopy(pool)

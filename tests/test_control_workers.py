@@ -14,6 +14,7 @@ from one_conv.control.workers import (
     Unconfirmed,
     WorkerError,
     WorkerManager,
+    machine_status,
     private_json,
 )
 
@@ -293,6 +294,81 @@ def test_automatic_pool_stop_resumes_the_known_box(provisioned, boat):
     assert boat.pools_resumed == ["bx_1"]
 
 
+@pytest.mark.parametrize("state", ["ready", "idle", "running"])
+def test_all_documented_running_states_reuse_the_tracked_pool(provisioned, spec, boat, state):
+    boat.state = state
+    provisioned.submit({**spec, "name": "builder"}, "request-2")
+    provisioned.run_once()
+    assert boat.creates == 1
+
+
+def test_api_archived_state_resumes_the_tracked_pool(provisioned, boat):
+    boat.state = "archived"
+    provisioned.recheck("request-1")
+    provisioned.run_once()
+    assert boat.pools_resumed == ["bx_1"]
+
+
+@pytest.mark.parametrize("state", ["archiving", "provisioning", "error", "up", "unknown"])
+def test_transient_or_unknown_states_are_not_running_capacity(state):
+    assert machine_status(state) is None
+
+
+@pytest.mark.parametrize("operation,states", [("stop", ["archiving", "archived"]),
+                                            ("stop", ["stopping", "stopped"]),
+                                            ("resume", ["provisioning", "ready"]),
+                                            ("resume", ["provisioned", "idle"]),
+                                            ("resume", ["cloning", "running"])])
+def test_known_box_transitions_poll_for_documented_terminal_states(monkeypatch, operation, states):
+    boat, commands = BoatCLI(), []
+    responses = iter(states)
+
+    def call(args, **kwargs):
+        commands.append(args)
+        return {"id": "bx_tracked", "state": next(responses)} if args[0] == "info" else {}
+
+    monkeypatch.setattr(boat, "_call", call)
+    monkeypatch.setattr("one_conv.control.workers.time.sleep", lambda duration: None)
+    (boat.stop_pool if operation == "stop" else boat.resume_pool)("bx_tracked")
+    assert commands == [[operation, "bx_tracked"], ["info", "bx_tracked"], ["info", "bx_tracked"]]
+
+
+def test_a_missing_stop_ack_is_confirmed_without_repeating_the_action(monkeypatch):
+    boat, commands = BoatCLI(), []
+
+    def call(args, **kwargs):
+        commands.append(args)
+        if args[0] == "stop":
+            raise Unconfirmed("lost acknowledgement")
+        return {"id": "bx_tracked", "state": "archived"}
+
+    monkeypatch.setattr(boat, "_call", call)
+    boat.stop_pool("bx_tracked")
+    assert commands == [["stop", "bx_tracked"], ["info", "bx_tracked"]]
+
+
+def test_stop_timeout_does_not_claim_a_snapshot_is_complete(monkeypatch):
+    boat = BoatCLI()
+    ticks = iter([0, 1, 2, 181, 182])
+    monkeypatch.setattr(boat, "_call", lambda args, **kwargs: {"id": "bx_tracked", "state": "archiving"})
+    monkeypatch.setattr("one_conv.control.workers.time.monotonic", lambda: next(ticks))
+    monkeypatch.setattr("one_conv.control.workers.time.sleep", lambda duration: None)
+    with pytest.raises(Unconfirmed):
+        boat.stop_pool("bx_tracked")
+
+
+def test_explicit_resume_inspects_an_automatically_stopped_pool(provisioned, boat):
+    boat.state = "stopped"
+    provisioned.resume_pool(provisioned.list()["pools"][0]["id"])
+    assert boat.pools_resumed == ["bx_1"]
+
+
+def test_explicit_stop_confirms_an_already_archived_pool(provisioned, boat):
+    boat.state = "archived"
+    provisioned.stop_pool(provisioned.list()["pools"][0]["id"])
+    assert provisioned.status("request-1")["status"] == "stopped"
+
+
 def test_automatic_pool_stop_invalidates_other_old_jobs(provisioned, spec, boat):
     provisioned.submit({**spec, "name": "builder"}, "request-2")
     provisioned.run_once()
@@ -516,6 +592,34 @@ def test_non_creation_operations_do_not_accept_progress_streams(boat_creation_ev
     output = "\n".join(json.dumps(row) for row in boat_creation_events)
     with pytest.raises(Unconfirmed):
         BoatCLI._receipt(output, "exec")
+
+
+@pytest.fixture
+def boat_resume_events():
+    return [{"event": "accepted", "id": "bx_fixture"},
+            {"event": "state", "id": "bx_fixture", "state": "ready"},
+            {"event": "state", "id": "bx_fixture", "state": "cloning"},
+            {"event": "state", "id": "bx_fixture", "state": "idle"},
+            {"event": "ready", "id": "bx_fixture", "state": "idle"}]
+
+
+def test_actual_resume_jsonl_waits_for_terminal_ready_idle(boat_resume_events):
+    output = "\n".join(json.dumps(row) for row in boat_resume_events)
+    assert BoatCLI._receipt(output, "resume") == {"event": "ready", "id": "bx_fixture", "state": "idle"}
+
+
+@pytest.mark.parametrize("count", [1, 2, 3, 4])
+def test_resume_state_ready_does_not_replace_a_terminal_ready_event(boat_resume_events, count):
+    output = "\n".join(json.dumps(row) for row in boat_resume_events[:count])
+    with pytest.raises(Unconfirmed):
+        BoatCLI._receipt(output, "resume")
+
+
+def test_resume_stream_cannot_change_box_identity(boat_resume_events):
+    boat_resume_events[2]["id"] = "bx_other"
+    output = "\n".join(json.dumps(row) for row in boat_resume_events)
+    with pytest.raises(Unconfirmed):
+        BoatCLI._receipt(output, "resume")
 
 
 @pytest.fixture

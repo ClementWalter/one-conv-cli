@@ -20,12 +20,15 @@ import os
 import platform
 import re
 import shutil
+import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -206,6 +209,84 @@ def install_omp():
     finally:
         staged.unlink(missing_ok=True)
     return target
+
+
+def omp_credential_count(path, *, active_anthropic=False):
+    """Read numeric native auth presence without exposing credentials or changing native state."""
+    if not path.exists() and not path.is_symlink():
+        return 0
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2) as database:
+            if not database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='auth_credentials'").fetchone():
+                return 0
+            query = "SELECT count(*) FROM auth_credentials"
+            if active_anthropic:
+                query += " WHERE provider='anthropic' AND credential_type='oauth' AND disabled_cause IS NULL"
+            return database.execute(query).fetchone()[0]
+    except sqlite3.Error:
+        return None
+
+
+def prepare_omp_auth(data, env):
+    """Import the selected Boat Pi identity once through OMP's official local importer."""
+    if data["spec"]["harness"] != "omp" or data["profile"].get("boat_agent_credentials") is not True:
+        return True
+    home = Path.home()
+    agent = home / ".omp/agent"
+    database = agent / "agent.db"
+    args = data["profile"]["harness_args"]["omp"]
+    # Existing identities, blocks, profiles, brokers and explicit credentials retain their own resolution.
+    if (omp_credential_count(database) != 0 or (agent / "auth.json").exists()
+            or data["profile"]["credential_refs"]
+            or any(env.get(key) for key in ("OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR", "PI_CODING_AGENT_DIR",
+                                            "OMP_AUTH_BROKER_URL", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
+                                            "OPENAI_API_KEY", "GEMINI_API_KEY", "OPENROUTER_API_KEY", "CURSOR_ACCESS_TOKEN"))
+            or any(arg in ("--profile", "--config") or arg.startswith(("--profile=", "--config=")) for arg in args)
+            or any((directory / name).exists() for directory in (home, home / ".omp", agent)
+                   for name in (".env", "config.yml", "config.yaml"))
+            or any(env.get(key) and (Path(env[key]) / "omp").exists() for key in ("XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"))):
+        return True
+    try:
+        descriptor = os.open(home / ".pi/agent/auth.json", os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor) as stream:
+            metadata = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o777 != 0o600
+                    or metadata.st_uid != os.getuid() or metadata.st_size > 128_000):
+                return False
+            raw = stream.read(128_001)
+            if len(raw) > 128_000:
+                return False
+            source = json.loads(raw)
+        credential = source.get("anthropic") if isinstance(source, dict) else None
+        if (not isinstance(credential, dict) or credential.get("type") != "oauth"
+                or any(not isinstance(credential.get(key), str) or not credential[key]
+                       or any(character.isspace() or character == "\x00" for character in credential[key])
+                       for key in ("access", "refresh"))
+                or type(credential.get("expires")) is not int or credential["expires"] <= 0):
+            return False
+        converted = {"type": "claude", "access_token": credential["access"], "refresh_token": credential["refresh"],
+                     "expired": datetime.fromtimestamp(credential["expires"] / 1000, tz=UTC).isoformat()}
+        for original, target in (("email", "email"), ("accountId", "account_id")):
+            if original in credential:
+                if not isinstance(credential[original], str) or not credential[original] or "\x00" in credential[original]:
+                    return False
+                converted[target] = credential[original]
+        root().mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(prefix="omp-auth-", dir=root()) as directory:
+            path = Path(directory) / "anthropic.json"
+            write_private(path, converted)
+            result = run(["omp", "auth-broker", "import", str(path), "--provider=anthropic", "--json"],
+                         stage="omp-auth-import", env=env, cwd=root(), timeout=30)
+            receipt = json.loads(result.stdout)
+            imported = receipt.get("imported") if isinstance(receipt, dict) else None
+            if (not isinstance(imported, list) or len(imported) != 1 or not isinstance(imported[0], dict)
+                    or imported[0].get("provider") != "anthropic" or receipt.get("skipped")):
+                return False
+        return omp_credential_count(database, active_anthropic=True) == 1
+    except (OSError, ValueError, OverflowError, TypeError, BootstrapError):
+        return False
 
 
 def prepare_repositories(data):
@@ -590,6 +671,8 @@ def bootstrap(data):
             install_omp()
         if shutil.which(harness) is None:
             return {"status": "failed", "stage": "harness-unavailable"}
+        if not prepare_omp_auth(data, env):
+            return {"status": "auth_needed", "stage": "omp-auth-import", "authenticated": False}
         if not data["profile"]["probe_enabled"]:
             return {"status": "unverified", "stage": "model-probe-disabled", "model_verified": False}
         if data.get("restart"):

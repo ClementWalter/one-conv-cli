@@ -1,8 +1,11 @@
 """A stub Boat HTTP provider and real loopback hub exercise complete worker job lifecycles."""
 
+import copy
 import json
 import os
+import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -15,7 +18,7 @@ uvicorn = pytest.importorskip("uvicorn")
 pytest.importorskip("starlette")
 
 from one_conv.control import worker_bootstrap as bootstrap
-from one_conv.control.workers import WorkerManager
+from one_conv.control.workers import DEFAULT_PROFILE, WorkerManager
 from one_conv.live.hub import Hub, application
 from one_conv.live.hubclient import HubClient
 
@@ -344,3 +347,48 @@ def test_real_git_initializes_the_selected_skill_submodule(selected_skill_submod
 def test_real_git_preserves_unselected_submodules_as_uninitialized(selected_skill_submodule):
     checkout, _ = selected_skill_submodule
     assert list((checkout / "external/unselected").iterdir()) == []
+
+
+@pytest.fixture
+def real_omp_import(tmp_path, monkeypatch):
+    if shutil.which("omp") is None:
+        pytest.skip("OMP 18 executable is required for the native import integration")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    env = {"HOME": str(tmp_path), "PATH": os.environ["PATH"]}
+    version = subprocess.run(["omp", "--version"], capture_output=True, text=True, check=False, timeout=30, env=env)
+    if version.stdout.strip() != "omp/18.0.6":
+        pytest.skip("Native import integration requires pinned OMP 18.0.6")
+    source = tmp_path / ".pi/agent/auth.json"
+    bootstrap.write_private(source, {"anthropic": {"type": "oauth", "access": "synthetic-access-not-a-token",
+                                                  "refresh": "synthetic-refresh-not-a-token", "expires": 4102444800000}})
+    original = source.read_bytes()
+    profile = copy.deepcopy(DEFAULT_PROFILE)
+    profile["boat_agent_credentials"] = True
+    data = {"spec": {"harness": "omp"}, "profile": profile}
+    result = bootstrap.prepare_omp_auth(data, env)
+    return result, tmp_path / ".omp/agent/agent.db", source, original, data, env
+
+
+def test_real_omp_import_accepts_the_selected_synthetic_pi_identity(real_omp_import):
+    result, _, _, _, _, _ = real_omp_import
+    assert result is True
+
+
+def test_real_omp_import_creates_an_active_native_oauth_row(real_omp_import):
+    _, database, _, _, _, _ = real_omp_import
+    assert bootstrap.omp_credential_count(database, active_anthropic=True) == 1
+
+
+def test_real_omp_import_preserves_the_pi_source(real_omp_import):
+    _, _, source, original, _, _ = real_omp_import
+    assert source.read_bytes() == original
+
+
+def test_real_omp_recheck_preserves_a_disabled_native_identity(real_omp_import):
+    _, database, _, _, data, env = real_omp_import
+    with sqlite3.connect(database) as store:
+        store.execute("UPDATE auth_credentials SET disabled_cause='spend_limit'")
+    bootstrap.prepare_omp_auth(data, env)
+    with sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True) as store:
+        cause = store.execute("SELECT disabled_cause FROM auth_credentials").fetchone()[0]
+    assert cause == "spend_limit"

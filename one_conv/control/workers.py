@@ -661,6 +661,11 @@ class WorkerManager:
                 if resume and pool["status"] != "stopped":
                     raise ValueError("only a confirmed stopped pool can be resumed")
                 pool["status"] = "resuming" if resume else "stopping"
+                for job in state["jobs"].values():
+                    if job.get("pool_id") == pool_id and job["status"] in ACTIVE:
+                        job.update(status="unconfirmed", phase="pool-unconfirmed", address=None,
+                                   health={"registered": False, "bridge": False, "published": False,
+                                           "joined": False, "collector": False}, updated=time.time())
                 self._save(state)
                 box_id = pool["box_id"]
             confirmed = False

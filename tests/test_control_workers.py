@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import threading
 
 import pytest
@@ -363,3 +364,18 @@ def test_boat_exec_never_interpolates_the_payload_text(tmp_path, monkeypatch):
     monkeypatch.setattr(boat, "_call", call)
     boat.bootstrap("bx_known", payload)
     assert all(payload["prompt"] not in json.dumps(command) and payload["token"] not in json.dumps(command) for command in commands)
+
+
+def test_boat_exec_flags_precede_the_remote_command_delimiter(monkeypatch):
+    commands = []
+
+    def run(argv, **kwargs):
+        commands.append(argv)
+        response = {"success": True, "exitCode": 0, "stdout": "{}", "stdoutTruncated": False,
+                    "timedOut": False, "launcherFailed": False, "oomKilled": False}
+        return subprocess.CompletedProcess(argv, 0, json.dumps(response), "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    BoatCLI()._exec("bx_known", ["python3", "/tmp/fixed-helper.py", "/tmp/private-payload.json"])
+    assert commands == [["box", "exec", "bx_known", "--timeout", "600", "--json", "--no-update", "--",
+                         "python3 /tmp/fixed-helper.py /tmp/private-payload.json"]]

@@ -54,6 +54,44 @@ class StubBoatHTTP:
         return self.call("resume", {"box": box})
 
 
+@pytest.mark.parametrize("kind", ["corrupt", "symlink", "directory", "fifo"])
+def test_real_bootstrap_unknown_omp_database_exits_before_native_calls(tmp_path, kind):
+    database = tmp_path / ".omp/agent/agent.db"
+    database.parent.mkdir(parents=True)
+    if kind == "corrupt":
+        database.write_bytes(b"invalid sqlite database")
+    elif kind == "symlink":
+        database.symlink_to(database.with_name("missing.db"))
+    elif kind == "directory":
+        database.mkdir()
+    else:
+        os.mkfifo(database, 0o600)
+    profile = copy.deepcopy(DEFAULT_PROFILE)
+    profile["boat_agent_credentials"] = True
+    data = {"operation": "start", "job_id": "job-1", "pool_id": "pool-1", "service_account": "synthetic",
+            "spec": {"name": "reviewer", "harness": "omp", "model": None, "topic": "release",
+                     "profile": "default", "prompt": "Review the repository."}, "profile": profile,
+            "hub": {"url": "https://hub.example.test", "node": "worker-pool", "token": "synthetic"}}
+    script = """
+import json
+import os
+import sys
+from pathlib import Path
+from one_conv.control import worker_bootstrap as bootstrap
+bootstrap.prepare_repositories = lambda data: {'HOME': str(Path.home()), 'PATH': os.environ['PATH']}
+bootstrap.worktree = lambda data, env: Path.home()
+bootstrap.shutil.which = lambda command: command
+def forbidden(*args, **kwargs):
+    raise RuntimeError('native import and model probe must not run')
+bootstrap.run = forbidden
+sys.stdout.write(json.dumps(bootstrap.bootstrap(json.load(sys.stdin))))
+"""
+    result = subprocess.run([sys.executable, "-O", "-c", script], input=json.dumps(data),
+                            env={**os.environ, "HOME": str(tmp_path)}, capture_output=True, text=True,
+                            check=True, timeout=3)
+    assert json.loads(result.stdout) == {"status": "auth_needed", "stage": "omp-auth-import", "authenticated": False}
+
+
 @pytest.fixture
 def loopback_hub(tmp_path):
     state = Hub(str(tmp_path / "hub.db"))

@@ -47,7 +47,10 @@ class Accounting:
             _fields(payload, ("action", "card"), ("replace",))
             if type(payload.get("replace", False)) is not bool:
                 raise ValueError("replace must be a boolean")
-            return {"card": self.rates.register(payload["card"], replace=payload.get("replace", False))}
+            # Browser tabs may hold stale identity fields after a worker joins or is renamed.
+            if payload.get("replace", False):
+                raise ValueError("Refresh the workspace to edit this card’s planning rate; browser registration cannot replace worker identity. API clients: use update_rate.")
+            return {"card": self.rates.register(payload["card"])}
         if payload.get("action") == "update_rate":
             _fields(payload, ("action", "reference", "hourly_rate"))
             return {"card": self.rates.update_rate(payload["reference"], payload["hourly_rate"])}

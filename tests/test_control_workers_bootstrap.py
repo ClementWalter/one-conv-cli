@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -51,6 +52,150 @@ def omp_release(worker_home, monkeypatch):
 
     monkeypatch.setattr(bootstrap, "run", run)
     return binary, ReleaseResponse
+
+
+@pytest.fixture
+def boat_pi_auth(worker_home, payload):
+    payload["spec"]["harness"] = "omp"
+    payload["profile"]["boat_agent_credentials"] = True
+    source = worker_home / ".pi/agent/auth.json"
+    bootstrap.write_private(source, {"anthropic": {"type": "oauth", "access": "synthetic-access",
+                                                  "refresh": "synthetic-refresh", "expires": 4102444800000}})
+    return payload, {"HOME": str(worker_home), "PATH": os.environ["PATH"]}, source
+
+
+@pytest.fixture
+def omp_import(worker_home, monkeypatch, boat_pi_auth):
+    calls = []
+
+    def run(argv, **kwargs):
+        path = Path(argv[3])
+        calls.append({"argv": argv, "converted": json.loads(path.read_text()), "mode": path.stat().st_mode & 0o777})
+        database = worker_home / ".omp/agent/agent.db"
+        database.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(database) as store:
+            store.execute("CREATE TABLE auth_credentials(provider TEXT, credential_type TEXT, disabled_cause TEXT)")
+            store.execute("INSERT INTO auth_credentials VALUES('anthropic','oauth',NULL)")
+        return subprocess.CompletedProcess(argv, 0, '{"imported":[{"provider":"anthropic"}],"skipped":[]}', "")
+
+    monkeypatch.setattr(bootstrap, "run", run)
+    return calls
+
+
+def test_selected_boat_pi_auth_uses_the_official_omp_importer(boat_pi_auth, omp_import):
+    data, env, _ = boat_pi_auth
+    bootstrap.prepare_omp_auth(data, env)
+    assert omp_import[0]["argv"][:3] + omp_import[0]["argv"][4:] == ["omp", "auth-broker", "import", "--provider=anthropic", "--json"]
+
+
+def test_pi_auth_conversion_retains_the_selected_tokens(boat_pi_auth, omp_import):
+    data, env, _ = boat_pi_auth
+    bootstrap.prepare_omp_auth(data, env)
+    assert omp_import[0]["converted"] == {"type": "claude", "access_token": "synthetic-access",
+                                         "refresh_token": "synthetic-refresh", "expired": "2100-01-01T00:00:00+00:00"}
+
+
+def test_converted_pi_auth_is_private(boat_pi_auth, omp_import):
+    data, env, _ = boat_pi_auth
+    bootstrap.prepare_omp_auth(data, env)
+    assert omp_import[0]["mode"] == 0o600
+
+
+def test_pi_auth_secrets_never_enter_import_arguments(boat_pi_auth, omp_import):
+    data, env, _ = boat_pi_auth
+    bootstrap.prepare_omp_auth(data, env)
+    assert "synthetic-access" not in json.dumps(omp_import[0]["argv"]) and "synthetic-refresh" not in json.dumps(omp_import[0]["argv"])
+
+
+def test_successful_omp_import_removes_the_temporary_credentials(boat_pi_auth, omp_import):
+    data, env, _ = boat_pi_auth
+    bootstrap.prepare_omp_auth(data, env)
+    assert not Path(omp_import[0]["argv"][3]).exists()
+
+
+def test_omp_import_does_not_rewrite_the_boat_source(boat_pi_auth, omp_import):
+    data, env, source = boat_pi_auth
+    original = source.read_bytes()
+    bootstrap.prepare_omp_auth(data, env)
+    assert source.read_bytes() == original
+
+
+def test_omp_import_recheck_never_reimports_an_existing_identity(boat_pi_auth, omp_import):
+    data, env, _ = boat_pi_auth
+    bootstrap.prepare_omp_auth(data, env)
+    bootstrap.prepare_omp_auth(data, env)
+    assert len(omp_import) == 1
+
+
+@pytest.mark.parametrize("provider,disabled", [("anthropic", None), ("anthropic", "spend_limit"), ("openai-codex", None)])
+def test_existing_native_omp_identities_are_preserved(boat_pi_auth, worker_home, monkeypatch, provider, disabled):
+    data, env, _ = boat_pi_auth
+    database = worker_home / ".omp/agent/agent.db"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as store:
+        store.execute("CREATE TABLE auth_credentials(provider TEXT, credential_type TEXT, disabled_cause TEXT)")
+        store.execute("INSERT INTO auth_credentials VALUES(?,'oauth',?)", (provider, disabled))
+    monkeypatch.setattr(bootstrap, "run", lambda *args, **kwargs: pytest.fail("native identities cannot be replaced"))
+    assert bootstrap.prepare_omp_auth(data, env) is True
+
+
+@pytest.mark.parametrize("harness,enabled", [("claude", True), ("codex", True), ("omp", False)])
+def test_pi_auth_import_requires_an_explicit_boat_omp_request(boat_pi_auth, monkeypatch, harness, enabled):
+    data, env, _ = boat_pi_auth
+    data["spec"]["harness"] = harness
+    data["profile"]["boat_agent_credentials"] = enabled
+    monkeypatch.setattr(bootstrap, "run", lambda *args, **kwargs: pytest.fail("not an authorized OMP import"))
+    assert bootstrap.prepare_omp_auth(data, env) is True
+
+
+@pytest.mark.parametrize("key", ["OMP_PROFILE", "PI_CODING_AGENT_DIR", "OMP_AUTH_BROKER_URL", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"])
+def test_explicit_native_omp_configuration_keeps_its_identity(boat_pi_auth, monkeypatch, key):
+    data, env, _ = boat_pi_auth
+    env[key] = "explicit-native-value"
+    monkeypatch.setattr(bootstrap, "run", lambda *args, **kwargs: pytest.fail("explicit native configuration"))
+    assert bootstrap.prepare_omp_auth(data, env) is True
+
+
+@pytest.mark.parametrize("source", [{"anthropic": {"type": "api_key", "key": "synthetic"}},
+                                   {"openai-codex": {"type": "oauth"}},
+                                   {"anthropic": {"type": "oauth", "access": "access", "refresh": "refresh", "expires": True}},
+                                   {"anthropic": {"type": "oauth", "access": "white space", "refresh": "refresh", "expires": 4102444800000}}])
+def test_unsupported_pi_credentials_remain_auth_needed(boat_pi_auth, source):
+    data, env, path = boat_pi_auth
+    bootstrap.write_private(path, source)
+    assert bootstrap.prepare_omp_auth(data, env) is False
+
+
+def test_world_readable_pi_auth_cannot_be_imported(boat_pi_auth):
+    data, env, source = boat_pi_auth
+    source.chmod(0o644)
+    assert bootstrap.prepare_omp_auth(data, env) is False
+
+
+def test_pi_auth_source_symlinks_are_refused(boat_pi_auth):
+    data, env, source = boat_pi_auth
+    target = source.with_name("other.json")
+    source.rename(target)
+    source.symlink_to(target)
+    assert bootstrap.prepare_omp_auth(data, env) is False
+
+
+def test_omp_import_receipt_needs_a_real_native_credential(boat_pi_auth, monkeypatch):
+    data, env, _ = boat_pi_auth
+    monkeypatch.setattr(bootstrap, "run", lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, '{"imported":[{"provider":"anthropic"}],"skipped":[]}', ""))
+    assert bootstrap.prepare_omp_auth(data, env) is False
+
+
+def test_omp_import_failure_removes_temporary_tokens(boat_pi_auth, monkeypatch):
+    data, env, _ = boat_pi_auth
+
+    def failed(*args, **kwargs):
+        raise bootstrap.BootstrapError("omp-auth-import")
+
+    monkeypatch.setattr(bootstrap, "run", failed)
+    bootstrap.prepare_omp_auth(data, env)
+    assert list(bootstrap.root().glob("omp-auth-*")) == []
 
 
 def test_official_omp_download_is_atomically_installed(omp_release, worker_home):

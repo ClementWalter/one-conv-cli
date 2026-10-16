@@ -182,6 +182,8 @@ class BoatCLI:
             raise Unconfirmed("Boat operation did not return a confirmed result") from None
         if result.returncode:
             raise Unconfirmed("Boat operation did not return a confirmed result")
+        if args[0] == "scp":
+            return {}  # SCP acknowledges transport by exit status; helper execution checks the files.
         return self._receipt(result.stdout, args[0])
 
     def credentials(self, profile):

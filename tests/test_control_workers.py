@@ -618,6 +618,32 @@ def test_boat_exec_flags_precede_the_remote_command_delimiter(monkeypatch):
                          "python3 /tmp/fixed-helper.py /tmp/private-payload.json"]]
 
 
+def test_scp_uses_its_successful_transport_exit_status(monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, "Copied private file to the sandbox.\n", ""))
+    assert BoatCLI()._call(["scp", "payload.json", "bx_tracked:/tmp/payload.json"]) == {}
+
+
+def test_scp_status_text_cannot_hide_a_failed_copy(monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 1, "Copied private file to the sandbox.\n", "private transport diagnostic"))
+    with pytest.raises(Unconfirmed):
+        BoatCLI()._call(["scp", "payload.json", "bx_tracked:/tmp/payload.json"])
+
+
+def test_non_json_scp_status_does_not_interrupt_the_verified_helper_flow(monkeypatch):
+    def run(argv, **kwargs):
+        if argv[1] == "scp":
+            return subprocess.CompletedProcess(argv, 0, "Copied private file to the sandbox.\n", "")
+        output = '{"status":"auth_needed","stage":"model-probe"}' if "helper.py" in argv[-1] else ""
+        receipt = {"success": True, "exitCode": 0, "stdout": output, "stdoutTruncated": False,
+                   "timedOut": False, "launcherFailed": False, "oomKilled": False}
+        return subprocess.CompletedProcess(argv, 0, json.dumps(receipt), "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert BoatCLI().bootstrap("bx_tracked", {"private": "payload"}) == {"status": "auth_needed", "stage": "model-probe"}
+
+
 @pytest.fixture
 def boat_creation_events():
     return [{"event": "created", "id": "bx_fixture", "ttlSeconds": 3600},

@@ -225,3 +225,20 @@ def test_registration_refuses_a_mismatched_registry(store, card):
         connection.execute("UPDATE cards SET cost_center_id='storage-only'")
     with pytest.raises(RateError, match="identity mismatch"):
         store.register(card, replace=True)
+
+
+def test_locked_cards_preserves_the_validated_snapshot(store, card):
+    saved = store.register(card)
+    with store.locked_cards() as cards:
+        assert cards == [saved]
+
+
+def test_locked_cards_allows_an_unconfigured_registry(store):
+    with store.locked_cards() as cards:
+        assert cards == []
+
+
+def test_locked_cards_blocks_other_database_writers(store, card):
+    store.register(card)
+    with store.locked_cards(), sqlite3.connect(store.path, timeout=0) as connection, pytest.raises(sqlite3.OperationalError, match="locked"):
+        connection.execute("BEGIN IMMEDIATE")

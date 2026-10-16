@@ -1,6 +1,7 @@
 """Shared accounting and managed staffing preserve browser and node authority boundaries."""
 
 import concurrent.futures
+import sqlite3
 import stat
 
 import pytest
@@ -83,6 +84,48 @@ def test_shared_usage_endpoint_returns_imported_events(node, recorded):
 
 def test_shared_summary_reports_unknown_cash(node, recorded):
     assert node.get("/v1/accounting/summary").json()["summary"]["cash_cost"]["unknown_events"] == 1
+
+
+@pytest.mark.parametrize("addresses", [["another/codex:session"], ["another/codex:session", "codex:legacy"]])
+def test_usage_cannot_charge_another_nodes_known_cost_center(node, app, card, event, addresses):
+    app.state.accounting.rates.register({**card, "addresses": addresses})
+    assert node.post("/v1/accounting/events", json={"events": [event]}).status_code == 403
+
+
+@pytest.mark.parametrize("addresses", [[], ["codex:legacy"], ["another/codex:session", "worker/codex:session"]])
+def test_unknown_or_shared_cost_center_ownership_allows_usage(node, app, card, event, addresses):
+    app.state.accounting.rates.register({**card, "addresses": addresses})
+    assert node.post("/v1/accounting/events", json={"events": [event]}).status_code == 200
+
+
+def test_known_owner_allows_distinct_native_child_usage(node, app, card, event):
+    app.state.accounting.rates.register(card)
+    child = {**event, "worker_id": "worker/codex:child", "parent_worker_id": "worker/codex:session"}
+    assert node.post("/v1/accounting/events", json={"events": [child]}).status_code == 200
+
+
+def test_wrong_owner_rejects_the_whole_usage_batch(node, app, card, event):
+    app.state.accounting.rates.register({**card, "addresses": ["another/codex:session"]})
+    node.post("/v1/accounting/events", json={"events": [{**event, "source_event_id": "unowned", "cost_center_id": "john"}, event]})
+    assert app.state.accounting.ledger.list_events() == []
+
+
+def test_rate_ownership_stays_locked_through_the_ledger_write(node, app, event, monkeypatch):
+    ledger = app.state.accounting.ledger
+    original = ledger.record_many
+    ownership_locked = []
+
+    def record(events):
+        with sqlite3.connect(app.state.accounting.rates.path, timeout=0) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                ownership_locked.append(True)
+        return original(events)
+
+    monkeypatch.setattr(ledger, "record_many", record)
+    node.post("/v1/accounting/events", json={"events": [event]})
+    assert ownership_locked == [True]
 
 
 def test_node_bearer_does_not_authorize_browser_accounting(node):

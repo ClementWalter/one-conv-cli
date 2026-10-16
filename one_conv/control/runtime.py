@@ -93,7 +93,15 @@ class Accounting:
                     raise HubError(403, "A node can report only its own workers")
                 event["node_id"] = node
                 accepted.append(event)
-            receipts = self.ledger.record_many(accepted)
+            with self.rates.locked_cards() as cards:
+                owners = {card["cost_center_id"]: card for card in cards}
+                for event in accepted:
+                    card = owners.get(event["cost_center_id"])
+                    nodes = {address.partition("/")[0] for address in card["addresses"]
+                             if "/" in address.partition(":")[0]} if card else set()
+                    if nodes and node not in nodes:
+                        raise HubError(403, "This cost center belongs to another node")
+                receipts = self.ledger.record_many(accepted)
             return {"receipts": receipts, "recorded": sum(row["status"] == "recorded" for row in receipts),
                     "duplicates": sum(row["status"] == "duplicate" for row in receipts)}
         raise HubError(405, "This accounting operation does not support that method")

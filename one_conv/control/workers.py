@@ -463,6 +463,8 @@ class WorkerManager:
         health = self.boat.bootstrap(pool["box_id"], payload)
         if not isinstance(health, dict) or health.get("status") not in ("ready", "auth_needed", "unverified", "failed", "unconfirmed"):
             raise Unconfirmed("worker returned no valid health receipt")
+        if health["status"] == "failed" and job.get("address"):
+            health = {**health, "status": "unconfirmed"}
         public = {key: health[key] is True for key in ("authenticated", "registered", "model_verified", "bridge", "published", "joined", "collector") if key in health}
         if isinstance(health.get("stage"), str) and re.fullmatch(r"[a-z-]{1,48}", health["stage"]):
             public["stage"] = health["stage"]
@@ -476,7 +478,8 @@ class WorkerManager:
                 or not self._hub_health(pool, job, health, token)):
             raise Unconfirmed("worker readiness was not confirmed by the live hub")
         self._update(job["id"], status=health["status"], phase=health["status"], health=public,
-                     address=f"{pool['node']}/{public['address']}" if public.get("address") else None, error=None,
+                     address=f"{pool['node']}/{public['address']}" if public.get("address") else
+                     job.get("address") if health["status"] == "unconfirmed" else None, error=None,
                      restart=False if health["status"] == "ready" else job.get("restart", False))
 
     def run_once(self):
@@ -490,7 +493,7 @@ class WorkerManager:
                 state = _read(self.state_path)
                 for job in state["jobs"].values():
                     if job["status"] == "provisioning":
-                        ambiguous = job["phase"] in ("creating", "bootstrapping", "resuming", "stopping")
+                        ambiguous = job["phase"] in ("creating", "bootstrapping", "resuming", "stopping") or bool(job.get("address"))
                         job.update(status="unconfirmed" if ambiguous else "failed",
                                    error="controller stopped during a provider operation", updated=time.time())
                 job = next((item for item in state["jobs"].values() if item["status"] == "queued"), None)
@@ -503,15 +506,17 @@ class WorkerManager:
             try:
                 self._provision(job)
             except PreflightRefused:
-                self._update(job["id"], status="failed", phase="preflight", error="worker environment preflight refused allocation")
+                current = self.status(job["id"])
+                self._update(job["id"], status="unconfirmed" if current.get("address") else "failed", phase="preflight",
+                             error="worker environment preflight refused allocation")
             except Unconfirmed:
                 current = self.status(job["id"])
-                status = "unconfirmed" if current["phase"] in ("creating", "bootstrapping", "resuming") else "failed"
+                status = "unconfirmed" if current["phase"] in ("creating", "bootstrapping", "resuming") or current.get("address") else "failed"
                 self._update(job["id"], status=status, error="provider outcome is unconfirmed; reconcile before retrying" if status == "unconfirmed" else "cloud credential read failed; no sandbox was created")
             except (OSError, ValueError, TypeError, KeyError, WorkerError, HubUnavailable, HubRefused):
                 # Provider exceptions may include credentials, commands or user text.
                 current = self.status(job["id"])
-                status = "unconfirmed" if current["phase"] in ("creating", "bootstrapping", "resuming") else "failed"
+                status = "unconfirmed" if current["phase"] in ("creating", "bootstrapping", "resuming") or current.get("address") else "failed"
                 self._update(job["id"], status=status, error="worker operation failed; provider diagnostics withheld")
             return self.status(job["id"])
 
@@ -520,7 +525,8 @@ class WorkerManager:
         with self._locked():
             state = _read(self.state_path)
             job = state["jobs"][id]
-            recheck = job["status"] == "unconfirmed" and job.get("box_id") and job["phase"] == "bootstrapping"
+            recheck = (job["status"] == "unconfirmed" and job.get("box_id")
+                       and job["phase"] in ("bootstrapping", "preflight", "inspecting", "resuming", "unconfirmed"))
             restart = job["status"] == "stopped" and job["phase"] == "pool-stopped"
             ready = job["status"] == "ready" and job.get("box_id")
             if job["status"] not in ("auth_needed", "unverified", "failed") and not recheck and not restart and not ready:

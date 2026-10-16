@@ -102,6 +102,15 @@ def test_missing_native_package_is_a_confirmed_failure(worker_home, monkeypatch,
     assert bootstrap.bootstrap(payload) == {"status": "failed", "stage": "harness-unavailable"}
 
 
+def test_a_foreign_oneconv_launcher_cannot_shadow_the_managed_checkout(worker_home, monkeypatch, payload):
+    path = worker_home / ".local/bin/one-conv"
+    path.parent.mkdir(parents=True)
+    path.write_text("a different launcher")
+    monkeypatch.setattr(bootstrap, "prepare_repositories", lambda data: {})
+    with pytest.raises(bootstrap.BootstrapError, match="launcher-conflict"):
+        bootstrap.bootstrap(payload)
+
+
 def test_a_changed_request_cannot_reuse_remote_worker_state(worker_home, monkeypatch, payload):
     payload["profile"]["probe_enabled"] = False
     monkeypatch.setattr(bootstrap, "prepare_repositories", lambda data: {})
@@ -114,6 +123,22 @@ def test_a_changed_request_cannot_reuse_remote_worker_state(worker_home, monkeyp
 
 def test_a_launch_marker_blocks_duplicate_native_launch(worker_home, payload):
     assert bootstrap._start(payload, {}, worker_home, worker_home / "job.json", {"phase": "launching"})["status"] == "unconfirmed"
+
+
+def test_the_actual_task_waits_for_bridge_publication_and_accounting(worker_home, monkeypatch, payload):
+    stages = []
+    monkeypatch.setattr(bootstrap, "prepare_repositories", lambda data: {})
+    monkeypatch.setattr(bootstrap, "worktree", lambda data, env: worker_home)
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda command: command)
+    monkeypatch.setattr(bootstrap, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 0, '{"type":"result","is_error":false,"result":"ONE_CONV_READY"}', ""))
+    monkeypatch.setattr(bootstrap, "_bridge", lambda *args: stages.append("bridge"))
+    monkeypatch.setattr(bootstrap, "_start", lambda *args: stages.append("native") or {"status": "registered", "address": "claude:resident"})
+    monkeypatch.setattr(bootstrap, "_readiness", lambda *args: stages.append("publish") or {"status": "ready"})
+    monkeypatch.setattr(bootstrap, "_collector", lambda *args: stages.append("collector") or True)
+    monkeypatch.setattr(bootstrap, "_dispatch_task", lambda *args: stages.append("task") or "a" * 32)
+    bootstrap.bootstrap(payload)
+    assert stages == ["bridge", "native", "publish", "collector", "task"]
 
 
 def test_secrets_and_prompt_are_direct_native_arguments(worker_home, monkeypatch):

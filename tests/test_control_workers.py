@@ -8,6 +8,7 @@ import threading
 import pytest
 
 from one_conv.control.workers import (
+    DEFAULT_PROFILE,
     BoatCLI,
     Unconfirmed,
     WorkerError,
@@ -379,3 +380,49 @@ def test_boat_exec_flags_precede_the_remote_command_delimiter(monkeypatch):
     BoatCLI()._exec("bx_known", ["python3", "/tmp/fixed-helper.py", "/tmp/private-payload.json"])
     assert commands == [["box", "exec", "bx_known", "--timeout", "600", "--json", "--no-update", "--",
                          "python3 /tmp/fixed-helper.py /tmp/private-payload.json"]]
+
+
+@pytest.fixture
+def agent_environment(monkeypatch):
+    boat = BoatCLI()
+    raw = {"environment": {"safeForThirdParties": False, "proxyAiCredentials": False,
+                           "effective": {"passGithub": False, "passSecrets": False,
+                                         "passSandboxCredentials": False, "passAgentsCredentials": True}}}
+    monkeypatch.setattr(boat, "_call", lambda *args, **kwargs: raw)
+    return boat, raw
+
+
+def test_dedicated_native_credentials_environment_is_verified(agent_environment):
+    boat, _ = agent_environment
+    profile = {**DEFAULT_PROFILE, "boat_agent_credentials": True, "environment": "oneconv-workers"}
+    assert boat.preflight(profile)["agent_credentials"] is True
+
+
+@pytest.mark.parametrize("field,value", [("passGithub", True), ("passSecrets", True),
+                                        ("passSandboxCredentials", True), ("passAgentsCredentials", False)])
+def test_unsafe_effective_environment_toggles_are_refused(agent_environment, field, value):
+    boat, raw = agent_environment
+    raw["environment"]["effective"][field] = value
+    profile = {**DEFAULT_PROFILE, "boat_agent_credentials": True, "environment": "oneconv-workers"}
+    with pytest.raises(WorkerError, match="pass only native agent credentials"):
+        boat.preflight(profile)
+
+
+def test_a_broad_personal_environment_cannot_pass_agent_credentials(agent_environment):
+    boat, _ = agent_environment
+    with pytest.raises(WorkerError, match="dedicated worker environment"):
+        boat.preflight({**DEFAULT_PROFILE, "boat_agent_credentials": True, "environment": "claudine"})
+
+
+@pytest.mark.parametrize("enabled,expected", [(False, True), (True, False)])
+def test_native_credentials_profiles_preserve_boat_agent_auth(monkeypatch, enabled, expected):
+    boat, commands = BoatCLI(), []
+
+    def call(args, **kwargs):
+        commands.append(args)
+        return {"id": "bx_created"}
+
+    monkeypatch.setattr(boat, "_call", call)
+    monkeypatch.setattr(boat, "preflight", lambda profile: {"agent_credentials": enabled})
+    boat.create({**DEFAULT_PROFILE, "boat_agent_credentials": enabled}, "pool-id")
+    assert ("--no-env" in commands[0]) is expected

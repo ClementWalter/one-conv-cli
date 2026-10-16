@@ -32,6 +32,7 @@ DEFAULT_PROFILE = {
     "work_repository": "ClementWalter/one-conv-cli", "skills": [],
     "type": "default", "slots": 4, "credential_environment": "claudine",
     "environment": "base", "probe_enabled": True, "credential_refs": {},
+    "boat_agent_credentials": False,
     "billing_scope": None, "revisions": {},
     "harness_args": {"claude": ["--dangerously-skip-permissions"],
                      "codex": ["--dangerously-bypass-approvals-and-sandbox"], "omp": ["--approval-mode=yolo"]},
@@ -44,6 +45,10 @@ class WorkerError(RuntimeError):
 
 class Unconfirmed(WorkerError):
     """A side effect may have happened and must not be repeated blindly."""
+
+
+class PreflightRefused(WorkerError):
+    """A verified unsafe configuration prevented sandbox allocation."""
 
 
 def private_json(path: Path, value: dict) -> None:
@@ -97,6 +102,8 @@ def _profile(value: dict) -> dict:
         raise ValueError("unsupported worker machine type")
     if type(profile["probe_enabled"]) is not bool:
         raise ValueError("probe_enabled must be a boolean")
+    if type(profile["boat_agent_credentials"]) is not bool:
+        raise ValueError("boat_agent_credentials must be a boolean")
     if not isinstance(profile["skills"], list) or not all(isinstance(s, str) and NAME.fullmatch(s) for s in profile["skills"]):
         raise ValueError("skills must be explicit names in the claudine skill directory")
     for key in ("environment", "credential_environment"):
@@ -180,8 +187,26 @@ class BoatCLI:
         except (AttributeError, KeyError, TypeError, ValueError):
             raise WorkerError("cloud credential environment has no unique service account") from None
 
+    def preflight(self, profile):
+        """Native provider logins require a dedicated environment with personal access disabled."""
+        if not profile["boat_agent_credentials"]:
+            return {"agent_credentials": False}
+        if profile["environment"] in ("base", "claudine"):
+            raise PreflightRefused("native agent credentials require a dedicated worker environment")
+        raw = self._call(["env", "info", profile["environment"]])
+        row = raw.get("environment", raw) if isinstance(raw, dict) else {}
+        effective = row.get("effective")
+        expected = {"passGithub": False, "passSecrets": False, "passSandboxCredentials": False, "passAgentsCredentials": True}
+        if (not isinstance(effective, dict) or any(effective.get(key) is not value for key, value in expected.items())
+                or row.get("safeForThirdParties") is not False or row.get("proxyAiCredentials") is not False):
+            raise PreflightRefused("worker environment must pass only native agent credentials; proxy mode requires separate configuration")
+        return {"agent_credentials": True, "environment": profile["environment"], "effective": expected,
+                "safeForThirdParties": False, "proxyAiCredentials": False}
+
     def create(self, profile, pool_id):
-        result = self._call(["new", "--environment", profile["environment"], "--no-env",
+        if profile["boat_agent_credentials"]:
+            self.preflight(profile)
+        result = self._call(["new", "--environment", profile["environment"], *([] if profile["boat_agent_credentials"] else ["--no-env"]),
                              "--type", profile["type"], "--env", f"ONE_CONV_POOL_ID={pool_id}"])
         box = result.get("sandbox", result).get("id") if isinstance(result, dict) else None
         if not isinstance(box, str) or not BOX.fullmatch(box):
@@ -378,6 +403,7 @@ class WorkerManager:
     def _provision(self, job):
         profile = self.profiles[job["spec"]["profile"]]
         check_url(self.config.get("public_hub_url", ""))
+        preflight = self.boat.preflight(profile) if hasattr(self.boat, "preflight") else {}
         credentials = self.boat.credentials(profile)
         pool = self._pool(job)
         token = self._token(pool)
@@ -399,6 +425,7 @@ class WorkerManager:
             with self._locked():
                 state = _read(self.state_path)
                 state["pools"][pool["id"]].update(box_id=box, status="available")
+                state["pools"][pool["id"]]["environment_health"] = preflight
                 state["jobs"][job["id"]].update(box_id=box, phase="bootstrapping")
                 self._save(state)
             pool.update(box_id=box, status="available")
@@ -414,12 +441,16 @@ class WorkerManager:
             public["stage"] = health["stage"]
         if isinstance(health.get("address"), str) and re.fullmatch(r"(?:claude|codex|omp):[A-Za-z0-9._-]{1,128}", health["address"]):
             public["address"] = health["address"]
+        if isinstance(health.get("task_id"), str) and re.fullmatch(r"[0-9a-f]{32}", health["task_id"]):
+            public["task_id"] = health["task_id"]
         if health["status"] == "ready" and (
                 any(health.get(key) is not True for key in ("authenticated", "registered", "model_verified", "bridge", "published", "joined", "collector"))
+                or "task_id" not in public
                 or not self._hub_health(pool, job, health, token)):
             raise Unconfirmed("worker readiness was not confirmed by the live hub")
         self._update(job["id"], status=health["status"], phase=health["status"], health=public,
-                     address=f"{pool['node']}/{public['address']}" if public.get("address") else None, error=None)
+                     address=f"{pool['node']}/{public['address']}" if public.get("address") else None, error=None,
+                     restart=False if health["status"] == "ready" else job.get("restart", False))
 
     def run_once(self):
         """Advance one queued job; a released claim is ambiguous after a controller crash."""
@@ -444,6 +475,8 @@ class WorkerManager:
                 return None
             try:
                 self._provision(job)
+            except PreflightRefused:
+                self._update(job["id"], status="failed", phase="preflight", error="worker environment preflight refused allocation")
             except Unconfirmed:
                 current = self.status(job["id"])
                 status = "unconfirmed" if current["phase"] in ("creating", "bootstrapping", "resuming") else "failed"
@@ -513,7 +546,8 @@ class WorkerManager:
                         raise Unconfirmed("native worker stop was not confirmed")
                 except (OSError, ValueError, TypeError, KeyError, WorkerError):
                     return self._update(id, status="unconfirmed", error="worker stop is unconfirmed")
-            return self._update(id, status="stopped", phase="stopped", address=None, error=None)
+            return self._update(id, status="stopped", phase="stopped", address=None, error=None,
+                                health={"registered": False, "bridge": False, "published": False, "joined": False, "collector": False})
 
     def _pool_action(self, pool_id, resume):
         with (self.directory / ".runner.lock").open("a") as lock:
@@ -547,7 +581,8 @@ class WorkerManager:
                     if job.get("pool_id") == pool_id and job["status"] in ACTIVE:
                         job.update(status="stopped" if confirmed and not resume else "unconfirmed",
                                    phase="pool-stopped" if confirmed and not resume else "pool-unconfirmed",
-                                   address=None, updated=time.time())
+                                   address=None, health={"registered": False, "bridge": False, "published": False,
+                                                         "joined": False, "collector": False}, updated=time.time())
                 self._save(state)
                 return copy.deepcopy(pool)
 

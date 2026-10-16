@@ -11,6 +11,7 @@ import pytest
 uvicorn = pytest.importorskip("uvicorn")
 pytest.importorskip("starlette")
 
+from one_conv.control import worker_bootstrap as bootstrap
 from one_conv.control.workers import WorkerManager
 from one_conv.live.hub import Hub, application
 from one_conv.live.hubclient import HubClient
@@ -94,7 +95,8 @@ def provider(loopback_hub):
                     if remote["join"] and remote["publish"]:
                         client.join(data["spec"]["topic"], address)
                     response = {"status": "ready", "address": address, "authenticated": True, "registered": True,
-                                "model_verified": remote["verified"], "bridge": True, "published": True, "joined": True, "collector": True}
+                                "model_verified": remote["verified"], "bridge": True, "published": True, "joined": True,
+                                "collector": True, "task_id": "a" * 32}
             else:
                 response = {"status": "stopped" if self.path == "/stop" else "running"}
             encoded = json.dumps(response).encode()
@@ -176,3 +178,50 @@ def test_stopping_then_reusing_a_cold_pool_resumes_the_tracked_box(runtime):
     manager.submit({**spec, "name": "builder"}, "job-2")
     manager.run_once()
     assert remote["created"] == 1
+
+
+@pytest.fixture
+def task_dispatch(loopback_hub, tmp_path):
+    state, url = loopback_hub
+    token = state.add_token("worker-node")
+    client = HubClient(url, token, "worker-node")
+    client.request("PUT", "/v1/sessions", {"sessions": [{"address": "claude:resident", "name": "reviewer"}]})
+    client.join("release", "claude:resident")
+    data = {"pool_id": "pool-1", "job_id": "job-1", "hub": {"url": url, "token": token, "node": "worker-node"},
+            "spec": {"name": "reviewer", "topic": "release", "prompt": "Continue the authorized review."}}
+    record = {"request_hash": "known-request"}
+    path = tmp_path / "worker.json"
+    return data, path, record, client
+
+
+def test_the_initial_task_is_durably_accepted_through_the_real_hub(task_dispatch):
+    data, path, record, client = task_dispatch
+    bootstrap._dispatch_task(data, "claude:resident", path, record)
+    assert len(client.request("GET", "/v1/inbox?wait=0")["messages"]) == 1
+
+
+def test_retrying_task_dispatch_does_not_post_a_second_task(task_dispatch):
+    data, path, record, client = task_dispatch
+    bootstrap._dispatch_task(data, "claude:resident", path, record)
+    bootstrap._dispatch_task(data, "claude:resident", path, record)
+    assert len(client.request("GET", "/v1/inbox?wait=0")["messages"]) == 1
+
+
+def test_task_relay_does_not_forge_a_new_human_approval(task_dispatch):
+    data, path, record, client = task_dispatch
+    bootstrap._dispatch_task(data, "claude:resident", path, record)
+    assert client.request("GET", "/v1/inbox?wait=0")["messages"][0]["from"] == "worker-node/unknown"
+
+
+def test_hub_configuration_exists_before_any_native_process_starts(loopback_hub, monkeypatch):
+    from one_conv.live import bridge, hubclient
+
+    state, url = loopback_hub
+    token = state.add_token("worker-node")
+    data = {"hub": {"url": url, "token": token, "node": "worker-node"}}
+    monkeypatch.delenv("ONE_CONV_HUB_URL", raising=False)
+    monkeypatch.delenv("ONE_CONV_HUB_TOKEN", raising=False)
+    monkeypatch.delenv("ONE_CONV_HUB_NODE", raising=False)
+    monkeypatch.setattr(bridge, "status", lambda: {"running": True})
+    bootstrap._bridge(data, ["one-conv"])
+    assert hubclient.configured().node == "worker-node"

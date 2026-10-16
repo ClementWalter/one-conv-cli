@@ -855,13 +855,33 @@ function renderJobs() {
   for (const job of (model.workers.jobs || []).slice(0, 12)) {
     const item = el("article", null, "worker-job");
     const spec = job.spec || job;
+    const pool = (model.workers.pools || []).find((candidate) => candidate.id === job.pool_id);
+    // Resuming compute does not verify that its stopped teammate has reconnected.
+    const restartable = job.status === "stopped" && job.phase === "pool-stopped" && pool?.status === "available";
+    const allocationBlocked = job.status === "unconfirmed" && job.phase === "allocation-blocked";
+    const blockedPool = (model.workers.pools || []).find((candidate) => candidate.id === job.blocked_by_pool);
+    const blockedOwner = blockedPool && (model.workers.jobs || []).find(
+      (owner) => owner.pool_id === blockedPool.id && owner.status !== "stopped");
+    // An existing owner keeps reconciliation authority until its reservation is orphaned.
+    const orphanedAllocation = allocationBlocked && !job.box_id && blockedPool && !blockedPool.box_id && blockedPool.status !== "retired" &&
+      spec.profile && blockedPool.profile === spec.profile && !blockedOwner;
     item.append(el("span", (spec.name || "A").slice(0, 2).toUpperCase(), "avatar codex"));
     const text = el("div");
     const online = job.status === "ready" && model.state.sessions.some(
       (peer) => peer.address === job.address && peer.online !== false);
-    text.append(el("strong", spec.name || "Teammate"), el("small", job.status === "ready" && !online ?
-      "Offline · check the connection" : jobLabels[job.status] || job.status || "Preparing"));
+    text.append(el("strong", spec.name || "Teammate"), el("small", allocationBlocked ? "Waiting for box recovery" :
+      job.status === "ready" && !online ? "Offline · check the connection" : jobLabels[job.status] || job.status || "Preparing"));
     if (job.error || job.detail) text.append(el("p", job.error || job.detail, "job-detail"));
+    if (job.status === "stopped" && job.phase === "pool-stopped") {
+      text.append(el("p", restartable ? "The box is available. Choose Check again to reconnect this teammate." :
+        "Resume its box, then choose Check again to reconnect this teammate.", "job-detail"));
+    }
+    if (allocationBlocked && !orphanedAllocation) {
+      const recovery = blockedPool?.box_id || blockedPool?.status === "retired" ? "Choose Check again to retry this request." :
+        (blockedOwner?.spec?.name ? `Recover the box from the ${blockedOwner.spec.name} request first, then choose Check again.` :
+          "Resolve the earlier box creation first, then choose Check again.");
+      text.append(el("p", recovery + " Cancelling this request leaves the earlier request unchanged.", "quiet-copy"));
+    }
     if (["auth_needed", "authentication_required"].includes(job.status)) {
       const help = el("p", "Check the provider’s login, model access or quota in ", "job-detail");
       const link = el("a", "Boat’s agent settings");
@@ -879,22 +899,25 @@ function renderJobs() {
       item.append(button);
     }
     if (["ready", "unverified", "auth_needed", "failed"].includes(job.status) ||
-        (job.status === "unconfirmed" && job.box_id)) {
+        (job.status === "unconfirmed" && job.box_id) || restartable || allocationBlocked) {
       const actions = el("div", null, "job-actions");
       if (["auth_needed", "unverified", "failed"].includes(job.status) ||
-          (job.status === "unconfirmed" && job.phase === "bootstrapping") || (job.status === "ready" && !online)) {
+          (job.status === "unconfirmed" && job.phase === "bootstrapping") || (job.status === "ready" && !online) ||
+          restartable || allocationBlocked) {
         const check = el("button", "Check again", "secondary-button");
         check.type = "button";
         check.addEventListener("click", () => workerAction("recheck", job.id));
         actions.append(check);
       }
-      const stop = el("button", "Stop teammate", "secondary-button");
-      stop.type = "button";
-      stop.addEventListener("click", () => workerAction("stop", job.id));
-      actions.append(stop);
+      if (!restartable) {
+        const stop = el("button", allocationBlocked ? "Cancel request" : "Stop teammate", "secondary-button");
+        stop.type = "button";
+        stop.addEventListener("click", () => workerAction("stop", job.id));
+        actions.append(stop);
+      }
       item.append(actions);
     }
-    if (job.status === "unconfirmed" && job.phase === "creating" && !job.box_id) {
+    if ((job.status === "unconfirmed" && job.phase === "creating" && !job.box_id) || orphanedAllocation) {
       const form = el("form", null, "quote-form"), label = el("label", "Existing box ID from Boat");
       const input = document.createElement("input"); input.placeholder = "bx_…"; input.required = true;
       input.setAttribute("aria-label", "Reconcile box for " + (spec.name || "teammate")); label.append(input);
@@ -910,15 +933,19 @@ function renderJobs() {
     container.append(item);
   }
   for (const pool of model.workers.pools || []) {
+    if (pool.status === "retired") continue;
     const item = el("article", null, "worker-job pool-job");
     const detail = el("div");
     detail.append(el("strong", pool.name || "Shared worker box"),
-      el("small", pool.status === "stopped" ? "Stopped · files preserved" : "Shared compute"));
-    const action = pool.status === "stopped" ? "resume_pool" : "stop_pool";
-    const button = el("button", action === "resume_pool" ? "Resume box" : "Stop box", "secondary-button");
-    button.type = "button";
-    button.addEventListener("click", () => workerAction(action, pool.id));
-    item.append(detail, button);
+      el("small", !pool.box_id ? "Box creation needs checking" : pool.status === "stopped" ? "Stopped · files preserved" : "Shared compute"));
+    item.append(detail);
+    if (pool.box_id) {
+      const action = pool.status === "stopped" ? "resume_pool" : "stop_pool";
+      const button = el("button", action === "resume_pool" ? "Resume box" : "Stop box", "secondary-button");
+      button.type = "button";
+      button.addEventListener("click", () => workerAction(action, pool.id));
+      item.append(button);
+    }
     container.append(item);
   }
 }

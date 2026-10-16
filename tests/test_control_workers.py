@@ -184,6 +184,254 @@ def test_lost_create_acknowledgement_is_never_retried(manager, spec, boat):
     assert boat.creates == 1
 
 
+@pytest.fixture
+def sibling_after_lost_create(manager, spec, boat):
+    boat.lose_create = True
+    manager.submit(spec, "request-1")
+    manager.run_once()
+    boat.lose_create = False
+    restarted = WorkerManager(manager.directory, manager.config)
+    restarted.submit({**spec, "name": "builder"}, "request-2")
+    restarted.run_once()
+    return restarted, boat
+
+
+def test_a_sibling_cannot_create_while_an_allocation_is_unconfirmed(sibling_after_lost_create):
+    _, boat = sibling_after_lost_create
+    assert boat.creates == 1
+
+
+def test_a_sibling_has_a_recoverable_allocation_block(sibling_after_lost_create):
+    manager, _ = sibling_after_lost_create
+    job = manager.status("request-2")
+    assert (job["status"], job["phase"], job["pool_id"]) == ("unconfirmed", "allocation-blocked", None)
+
+
+def test_a_blocked_sibling_preserves_the_original_pool_reservation(sibling_after_lost_create):
+    manager, _ = sibling_after_lost_create
+    assert len(manager.list()["pools"]) == 1
+
+
+def test_rechecking_a_blocked_sibling_cannot_allocate_again(sibling_after_lost_create):
+    manager, boat = sibling_after_lost_create
+    manager.recheck("request-2")
+    manager.run_once()
+    assert boat.creates == 1
+
+
+def test_reconciled_creation_unblocks_a_sibling_on_the_same_box(sibling_after_lost_create):
+    manager, _ = sibling_after_lost_create
+    manager.reconcile("request-1", "bx_1")
+    manager.recheck("request-2")
+    manager.run_once()
+    manager.run_once()
+    assert manager.status("request-2")["box_id"] == "bx_1"
+
+
+def test_a_blocked_unstarted_sibling_can_be_cancelled(sibling_after_lost_create):
+    manager, _ = sibling_after_lost_create
+    assert manager.stop("request-2")["status"] == "stopped"
+
+
+def test_known_capacity_is_usable_while_another_creation_is_unconfirmed(tmp_path, config, spec, boat):
+    manager = WorkerManager(tmp_path / "workers", {**config, "profiles": {"default": {"slots": 1}}})
+    manager.submit(spec, "request-1")
+    manager.run_once()
+    boat.lose_create = True
+    manager.submit({**spec, "name": "builder"}, "request-2")
+    manager.run_once()
+    boat.lose_create = False
+    manager.stop("request-1")
+    manager.submit({**spec, "name": "observer"}, "request-3")
+    manager.run_once()
+    assert manager.status("request-3")["box_id"] == "bx_1"
+
+
+@pytest.fixture
+def orphaned_allocation(manager):
+    pool = {"id": "orphan-pool", "node": "worker-orphan", "profile": "default", "slots": 4,
+            "type": "default", "status": "allocated", "box_id": None, "created": 0}
+    private_json(manager.state_path, {"jobs": {}, "pools": {pool["id"]: pool}})
+    return manager
+
+
+def test_an_orphaned_allocation_blocks_fresh_sibling_creation(orphaned_allocation, spec, boat):
+    orphaned_allocation.submit(spec, "request-1")
+    orphaned_allocation.run_once()
+    assert boat.creates == 0
+
+
+def test_an_orphan_can_be_reconciled_through_its_blocked_request(orphaned_allocation, spec, boat):
+    orphaned_allocation.submit(spec, "request-1")
+    orphaned_allocation.run_once()
+    orphaned_allocation.reconcile("request-1", "bx_inspected")
+    orphaned_allocation.run_once()
+    assert (orphaned_allocation.status("request-1")["box_id"], boat.creates) == ("bx_inspected", 0)
+
+
+def test_pre_create_setup_failure_can_be_cancelled_without_stranding_capacity(tmp_path, config, spec, boat):
+    def unavailable(node):
+        raise WorkerError("node credential creation failed")
+
+    manager = WorkerManager(tmp_path / "workers", {**config, "create_node_token": unavailable})
+    manager.submit(spec, "request-1")
+    manager.run_once()
+    manager.stop("request-1")
+    manager.config["create_node_token"] = lambda node: "private-hub-token"
+    manager.submit({**spec, "name": "builder"}, "request-2")
+    manager.run_once()
+    assert boat.creates == 1
+
+
+def test_pre_create_cancellation_retires_only_the_unused_reservation(tmp_path, config, spec):
+    def unavailable(node):
+        raise WorkerError("node credential creation failed")
+
+    manager = WorkerManager(tmp_path / "workers", {**config, "create_node_token": unavailable})
+    manager.submit(spec, "request-1")
+    manager.run_once()
+    manager.stop("request-1")
+    assert manager.list()["pools"][0]["status"] == "retired"
+
+
+def test_failed_pre_create_setup_retries_its_original_reservation(tmp_path, config, spec, boat):
+    def unavailable(node):
+        raise WorkerError("node credential creation failed")
+
+    manager = WorkerManager(tmp_path / "workers", {**config, "create_node_token": unavailable})
+    manager.submit(spec, "request-1")
+    manager.run_once()
+    pool = manager.list()["pools"][0]["id"]
+    manager.config["create_node_token"] = lambda node: "private-hub-token"
+    manager.recheck("request-1")
+    manager.run_once()
+    assert (boat.creates, manager.status("request-1")["pool_id"]) == (1, pool)
+
+
+def test_preflight_refusal_after_token_failure_still_allows_safe_cancellation(tmp_path, config, spec, boat):
+    def unavailable(node):
+        raise WorkerError("node credential creation failed")
+
+    def refused(profile):
+        raise PreflightRefused("environment needs correction")
+
+    manager = WorkerManager(tmp_path / "workers", {**config, "create_node_token": unavailable})
+    manager.submit(spec, "request-1")
+    manager.run_once()
+    manager.recheck("request-1")
+    boat.preflight = refused
+    manager.run_once()
+    manager.stop("request-1")
+    manager.config["create_node_token"] = lambda node: "private-hub-token"
+    boat.preflight = lambda profile: {}
+    manager.submit({**spec, "name": "builder"}, "request-2")
+    manager.run_once()
+    assert boat.creates == 1
+
+
+def test_ordinary_terminal_stop_cannot_restart_a_retired_reservation(tmp_path, config, spec):
+    def unavailable(node):
+        raise WorkerError("node credential creation failed")
+
+    manager = WorkerManager(tmp_path / "workers", {**config, "create_node_token": unavailable})
+    manager.submit(spec, "request-1")
+    manager.run_once()
+    manager.stop("request-1")
+    with pytest.raises(ValueError, match="known safe setup"):
+        manager.recheck("request-1")
+
+
+def test_sibling_reconcile_cannot_bypass_an_original_owners_last_slot(tmp_path, config, spec, boat):
+    manager = WorkerManager(tmp_path / "workers", {**config, "profiles": {"default": {"slots": 1}}})
+    boat.lose_create = True
+    manager.submit(spec, "request-1")
+    manager.run_once()
+    manager.submit({**spec, "name": "builder"}, "request-2")
+    manager.run_once()
+    with pytest.raises(ValueError, match="original allocation owner"):
+        manager.reconcile("request-2", "bx_1")
+
+
+def test_stale_sibling_reconcile_cannot_replace_a_known_box(sibling_after_lost_create):
+    manager, _ = sibling_after_lost_create
+    manager.reconcile("request-1", "bx_1")
+    with pytest.raises(ValueError, match="only an unresolved pool"):
+        manager.reconcile("request-2", "bx_different")
+
+
+def test_reconciliation_clears_the_siblings_allocation_block(sibling_after_lost_create):
+    manager, _ = sibling_after_lost_create
+    manager.reconcile("request-1", "bx_1")
+    manager.recheck("request-2")
+    manager.run_once()
+    manager.run_once()
+    assert "blocked_by_pool" not in manager.status("request-2")
+
+
+def test_unresolved_creation_is_scoped_to_its_selected_profile(tmp_path, config, spec, boat):
+    manager = WorkerManager(tmp_path / "workers", {**config, "profiles": {"default": {}, "other": {}}})
+    boat.lose_create = True
+    manager.submit(spec, "request-1")
+    manager.run_once()
+    boat.lose_create = False
+    manager.submit({**spec, "name": "builder", "profile": "other"}, "request-2")
+    manager.run_once()
+    assert boat.creates == 2
+
+
+@pytest.fixture
+def crashed_create_boundary(manager, spec, boat, tmp_path, request):
+    boundary = request.param
+    manager.submit(spec, "request-1")
+    effect = tmp_path / "provider-create-effect"
+    script = """
+import os
+import sys
+from pathlib import Path
+from one_conv.control.workers import WorkerManager
+class CrashBoat:
+    def credentials(self, profile):
+        return {'service_account': 'private-service-account'}
+    def create(self, profile, pool):
+        if sys.argv[2] == 'after-create':
+            with Path(sys.argv[3]).open('w') as stream:
+                stream.write('bx_created')
+                stream.flush()
+                os.fsync(stream.fileno())
+        os._exit(99)
+manager = WorkerManager(Path(sys.argv[1]), {'boat': CrashBoat(), 'public_hub_url': 'https://hub.example.test',
+                       'create_node_token': lambda node: 'private-hub-token'})
+if sys.argv[2] == 'allocated':
+    manager._token = lambda pool: os._exit(99)
+manager.run_once()
+"""
+    result = subprocess.run([sys.executable, "-O", "-c", script, str(manager.directory), boundary, str(effect)],
+                            check=False, capture_output=True, text=True, timeout=10)
+    restarted = WorkerManager(manager.directory, manager.config)
+    restarted.submit({**spec, "name": "builder"}, "request-2")
+    restarted.run_once()
+    return restarted, boat, result, effect
+
+
+@pytest.mark.parametrize("crashed_create_boundary", ["allocated", "before-create", "after-create"], indirect=True)
+def test_create_boundary_crashes_cannot_allocate_for_a_sibling(crashed_create_boundary):
+    _, boat, _, _ = crashed_create_boundary
+    assert boat.creates == 0
+
+
+@pytest.mark.parametrize("crashed_create_boundary", ["allocated", "before-create", "after-create"], indirect=True)
+def test_create_boundary_crashes_leave_a_recoverable_block(crashed_create_boundary):
+    manager, _, _, _ = crashed_create_boundary
+    assert manager.status("request-2")["phase"] == "allocation-blocked"
+
+
+@pytest.mark.parametrize("crashed_create_boundary,occurred", [("allocated", False), ("before-create", False),
+                                                           ("after-create", True)], indirect=["crashed_create_boundary"])
+def test_create_boundary_crash_reaches_the_selected_effect(crashed_create_boundary, occurred):
+    _, _, result, effect = crashed_create_boundary
+    assert (result.returncode, effect.exists()) == (99, occurred)
+
+
 def test_lost_create_requires_explicit_reconciliation(manager, spec, boat):
     boat.lose_create = True
     manager.submit(spec, "request-1")

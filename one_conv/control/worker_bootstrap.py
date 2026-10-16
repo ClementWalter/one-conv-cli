@@ -31,6 +31,12 @@ from urllib.parse import urlsplit
 
 log = logging.getLogger(__name__)
 OP_VERSION = "2.32.0"
+OMP_VERSION = "18.0.6"
+# Official v18.0.6 release assets and SHA256SUMS.txt pin both content and download bounds.
+OMP_RELEASES = {
+    "x86_64": ("x64", 183637192, "9cbc78be9ba6357b53a6a055c98ad7afee4c00d20a320d51bb76a949b8a5a444", 62),
+    "aarch64": ("arm64", 147113976, "8566b0a8cbc6fb4a01decc937fa37572bded86c3de75f811ef37fb2fab43f912", 183),
+}
 GITHUB_REF = "op://Claudine/GitHub gh token/credential"
 PROBE = "Reply exactly ONE_CONV_READY. Do not use tools."
 STAGE = "payload"
@@ -145,6 +151,58 @@ def install_op():
         with urllib.request.urlopen(url, timeout=60) as response, zipfile.ZipFile(io.BytesIO(response.read())) as archive:
             target.write_bytes(archive.read("op"))
         target.chmod(0o755)
+    return target
+
+
+def install_omp():
+    """Verify a bounded official ELF download before atomically exposing the executable."""
+    release = OMP_RELEASES.get(platform.machine()) if platform.system() == "Linux" else None
+    if release is None:
+        raise BootstrapError("omp-architecture")
+    arch, size, checksum, machine = release
+    url = f"https://github.com/can1357/oh-my-pi/releases/download/v{OMP_VERSION}/omp-linux-{arch}"
+    target = Path.home() / ".local/bin/omp"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".omp-", dir=target.parent)
+    staged = Path(temporary)
+    digest, count, header = hashlib.sha256(), 0, b""
+    deadline = time.monotonic() + 180
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            try:
+                with urllib.request.urlopen(url, timeout=60) as response:
+                    if urlsplit(response.geturl()).scheme != "https":
+                        raise BootstrapError("omp-download")
+                    while chunk := response.read(1024 * 1024):
+                        count += len(chunk)
+                        if count > size or time.monotonic() > deadline:
+                            raise BootstrapError("omp-download")
+                        if not header:
+                            header = chunk[:64]
+                        digest.update(chunk)
+                        stream.write(chunk)
+            except (OSError, ValueError):
+                raise BootstrapError("omp-download") from None
+            stream.flush()
+            os.fsync(stream.fileno())
+        if count != size or digest.hexdigest() != checksum:
+            raise BootstrapError("omp-checksum")
+        if len(header) < 64 or header[:7] != b"\x7fELF\x02\x01\x01" or int.from_bytes(header[18:20], "little") != machine:
+            raise BootstrapError("omp-architecture")
+        staged.chmod(0o700)
+        with tempfile.TemporaryDirectory(prefix="omp-verify-") as isolated:
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": isolated, "XDG_CONFIG_HOME": isolated,
+                   "PI_CODING_AGENT_DIR": isolated}
+            version = run([str(staged), "--version"], stage="omp-version", env=env, timeout=30)
+            if version.stdout.strip() != f"omp/{OMP_VERSION}":
+                raise BootstrapError("omp-version")
+            help_text = run([str(staged), "--help"], stage="omp-help", env=env, timeout=30).stdout
+            if not all(flag in help_text for flag in ("--no-tools", "--mode", "--approval-mode")):
+                raise BootstrapError("omp-help")
+        staged.chmod(0o755)
+        os.replace(staged, target)
+    finally:
+        staged.unlink(missing_ok=True)
     return target
 
 
@@ -513,6 +571,8 @@ def bootstrap(data):
         sys.path.insert(0, str(checkout))
         cwd = worktree(data, env)
         harness = data["spec"]["harness"]
+        if harness == "omp" and shutil.which(harness) is None:
+            install_omp()
         if shutil.which(harness) is None:
             return {"status": "failed", "stage": "harness-unavailable"}
         if not data["profile"]["probe_enabled"]:

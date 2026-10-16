@@ -1,7 +1,10 @@
 """A stub Boat HTTP provider and real loopback hub exercise complete worker job lifecycles."""
 
 import json
+import os
 import socket
+import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
@@ -225,3 +228,49 @@ def test_hub_configuration_exists_before_any_native_process_starts(loopback_hub,
     monkeypatch.setattr(bridge, "status", lambda: {"running": True})
     bootstrap._bridge(data, ["one-conv"])
     assert hubclient.configured().node == "worker-node"
+
+
+@pytest.fixture
+def invalid_omp_release():
+    class Handler(BaseHTTPRequestHandler):
+        """A corrupt downloadable release must never become a runnable tool."""
+
+        def log_message(self, format, *args):
+            return
+
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"corrupt release")
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_address[1]}/omp"
+    server.shutdown()
+    thread.join(5)
+    server.server_close()
+
+
+def test_installer_subprocess_rejects_a_corrupt_http_download(tmp_path, invalid_omp_release):
+    script = """
+import os
+from urllib.request import urlopen
+from one_conv.control import worker_bootstrap as bootstrap
+bootstrap.platform.system = lambda: 'Linux'
+bootstrap.platform.machine = lambda: 'x86_64'
+bootstrap.OMP_RELEASES = {'x86_64': ('x64', 15, '0' * 64, 62)}
+def download(*args, **kwargs):
+    response = urlopen(os.environ['RELEASE_URL'], timeout=5)
+    response.geturl = lambda: 'https://release-assets.githubusercontent.com/pinned'
+    return response
+bootstrap.urllib.request.urlopen = download
+try:
+    bootstrap.install_omp()
+except bootstrap.BootstrapError as error:
+    raise SystemExit(0 if str(error) == 'omp-checksum' else 2)
+raise SystemExit(3)
+"""
+    result = subprocess.run([sys.executable, "-O", "-c", script], check=False, capture_output=True, text=True,
+                            env={**os.environ, "HOME": str(tmp_path), "RELEASE_URL": invalid_omp_release}, timeout=10)
+    assert (result.returncode, list((tmp_path / ".local/bin").iterdir())) == (0, [])

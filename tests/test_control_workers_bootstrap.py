@@ -1,6 +1,8 @@
 """Cloud bootstrap validates private payloads and verifies native assistant answers."""
 
 import copy
+import hashlib
+import io
 import json
 import os
 import subprocess
@@ -26,6 +28,170 @@ def worker_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     return tmp_path
+
+
+@pytest.fixture
+def omp_release(worker_home, monkeypatch):
+    binary = b"\x7fELF\x02\x01\x01" + bytes(11) + (62).to_bytes(2, "little") + bytes(44) + b"pinned release"
+
+    class ReleaseResponse(io.BytesIO):
+        """A pinned HTTPS response keeps transport tests independent of release size."""
+
+        def geturl(self):
+            return "https://release-assets.githubusercontent.com/pinned"
+
+    monkeypatch.setattr(bootstrap.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(bootstrap.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(bootstrap, "OMP_RELEASES", {"x86_64": ("x64", len(binary), hashlib.sha256(binary).hexdigest(), 62)})
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", lambda *args, **kwargs: ReleaseResponse(binary))
+
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, "omp/18.0.6\n" if argv[-1] == "--version"
+                                           else "--no-tools --mode --approval-mode", "")
+
+    monkeypatch.setattr(bootstrap, "run", run)
+    return binary, ReleaseResponse
+
+
+def test_official_omp_download_is_atomically_installed(omp_release, worker_home):
+    binary, _ = omp_release
+    assert bootstrap.install_omp().read_bytes() == binary
+
+
+def test_installed_omp_is_executable(omp_release):
+    assert bootstrap.install_omp().stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.parametrize("delta", [-1, 1])
+def test_omp_download_requires_the_exact_pinned_size(omp_release, monkeypatch, delta):
+    binary, response = omp_release
+    changed = binary[:-1] if delta < 0 else binary + b"x"
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", lambda *args, **kwargs: response(changed))
+    with pytest.raises(bootstrap.BootstrapError, match="^omp-(checksum|download)$"):
+        bootstrap.install_omp()
+
+
+def test_omp_rejects_an_incorrect_release_checksum(omp_release, monkeypatch):
+    binary, response = omp_release
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", lambda *args, **kwargs: response(binary[:-1] + b"x"))
+    with pytest.raises(bootstrap.BootstrapError, match="^omp-checksum$"):
+        bootstrap.install_omp()
+
+
+def test_omp_rejects_an_insecure_download_redirect(omp_release, monkeypatch):
+    binary, response = omp_release
+    monkeypatch.setattr(response, "geturl", lambda self: "http://release.example.test/binary")
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", lambda *args, **kwargs: response(binary))
+    with pytest.raises(bootstrap.BootstrapError, match="^omp-download$"):
+        bootstrap.install_omp()
+
+
+def test_omp_arm64_release_requires_the_arm64_machine(omp_release, monkeypatch):
+    binary, response = omp_release
+    changed = binary[:18] + (183).to_bytes(2, "little") + binary[20:]
+    monkeypatch.setattr(bootstrap.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(bootstrap, "OMP_RELEASES", {"aarch64": ("arm64", len(changed), hashlib.sha256(changed).hexdigest(), 183)})
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", lambda *args, **kwargs: response(changed))
+    assert bootstrap.install_omp().read_bytes() == changed
+
+
+def test_unsupported_omp_platform_never_downloads(omp_release, monkeypatch):
+    monkeypatch.setattr(bootstrap.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", lambda *args, **kwargs: pytest.fail("unsupported platform"))
+    with pytest.raises(bootstrap.BootstrapError, match="^omp-architecture$"):
+        bootstrap.install_omp()
+
+
+@pytest.mark.parametrize("offset,value", [(0, 0), (4, 1), (5, 2), (18, 183)])
+def test_omp_requires_a_matching_linux_elf(omp_release, monkeypatch, offset, value):
+    binary, response = omp_release
+    changed = bytearray(binary)
+    changed[offset] = value
+    monkeypatch.setattr(bootstrap, "OMP_RELEASES", {"x86_64": ("x64", len(changed), hashlib.sha256(changed).hexdigest(), 62)})
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", lambda *args, **kwargs: response(changed))
+    with pytest.raises(bootstrap.BootstrapError, match="^omp-architecture$"):
+        bootstrap.install_omp()
+
+
+@pytest.mark.parametrize("stage", ["omp-version", "omp-help"])
+def test_omp_rejected_execution_preserves_existing_binary(omp_release, worker_home, monkeypatch, stage):
+    target = worker_home / ".local/bin/omp"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"previous binary")
+
+    def run(argv, **kwargs):
+        if kwargs["stage"] == stage:
+            raise bootstrap.BootstrapError(stage)
+        return subprocess.CompletedProcess(argv, 0, "omp/18.0.6\n", "")
+
+    monkeypatch.setattr(bootstrap, "run", run)
+    try:
+        bootstrap.install_omp()
+    except bootstrap.BootstrapError:
+        pass
+    assert target.read_bytes() == b"previous binary"
+
+
+@pytest.mark.parametrize("output", ["omp/17.3.8", "", "18.0.6"])
+def test_omp_requires_the_pinned_executable_version(omp_release, monkeypatch, output):
+    monkeypatch.setattr(bootstrap, "run", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, output, ""))
+    with pytest.raises(bootstrap.BootstrapError, match="^omp-version$"):
+        bootstrap.install_omp()
+
+
+def test_omp_requires_the_native_flags_used_by_workers(omp_release, monkeypatch):
+    monkeypatch.setattr(bootstrap, "run", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "omp/18.0.6", ""))
+    with pytest.raises(bootstrap.BootstrapError, match="^omp-help$"):
+        bootstrap.install_omp()
+
+
+def test_omp_failed_download_leaves_no_staging_executable(omp_release, worker_home, monkeypatch):
+    def failed(*args, **kwargs):
+        raise OSError("private network diagnostics")
+
+    monkeypatch.setattr(bootstrap.urllib.request, "urlopen", failed)
+    try:
+        bootstrap.install_omp()
+    except bootstrap.BootstrapError:
+        pass
+    assert list((worker_home / ".local/bin").iterdir()) == []
+
+
+def test_omp_verification_receives_no_provider_credentials(omp_release, monkeypatch):
+    calls = []
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "private-provider-token")
+
+    def run(argv, **kwargs):
+        calls.append(kwargs["env"])
+        return subprocess.CompletedProcess(argv, 0, "omp/18.0.6" if argv[-1] == "--version"
+                                           else "--no-tools --mode --approval-mode", "")
+
+    monkeypatch.setattr(bootstrap, "run", run)
+    bootstrap.install_omp()
+    assert all("ANTHROPIC_API_KEY" not in env for env in calls)
+
+
+def test_only_a_missing_requested_omp_is_installed(worker_home, monkeypatch, payload):
+    payload["spec"]["harness"] = "omp"
+    payload["profile"]["probe_enabled"] = False
+    calls = []
+    monkeypatch.setattr(bootstrap, "prepare_repositories", lambda data: {})
+    monkeypatch.setattr(bootstrap, "worktree", lambda data, env: worker_home)
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda command: command if calls else None)
+    monkeypatch.setattr(bootstrap, "install_omp", lambda: calls.append("installed"))
+    bootstrap.bootstrap(payload)
+    assert calls == ["installed"]
+
+
+@pytest.mark.parametrize("harness", ["claude", "codex", "omp"])
+def test_installed_harnesses_do_not_download_omp(worker_home, monkeypatch, payload, harness):
+    payload["spec"]["harness"] = harness
+    payload["profile"]["probe_enabled"] = False
+    monkeypatch.setattr(bootstrap, "prepare_repositories", lambda data: {})
+    monkeypatch.setattr(bootstrap, "worktree", lambda data, env: worker_home)
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda command: command)
+    monkeypatch.setattr(bootstrap, "install_omp", lambda: pytest.fail("installed tools require no download"))
+    assert bootstrap.bootstrap(payload)["status"] == "unverified"
 
 
 @pytest.mark.parametrize("field,value", [("job_id", "../escape"), ("service_account", "white space"),
@@ -150,6 +316,18 @@ def test_secrets_and_prompt_are_direct_native_arguments(worker_home, monkeypatch
     monkeypatch.setattr(os, "execvpe", lambda executable, args, env: calls.append((executable, args, env)))
     bootstrap.run_native(path)
     assert calls[0][1] == ["claude", "--model", "selected-model", "--", prompt]
+
+
+def test_cloud_claude_bypass_confirmation_is_per_invocation(worker_home, monkeypatch):
+    bootstrap.write_private(bootstrap.root() / "credentials.json", {})
+    path = worker_home / "run.json"
+    bootstrap.write_private(path, {"harness": "claude", "model": None, "prompt": "task",
+                                   "args": DEFAULT_PROFILE["harness_args"]["claude"]})
+    calls = []
+    monkeypatch.setattr(os, "execvpe", lambda executable, args, env: calls.append(args))
+    bootstrap.run_native(path)
+    assert calls == [["claude", "--dangerously-skip-permissions", "--settings",
+                      '{"skipDangerousModePermissionPrompt":true}', "--", "task"]]
 
 
 def test_native_secret_payload_disappears_before_exec(worker_home, monkeypatch):

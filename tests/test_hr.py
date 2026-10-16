@@ -2,6 +2,8 @@
 
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
@@ -225,3 +227,130 @@ def test_registration_refuses_a_mismatched_registry(store, card):
         connection.execute("UPDATE cards SET cost_center_id='storage-only'")
     with pytest.raises(RateError, match="identity mismatch"):
         store.register(card, replace=True)
+
+
+def test_locked_cards_preserves_the_validated_snapshot(store, card):
+    saved = store.register(card)
+    with store.locked_cards() as cards:
+        assert cards == [saved]
+
+
+def test_locked_cards_allows_an_unconfigured_registry(store):
+    with store.locked_cards() as cards:
+        assert cards == []
+
+
+def test_locked_cards_blocks_other_database_writers(store, card):
+    store.register(card)
+    with store.locked_cards(), sqlite3.connect(store.path, timeout=0) as connection, pytest.raises(sqlite3.OperationalError, match="locked"):
+        connection.execute("BEGIN IMMEDIATE")
+
+
+@pytest.mark.parametrize("reference", ["jack", "@jack", "boat:box/session"])
+def test_rate_update_resolves_existing_references(store, card, reference):
+    store.register(card)
+    updated = store.update_rate(reference, {**card["hourly_rate"], "amount": "5"})
+    assert updated["hourly_rate"]["amount"] == "5"
+
+
+def test_rate_update_preserves_latest_worker_bindings(store, card):
+    store.register({**card, "addresses": []})
+    store.register(card, replace=True)
+    updated = store.update_rate("jack", {**card["hourly_rate"], "amount": "5"})
+    assert updated["addresses"] == card["addresses"]
+
+
+@pytest.mark.parametrize("field", ["cost_center_id", "name", "aliases", "includes_internal_subagents"])
+def test_rate_update_preserves_identity(store, card, field):
+    store.register(card)
+    assert store.update_rate("jack", {**card["hourly_rate"], "amount": "5"})[field] == card[field]
+
+
+@pytest.mark.parametrize("amount", [None, "0", "5"])
+def test_rate_update_preserves_unknown_vs_zero(store, card, amount):
+    store.register(card)
+    assert store.update_rate("jack", {**card["hourly_rate"], "amount": amount})["hourly_rate"]["amount"] == amount
+
+
+@pytest.mark.parametrize("rate", [{}, {"amount": "5"}, {"amount": "NaN"}, None])
+def test_invalid_partial_rates_leave_existing_card_unchanged(store, card, rate):
+    saved = store.register(card)
+    try:
+        store.update_rate("jack", rate)
+    except RateError:
+        pass
+    assert store.show("jack") == saved
+
+
+def test_identical_rate_update_is_idempotent(store, card):
+    saved = store.register(card)
+    assert store.update_rate("jack", card["hourly_rate"]) == saved
+
+
+def test_rate_update_requires_an_existing_card(store, card):
+    with pytest.raises(RateError, match="No rate card"):
+        store.update_rate("jack", card["hourly_rate"])
+
+
+@pytest.mark.parametrize(("field", "value"), [("amount", "NaN"), ("currency", "invalid"),
+                                               ("basis", "invented"), ("provenance", ""), ("extra", "forbidden")])
+def test_rate_update_rejects_invalid_complete_rate(store, card, field, value):
+    store.register(card)
+    with pytest.raises(RateError):
+        store.update_rate("jack", {**card["hourly_rate"], field: value})
+
+
+def test_binding_creates_a_missing_unknown_rate(store, card):
+    card["hourly_rate"]["amount"] = None
+    assert store.bind_worker(card, "worker/codex:new")["hourly_rate"]["amount"] is None
+
+
+def test_binding_uses_latest_human_rate(store, card):
+    default = {**card, "hourly_rate": {**card["hourly_rate"], "amount": None}}
+    store.register(card)
+    store.update_rate("jack", {**card["hourly_rate"], "amount": "5"})
+    assert store.bind_worker(default, "worker/codex:new")["hourly_rate"]["amount"] == "5"
+
+
+@pytest.mark.parametrize("field", ["name", "aliases"])
+def test_binding_preserves_human_identity_labels(store, card, field):
+    store.register(card)
+    default = {**card, "name": "default", "aliases": []}
+    assert store.bind_worker(default, "worker/codex:new")[field] == card[field]
+
+
+def test_binding_appends_to_existing_addresses(store, card):
+    store.register(card)
+    assert store.bind_worker(card, "worker/codex:new")["addresses"] == ["boat:box/session", "worker/codex:new"]
+
+
+def test_repeated_binding_is_idempotent(store, card):
+    saved = store.bind_worker(card, "worker/codex:new")
+    assert store.bind_worker(card, "worker/codex:new") == saved
+
+
+def test_binding_cannot_take_another_cost_centers_address(store, card):
+    other = {**card, "cost_center_id": "john", "aliases": ["@john"], "addresses": ["worker/codex:new"]}
+    store.register(other)
+    with pytest.raises(RateError, match="another cost center"):
+        store.bind_worker(card, "worker/codex:new")
+
+
+def test_concurrent_rate_and_binding_preserve_both_changes(store, card):
+    store.register(card)
+    barrier = Barrier(2)
+
+    def price():
+        barrier.wait(timeout=2)
+        return store.update_rate("jack", {**card["hourly_rate"], "amount": "5"})
+
+    def bind():
+        barrier.wait(timeout=2)
+        return store.bind_worker(card, "worker/codex:new")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        priced, bound = pool.submit(price), pool.submit(bind)
+        priced.result(timeout=5)
+        bound.result(timeout=5)
+    saved = store.show("jack")
+    assert (saved["hourly_rate"]["amount"], saved["addresses"]) == ("5", ["boat:box/session", "worker/codex:new"])

@@ -4,7 +4,7 @@ import json
 import os
 import re
 import sqlite3
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from pathlib import Path
@@ -141,6 +141,18 @@ class RateStore:
                 return card
         raise RateError(f"No rate card for {reference!r}; run one-conv hr list")
 
+    @contextmanager
+    def locked_cards(self):
+        """Keep ownership stable while another store commits an authorized accounting operation."""
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            with closing(sqlite3.connect(self.path, timeout=30)) as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("CREATE TABLE IF NOT EXISTS cards (cost_center_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+                yield self._cards(connection)
+        except sqlite3.Error as error:
+            raise RateError("Cannot lock the HR registry; inspect ONE_CONV_HR_DIR or restore its database") from error
+
     @staticmethod
     def _decode(payload):
         try:
@@ -162,7 +174,58 @@ class RateStore:
             cards.append(card)
         return cards
 
-    def register(self, card, *, replace=False):
+    def update_rate(self, reference, hourly_rate):
+        """Change only pricing while preserving the latest identity and worker ownership bindings."""
+        reference = _text(reference, "reference")
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            with closing(sqlite3.connect(self.path, timeout=30)) as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("CREATE TABLE IF NOT EXISTS cards (cost_center_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+                current = next((card for card in self._cards(connection)
+                                if reference == card["cost_center_id"] or reference in (*card["aliases"], *card["addresses"])), None)
+                if current is None:
+                    raise RateError(f"No rate card for {reference!r}; run one-conv hr list")
+                card = _validate_card({**current, "hourly_rate": hourly_rate})
+                if current["hourly_rate"] == card["hourly_rate"]:
+                    return current
+                saved = {**card, "updated_at": datetime.now(UTC).isoformat()}
+                connection.execute("UPDATE cards SET payload=? WHERE cost_center_id=?",
+                                   (json.dumps(saved), saved["cost_center_id"]))
+                return saved
+        except sqlite3.Error as error:
+            raise RateError("Cannot update the HR rate; inspect ONE_CONV_HR_DIR or restore its database") from error
+
+    def bind_worker(self, default_card, address=None):
+        """Create missing identity or attach a worker while preserving current human pricing and labels."""
+        default_card = _validate_card(default_card)
+        if address is not None:
+            address = _text(address, "address")
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            with closing(sqlite3.connect(self.path, timeout=30)) as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("CREATE TABLE IF NOT EXISTS cards (cost_center_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+                rows = self._cards(connection)
+                current = next((card for card in rows if card["cost_center_id"] == default_card["cost_center_id"]), None)
+                card = current or default_card
+                addresses = set(card["addresses"])
+                if address is not None:
+                    addresses.add(address)
+                card = _validate_card({**card, "addresses": sorted(addresses)})
+                if current == card:
+                    return current
+                wanted = {*card["aliases"], *card["addresses"]}
+                if any(other["cost_center_id"] != card["cost_center_id"] and wanted.intersection((*other["aliases"], *other["addresses"])) for other in rows):
+                    raise RateError("A worker address or alias already belongs to another cost center")
+                saved = {**card, "updated_at": datetime.now(UTC).isoformat()}
+                connection.execute("INSERT INTO cards VALUES (?, ?) ON CONFLICT(cost_center_id) DO UPDATE SET payload=excluded.payload",
+                                   (card["cost_center_id"], json.dumps(saved)))
+                return saved
+        except sqlite3.Error as error:
+            raise RateError("Cannot bind the HR worker; inspect ONE_CONV_HR_DIR or restore its database") from error
+
+    def register(self, card, *, replace=False, authorize=None):
         card = _validate_card(card)
         card.pop("updated_at", None)
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -172,6 +235,9 @@ class RateStore:
                 connection.execute("CREATE TABLE IF NOT EXISTS cards (cost_center_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
                 rows = self._cards(connection)
                 current = next((row for row in rows if row["cost_center_id"] == card["cost_center_id"]), None)
+                if authorize is not None:
+                    # Ownership is checked under the write lock so concurrent creators cannot replace each other.
+                    authorize(current)
                 if current and {key: value for key, value in current.items() if key != "updated_at"} == card:
                     return current
                 if current and not replace:

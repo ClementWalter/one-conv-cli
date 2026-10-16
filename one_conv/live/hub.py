@@ -69,9 +69,9 @@ def _hash(token: str) -> str:
 
 
 def split_address(address: str) -> tuple[str, str]:
-    """NODE/harness:id into its node and local address; refuses anything else."""
+    """Split an agent or a published human's canonical return route."""
     node, sep, local = address.partition("/")
-    if not sep or not NODE.fullmatch(node) or ":" not in local or "/" in local.split(":", 1)[0]:
+    if not sep or not NODE.fullmatch(node) or (local != "user" and ":" not in local) or "/" in local.split(":", 1)[0]:
         raise HubError(400, f"a remote address is NODE/harness:id, not {address!r}")
     return node, local
 
@@ -121,6 +121,16 @@ class Hub:
             if hmac.compare_digest(stored, digest):
                 return node
         raise HubError(401, "unknown or revoked token")
+
+    def authenticated_node(self, request) -> str:
+        """Authenticate node extensions with bearer authority, never browser cookies."""
+        values = request.headers.getlist("authorization")
+        if len(values) != 1:
+            raise HubError(401, "exactly one bearer authorization header is required")
+        scheme, separator, token = values[0].partition(" ")
+        if not separator or scheme.lower() != "bearer" or not token or any(char.isspace() for char in token):
+            raise HubError(401, "a bearer authorization header is required")
+        return self.node_for(token)
 
     def _seen(self, db, node: str) -> None:
         db.execute("INSERT OR REPLACE INTO nodes VALUES (?, ?)", (node, time.time()))
@@ -191,7 +201,7 @@ class Hub:
         return {"id": msg_id, "duplicate": duplicate,
                 "recipients": [{"to": f"{n}/{a}", "delivery": d, "status": o or "stored"} for d, n, a, o in rows]}
 
-    def send(self, node: str, message: dict) -> dict:
+    def send(self, node: str, message: dict, *, join_sender: bool = False) -> dict:
         """Store a post and one delivery per recipient; a retry of the same post returns its first receipt."""
         msg_id, sender, text = message.get("id"), message.get("from"), message.get("text")
         if not isinstance(msg_id, str) or not MESSAGE_ID.fullmatch(msg_id):
@@ -222,6 +232,11 @@ class Hub:
             # A sender is this node's own session or the person at its terminal, never another node's agent.
             if not isinstance(sender, str) or (not self._published(db, node, sender) and sender not in ("user", "unknown")):
                 raise HubError(403, "from must be a session this node published, or user/unknown")
+            if join_sender:
+                # A trusted workspace caller creates membership atomically with its first topic post.
+                if not target.startswith("#") or not self._published(db, node, sender):
+                    raise HubError(403, "joining a topic requires a published sender and a topic target")
+                db.execute("INSERT OR IGNORE INTO members VALUES (?, ?, ?, ?)", (topic, node, sender, time.time()))
             recipients = self._recipients(db, target, node, sender)
             seq = db.execute("INSERT INTO posts (from_node, id, digest, target, sender, topic, reply, mode, text, created)"
                              " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -326,9 +341,7 @@ def application(hub: Hub):
 
     async def handle(request: Request, work):
         try:
-            header = request.headers.get("authorization", "")
-            token = header[7:] if header.lower().startswith("bearer ") else None
-            node = await run_in_threadpool(hub.node_for, token)
+            node = await run_in_threadpool(hub.authenticated_node, request)
             body = {}
             if request.method in ("POST", "PUT"):
                 body = json.loads(await bounded_body(request) or b"{}")

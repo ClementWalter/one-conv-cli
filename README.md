@@ -3,11 +3,16 @@
 Read and search your AI conversations from one CLI. Pull cloud conversations
 into a local history, or read sessions already saved by your coding tools.
 
+Work with live teammates from a Slack-style workspace, including human messages
+and a paired iPhone app. See [the mobile workspace guide](MOBILE_WORKSPACE.md)
+for cloud hosting, shared worker boxes and team accounting.
+
 | Namespace | Sources |
 | --- | --- |
 | `cloud` | ChatGPT, Claude Chat, Codex cloud, Cowork cloud |
 | `local` | Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi, shared corpus files |
-| `hr` | Local agent rate cards and expected ask costs |
+| `live` | Agent messaging, topics, spawning, hub and mobile workspace |
+| `hr` | Shared or local rate cards, usage evidence and expected ask costs |
 
 Cloud conversations are addressed by ID or title. Local sessions are grouped
 by the project where the agent ran.
@@ -63,11 +68,113 @@ Identical registration retries return the existing card. To change a card, repea
 `register` with the same ID and `--replace`; this replaces the whole card,
 including its aliases and addresses. References cannot belong to two cost centers.
 
-Cards are local to this machine in `hr/rates.sqlite3` under the live state
-directory (`ONE_CONV_LIVE_DIR`). `ONE_CONV_HR_DIR` overrides the HR directory.
-The registry starts empty. Distributed synchronization, UI and MCP exposure,
-provider usage ingestion and reconciliation with actual charges are pending;
-the CFO can use the CLI output to make staffing decisions freely.
+With a configured live hub, HR commands use its authenticated shared authority.
+`--hub` requires that authority; `--local` explicitly selects this machine.
+An unavailable hub never silently becomes a separate local registry. Local cards
+live in `hr/rates.sqlite3` under the live state directory (`ONE_CONV_LIVE_DIR`).
+`ONE_CONV_HR_DIR` overrides the local HR directory.
+The registry starts empty; accounting does not choose staffing or seed rates.
+
+Import actual usage metadata from an explicit Codex, Claude Code or Oh My Pi
+transcript, an OpenRouter JSONL response/SSE capture, or canonical accounting
+events. For example, with an existing saved OpenRouter response:
+
+```bash
+one-conv hr ingest response.jsonl --source openrouter --cost-center jack \
+  --billing-scope router-account --worker jack-session --json
+one-conv hr usage --cost-center jack --json
+one-conv hr summary --cost-center jack --json
+one-conv hr summary --cost-center jack --since 2026-01-01T00:00:00Z \
+  --until 2026-01-01T01:00:00Z --occupied-seconds 1800 --json
+```
+
+`--source` also accepts `codex`, `claude`, `omp` and `event`; `-` reads stdin.
+Native session IDs identify workers unless `--worker` is supplied. The explicit
+`--cost-center` owns imported internal subagents too; `--parent-worker` records
+their parent when needed. `--billing-scope` is a stable billing authority/account
+label, shared across machines importing that account, never an API key.
+
+Every event keeps its reported model/provider, native token counters, timestamp,
+worker/parent, provenance and coverage. Missing metadata remains `null`. Cached
+and reasoning tokens are retained without inferring a price or entitlement
+consumption. Native token fields have source-specific cache semantics. Native
+durations whose units are unverified remain unknown; explicit canonical events
+can provide `wall_seconds`.
+
+Cash, subscription allocations, configured-price estimates and quota are separate
+fields and summary buckets. [OpenRouter's reported `usage.cost`](https://openrouter.ai/docs/cookbook/administration/usage-accounting)
+or generation `total_cost` is recorded as its account charge; upstream inference
+cost is not added again. Other provider bills and fixed subscriptions remain
+outside that account charge. OMP's calculated `usage.cost` is an estimate,
+including an explicit estimated zero; it is never treated as reported cash.
+Allocations and quota require explicit canonical event values with provenance.
+
+Summaries describe recorded events only. Unknown cash charges prevent a complete
+cash total and observed cash hourly rate. Currencies stay separate. An observed
+rate requires one owner, a half-open `[since, until)` window and positive occupied
+owner seconds inside that window; parallel subagent wall times are not summed
+into the denominator. Rate cards are not changed automatically.
+
+The SQLite ledger deduplicates by billing scope and provider request/generation
+ID, or by stable native source identity when no request ID is available. Repeated
+imports return duplicate counts. Later provider evidence can fill unknown cost,
+tokens, model or provider fields; receipts report `enriched: true` for the same
+identity. Known values and node/owner attribution cannot be overwritten. Per-field
+provenance retains the evidence that established each value. Conflicting known
+facts reject the whole batch. OpenRouter creation timestamps use whole seconds
+so completion and later generation metadata can join. Importers handle
+current Codex response records, legacy cumulative-counter snapshots, and repeated
+Claude content blocks without adding the same usage twice. Malformed records
+fail visibly. Inputs are bounded at 100000 records and 4 MiB per record.
+
+The ledger stores accounting metadata only in `usage.sqlite3`. For local mode, set
+`ONE_CONV_ACCOUNTING_DIR` or pass `--directory` on usage commands to select its
+directory; the default is the HR directory. Combine `--directory` with `--local`
+when a hub is configured. The same
+`one_conv.accounting.Ledger(directory)` helpers serve a cloud authority. SQLite
+transactions protect concurrent processes. Hub imports send canonical numeric
+events in bounded, idempotent batches; workers and parents are qualified with
+the configured node. The authority derives bearer node identity and enforces
+ownership. UI and MCP can use the same authority separately. No model API request
+or transcript scan occurs implicitly.
+
+For automatic worker metering, a worker bootstrap supplies a private ownership
+mapping. Only its explicit native history paths are scanned. Relative paths are
+resolved beside this JSON file; this is an illustrative mapping:
+
+```json
+{
+  "schema_version": 1,
+  "histories": [
+    {"source": "codex", "path": "history", "billing_scope": "native-account"}
+  ],
+  "owners": {
+    "codex:SESSION": {"cost_center_id": "jack", "worker_id": "node/codex:SESSION"}
+  }
+}
+```
+
+Each history requires `source` (`codex`, `claude` or `omp`), `path` (a directory or
+file) and a stable `billing_scope`. Owners can override `billing_scope` or provide
+`parent_worker_id`. Unmapped sessions are counted and skipped; native Codex and
+Claude children inherit their mapped parent's cost center with distinct worker
+IDs. Keep retired worker/probe mappings for late usage. No subscription quota or
+cash charge is inferred from native token counts.
+
+```bash
+one-conv hr sync --mapping workers.json --hub --json
+one-conv hr watch --mapping workers.json --hub --interval 5 --max-backoff 60 --json
+```
+
+`sync` runs once; `watch` reloads mappings and hub credentials each pass. Use
+`--iterations 1` for a bounded check or `--local` for an isolated local ledger.
+Polling defaults to five seconds; failures back off up to sixty seconds and retry
+the same identities. Each pass bounds file count, event count and scan time;
+oversized inputs fail visibly. Incomplete final writes wait for the next pass.
+Only finalized Claude responses are imported automatically. The watcher reports
+coverage and transfers canonical accounting metadata, never transcript content.
+The reusable entrypoints are `sync_mapping(mapping_path, sink)` and
+`watch_mapping(mapping_path, sink_factory, ...)` in `one_conv.accounting.watcher`.
 
 ## Connect a cloud account
 

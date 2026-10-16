@@ -48,7 +48,10 @@ class Accounting:
             if type(payload.get("replace", False)) is not bool:
                 raise ValueError("replace must be a boolean")
             return {"card": self.rates.register(payload["card"], replace=payload.get("replace", False))}
-        raise ValueError("Choose quote or register")
+        if payload.get("action") == "update_rate":
+            _fields(payload, ("action", "reference", "hourly_rate"))
+            return {"card": self.rates.update_rate(payload["reference"], payload["hourly_rate"])}
+        raise ValueError("Choose quote, register or update_rate")
 
     def node(self, node, resource, method, payload):
         from ..accounting import normalize_event
@@ -116,17 +119,11 @@ class Workers:
     def rate_card(self, job):
         """New teammates start with an unknown all-in rate instead of a fictitious free rate."""
         name = job["spec"]["name"]
+        card = make_card(name, name, aliases=[name], currency="USD", basis="allocated",
+                         provenance="Not yet measured or allocated by the team",
+                         metering_basis="Occupied work hour, including internal subagents")
         try:
-            card = self.rates.show(name)
-        except RateError:
-            card = make_card(name, name, aliases=[name], currency="USD", basis="allocated",
-                             provenance="Not yet measured or allocated by the team",
-                             metering_basis="Occupied work hour, including internal subagents")
-        card = {key: value for key, value in card.items() if key != "updated_at"}
-        if job.get("address") and job["address"] not in card["addresses"]:
-            card["addresses"] = sorted([*card["addresses"], job["address"]])
-        try:
-            self.rates.register(card, replace=True)
+            self.rates.bind_worker(card, job.get("address"))
         except RateError:
             log.error("Worker rate card could not be reconciled")
 

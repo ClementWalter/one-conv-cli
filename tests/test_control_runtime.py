@@ -138,6 +138,42 @@ def card():
                      provenance="Subscription allocation", metering_basis="Occupied work hour")
 
 
+@pytest.fixture
+def paired_browser(client, app):
+    client.post("/api/login", json={"token": app.state.auth.issue_pairing_token()}, headers={"Origin": ORIGIN})
+    client.headers.update({"Origin": ORIGIN, "X-One-Conv-Token": client.get("/api/session").json()["csrf_token"]})
+    return client
+
+
+@pytest.fixture
+def planning_update(paired_browser, app, card):
+    cached = app.state.accounting.rates.register({**card, "addresses": []})
+    Workers(None, app.state.accounting.rates).rate_card({"spec": {"name": "jack"}, "address": "worker/codex:session"})
+    return paired_browser.post("/api/providers/accounting", json={"action": "update_rate", "reference": cached["cost_center_id"],
+                                                               "hourly_rate": {**cached["hourly_rate"], "amount": "5"}})
+
+
+def test_browser_partial_rate_update_preserves_ready_worker_address(planning_update):
+    assert planning_update.json()["card"]["addresses"] == ["worker/codex:session"]
+
+
+def test_browser_partial_rate_update_sets_the_planning_rate(planning_update):
+    assert planning_update.json()["card"]["hourly_rate"]["amount"] == "5"
+
+
+def test_worker_reconciliation_preserves_the_latest_browser_rate(planning_update, app):
+    Workers(None, app.state.accounting.rates).rate_card({"spec": {"name": "jack"}, "address": "worker/codex:second"})
+    assert app.state.accounting.rates.show("jack")["hourly_rate"]["amount"] == "5"
+
+
+def test_browser_rate_update_requires_browser_authority(node, card):
+    assert node.post("/api/providers/accounting", json={"action": "update_rate", "reference": "jack", "hourly_rate": card["hourly_rate"]}).status_code == 401
+
+
+def test_browser_rate_update_cannot_submit_stale_identity_fields(paired_browser, card):
+    assert paired_browser.post("/api/providers/accounting", json={"action": "update_rate", "reference": "jack", "hourly_rate": card["hourly_rate"], "addresses": []}).status_code == 400
+
+
 def test_node_can_publish_its_rate_card(node, card):
     assert node.post("/v1/accounting/rates", json={"card": card}).status_code == 200
 

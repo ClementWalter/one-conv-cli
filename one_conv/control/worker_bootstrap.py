@@ -249,7 +249,7 @@ def prepare_omp_auth(data, env):
             or any(env.get(key) and (Path(env[key]) / "omp").exists() for key in ("XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"))):
         return True
     try:
-        descriptor = os.open(home / ".pi/agent/auth.json", os.O_RDONLY | os.O_NOFOLLOW)
+        descriptor = os.open(home / ".pi/agent/auth.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor) as stream:
             metadata = os.fstat(stream.fileno())
             if (not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o777 != 0o600

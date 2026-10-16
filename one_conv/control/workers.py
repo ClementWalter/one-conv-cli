@@ -190,7 +190,7 @@ class BoatCLI:
         """Read only the service account from a cloud environment, before allocating compute."""
         if self.service_account_file is not None:
             try:
-                descriptor = os.open(self.service_account_file, os.O_RDONLY | os.O_NOFOLLOW)
+                descriptor = os.open(self.service_account_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
                 with os.fdopen(descriptor) as stream:
                     metadata = os.fstat(stream.fileno())
                     if (not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o777 != 0o600

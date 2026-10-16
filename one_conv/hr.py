@@ -4,7 +4,7 @@ import json
 import os
 import re
 import sqlite3
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from pathlib import Path
@@ -140,6 +140,18 @@ class RateStore:
             if reference == card["cost_center_id"] or reference in (*card["aliases"], *card["addresses"]):
                 return card
         raise RateError(f"No rate card for {reference!r}; run one-conv hr list")
+
+    @contextmanager
+    def locked_cards(self):
+        """Keep ownership stable while another store commits an authorized accounting operation."""
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            with closing(sqlite3.connect(self.path, timeout=30)) as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("CREATE TABLE IF NOT EXISTS cards (cost_center_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+                yield self._cards(connection)
+        except sqlite3.Error as error:
+            raise RateError("Cannot lock the HR registry; inspect ONE_CONV_HR_DIR or restore its database") from error
 
     @staticmethod
     def _decode(payload):

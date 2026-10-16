@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import sys
 import threading
 
 import pytest
@@ -400,6 +401,60 @@ def test_ambiguous_stop_recovery_preserves_the_native_claim(resumed_after_ambigu
     manager.recheck("request-1")
     manager.run_once()
     assert (boat.starts[-1][0], boat.starts[-1][1]["job_id"], boat.starts[-1][1]["restart"]) == ("bx_1", "request-1", False)
+
+
+@pytest.fixture
+def crashed_pool_stop(provisioned, boat, tmp_path):
+    provisioned._update("request-1", status="ready", address="worker-node/claude:existing", health={"registered": True})
+    marker = tmp_path / "provider-stop-effect"
+    script = """
+import os
+import sys
+from pathlib import Path
+from one_conv.control.workers import WorkerManager
+class CrashBoat:
+    def info(self, box):
+        return {'id': box, 'state': 'idle'}
+    def stop_pool(self, box):
+        with Path(sys.argv[3]).open('w') as stream:
+            stream.write(box)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os._exit(99)
+WorkerManager(Path(sys.argv[1]), {'boat': CrashBoat()}).stop_pool(sys.argv[2])
+"""
+    result = subprocess.run([sys.executable, "-O", "-c", script, str(provisioned.directory),
+                             provisioned.list()["pools"][0]["id"], str(marker)], check=False,
+                            capture_output=True, text=True, timeout=10)
+    manager = WorkerManager(provisioned.directory, provisioned.config)
+    manager.run_once()
+    return manager, boat, result, marker
+
+
+def test_pool_stop_crash_reaches_the_provider_effect(crashed_pool_stop):
+    _, _, result, marker = crashed_pool_stop
+    assert (result.returncode, marker.read_text()) == (99, "bx_1")
+
+
+def test_pool_stop_crash_preserves_an_unconfirmed_job(crashed_pool_stop):
+    manager, _, _, _ = crashed_pool_stop
+    assert manager.status("request-1")["status"] == "unconfirmed"
+
+
+def test_pool_stop_crash_clears_live_health_before_the_effect(crashed_pool_stop):
+    manager, _, _, _ = crashed_pool_stop
+    assert manager.status("request-1")["health"]["registered"] is False
+
+
+def test_pool_stop_crash_does_not_allocate_a_replacement(crashed_pool_stop):
+    _, boat, _, _ = crashed_pool_stop
+    assert boat.creates == 1
+
+
+def test_pool_stop_crash_keeps_the_native_name_reserved(crashed_pool_stop, spec):
+    manager, _, _, _ = crashed_pool_stop
+    with pytest.raises(ValueError, match="active job"):
+        manager.submit(spec, "request-2")
 
 
 def test_automatic_pool_stop_invalidates_other_old_jobs(provisioned, spec, boat):

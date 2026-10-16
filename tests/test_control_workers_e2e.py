@@ -87,6 +87,9 @@ def provider(loopback_hub):
                 response = {"id": f"bx_{remote['created']}"}
             elif self.path == "/info":
                 response = {"id": body["box"], "state": remote["machine_state"]}
+            elif self.path == "/stop" and remote.get("lose_stop"):
+                self.send_error(503, "stop outcome is unconfirmed")
+                return
             elif self.path == "/bootstrap":
                 data = body["payload"]
                 if data["operation"] == "stop":
@@ -185,6 +188,18 @@ def test_stopping_then_reusing_a_cold_pool_resumes_the_tracked_box(runtime):
     manager.submit({**spec, "name": "builder"}, "job-2")
     manager.run_once()
     assert remote["created"] == 1
+
+
+def test_http_stop_failure_recovers_the_existing_hub_worker(runtime):
+    manager, spec, remote = runtime
+    manager.submit(spec, "job-1")
+    manager.run_once()
+    remote["lose_stop"] = True
+    pool = manager.list()["pools"][0]["id"]
+    manager.stop_pool(pool)
+    manager.resume_pool(pool)
+    manager.recheck("job-1")
+    assert manager.run_once()["status"] == "ready"
 
 
 @pytest.fixture

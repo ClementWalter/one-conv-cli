@@ -18,11 +18,26 @@ browser = phone_tests.browser
 class BoatWithoutLogin:
     """A disposable provider boundary that creates no remote resources."""
 
+    def __init__(self):
+        self.state = "ready"
+        self.created = 0
+
     def credentials(self, _profile):
         return {"service_account": "synthetic-private-service-account"}
 
     def create(self, _profile, _pool):
+        self.created += 1
+        self.state = "ready"
         return "bx_synthetic"
+
+    def info(self, _box):
+        return {"state": self.state}
+
+    def stop_pool(self, _box):
+        self.state = "archived"
+
+    def resume_pool(self, _box):
+        self.state = "ready"
 
     def bootstrap(self, _box, payload):
         return {"status": "stopped"} if payload["operation"] == "stop" else {"status": "auth_needed", "authenticated": False}
@@ -97,6 +112,46 @@ def test_phone_can_stop_a_teammate_without_deleting_its_box(staffed_phone):
     page.get_by_role("button", name="Stop teammate").click()
     page.locator(".worker-job").filter(has_text="Stopped").wait_for()
     assert app.state.workers.manager.list()["pools"][0]["box_id"] == "bx_synthetic"
+
+
+def test_phone_can_recheck_a_box_stopped_teammate_after_resuming_the_same_box(staffed_phone):
+    page, app = staffed_phone
+    page.get_by_role("button", name="Stop teammate", exact=True).wait_for(timeout=10000)
+    original = app.state.workers.manager.list()["jobs"][0]
+    page.get_by_role("button", name="Stop box", exact=True).click()
+    page.get_by_role("button", name="Resume box", exact=True).wait_for()
+    page.get_by_role("button", name="Resume box", exact=True).click()
+    check = page.get_by_role("button", name="Check again", exact=True)
+    check.wait_for()
+    with page.expect_response(lambda response: response.url.endswith("/api/providers/workers") and response.request.method == "POST") as response:
+        check.click()
+    response.value.finished()
+    page.locator(".worker-job").filter(has_text="Provider needs attention").wait_for(timeout=10000)
+    current = app.state.workers.manager.list()["jobs"][0]
+    assert (current["id"], current["box_id"], app.state.workers.manager.boat.created) == (original["id"], "bx_synthetic", 1)
+
+
+def test_individually_stopped_teammate_does_not_offer_recheck(staffed_phone):
+    page, _app = staffed_phone
+    page.get_by_role("button", name="Stop teammate", exact=True).wait_for(timeout=10000)
+    page.get_by_role("button", name="Stop teammate", exact=True).click()
+    page.locator(".worker-job").filter(has_text="Stopped").wait_for()
+    assert page.get_by_role("button", name="Check again", exact=True).count() == 0
+
+
+def test_resumed_box_requires_a_worker_recheck_before_looking_online(staffed_phone, tmp_path):
+    page, _app = staffed_phone
+    page.get_by_role("button", name="Stop teammate", exact=True).wait_for(timeout=10000)
+    page.get_by_role("button", name="Stop box", exact=True).click()
+    page.get_by_role("button", name="Resume box", exact=True).wait_for()
+    page.get_by_role("button", name="Resume box", exact=True).click()
+    page.get_by_role("button", name="Check again", exact=True).wait_for()
+    page.screenshot(path=str(tmp_path / "resumed-box-recovery-390px.png"), full_page=True)
+    assert page.get_by_role("button", name="Message", exact=True).count() == 0
+    close = page.get_by_role("button", name="Close add teammate", exact=True)
+    close.scroll_into_view_if_needed()
+    page.screenshot(path=str(tmp_path / "recovery-dialog-close-390px.png"), full_page=True)
+    close.click()
 
 
 @pytest.mark.parametrize(("entered", "expected"), [("0", "0"), ("12.50", "12.50"), ("", None)])

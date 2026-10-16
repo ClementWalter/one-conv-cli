@@ -46,7 +46,23 @@ box with free slots, but wait before allocating another box. Canceling a waiting
 request does not cancel the original uncertain creation. Inspect Boat and use
 the original request's **Use this existing box** form to attach its sandbox.
 
-Configured agents can use the same managed pool:
+Ordinary node credentials can inspect jobs but cannot change staffing. The
+operator can delegate staffing to a CFO or another node using the service's
+existing control state directory:
+
+```console
+one-conv live control node add cfo --output cfo.token --staffing
+```
+
+Use the service's `live control --directory` setting when it uses a custom state
+directory. To delegate an existing key instead, run
+`one-conv live control node grant-staffing cfo`. The grant covers every process
+sharing that node key; replacing the key requires a new grant. Later,
+`one-conv live control node revoke-staffing cfo` removes staffing authority while
+keeping messaging and accounting available. Revoking the node key also removes
+its grant. Paired human browsers retain their staffing authority.
+
+An explicitly delegated agent can use the same managed pool:
 
 ```console
 one-conv live spawn codex 'Review the current change.' --cloud --name jack --topic release --yes --json
@@ -62,8 +78,11 @@ restart it under the same request and box. A teammate stopped individually
 stays stopped; add a new teammate to replace it.
 
 Profiles select GitHub repositories, pinned revisions, skills, provider
-credentials, unattended harness flags and resident slots. Each agent gets its
-own git worktree. A box shares its OS user and credentials across those agents;
+credentials, harness approval settings and resident slots. Built-in default
+harness settings run unattended; custom profiles can change approval and
+sandbox settings. The phone describes the selected profile and harness's
+configured access before **Bring teammate online**. Each agent gets its own git
+worktree. A box shares its OS user and credentials across those agents;
 this is a personal trusted team, with no credential isolation between teammates.
 Selected skills are linked into Claude Code, Codex and Oh My Pi discovery paths.
 GitHub access comes from the cloud vault, independently of any laptop keychain.
@@ -74,6 +93,10 @@ dedicated environment that withholds personal secrets, GitHub injection and
 Boat administration credentials while allowing agent credentials. An explicit
 vault-key profile can instead use `--no-env`. Missing login, model access or
 quota leaves the job needing attention on the same box.
+
+Task dispatch waits for an authenticated model response, hub registration and
+channel membership, and a working numeric usage collector; a collector failure
+leaves the outcome needing checking rather than **Online**.
 
 For a fresh OMP worker, the native-credentials profile can import its selected
 Boat Pi Anthropic OAuth identity through OMP's official local importer. Existing

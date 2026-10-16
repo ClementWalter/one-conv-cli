@@ -73,28 +73,37 @@ def build_control_group():
             raise click.ClickException(str(error)) from None
         click.echo(f"Pairing link written privately; valid for {ttl} seconds.")
 
-    @control.command("node", epilog="\b\nExamples:\n  one-conv live control node add laptop --output laptop.token\n  one-conv live control node revoke laptop")
-    @click.argument("action", type=click.Choice(["add", "revoke"]))
+    @control.command("node", epilog="\b\nExamples:\n  one-conv live control node add laptop --output laptop.token\n  one-conv live control node add cfo --output cfo.token --staffing\n  one-conv live control node grant-staffing cfo\n  one-conv live control node revoke-staffing cfo\n  one-conv live control node revoke laptop")
+    @click.argument("action", type=click.Choice(["add", "revoke", "grant-staffing", "revoke-staffing"]))
     @click.argument("name")
     @click.option("--output", type=click.Path(path_type=Path), help="Required for add; new private file receiving the node key.")
+    @click.option("--staffing", is_flag=True, help="Only with add: delegate staffing mutations to every process sharing this node key.")
     @click.pass_context
-    def node(context, action, name, output):
-        """Manage bearer credentials for ordinary peer machines, separate from browser login."""
+    def node(context, action, name, output, staffing):
+        """Manage node credentials and staffing delegation. Ordinary keys cannot change staffing."""
         from ..live.hub import HubError
         from .store import NODE, ControlStore
         if name == NODE:
             raise click.ClickException("workspace is reserved for the human mailbox")
         try:
+            if action != "add" and (output is not None or staffing):
+                raise ValueError("--output and --staffing are supported only with add")
             if action == "add" and (output is None or output.exists()):
                 raise ValueError("add requires a new --output file")
-            hub = ControlStore(context.obj["control_directory"]).hub
+            store = ControlStore(context.obj["control_directory"])
             if action == "add":
-                private_output(output, hub.add_token(name))
-            elif not hub.revoke(name):
+                private_output(output, store.add_node(name, staffing=staffing))
+            elif action == "grant-staffing":
+                store.grant_staffing(name)
+            elif action == "revoke-staffing":
+                store.revoke_staffing(name)
+            elif not store.revoke_node(name):
                 raise ValueError("No active node credential has that name")
         except (OSError, ValueError, HubError) as error:
             raise click.ClickException(str(error)) from None
-        click.echo("Node credential written privately." if action == "add" else "Node credential revoked.")
+        click.echo({"add": "Node credential written privately.", "revoke": "Node credential revoked.",
+                    "grant-staffing": "Staffing authority granted to the current node credential.",
+                    "revoke-staffing": "Staffing authority revoked; node messaging remains enabled."}[action])
 
     @control.command("revoke-devices", epilog="\b\nExamples:\n  one-conv live control revoke-devices --yes")
     @click.option("--yes", is_flag=True, required=True, help="Invalidate every paired browser session.")

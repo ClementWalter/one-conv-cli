@@ -482,7 +482,8 @@
           <label class="full-field">First task<textarea id="staff-prompt" name="prompt" required maxlength="16000" rows="3" placeholder="What would you like them to work on?"></textarea></label>
         </div>
         <p id="staff-feedback" class="quiet-copy" role="status">Agents share a box when capacity is available, with a separate worktree each.</p>
-        <button id="staff-submit" class="primary-button" type="submit">Bring teammate online <span aria-hidden="true">↗</span></button>
+        <p id="staff-access-disclosure" class="quiet-copy" aria-live="polite">This teammate uses this profile’s repository access, credentials and approval settings.</p>
+        <button id="staff-submit" class="primary-button" type="submit" aria-describedby="staff-access-disclosure">Bring teammate online <span aria-hidden="true">↗</span></button>
       </form>
       <div id="worker-jobs" class="worker-jobs" aria-live="polite"></div>
     </dialog>

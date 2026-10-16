@@ -84,6 +84,14 @@ def test_phone_uses_the_production_profile_mapping(staffed_phone):
     assert staffed_phone[0].locator("#staff-profile").input_value() == "default"
 
 
+def test_default_profile_disclosure_is_linked_to_the_staffing_action(staffed_phone):
+    assert staffed_phone[0].locator("#staff-submit").get_attribute("aria-describedby") == "staff-access-disclosure"
+
+
+def test_actual_default_profile_explains_unattended_access(staffed_phone):
+    assert staffed_phone[0].locator("#staff-access-disclosure").inner_text() == "This teammate runs unattended with this profile’s repository access and credentials."
+
+
 def test_phone_staffing_is_durable_before_remote_completion(staffed_phone):
     assert len(staffed_phone[1].state.workers.manager.list()["jobs"]) == 1
 

@@ -2,12 +2,27 @@
 <html lang="en" data-theme="light">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#3a103e" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
     <title>OneConv — your team, in conversation</title>
     <link rel="stylesheet" href="/app.css" />
   </head>
   <body>
+    <section id="pairing" class="pairing-screen" aria-labelledby="pairing-title" hidden>
+      <div class="connection-card">
+        <span class="pair-brand" aria-hidden="true">✳</span>
+        <span class="eyebrow">YOUR TEAM, EVERYWHERE</span>
+        <h1 id="pairing-title">A seat at the table.<br />From wherever you are.</h1>
+        <p id="pairing-copy">Open a pairing link from your workspace to connect this device.</p>
+        <button id="pair-device" class="primary-button" type="button" hidden>Connect this device</button>
+        <p id="pairing-feedback" class="quiet-copy" role="status">Pairing links are private, expire, and work once.</p>
+      </div>
+    </section>
     <svg
       class="icon-library"
       xmlns="http://www.w3.org/2000/svg"
@@ -110,6 +125,9 @@
         <kbd>⌘ K</kbd>
       </form>
       <div class="topbar-end">
+        <button id="staff-team" class="staff-button" type="button" hidden><span aria-hidden="true">+</span> Teammate</button>
+        <button id="show-costs" class="icon-button" type="button" aria-label="Team costs" title="Team costs" hidden>$</button>
+        <button id="device-menu" class="icon-button" type="button" aria-label="Device settings" title="Device settings">⋯</button>
         <span id="connection" class="connection"
           ><span class="presence-dot"></span><span>Connecting</span></span
         ><span class="top-avatar" title="You · Human">Y</span>
@@ -450,6 +468,35 @@
           <span class="mini-human">Y</span> You’ll send this message as a human.
         </p>
       </form>
+    </dialog>
+    <dialog id="staff-dialog" class="message-dialog staff-dialog">
+      <form id="staff-form">
+        <div class="dialog-heading"><div><span class="eyebrow">BRING SOMEONE IN</span><h2>Good work is a team sport.</h2></div><button class="icon-button" type="button" data-close="staff-dialog" aria-label="Close add teammate">×</button></div>
+        <p class="dialog-description">Give your teammate a name and a place to start. We’ll get their workspace ready.</p>
+        <div class="field-grid">
+          <label>Name<input id="staff-name" name="name" required maxlength="32" pattern="[a-z0-9][a-z0-9-]*" placeholder="e.g. jack" autocomplete="off" /></label>
+          <label>Harness<select id="staff-harness" name="harness"><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="omp">Oh My Pi</option></select></label>
+          <label class="full-field">Model<input id="staff-model" name="model" maxlength="160" placeholder="Your configured default" autocomplete="off" /></label>
+          <label>Channel<input id="staff-topic" name="topic" required maxlength="32" pattern="[a-z0-9][a-z0-9-]*" placeholder="e.g. product" autocomplete="off" /></label>
+          <label>Workspace profile<select id="staff-profile" name="profile"><option value="default">Default</option></select></label>
+          <label class="full-field">First task<textarea id="staff-prompt" name="prompt" required maxlength="16000" rows="3" placeholder="What would you like them to work on?"></textarea></label>
+        </div>
+        <p id="staff-feedback" class="quiet-copy" role="status">Agents share a box when capacity is available, with a separate worktree each.</p>
+        <button id="staff-submit" class="primary-button" type="submit">Bring teammate online <span aria-hidden="true">↗</span></button>
+      </form>
+      <div id="worker-jobs" class="worker-jobs" aria-live="polite"></div>
+    </dialog>
+    <dialog id="costs-dialog" class="message-dialog costs-dialog">
+      <div class="dialog-heading"><div><span class="eyebrow">THE BUSINESS OF GOOD WORK</span><h2>Your team, accounted for.</h2></div><button class="icon-button" type="button" data-close="costs-dialog" aria-label="Close team costs">×</button></div>
+      <p class="dialog-description">Hourly rates include each teammate’s own subagents. Recorded spend and planning estimates stay separate.</p>
+      <div id="costs-content" class="costs-content" aria-live="polite"></div>
+    </dialog>
+    <dialog id="device-dialog" class="message-dialog device-dialog">
+      <div class="dialog-heading"><div><span class="eyebrow">YOUR WORKSPACE, YOUR DEVICE</span><h2>Take your team with you.</h2></div><button class="icon-button" type="button" data-close="device-dialog" aria-label="Close device settings">×</button></div>
+      <p class="dialog-description">On iPhone, open Safari’s Share menu and choose <strong>Add to Home Screen</strong>. OneConv opens as its own app.</p>
+      <button id="install-app" class="primary-button" type="button" hidden>Install OneConv</button>
+      <button id="logout-device" class="secondary-button" type="button" hidden>Disconnect this device</button>
+      <p class="quiet-copy">Disconnecting removes this device’s access. It doesn’t stop your teammates.</p>
     </dialog>
     <div id="toast" class="toast" role="status" hidden></div>
     <script src="/app.js"></script>

@@ -15,7 +15,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from . import router, team, web_send
+from . import pwa, router, team, web_send
 from .model import live_home
 
 # The viewer is a reader of its own: it never moves an agent's catch-up position.
@@ -88,7 +88,8 @@ def direct() -> dict:
 
 SECURITY_HEADERS = {
     "Content-Security-Policy": ("default-src 'none'; script-src 'self'; style-src 'self'; "
-                                "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"),
+                                "connect-src 'self'; img-src 'self' data:; manifest-src 'self'; "
+                                "worker-src 'self'; frame-ancestors 'none'; base-uri 'none'"),
     "X-Content-Type-Options": "nosniff",
     "Cache-Control": "no-store",
     "Referrer-Policy": "no-referrer",
@@ -165,6 +166,8 @@ def application(port: int):
                                 status_code=503, headers=SECURITY_HEADERS)
         return JSONResponse(result, status_code=status, headers=SECURITY_HEADERS)
 
+    assets = [Route(path, guarded(lambda request, body=body: body, media_type))
+              for path, (body, media_type) in pwa.ASSETS.items()]
     return Starlette(routes=[
         Route("/", guarded(lambda request: PAGE, "text/html; charset=utf-8")),
         Route("/app.js", guarded(lambda request: SCRIPT, "text/javascript; charset=utf-8")),
@@ -175,6 +178,7 @@ def application(port: int):
         Route("/api/session", guarded(lambda request: {"csrf_token": token,
               "human": {"address": "user", "name": "You", "kind": "human"}})),
         Route("/api/messages", message, methods=["POST"]),
+        *assets,
     ])
 
 

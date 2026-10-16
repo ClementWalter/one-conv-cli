@@ -3,11 +3,16 @@
 Read and search your AI conversations from one CLI. Pull cloud conversations
 into a local history, or read sessions already saved by your coding tools.
 
+Work with live teammates from a Slack-style workspace, including human messages
+and a paired iPhone app. See [the mobile workspace guide](MOBILE_WORKSPACE.md)
+for cloud hosting, shared worker boxes and team accounting.
+
 | Namespace | Sources |
 | --- | --- |
 | `cloud` | ChatGPT, Claude Chat, Codex cloud, Cowork cloud |
 | `local` | Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi, shared corpus files |
-| `hr` | Local agent rate cards and expected ask costs |
+| `live` | Agent messaging, topics, spawning, hub and mobile workspace |
+| `hr` | Shared or local rate cards, usage evidence and expected ask costs |
 
 Cloud conversations are addressed by ID or title. Local sessions are grouped
 by the project where the agent ran.

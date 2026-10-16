@@ -162,7 +162,7 @@ class RateStore:
             cards.append(card)
         return cards
 
-    def register(self, card, *, replace=False):
+    def register(self, card, *, replace=False, authorize=None):
         card = _validate_card(card)
         card.pop("updated_at", None)
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -172,6 +172,9 @@ class RateStore:
                 connection.execute("CREATE TABLE IF NOT EXISTS cards (cost_center_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")
                 rows = self._cards(connection)
                 current = next((row for row in rows if row["cost_center_id"] == card["cost_center_id"]), None)
+                if authorize is not None:
+                    # Ownership is checked under the write lock so concurrent creators cannot replace each other.
+                    authorize(current)
                 if current and {key: value for key, value in current.items() if key != "updated_at"} == card:
                     return current
                 if current and not replace:

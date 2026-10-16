@@ -17,6 +17,11 @@ const model = {
   drafts: new Map(),
   details: false,
   searchGeneration: 0,
+  authenticated: false,
+  capabilities: {},
+  workers: { jobs: [], pools: [], profiles: [] },
+  costs: null,
+  staffing: false,
 };
 const harnesses = {
   claude: "Claude",
@@ -25,6 +30,11 @@ const harnesses = {
   cursor: "Cursor",
   boat: "Boat",
 };
+const pairingFragment = new URLSearchParams(location.hash.slice(1));
+let pairingToken = pairingFragment.get("pair");
+// Invitation secrets never remain in navigation history or reach later requests.
+if (pairingFragment.has("pair")) history.replaceState(null, "", location.pathname + location.search);
+let installPrompt = null;
 let toastTimer;
 
 function el(tag, text, cls) {
@@ -82,7 +92,7 @@ function person(address) {
       ? name.slice(0, 2).toUpperCase()
       : { claude: "C", codex: "◈", omp: "π", cursor: "↗", boat: "B" }[kind] ||
         name.slice(0, 2).toUpperCase(),
-    status: session ? session.status : "offline",
+    status: session && session.online !== false ? session.status : "offline",
     session,
   };
 }
@@ -166,6 +176,7 @@ async function get(path) {
     cache: "no-store",
   });
   const result = await response.json();
+  if (response.status === 401) authentication(false);
   if (!response.ok || result.error)
     throw new Error(result.error || "The workspace could not be reached.");
   return result;
@@ -677,6 +688,7 @@ function select(kind, key = "", updateHash = true) {
   else refreshView();
 }
 async function refreshState() {
+  if (!model.authenticated) return;
   if (model.refreshing) return;
   model.refreshing = true;
   try {
@@ -746,12 +758,286 @@ function feedback(text, type = "") {
 async function session() {
   try {
     const data = await get("/api/session");
-    model.token = data.csrf_token;
+    model.token = data.csrf_token || null;
+    model.capabilities = data.capabilities || {};
+    authentication(data.authenticated !== false);
+    $("staff-team").hidden = !model.capabilities.workers;
+    $("show-costs").hidden = !model.capabilities.accounting;
+    $("logout-device").hidden = !data.authenticated;
     updateComposer();
+    return model.authenticated;
   } catch (error) {
     model.token = null;
+    authentication(false);
     feedback("Message sending is reconnecting. Your draft is safe.", "error");
+    return false;
   }
+}
+
+function authentication(accepted) {
+  model.authenticated = accepted;
+  document.body.classList.toggle("authentication-required", !accepted);
+  $("pairing").hidden = accepted;
+  if (!accepted) {
+    model.token = null;
+    for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
+  }
+}
+
+async function post(path, body, login = false) {
+  let response, data;
+  try {
+    response = await fetch(path, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(login ? {} : { "X-One-Conv-Token": model.token || "" }),
+      },
+      body: JSON.stringify(body),
+    });
+    data = await response.json();
+  } catch (_) {
+    throw new Error("The connection ended before a receipt arrived. Retry the same request to check its outcome.");
+  }
+  if (response.status === 401) authentication(false);
+  if (!response.ok) throw new Error(data.error || "The workspace could not complete that request.");
+  return data;
+}
+
+async function connectDevice() {
+  if (!pairingToken) return;
+  $("pair-device").disabled = true;
+  $("pairing-feedback").textContent = "Connecting your device…";
+  try {
+    await post("/api/login", { token: pairingToken }, true);
+    pairingToken = null;
+    if (await session()) await refreshState();
+  } catch (error) {
+    $("pairing-feedback").textContent = error.message;
+    $("pair-device").disabled = false;
+  }
+}
+
+async function disconnectDevice() {
+  try {
+    await post("/api/logout", {});
+    model.state = { topics: [], sessions: [], names: {} };
+    model.threads = [];
+    model.rows = [];
+    model.view = null;
+    model.drafts.clear();
+    model.pending.clear();
+    try { sessionStorage.removeItem("oneconv:staffing"); } catch (_) { /* Some browsers disable storage. */ }
+    model.costs = null;
+    model.workers = { jobs: [], pools: [], profiles: [] };
+    $("messages").replaceChildren();
+    $("costs-content").replaceChildren();
+    $("worker-jobs").replaceChildren();
+    $("message-input").value = "";
+    sidebar();
+    authentication(false);
+    $("pair-device").hidden = true;
+    $("pairing-feedback").textContent = "This device is disconnected. Open a new pairing link to return.";
+  } catch (error) { toast(error.message); }
+}
+
+const jobLabels = {
+  queued: "Getting started", provisioning: "Preparing workspace", bootstrapping: "Setting up tools",
+  starting: "Starting teammate", registering: "Joining the team", ready: "Online",
+  auth_needed: "Provider needs attention", authentication_required: "Provider needs attention", failed: "Needs attention",
+  unknown: "Checking what happened", unconfirmed: "Checking what happened", stopped: "Stopped",
+  unverified: "Connection not verified",
+};
+
+function renderJobs() {
+  const container = $("worker-jobs");
+  container.replaceChildren();
+  for (const job of (model.workers.jobs || []).slice(0, 12)) {
+    const item = el("article", null, "worker-job");
+    const spec = job.spec || job;
+    item.append(el("span", (spec.name || "A").slice(0, 2).toUpperCase(), "avatar codex"));
+    const text = el("div");
+    const online = job.status === "ready" && model.state.sessions.some(
+      (peer) => peer.address === job.address && peer.online !== false);
+    text.append(el("strong", spec.name || "Teammate"), el("small", job.status === "ready" && !online ?
+      "Offline · check the connection" : jobLabels[job.status] || job.status || "Preparing"));
+    if (job.error || job.detail) text.append(el("p", job.error || job.detail, "job-detail"));
+    if (["auth_needed", "authentication_required"].includes(job.status)) {
+      const help = el("p", "Check the provider’s login, model access or quota in ", "job-detail");
+      const link = el("a", "Boat’s agent settings");
+      link.href = "https://boat.dev/dashboard?tab=agents"; link.target = "_blank"; link.rel = "noopener noreferrer";
+      help.append(link, document.createTextNode(", then choose Check again. Your existing box is kept."));
+      text.append(help);
+    }
+    item.append(text);
+    if (online && job.address) {
+      const button = el("button", "Message", "secondary-button");
+      button.type = "button";
+      button.addEventListener("click", () => {
+        $("staff-dialog").close(); select("direct", pairOf(job.address));
+      });
+      item.append(button);
+    }
+    if (["ready", "unverified", "auth_needed", "failed"].includes(job.status)) {
+      const actions = el("div", null, "job-actions");
+      if (["auth_needed", "unverified", "failed"].includes(job.status) || (job.status === "ready" && !online)) {
+        const check = el("button", "Check again", "secondary-button");
+        check.type = "button";
+        check.addEventListener("click", () => workerAction("recheck", job.id));
+        actions.append(check);
+      }
+      const stop = el("button", "Stop teammate", "secondary-button");
+      stop.type = "button";
+      stop.addEventListener("click", () => workerAction("stop", job.id));
+      actions.append(stop);
+      item.append(actions);
+    }
+    container.append(item);
+  }
+  for (const pool of model.workers.pools || []) {
+    const item = el("article", null, "worker-job pool-job");
+    const detail = el("div");
+    detail.append(el("strong", pool.name || "Shared worker box"),
+      el("small", pool.status === "stopped" ? "Stopped · files preserved" : "Shared compute"));
+    const action = pool.status === "stopped" ? "resume_pool" : "stop_pool";
+    const button = el("button", action === "resume_pool" ? "Resume box" : "Stop box", "secondary-button");
+    button.type = "button";
+    button.addEventListener("click", () => workerAction(action, pool.id));
+    item.append(detail, button);
+    container.append(item);
+  }
+}
+
+async function workerAction(action, id) {
+  try {
+    await post("/api/providers/workers", { action, id });
+    await refreshWorkers();
+  } catch (error) { $("staff-feedback").textContent = error.message; }
+}
+
+async function refreshWorkers() {
+  if (!model.capabilities.workers || !model.authenticated) return;
+  try {
+    model.workers = await get("/api/providers/workers");
+    renderJobs();
+    const picker = $("staff-profile"), selected = picker.value;
+    picker.replaceChildren();
+    const profiles = Array.isArray(model.workers.profiles) ? model.workers.profiles :
+      Object.entries(model.workers.profiles || {}).map(([id, profile]) => ({ ...profile, id }));
+    for (const profile of profiles) {
+      const option = el("option", profile.label || profile.name || profile.id);
+      option.value = profile.id || profile.name;
+      picker.append(option);
+    }
+    if (!picker.children.length) {
+      const option = el("option", "Default"); option.value = "default"; picker.append(option);
+    }
+    if ([...picker.options].some((option) => option.value === selected)) picker.value = selected;
+  } catch (error) { $("staff-feedback").textContent = error.message; }
+}
+
+async function staffingIdentity(spec) {
+  const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(spec))))]
+    .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  let pending;
+  try { pending = JSON.parse(sessionStorage.getItem("oneconv:staffing")); } catch (_) { /* Storage can be unavailable. */ }
+  if (!pending || pending.digest !== digest) pending = { digest, id: crypto.randomUUID().replaceAll("-", "") };
+  try { sessionStorage.setItem("oneconv:staffing", JSON.stringify(pending)); } catch (_) { /* The server also rejects duplicate active names. */ }
+  return pending.id;
+}
+
+async function staffTeammate(event) {
+  event.preventDefault();
+  if (model.staffing || !model.token) return;
+  const spec = {
+    name: $("staff-name").value.trim(), harness: $("staff-harness").value,
+    model: $("staff-model").value.trim() || null, topic: $("staff-topic").value.trim().replace(/^#/, ""),
+    profile: $("staff-profile").value, prompt: $("staff-prompt").value.trim(),
+  };
+  model.staffing = true; $("staff-submit").disabled = true;
+  $("staff-feedback").textContent = "Your teammate’s workspace is being prepared…";
+  try {
+    const id = await staffingIdentity(spec);
+    const data = await post("/api/providers/workers", { action: "spawn", id, spec });
+    if (data.id !== id || typeof data.status !== "string") throw new Error("The request is not confirmed yet. Retry to check the same request.");
+    $("staff-feedback").textContent = "We’re on it. You can close this window; preparation continues in the cloud.";
+    await refreshWorkers();
+  } catch (error) { $("staff-feedback").textContent = error.message; }
+  finally { model.staffing = false; $("staff-submit").disabled = false; }
+}
+
+function money(value, currency = "USD") {
+  if (value === null || value === undefined || value === "") return "Not measured";
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "Not measured";
+  if (amount > 0 && amount < 0.00000001) return "< 0.00000001 " + currency;
+  try { return new Intl.NumberFormat(undefined, { style: "currency", currency, maximumFractionDigits: 8 }).format(amount); }
+  catch (_) { return String(value) + " " + currency; }
+}
+
+async function showCosts() {
+  $("costs-dialog").showModal();
+  const content = $("costs-content"); content.replaceChildren(el("p", "Gathering your team’s accounting…", "quiet-copy"));
+  try {
+    const data = await get("/api/providers/accounting"); model.costs = data; content.replaceChildren();
+    for (const card of data.cards || []) {
+      const item = el("article", null, "rate-card"), rate = card.hourly_rate || {};
+      item.append(el("h3", card.name || card.cost_center_id),
+        el("strong", money(rate.amount, rate.currency) + (rate.amount == null ? "" : " / hour"), "rate-amount"),
+        el("span", rate.basis || "Rate not measured", "rate-basis"),
+        el("p", rate.metering_basis || "Includes internal subagents", "quiet-copy"));
+      const form = el("form", null, "quote-form"), label = el("label", "Estimate an ask");
+      const input = document.createElement("input"); input.type = "number"; input.min = "0"; input.max = "525600";
+      input.step = "any"; input.value = "15"; input.setAttribute("aria-label", "Estimated minutes for " + (card.name || card.cost_center_id));
+      label.append(input, document.createTextNode(" minutes"));
+      const button = el("button", "Estimate", "secondary-button"); button.type = "submit";
+      const result = el("p", "Planning estimate; includes their subagents.", "quiet-copy");
+      form.append(label, button);
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault(); button.disabled = true;
+        try {
+          const quote = await post("/api/providers/accounting", { action: "quote", reference: card.cost_center_id, minutes: input.value });
+          result.textContent = money(quote.expected_cost.amount, quote.expected_cost.currency) + " · " + (quote.hourly_rate.basis || "estimated") + ", including subagents";
+        } catch (error) { result.textContent = error.message; }
+        finally { button.disabled = false; }
+      });
+      item.append(form, result); content.append(item);
+      const edit = el("button", "Set planning rate", "text-button"); edit.type = "button";
+      edit.addEventListener("click", () => {
+        edit.hidden = true;
+        const editor = el("form", null, "quote-form"), label = el("label", "All-in hourly rate");
+        const amount = document.createElement("input"); amount.type = "number"; amount.min = "0";
+        amount.step = "0.00000001"; amount.value = rate.amount == null ? "" : rate.amount;
+        amount.placeholder = "Unknown"; amount.setAttribute("aria-label", "Hourly rate for " + (card.name || card.cost_center_id));
+        label.append(amount, document.createTextNode(" " + (rate.currency || "USD") + " / hour"));
+        const save = el("button", "Save rate", "secondary-button"); save.type = "submit"; editor.append(label, save);
+        editor.addEventListener("submit", async (event) => {
+          event.preventDefault(); save.disabled = true;
+          try {
+            await post("/api/providers/accounting", { action: "register", replace: true, card: {
+              ...card, hourly_rate: { ...rate, amount: amount.value === "" ? null : amount.value,
+                basis: "allocated", provenance: "Human planning allocation in the workspace" },
+            }});
+            await showCosts();
+          } catch (error) { result.textContent = error.message; save.disabled = false; }
+        });
+        item.append(editor);
+      });
+      item.append(edit);
+    }
+    if (!(data.cards || []).length) content.append(el("p", "Your team’s hourly rates will appear here once they’re registered. Unmeasured costs stay unknown.", "cost-empty"));
+    const events = data.events || [];
+    content.append(el("h3", "Recorded usage", "details-section-label"));
+    if (!events.length) content.append(el("p", "No usage records yet. A subscription does not become a zero-dollar answer.", "quiet-copy"));
+    for (const record of events.slice(0, 30)) {
+      const item = el("article", null, "usage-row");
+      const cash = record.cash_cost || {}, allocated = record.allocated_cost || {};
+      item.append(el("strong", record.model || record.worker_id || "Agent"),
+        el("span", money(cash.amount, cash.currency || "USD") + " cash"),
+        el("small", allocated.amount == null ? "Allocation not measured" : money(allocated.amount, allocated.currency) + " allocated"));
+      content.append(item);
+    }
+  } catch (error) { content.replaceChildren(el("p", error.message, "quiet-copy")); }
 }
 async function send(event) {
   event.preventDefault();
@@ -1062,6 +1348,27 @@ document.querySelectorAll("[data-section]").forEach((button) =>
   }),
 );
 $("new-message").addEventListener("click", newMessage);
+$("pair-device").hidden = !pairingToken;
+$("pair-device").addEventListener("click", connectDevice);
+$("logout-device").addEventListener("click", disconnectDevice);
+$("device-menu").addEventListener("click", () => $("device-dialog").showModal());
+$("staff-team").addEventListener("click", () => {
+  $("staff-dialog").showModal();
+  if (model.view && model.view.kind === "topic") $("staff-topic").value = model.view.key;
+  refreshWorkers();
+});
+$("staff-form").addEventListener("submit", staffTeammate);
+$("show-costs").addEventListener("click", showCosts);
+for (const button of document.querySelectorAll("[data-close]")) {
+  button.addEventListener("click", () => $(button.dataset.close).close());
+}
+window.addEventListener("beforeinstallprompt", (event) => {
+  event.preventDefault(); installPrompt = event; $("install-app").hidden = false;
+});
+$("install-app").addEventListener("click", async () => {
+  if (!installPrompt) return;
+  await installPrompt.prompt(); installPrompt = null; $("install-app").hidden = true;
+});
 $("start-human-message").addEventListener("click", newMessage);
 $("dialog-close").addEventListener("click", () => $("message-dialog").close());
 $("recipient-form").addEventListener("submit", (event) =>
@@ -1154,9 +1461,12 @@ try {
 } catch (_) {
   theme("light");
 }
-session();
-refreshState();
+session().then((ready) => { if (ready) refreshState(); });
+if ("serviceWorker" in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register("/sw.js").catch(() => { /* Messaging also works without offline assets. */ });
+}
 setInterval(refreshState, 4000);
 setInterval(() => {
-  if (model.view && !model.refreshing) refreshView();
+  if (model.authenticated && model.view && !model.refreshing) refreshView();
 }, 3000);
+setInterval(() => { if ($("staff-dialog").open) refreshWorkers(); }, 4000);

@@ -87,6 +87,9 @@ def provider(loopback_hub):
             elif self.path == "/create":
                 remote["created"] += 1
                 remote["machine_state"] = "idle"
+                if remote.get("lose_create"):
+                    self.send_error(503, "creation acknowledgement is unconfirmed")
+                    return
                 response = {"id": f"bx_{remote['created']}"}
             elif self.path == "/info":
                 response = {"id": body["box"], "state": remote["machine_state"]}
@@ -203,6 +206,40 @@ def test_http_stop_failure_recovers_the_existing_hub_worker(runtime):
     manager.resume_pool(pool)
     manager.recheck("job-1")
     assert manager.run_once()["status"] == "ready"
+
+
+@pytest.fixture
+def lost_create_runtime(runtime):
+    manager, spec, remote = runtime
+    remote["lose_create"] = True
+    manager.submit(spec, "job-1")
+    manager.run_once()
+    restarted = WorkerManager(manager.directory, manager.config)
+    restarted.submit({**spec, "name": "builder"}, "job-2")
+    restarted.run_once()
+    return restarted, remote
+
+
+def test_http_lost_create_cannot_allocate_another_pool_for_a_sibling(lost_create_runtime):
+    _, remote = lost_create_runtime
+    assert remote["created"] == 1
+
+
+def test_http_blocked_recheck_does_not_repeat_provider_creation(lost_create_runtime):
+    manager, remote = lost_create_runtime
+    manager.recheck("job-2")
+    manager.run_once()
+    assert remote["created"] == 1
+
+
+def test_http_reconciliation_recovers_sibling_readiness_on_the_existing_box(lost_create_runtime):
+    manager, remote = lost_create_runtime
+    remote["lose_create"] = False
+    manager.reconcile("job-1", "bx_1")
+    manager.recheck("job-2")
+    manager.run_once()
+    job = manager.run_once()
+    assert (job["status"], job["box_id"], remote["created"]) == ("ready", "bx_1", 1)
 
 
 @pytest.fixture

@@ -51,6 +51,10 @@ class PreflightRefused(WorkerError):
     """A verified unsafe configuration prevented sandbox allocation."""
 
 
+class AllocationBlocked(WorkerError):
+    """A durable unknown creation must be reconciled before allocating more compute."""
+
+
 def machine_status(state):
     """Normalize Boat's documented API states and stopped CLI label."""
     if state in ("ready", "idle", "running"):
@@ -409,15 +413,27 @@ class WorkerManager:
             for pool in state["pools"].values():
                 occupied = sum(item.get("pool_id") == pool["id"] and item["status"] in ACTIVE
                                for item in state["jobs"].values())
-                if pool["profile"] == job["spec"]["profile"] and pool["status"] in ("available", "stopped") and occupied < pool["slots"]:
+                if (pool["profile"] == job["spec"]["profile"] and pool.get("box_id")
+                        and pool["status"] in ("available", "stopped") and occupied < pool["slots"]):
                     break
             else:
+                # Unknown outcomes reserve allocation intent across sibling names.
+                unresolved = next((pool for pool in state["pools"].values()
+                                   if pool["profile"] == job["spec"]["profile"] and not pool.get("box_id")
+                                   and pool["status"] != "retired"), None)
+                if unresolved is not None:
+                    state["jobs"][job["id"]].update(status="unconfirmed", phase="allocation-blocked",
+                                                    blocked_by_pool=unresolved["id"], updated=time.time(),
+                                                    error="reconcile the unresolved sandbox creation before rechecking")
+                    self._save(state)
+                    raise AllocationBlocked("another sandbox creation for this profile is unresolved")
                 ident = uuid.uuid4().hex
                 pool = {"id": ident, "node": f"worker-{ident[:16]}", "profile": job["spec"]["profile"],
                         "slots": profile["slots"], "type": profile["type"], "status": "allocated",
                         "box_id": None, "created": time.time(), "active_capacity": "unverified"}
                 state["pools"][ident] = pool
             state["jobs"][job["id"]].update(pool_id=pool["id"], box_id=pool["box_id"])
+            state["jobs"][job["id"]].pop("blocked_by_pool", None)
             self._save(state)
             return copy.deepcopy(pool)
 
@@ -560,6 +576,8 @@ class WorkerManager:
                 return None
             try:
                 self._provision(job)
+            except AllocationBlocked:
+                pass  # The reservation barrier persists a recoverable outcome before returning.
             except PreflightRefused:
                 current = self.status(job["id"])
                 self._update(job["id"], status="unconfirmed" if current.get("address") else "failed", phase="preflight",
@@ -584,7 +602,8 @@ class WorkerManager:
                        and job["phase"] in ("bootstrapping", "preflight", "inspecting", "resuming", "unconfirmed", "pool-unconfirmed"))
             restart = job["status"] == "stopped" and job["phase"] == "pool-stopped"
             ready = job["status"] == "ready" and job.get("box_id")
-            if job["status"] not in ("auth_needed", "unverified", "failed") and not recheck and not restart and not ready:
+            blocked = job["status"] == "unconfirmed" and job["phase"] == "allocation-blocked"
+            if job["status"] not in ("auth_needed", "unverified", "failed") and not recheck and not restart and not ready and not blocked:
                 raise ValueError("only known safe setup or a known-box readiness check can be retried")
             if restart or ready:
                 pool = state["pools"][job["pool_id"]]
@@ -598,20 +617,28 @@ class WorkerManager:
     recheck = retry
 
     def reconcile(self, id, box_id):
-        """Attach an explicitly inspected sandbox after a lost create acknowledgement."""
+        """Bind an explicitly inspected sandbox to an unresolved creation reservation."""
         if not isinstance(box_id, str) or not BOX.fullmatch(box_id):
             raise ValueError("invalid Boat sandbox id")
         self.boat.info(box_id)
         with self._locked():
             state = _read(self.state_path)
             job = state["jobs"][id]
-            if job["status"] != "unconfirmed" or job["phase"] != "creating" or not job.get("pool_id"):
+            blocked = job["phase"] == "allocation-blocked" and not job.get("pool_id") and not job.get("box_id")
+            pool_id = job.get("blocked_by_pool") if blocked else job.get("pool_id")
+            if job["status"] != "unconfirmed" or (job["phase"] != "creating" and not blocked) or pool_id not in state["pools"]:
                 raise ValueError("only an unconfirmed sandbox create can be reconciled")
-            if any(pool["box_id"] == box_id and pool["id"] != job["pool_id"] for pool in state["pools"].values()):
+            pool = state["pools"][pool_id]
+            if pool.get("box_id") or pool["status"] == "retired" or pool["profile"] != job["spec"]["profile"]:
+                raise ValueError("only an unresolved pool for the same profile can be reconciled")
+            if blocked and any(other.get("pool_id") == pool_id and other["status"] in ACTIVE | {"failed"}
+                               for other in state["jobs"].values()):
+                raise ValueError("reconcile the original allocation owner before rechecking this request")
+            if any(pool["box_id"] == box_id and pool["id"] != pool_id for pool in state["pools"].values()):
                 raise ValueError("sandbox already belongs to another pool")
-            pool = state["pools"][job["pool_id"]]
             pool.update(box_id=box_id, status="available")
-            job.update(box_id=box_id, status="queued", phase="reconciled", error=None, updated=time.time())
+            job.update(pool_id=pool_id, box_id=box_id, status="queued", phase="reconciled", error=None, updated=time.time())
+            job.pop("blocked_by_pool", None)
             self._save(state)
             return copy.deepcopy(job)
 
@@ -625,7 +652,7 @@ class WorkerManager:
             job = self.status(id)
             if job["status"] == "stopped":
                 return job
-            if job["status"] == "unconfirmed" and not job.get("box_id"):
+            if job["status"] == "unconfirmed" and not job.get("box_id") and job["phase"] != "allocation-blocked":
                 raise WorkerError("sandbox creation is unconfirmed; reconcile before stopping")
             if job.get("box_id"):
                 self._update(id, status="provisioning", phase="stopping")
@@ -635,8 +662,19 @@ class WorkerManager:
                         raise Unconfirmed("native worker stop was not confirmed")
                 except (OSError, ValueError, TypeError, KeyError, WorkerError):
                     return self._update(id, status="unconfirmed", error="worker stop is unconfirmed")
-            return self._update(id, status="stopped", phase="stopped", address=None, error=None,
-                                health={"registered": False, "bridge": False, "published": False, "joined": False, "collector": False})
+            with self._locked():
+                state = _read(self.state_path)
+                pool = state["pools"].get(job.get("pool_id"))
+                # Creating is flushed before Boat; earlier phases prove this reservation is unused.
+                if (pool is not None and not pool.get("box_id") and pool["status"] == "allocated"
+                        and job["status"] in ("queued", "failed") and job["phase"] in ("queued", "preflight")
+                        and not any(other["id"] != id and other.get("pool_id") == pool["id"] for other in state["jobs"].values())):
+                    pool.update(status="retired", retired_reason="cancelled-before-create")
+                state["jobs"][id].update(status="stopped", phase="stopped", address=None, error=None, updated=time.time(),
+                                         health={"registered": False, "bridge": False, "published": False,
+                                                 "joined": False, "collector": False})
+                self._save(state)
+                return copy.deepcopy(state["jobs"][id])
 
     def _pool_action(self, pool_id, resume):
         with (self.directory / ".runner.lock").open("a") as lock:

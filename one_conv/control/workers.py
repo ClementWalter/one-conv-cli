@@ -34,7 +34,7 @@ DEFAULT_PROFILE = {
     "environment": "base", "probe_enabled": True, "credential_refs": {},
     "boat_agent_credentials": False,
     "billing_scope": None, "revisions": {},
-    "harness_args": {"claude": ["--dangerously-skip-permissions"],
+    "harness_args": {"claude": ["--dangerously-skip-permissions", "--settings", '{"skipDangerousModePermissionPrompt":true}'],
                      "codex": ["--dangerously-bypass-approvals-and-sandbox"], "omp": ["--approval-mode=yolo"]},
 }
 
@@ -419,6 +419,7 @@ class WorkerManager:
                         if previous["id"] == job["id"]:
                             previous["restart"] = True
                             job["restart"] = True
+                            job["address"] = None
                         else:
                             previous.update(status="stopped", phase="pool-stopped")
             self._save(state)

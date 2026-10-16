@@ -325,6 +325,15 @@ def test_ready_worker_setup_failure_preserves_its_known_address(provisioned, boa
     assert provisioned.status("request-1")["address"] == "worker-node/claude:existing"
 
 
+def test_an_automatically_stopped_pool_cannot_restore_an_old_address(provisioned, boat):
+    provisioned._update("request-1", status="ready", address="worker-node/claude:existing")
+    boat.state = "stopped"
+    boat.health = {"status": "failed", "stage": "github-vault"}
+    provisioned.recheck("request-1")
+    provisioned.run_once()
+    assert provisioned.status("request-1")["address"] is None
+
+
 def test_failed_preflight_does_not_free_an_existing_native_name(provisioned, spec, boat):
     provisioned._update("request-1", status="ready", address="worker-node/claude:existing")
 

@@ -354,12 +354,10 @@ def test_before_deadline_protocol_faults_are_not_suppressed(unix_daemon, monkeyp
     def failed(connection):
         raise RuntimeError("genuine protocol fault")
 
-    with codex_rpc._connect(path, time.monotonic() + 2) as connection:
-        with monkeypatch.context() as changed:
-            changed.setattr(ClientConnection, "send_data", failed)
-            with connection.protocol_mutex:
-                with pytest.raises(RuntimeError, match="genuine protocol fault"):
-                    connection.send_data()
+    with codex_rpc._connect(path, time.monotonic() + 2) as connection, monkeypatch.context() as changed:
+        changed.setattr(ClientConnection, "send_data", failed)
+        with connection.protocol_mutex, pytest.raises(RuntimeError, match="genuine protocol fault"):
+            connection.send_data()
 
 
 @pytest.mark.parametrize("transport,pressure", [("raw", "requests"), ("presence", "requests"), ("presence", "control-frames")])

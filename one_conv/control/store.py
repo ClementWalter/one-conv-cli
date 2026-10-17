@@ -12,6 +12,7 @@ from pathlib import Path
 
 from ..live.hub import MESSAGE_ID, TOPIC, Hub, HubError, split_address
 from ..live.hub import NODE as PEER_NODE
+from .presence import message_activity, message_delivery, session_presence
 
 NODE = "workspace"
 HUMAN = "workspace/user"
@@ -176,9 +177,28 @@ class ControlStore:
     def state(self):
         self.refresh_human()
         directory = self.hub.directory()
-        return {"at": time.time(), "sessions": [
+        with self.hub._db() as db:
+            activity = self._activity(db)
+            seen = dict(db.execute("SELECT node, seen FROM nodes"))
+            contacts = db.execute(
+                "SELECT p.from_node,p.sender FROM posts p JOIN deliveries d ON d.post=p.seq "
+                "WHERE p.topic IS NULL AND d.to_node=? AND d.to_address='user' "
+                "UNION SELECT d.to_node,d.to_address FROM posts p JOIN deliveries d ON d.post=p.seq "
+                "WHERE p.topic IS NULL AND p.from_node=? AND p.sender='user'", (NODE, NODE)).fetchall()
+        published = {row["address"] for row in directory}
+        # Conversation identities survive disappearing publications without inventing an alias or live process.
+        for node, local in contacts:
+            address = f"{node}/{local}"
+            if address not in published and (":" in local or local == "user"):
+                directory.append({"address": address, "node": node, "local": local, "name": None, "title": "",
+                                  "cwd": "", "status": "", "seen": seen.get(node), "published_at": None,
+                                  "online": False, "history_only": True})
+                published.add(address)
+        now = time.time()
+        return {"at": now, "sessions": [
             {**row, "harness": row["local"].partition(":")[0],
-             "id": row["local"].partition(":")[2], "delivery": "hub"}
+             "id": row["local"].partition(":")[2], "delivery": "hub", "history_only": row.get("history_only", False),
+             "presence": session_presence(row, now), "activity": message_activity(activity.get(row["address"]))}
             for row in directory if row["address"] != HUMAN],
             "names": {row["name"]: display_address(row["address"]) for row in directory if row["name"]},
             "topics": [{**topic, "members": [display_address(member) for member in topic["members"]]}
@@ -186,17 +206,33 @@ class ControlStore:
             "bridge": {"node": NODE, "running": True, "mode": "cloud"}, "error": None}
 
     @staticmethod
-    def _row(seq, ident, node, sender, target, topic, reply, mode, text, created, outcome):
+    def _activity(db):
+        """Use the last persisted interaction per route without interpreting message contents as a task."""
+        rows = db.execute(
+            "WITH routes AS (SELECT from_node AS node,sender AS local,seq FROM posts UNION ALL "
+            "SELECT to_node,to_address,post FROM deliveries), "
+            "latest AS (SELECT node,local,MAX(seq) AS seq FROM routes GROUP BY node,local) "
+            "SELECT l.node,l.local,p.id,p.from_node,p.sender,p.target,p.topic,substr(p.text,1,241),p.created "
+            "FROM latest l JOIN posts p ON p.seq=l.seq").fetchall()
+        return {f"{node}/{local}": {"id": ident, "at": created, "topic": topic, "text": text,
+                                   "direction": "outgoing" if (node, local) == (sender_node, sender) else "incoming",
+                                   "peer": display_address(target if (node, local) == (sender_node, sender)
+                                                           else f"{sender_node}/{sender}")}
+                for node, local, ident, sender_node, sender, target, topic, text, created in rows}
+
+    @staticmethod
+    def _row(seq, ident, node, sender, target, topic, reply, mode, text, created, outcome, outcome_at=None):
         return {"cursor": str(seq), "id": ident, "from": display_address(f"{node}/{sender}"),
                 "to": display_address(target), "topic": topic, "reply": reply, "mode": mode,
-                "text": text, "at": created, "status": outcome or "stored"}
+                "text": text, "at": created, "status": outcome or "stored",
+                "delivery": message_delivery(outcome, outcome_at, human_inbox=target == HUMAN)}
 
     def direct(self):
         self.drain_human()
         with self.hub._db() as db:
             rows = db.execute(
                 "SELECT p.seq,p.id,p.from_node,p.sender,d.to_node || '/' || d.to_address,p.topic,p.reply,p.mode,"
-                "p.text,p.created,d.outcome FROM posts p JOIN deliveries d ON d.post=p.seq "
+                "p.text,p.created,d.outcome,d.outcome_at FROM posts p JOIN deliveries d ON d.post=p.seq "
                 "WHERE p.topic IS NULL ORDER BY p.seq DESC LIMIT ?", (MESSAGES_SHOWN,)).fetchall()
         threads = defaultdict(list)
         for values in reversed(rows):
@@ -222,7 +258,8 @@ class ControlStore:
         payload = validate_message(payload)
         receipt = self.hub.send(NODE, {"id": payload["id"], "from": "user", "to": payload["target"],
                                        "text": payload["text"], "reply": "expected", "mode": "push"},
-                                join_sender=payload["target"].startswith("#"))
+                                join_sender=payload["target"].startswith("#"),
+                                require_online=not payload["target"].startswith("#"))
         recipients = receipt["recipients"]
         unconfirmed = any(row["status"] in ("refused", "unconfirmed") for row in recipients)
         return {"id": payload["id"], "status": "unconfirmed" if unconfirmed else "sent", "receipt": {

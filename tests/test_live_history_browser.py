@@ -4,6 +4,7 @@ import time
 
 import pytest
 
+from one_conv.control.auth import AuthStore
 from tests import test_control_browser as phone_tests
 from tests import test_control_messages as https_tests
 from tests import test_pwa_browser as browser_tests
@@ -50,3 +51,41 @@ def test_the_reported_dm_appears_under_direct_messages(reported):
 
 def test_the_grouped_second_dm_says_it_is_synced_history(reported):
     assert reported.locator(".message-synced").nth(1).is_visible()
+
+
+@pytest.fixture(params=[320, 390])
+def long_recipient(browser, real_http_workspace, request):
+    """A tagged DM to an agent with the longest allowed name, on a narrow phone."""
+    workspace = real_http_workspace
+    workspace["worker"].put("/v1/sessions", json={"sessions": [
+        {"address": "omp:agent", "name": "builder", "status": "idle"},
+        {"address": "codex:alpha", "name": "m" * 32, "status": "idle"}]}).raise_for_status()
+    workspace["worker"].post("/v1/history", json={"messages": [
+        {"id": "3" * 32, "from": "omp:agent", "to": "codex:alpha", "topic": "release", "text": "Rerun the suite.",
+         "at": time.time() - 60, "outcome": "accepted"}]}).raise_for_status()
+    context = browser.new_context(viewport={"width": request.param, "height": 740}, is_mobile=True, has_touch=True,
+                                  ignore_https_errors=True)
+    page = context.new_page()
+    token = AuthStore(workspace["directory"]).issue_pairing_token()
+    page.goto(workspace["origin"] + "/#pair=" + token, wait_until="networkidle")
+    page.get_by_role("button", name="Connect this device", exact=True).click()
+    page.locator("#pairing").wait_for(state="hidden")
+    page.goto(workspace["origin"] + "/#topic=release", wait_until="networkidle")
+    page.reload(wait_until="networkidle")
+    page.locator(".message-directed").wait_for()
+    yield page
+    context.close()
+
+
+def test_a_long_recipient_does_not_widen_the_message_list(long_recipient):
+    assert long_recipient.locator("#message-scroll").evaluate("node => node.scrollWidth <= node.clientWidth")
+
+
+def test_a_long_recipient_marker_stays_inside_the_list(long_recipient):
+    assert long_recipient.locator(".message-directed").evaluate(
+        "node => node.getBoundingClientRect().right <= "
+        "document.getElementById('message-scroll').getBoundingClientRect().right")
+
+
+def test_a_long_recipient_marker_shows_the_full_name(long_recipient):
+    assert long_recipient.locator(".message-directed").inner_text() == "To @" + "m" * 32 + " only"

@@ -77,29 +77,25 @@ def _ack(store, address, outcome):
     store.hub.ack("worker", delivery, outcome)
 
 
-def _delivery(store, topic="release"):
-    return store.topic(topic)["messages"][-1]["delivery"]
-
-
 def test_unacknowledged_channel_post_awaits_delivery(store):
-    assert _delivery(store)["state"] == "stored"
+    assert store.topic("release")["messages"][-1]["delivery"]["state"] == "stored"
 
 
 def test_one_acceptance_shows_partial_delivery(store):
     _ack(store, "omp:agent", "accepted")
-    assert _delivery(store)["label"] == "Accepted by 1 of 2"
+    assert store.topic("release")["messages"][-1]["delivery"]["label"] == "Accepted by 1 of 2"
 
 
 def test_every_acceptance_shows_full_delivery(store):
     _ack(store, "omp:agent", "accepted")
     _ack(store, "codex:other", "accepted")
-    assert _delivery(store)["state"] == "accepted"
+    assert store.topic("release")["messages"][-1]["delivery"]["state"] == "accepted"
 
 
 def test_a_refusal_is_not_hidden_by_an_acceptance(store):
     _ack(store, "omp:agent", "accepted")
     _ack(store, "codex:other", "refused")
-    assert _delivery(store)["counts"]["refused"] == 1
+    assert store.topic("release")["messages"][-1]["delivery"]["counts"]["refused"] == 1
 
 
 def test_row_status_matches_the_rollup(store):
@@ -108,18 +104,18 @@ def test_row_status_matches_the_rollup(store):
 
 
 def test_recipients_use_browser_routes(store):
-    assert [row["to"] for row in _delivery(store)["recipients"]] == ["worker/omp:agent", "worker/codex:other"]
+    assert [row["to"] for row in store.topic("release")["messages"][-1]["delivery"]["recipients"]] == ["worker/omp:agent", "worker/codex:other"]
 
 
 def test_post_with_no_other_member_says_so(store):
     store.send({"id": "b" * 32, "target": "#solo", "text": "Notes to self."})
-    assert _delivery(store, "solo")["state"] == "no_recipients"
+    assert store.topic("solo")["messages"][-1]["delivery"]["state"] == "no_recipients"
 
 
 def test_other_topics_deliveries_are_not_counted(store):
     store.hub.join("worker", "other", "omp:agent")
     store.send({"id": "c" * 32, "target": "#other", "text": "Elsewhere."})
-    assert _delivery(store)["total"] == 2
+    assert store.topic("release")["messages"][-1]["delivery"]["total"] == 2
 
 
 def test_older_posts_reflect_acceptance_recorded_before_the_fix(store):

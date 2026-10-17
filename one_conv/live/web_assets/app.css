@@ -649,9 +649,26 @@ button {
   margin-left: auto;
   flex: none;
 }
-.row-presence.online {
+.row-presence.online,
+.row-presence.idle {
   background: #4b9f78;
 }
+.row-presence.busy { background: #7a87ca; }
+.row-presence.unverified { background: #b78538; }
+#offline-people .conversation-row { padding-top: 7px; padding-bottom: 7px; }
+.agent-state { font-size: 10px; }
+.conversation-response { padding: 9px 24px; color: var(--muted); background: var(--hover); font-size: 11px; line-height: 1.5; }
+.message-delivery { display: block; margin-top: 6px; color: var(--muted); font-size: 10px; }
+.member-row > div { min-width: 0; }
+.member-row small { overflow-wrap: anywhere; line-height: 1.5; }
+.member-row .member-presence { color: var(--text); }
+.member-row .member-activity { margin-top: 9px; }
+.device-connect { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--border); }
+.device-connect h3 { margin: 0 0 8px; font-size: 15px; }
+.device-connect label { display: block; margin: 16px 0 7px; font-size: 12px; }
+#device-invitation-url { width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); font-size: 12px; }
+.invitation-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.device-dialog .invitation-actions .secondary-button { margin-top: 0; }
 .sidebar-empty {
   font-size: 11px;
   color: var(--sidebar-muted);

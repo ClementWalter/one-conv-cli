@@ -53,7 +53,9 @@ CREATE TABLE IF NOT EXISTS deliveries (delivery TEXT PRIMARY KEY, post INTEGER N
     to_node TEXT NOT NULL, to_address TEXT NOT NULL, taken REAL, outcome TEXT, outcome_at REAL,
     UNIQUE (post, to_node, to_address));
 CREATE INDEX IF NOT EXISTS pending ON deliveries (to_node, outcome, post);
+CREATE TABLE IF NOT EXISTS welcomed (node TEXT NOT NULL, address TEXT NOT NULL, PRIMARY KEY (node, address));
 """
+GENERAL = "general"
 
 
 class HubError(Exception):
@@ -84,8 +86,10 @@ def split_address(address: str) -> tuple[str, str]:
 class Hub:
     """The hub's state in one SQLite file, safe for the server's threads."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, general: str | None = None):
         self.path, self.lock = path, threading.Lock()
+        # A channel every session joins the first time it is published; leaving it afterwards sticks.
+        self.general = general
         with self._db() as db:
             db.executescript(SCHEMA)
 
@@ -112,6 +116,7 @@ class Hub:
             removed = db.execute("DELETE FROM tokens WHERE node = ?", (node,)).rowcount
             db.execute("DELETE FROM sessions WHERE node = ?", (node,))
             db.execute("DELETE FROM members WHERE node = ?", (node,))
+            db.execute("DELETE FROM welcomed WHERE node = ?", (node,))
             db.execute("DELETE FROM nodes WHERE node = ?", (node,))
         return bool(removed)
 
@@ -163,6 +168,9 @@ class Hub:
                     raise HubError(409, f"@{name} is already used on another node")
             db.execute("DELETE FROM sessions WHERE node = ?", (node,))
             db.executemany("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+            for row in rows if self.general else ():
+                if db.execute("INSERT OR IGNORE INTO welcomed VALUES (?, ?)", row[:2]).rowcount:
+                    db.execute("INSERT OR IGNORE INTO members VALUES (?, ?, ?, ?)", (self.general, *row[:2], row[-1]))
             self._seen(db, node)
         return len(rows)
 

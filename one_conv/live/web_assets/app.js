@@ -853,6 +853,7 @@ async function session() {
     model.capabilities = data.capabilities || {};
     authentication(data.authenticated !== false);
     $("staff-team").hidden = !model.capabilities.workers;
+    $("new-channel").hidden = !model.capabilities.channels;
     $("show-costs").hidden = !model.capabilities.accounting;
     $("logout-device").hidden = !data.authenticated;
     $("generate-invitation").hidden = !model.capabilities.pairing;
@@ -1178,6 +1179,50 @@ async function staffTeammate(event) {
     await refreshWorkers();
   } catch (error) { $("staff-feedback").textContent = error.message; }
   finally { model.staffing = false; $("staff-submit").disabled = false; }
+}
+
+function openChannelDialog() {
+  const list = $("channel-members");
+  list.replaceChildren();
+  const online = model.state.sessions.filter(
+    (s) => !s.history_only && (!s.presence || s.presence.state !== "offline"),
+  );
+  for (const s of online) {
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = s.address;
+    const p = person(s.address);
+    const label = el("label");
+    label.append(box, el("span", p.name + " · " + (s.title || s.cwd || s.address)));
+    list.appendChild(label);
+  }
+  if (!online.length) list.appendChild(el("p", "No agent is connected; you can still create the channel and invite them later.", "quiet-copy"));
+  $("channel-feedback").textContent = "";
+  $("channel-dialog").showModal();
+  $("channel-name").focus();
+}
+
+async function createChannel(event) {
+  event.preventDefault();
+  if (model.creatingChannel || !model.token) return;
+  const spec = {
+    topic: $("channel-name").value.trim().replace(/^#/, "").toLowerCase(),
+    purpose: $("channel-purpose").value.trim(),
+    members: [...$("channel-members").querySelectorAll("input:checked")].map((box) => box.value),
+  };
+  model.creatingChannel = true; $("channel-submit").disabled = true;
+  $("channel-feedback").textContent = "Creating #" + spec.topic + "…";
+  try {
+    // The same form contents keep the same request ID, so a retry finishes the same channel.
+    const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(spec))))]
+      .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    const data = await post("/api/channels", { id: digest.slice(0, 32), ...spec });
+    $("channel-dialog").close();
+    $("channel-form").reset();
+    await refreshState();
+    select("topic", data.topic);
+  } catch (error) { $("channel-feedback").textContent = error.message; }
+  finally { model.creatingChannel = false; $("channel-submit").disabled = false; }
 }
 
 function money(value, currency = "USD") {
@@ -1598,6 +1643,8 @@ $("staff-team").addEventListener("click", () => {
   refreshWorkers();
 });
 $("staff-form").addEventListener("submit", staffTeammate);
+$("new-channel").addEventListener("click", openChannelDialog);
+$("channel-form").addEventListener("submit", createChannel);
 $("staff-profile").addEventListener("change", renderStaffingDisclosure);
 $("staff-harness").addEventListener("change", renderStaffingDisclosure);
 $("show-costs").addEventListener("click", showCosts);

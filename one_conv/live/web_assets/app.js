@@ -19,8 +19,6 @@ const model = {
   changeLoop: null,
   feedAbort: null,
   viewSequence: 0,
-  // The send whose text the app put back in a composer, until someone edits it.
-  restored: null,
   signature: "",
   first: true,
   refreshing: null,
@@ -596,11 +594,11 @@ function withOutbox(rows) {
       model.outbox.delete(row.id);
       model.pending.delete(entry.draftKey);
       // A draft restored only because the answer was lost is now known to be stored: nothing is left to resend.
-      // Only a draft the app restored, and nobody has edited since, is cleared.
-      if (model.restored === entry) {
+      // Only a draft the app restored for this send, and nobody has edited since, is cleared.
+      if (entry.restored) {
         if (entry.target === target() && $("message-input").value === entry.text) $("message-input").value = "";
-        else if (model.drafts.get(entry.target) === entry.text) model.drafts.delete(entry.target);
-        model.restored = null;
+        else if (entry.target !== target() && model.drafts.get(entry.target) === entry.text)
+          model.drafts.delete(entry.target);
       }
     }
   }
@@ -1496,10 +1494,10 @@ async function transmit(entry) {
   // The text returns to an empty composer only; a newer draft is never replaced.
   if (here() && !$("message-input").value) {
     $("message-input").value = entry.text;
-    model.restored = entry;
+    entry.restored = true;
   } else if (!here() && !model.drafts.get(entry.target)) {
     model.drafts.set(entry.target, entry.text);
-    model.restored = entry;
+    entry.restored = true;
   }
   if (here()) {
     renderRows(model.serverRows || [], true);
@@ -1742,7 +1740,11 @@ function theme(value) {
 }
 
 $("composer").addEventListener("submit", send);
-$("message-input").addEventListener("input", () => { model.restored = null; });
+$("message-input").addEventListener("input", () => {
+  // Editing a conversation's composer makes its draft the person's own, for that conversation only.
+  const destination = target();
+  for (const entry of model.outbox.values()) if (entry.target === destination) entry.restored = false;
+});
 $("message-input").addEventListener("input", () => {
   const input = $("message-input");
   input.style.height = "auto";

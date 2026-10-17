@@ -477,3 +477,46 @@ def repaired_behind_a_slow_refresh(phone):
 
 def test_a_new_session_does_not_wait_behind_the_old_sessions_refresh(repaired_behind_a_slow_refresh):
     assert repaired_behind_a_slow_refresh.evaluate("model.state.topics.length") >= 1
+
+
+LOSE_ANSWERS = """() => {
+  const original = window.fetch;
+  window.fetch = async (url, options) => {
+    const response = await original(url, options);
+    if (String(url).includes('/api/messages')) throw new TypeError('connection lost after commit');
+    return response;
+  };
+}"""
+
+
+@pytest.fixture
+def two_lost_sends(phone):
+    """Lost answers in #alpha then #beta; returning to #alpha once its stored copy is visible."""
+    page, _ = phone
+    page.evaluate(LOSE_ANSWERS)
+    # Each chat is left the moment its send turns uncertain, before a refresh can show the stored copy.
+    for topic, text, leave in (("alpha", "Alpha task.", "beta"), ("beta", "Beta task.", "alpha")):
+        page.evaluate(f"location.hash = 'topic={topic}'")
+        page.locator("#composer:not([hidden]) #message-input").wait_for()
+        page.evaluate("""([text, leave]) => new Promise((resolve) => {
+          const observer = new MutationObserver(() => {
+            if ([...document.querySelectorAll('#messages li')].some((li) =>
+                li.textContent.includes(text) && li.textContent.includes('Not confirmed'))) {
+              observer.disconnect();
+              location.hash = 'topic=' + leave;
+              resolve();
+            }
+          });
+          observer.observe(document.getElementById('messages'), { childList: true, subtree: true });
+          const input = document.getElementById('message-input');
+          input.value = text;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          document.getElementById('composer').requestSubmit();
+        })""", [text, leave])
+    page.locator(".message-body").filter(has_text="Alpha task.").first.wait_for()
+    page.wait_for_timeout(1500)
+    return page
+
+
+def test_a_restored_draft_is_cleared_in_its_own_chat_after_another_chat_lost_an_answer(two_lost_sends):
+    assert two_lost_sends.locator("#message-input").input_value() == ""

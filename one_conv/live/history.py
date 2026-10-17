@@ -111,9 +111,12 @@ def report(client) -> dict:
     counts = {"recorded": 0, "duplicate": 0, "conflict": 0, "refused": 0}
     sent = {row["id"] for row in batch}
     answered = []
-    for result in answer.get("results", []) if isinstance(answer, dict) else []:
-        if not isinstance(result, dict) or result.get("id") not in sent or result.get("status") not in counts:
-            continue  # An answer this batch did not ask about settles nothing.
+    results = answer.get("results") if isinstance(answer, dict) else None
+    for result in results if isinstance(results, list) else []:
+        # Only a well-formed answer about an id in this batch settles it; anything else leaves ids pending.
+        if not (isinstance(result, dict) and isinstance(result.get("id"), str) and isinstance(result.get("status"), str)
+                and result["id"] in sent and result["status"] in counts):
+            continue
         counts[result["status"]] += 1
         answered.append(result["id"])
         if result["status"] in ("conflict", "refused"):

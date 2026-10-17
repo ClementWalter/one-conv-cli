@@ -324,6 +324,17 @@ def test_an_unreachable_history_route_does_not_stop_deliveries(home, served, row
     assert [r["id"] for r in history.pending()] == ["a" * 32]
 
 
+@pytest.mark.parametrize("answer", [
+    {"results": None}, {"results": [{"id": [], "status": "recorded"}]},
+    {"results": [{"id": "a" * 32, "status": []}]},
+])
+def test_a_malformed_answer_leaves_the_row_pending(home, served, row, monkeypatch, answer):
+    _log(home, row)
+    monkeypatch.setattr(served[1].client, "request", lambda method, path, body=None: answer)
+    served[1].report_history()
+    assert [r["id"] for r in history.pending()] == ["a" * 32]
+
+
 def test_a_hub_without_the_history_route_does_not_stop_the_bridge(home, served, row, monkeypatch):
     _log(home, row)
 

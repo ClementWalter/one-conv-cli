@@ -195,6 +195,6 @@ def threads(home):
         try:
             with _connect(path, deadline) as connection:
                 return _read(connection, deadline)
-        except (OSError, ValueError, TypeError, RecursionError, WebSocketException, ReadUnavailable, TimeoutError):
+        except (ImportError, OSError, ValueError, TypeError, RecursionError, WebSocketException, ReadUnavailable, TimeoutError):
             continue
     return {}

@@ -103,6 +103,19 @@ def test_optional_websocket_dependency_does_not_break_minimal_install(home, monk
     assert codex_rpc.threads(home) == {}
 
 
+def test_partial_websocket_installation_preserves_loaded_fallback(home, monkeypatch):
+    original = builtins.__import__
+
+    def optional(name, *args, **kwargs):
+        if name == "websockets.sync.client":
+            raise ImportError("optional sync WebSocket client absent")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", optional)
+    monkeypatch.setattr(codex_rpc, "_sockets", lambda *args: ["synthetic-socket-never-connected"])
+    assert codex_rpc.threads(home) == {}
+
+
 def test_pid_fifo_is_rejected_without_blocking(pid_file):
     pid_file.unlink()
     os.mkfifo(pid_file, 0o600)

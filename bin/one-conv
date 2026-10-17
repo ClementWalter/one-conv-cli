@@ -6,6 +6,7 @@
 #     "curl_cffi==0.13.0",
 #     "pycryptodome==3.23.0",
 #     "mcp==2.2.0",
+#     "websockets==17.2",
 # ]
 # ///
 """Read your own local Claude Code / Codex CLI / Cursor / Oh My Pi conversation history.

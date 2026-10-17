@@ -6,15 +6,15 @@ one, and stores the message for the next resume when no process has the thread l
 
 import json
 import os
-import re
 import subprocess
 import time
 from pathlib import Path
 
+from . import codex_rpc
 from .model import LiveSession, live_home
 
 # The locks directory also holds bookkeeping files such as `.coordination.lock`.
-THREAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+THREAD_ID = codex_rpc.THREAD_ID
 
 
 def codex_home() -> Path:
@@ -81,16 +81,24 @@ def ended(thread_id: str, stopped: dict | None = None) -> bool:
 
 def list_sessions() -> list[LiveSession]:
     names, stopped = _names(), stopped_threads()
-    sessions = []
+    sessions = {}
     for lock in sorted((codex_home() / "thread-writer-locks").glob("*.lock")):
         if not THREAD_ID.fullmatch(lock.stem):
             continue
         # A lock not touched since its thread was stopped is the app-server's leftover, not a live session.
         if ended(lock.stem, stopped):
             continue
-        sessions.append(LiveSession("codex", lock.stem, _cwd(lock.stem), names.get(lock.stem, ""), "loaded",
-                                    None, "codex queue"))
-    return sessions
+        sessions[lock.stem] = LiveSession("codex", lock.stem, _cwd(lock.stem), names.get(lock.stem, ""), "loaded",
+                                        None, "codex queue")
+    # A daemon summary proves runtime activity; unrelated standalone locks remain unverified fallbacks.
+    for ident, metadata in codex_rpc.threads(codex_home()).items():
+        if ended(ident, stopped):
+            continue
+        previous = sessions.get(ident)
+        sessions[ident] = LiveSession("codex", ident, metadata["cwd"] or (previous.cwd if previous else _cwd(ident)),
+                                     (previous.title if previous else names.get(ident, "")) or metadata["title"],
+                                     metadata["status"], None, "codex queue")
+    return [sessions[ident] for ident in sorted(sessions)]
 
 
 def stored_session(thread_id: str) -> LiveSession | None:
@@ -106,4 +114,4 @@ def deliver(session: LiveSession, text: str) -> str:
                             check=False, capture_output=True, text=True, timeout=60)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or f"codex queue exited {result.returncode}")
-    return "delivered" if session.status == "loaded" else "queued until the thread is resumed"
+    return "delivered" if session.status in ("loaded", "idle", "busy") else "queued until the thread is resumed"

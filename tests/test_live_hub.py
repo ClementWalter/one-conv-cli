@@ -15,7 +15,7 @@ import pytest
 uvicorn = pytest.importorskip("uvicorn")
 pytest.importorskip("starlette")
 
-from one_conv.live.hub import MAX_BODY, Hub, application
+from one_conv.live.hub import MAX_BODY, Hub, HubError, application
 
 
 def serve(app):
@@ -115,6 +115,63 @@ def test_a_node_that_stopped_renewing_is_listed_offline(two_nodes):
         db.execute("UPDATE nodes SET seen = 0 WHERE node = 'box'")
     rows = call(url, "/v1/sessions", mac)[1]["sessions"]
     assert {s["node"]: s["online"] for s in rows} == {"box": False, "mac": True}
+
+
+def test_inbox_polling_cannot_keep_an_old_session_publication_online(two_nodes):
+    state, url, mac, box = two_nodes
+    with sqlite3.connect(state.path) as db:
+        db.execute("UPDATE sessions SET updated = 0 WHERE node = 'box'")
+    call(url, "/v1/inbox?wait=0", box)
+    rows = call(url, "/v1/sessions", mac)[1]["sessions"]
+    assert next(row for row in rows if row["node"] == "box")["online"] is False
+
+
+def test_directory_keeps_session_publication_time_separate_from_bridge_polling(two_nodes):
+    state, url, mac, box = two_nodes
+    with sqlite3.connect(state.path) as db:
+        db.execute("UPDATE sessions SET updated = 123 WHERE node = 'box'")
+    call(url, "/v1/inbox?wait=0", box)
+    rows = call(url, "/v1/sessions", mac)[1]["sessions"]
+    assert next(row for row in rows if row["node"] == "box")["published_at"] == 123
+
+
+@pytest.fixture(params=["nodes", "sessions"])
+def stale_recipient(two_nodes, request):
+    state, *_ = two_nodes
+    column = "seen" if request.param == "nodes" else "updated"
+    with sqlite3.connect(state.path) as db:
+        db.execute(f"UPDATE {request.param} SET {column} = 0 WHERE node = 'box'")
+    return two_nodes
+
+
+def test_human_online_gate_refuses_a_stale_recipient(stale_recipient):
+    state, *_ = stale_recipient
+    with pytest.raises(HubError, match="Recipient is offline"):
+        state.send("mac", message("box/claude:bbb"), require_online=True)
+
+
+def test_machine_queueing_remains_available_for_a_stale_recipient(stale_recipient):
+    state, *_ = stale_recipient
+    assert len(state.send("mac", message("box/claude:bbb"))["recipients"]) == 1
+
+
+def test_online_gate_keeps_the_original_receipt_after_the_recipient_disconnects(two_nodes):
+    state, *_ = two_nodes
+    sent = message("box/claude:bbb")
+    state.send("mac", sent, require_online=True)
+    with sqlite3.connect(state.path) as db:
+        db.execute("UPDATE sessions SET updated = 0 WHERE node = 'box'")
+    assert state.send("mac", sent, require_online=True)["duplicate"] is True
+
+
+def test_online_gate_does_not_accept_a_changed_retry_after_disconnect(two_nodes):
+    state, *_ = two_nodes
+    sent = message("box/claude:bbb")
+    state.send("mac", sent, require_online=True)
+    with sqlite3.connect(state.path) as db:
+        db.execute("UPDATE sessions SET updated = 0 WHERE node = 'box'")
+    with pytest.raises(HubError, match="different message"):
+        state.send("mac", {**sent, "text": "Different request"}, require_online=True)
 
 
 def test_a_name_used_on_another_node_is_refused(two_nodes):

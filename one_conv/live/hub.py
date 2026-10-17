@@ -116,6 +116,7 @@ class Hub:
             removed = db.execute("DELETE FROM tokens WHERE node = ?", (node,)).rowcount
             db.execute("DELETE FROM sessions WHERE node = ?", (node,))
             db.execute("DELETE FROM members WHERE node = ?", (node,))
+            db.execute("DELETE FROM welcomed WHERE node = ?", (node,))
             db.execute("DELETE FROM nodes WHERE node = ?", (node,))
         return bool(removed)
 

@@ -1,9 +1,13 @@
 """#general membership and channels the workspace owner creates from the phone."""
 
+import time
+
 import pytest
 
 from one_conv.control.store import ControlStore
-from one_conv.live.hub import Hub, HubError
+from one_conv.live.hub import LEASE_SECONDS, Hub, HubError
+
+real_time = time.time
 
 
 @pytest.fixture
@@ -112,6 +116,12 @@ def test_a_disconnected_agent_cannot_be_added(store, channel):
         store.create_channel({**channel, "members": ["worker/omp:gone"]})
 
 
+def test_an_agent_with_a_stale_lease_cannot_be_added(store, channel, monkeypatch):
+    monkeypatch.setattr(time, "time", lambda: real_time() + LEASE_SECONDS + 1)
+    with pytest.raises(HubError, match="not connected"):
+        store.create_channel(channel)
+
+
 def test_a_refused_member_leaves_no_channel_behind(store, channel):
     with pytest.raises(HubError):
         store.create_channel({**channel, "members": ["worker/omp:gone"]})
@@ -135,3 +145,70 @@ def test_invalid_channel_requests_are_refused(store, channel, change):
 def test_extra_fields_are_refused(store, channel):
     with pytest.raises(HubError, match="only id, topic, purpose and members"):
         store.create_channel({**channel, "from": "worker/omp:agent"})
+
+
+# --- retries -------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def interrupted(store, channel, monkeypatch):
+    """The process dies after the members commit and before the kickoff is posted."""
+    send = store.hub.send
+
+    def crash(*args, **kwargs):
+        raise OSError("crashed before the kickoff")
+
+    monkeypatch.setattr(store.hub, "send", crash)
+    with pytest.raises(OSError):
+        store.create_channel(channel)
+    monkeypatch.setattr(store.hub, "send", send)
+    return store
+
+
+def test_retry_after_a_crash_posts_the_kickoff(interrupted, channel):
+    interrupted.create_channel(channel)
+    assert _texts(interrupted, "release") == ["Ship 1.2 this week.\nStart with the changelog."]
+
+
+def test_retry_after_a_crash_announces_once(interrupted, channel):
+    interrupted.create_channel(channel)
+    interrupted.create_channel(channel)
+    assert len(_texts(interrupted, "general")) == 1
+
+
+def test_retry_after_a_rename_keeps_the_first_announcement(interrupted, channel):
+    interrupted.hub.publish("worker", [{"address": "omp:agent", "name": "renamed"}, {"address": "codex:other"}])
+    interrupted.create_channel(channel)
+    assert "@builder" in _texts(interrupted, "general")[0]
+
+
+def test_same_id_with_other_members_is_refused(store, channel, created):
+    with pytest.raises(HubError, match="different channel"):
+        store.create_channel({**channel, "members": ["worker/omp:agent", "worker/codex:other"]})
+
+
+def test_same_id_with_other_members_does_not_enlarge_the_channel(store, channel, created):
+    with pytest.raises(HubError):
+        store.create_channel({**channel, "members": ["worker/omp:agent", "worker/codex:other"]})
+    assert "worker/codex:other" not in _members(store, "release")
+
+
+# --- credential rotation --------------------------------------------------------------------------------
+
+
+def test_a_revoked_hub_node_rejoins_general_when_published_again(tmp_path):
+    hub = Hub(str(tmp_path / "hub.sqlite3"), general="general")
+    hub.publish("laptop", [{"address": "claude:c1"}])
+    hub.revoke("laptop")
+    hub.publish("laptop", [{"address": "claude:c1"}])
+    assert _members_of(hub, "general") == ["laptop/claude:c1"]
+
+
+def test_a_revoked_workspace_node_rejoins_general_when_published_again(store):
+    store.revoke_node("worker")
+    store.hub.publish("worker", [{"address": "omp:agent"}])
+    assert "worker/omp:agent" in _members(store, "general")
+
+
+def _members_of(hub, topic):
+    return next(row["members"] for row in hub.topics() if row["topic"] == topic)

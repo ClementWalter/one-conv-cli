@@ -1193,7 +1193,7 @@ function openChannelDialog() {
     box.value = s.address;
     const p = person(s.address);
     const label = el("label");
-    label.append(box, document.createTextNode(p.name + " · " + (s.title || s.cwd || s.address)));
+    label.append(box, el("span", p.name + " · " + (s.title || s.cwd || s.address)));
     list.appendChild(label);
   }
   if (!online.length) list.appendChild(el("p", "No agent is connected; you can still create the channel and invite them later.", "quiet-copy"));

@@ -1,6 +1,7 @@
 """Persist the personal workspace independently of any operator laptop or relay."""
 
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -10,7 +11,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 
-from ..live.hub import GENERAL, MESSAGE_ID, TOPIC, Hub, HubError, split_address
+from ..live.hub import GENERAL, MESSAGE_ID, TOPIC, Hub, HubError, _online, split_address
 from ..live.hub import NODE as PEER_NODE
 from .presence import message_activity, message_delivery, session_presence
 
@@ -115,6 +116,8 @@ class ControlStore:
         with self.hub._db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS staffing_grants "
                        "(node TEXT PRIMARY KEY, token_hash TEXT NOT NULL, granted REAL NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS channel_requests (id TEXT PRIMARY KEY, digest TEXT NOT NULL, "
+                       "topic TEXT NOT NULL, announcement TEXT NOT NULL, created REAL NOT NULL)")
         self.refresh_human()
 
     @staticmethod
@@ -146,6 +149,7 @@ class ControlStore:
             db.execute("DELETE FROM staffing_grants WHERE node = ?", (node,))
             db.execute("DELETE FROM sessions WHERE node = ?", (node,))
             db.execute("DELETE FROM members WHERE node = ?", (node,))
+            db.execute("DELETE FROM welcomed WHERE node = ?", (node,))
             db.execute("DELETE FROM nodes WHERE node = ?", (node,))
         return bool(removed)
 
@@ -298,33 +302,43 @@ class ControlStore:
     def create_channel(self, payload):
         """Add the human and the chosen agents, post the kickoff in the channel and announce it in #general.
 
-        Every step is idempotent under the request ID, so a retry after any failure finishes the same channel.
+        The request, its members and the announcement text commit together, so a retry under the same
+        ID finishes exactly that channel, and the same ID with any other content is refused.
         """
         payload = validate_channel(payload)
         topic, ident = payload["topic"], payload["id"]
+        digest = hashlib.sha256(json.dumps([topic, payload["purpose"], sorted(payload["members"])]).encode()).hexdigest()
         with self.hub.lock, self.hub._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            retry = db.execute("SELECT 1 FROM posts WHERE from_node = ? AND id = ?", (NODE, ident)).fetchone()
-            exists = (db.execute("SELECT 1 FROM members WHERE topic = ?", (topic,)).fetchone()
-                      or db.execute("SELECT 1 FROM posts WHERE topic = ?", (topic,)).fetchone())
-            if exists and not retry:
-                raise HubError(409, f"#{topic} already exists; open it from Channels.")
-            for node, local in payload["members"]:
-                if not self.hub._published(db, node, local):
-                    raise HubError(404, f"{node}/{local} is not connected; reconnect it or leave it out.")
-            names = {(node, address): name for node, address, name in
-                     db.execute("SELECT node, address, name FROM sessions WHERE name IS NOT NULL")}
-            now = time.time()
-            # The workspace owner places agents directly; they can still leave on their own.
-            db.executemany("INSERT OR IGNORE INTO members VALUES (?, ?, ?, ?)",
-                           [(topic, NODE, "user", now)] + [(topic, node, local, now) for node, local in payload["members"]])
+            request = db.execute("SELECT digest, announcement FROM channel_requests WHERE id = ?", (ident,)).fetchone()
+            if request is not None and request[0] != digest:
+                raise HubError(409, "This request ID was already used for a different channel; start a new request.")
+            if request is None:
+                if (db.execute("SELECT 1 FROM members WHERE topic = ?", (topic,)).fetchone()
+                        or db.execute("SELECT 1 FROM posts WHERE topic = ?", (topic,)).fetchone()):
+                    raise HubError(409, f"#{topic} already exists; open it from Channels.")
+                now = time.time()
+                for node, local in payload["members"]:
+                    lease = db.execute("SELECT n.seen, s.updated FROM sessions s JOIN nodes n ON n.node = s.node "
+                                       "WHERE s.node = ? AND s.address = ?", (node, local)).fetchone()
+                    if lease is None or not _online(*lease, now):
+                        raise HubError(404, f"{node}/{local} is not connected; reconnect it or leave it out.")
+                names = {(node, address): name for node, address, name in
+                         db.execute("SELECT node, address, name FROM sessions WHERE name IS NOT NULL")}
+                who = ", ".join("@" + names[member] if member in names else f"{member[0]}/{member[1]}"
+                                for member in payload["members"]) or "only you so far"
+                summary = payload["purpose"].strip().splitlines()[0][:200]
+                announcement = (f"You created #{topic}: {summary}\nMembers: {who}.\n"
+                                f"Anyone else can join with the join_topic tool or `one-conv live join {topic}`.")
+                db.execute("INSERT INTO channel_requests VALUES (?, ?, ?, ?, ?)", (ident, digest, topic, announcement, now))
+                # The workspace owner places agents directly; they can still leave on their own.
+                db.executemany("INSERT OR IGNORE INTO members VALUES (?, ?, ?, ?)",
+                               [(topic, NODE, "user", now)]
+                               + [(topic, node, local, now) for node, local in payload["members"]])
+            else:
+                announcement = request[1]
         kickoff = self.hub.send(NODE, {"id": ident, "from": "user", "to": f"#{topic}", "text": payload["purpose"],
                                        "reply": "expected", "mode": "push"}, join_sender=True)
-        who = ", ".join("@" + names[member] if member in names else f"{member[0]}/{member[1]}"
-                        for member in payload["members"]) or "only you so far"
-        summary = payload["purpose"].strip().splitlines()[0][:200]
-        announcement = (f"You created #{topic}: {summary}\nMembers: {who}.\n"
-                        f"Anyone else can join with the join_topic tool or `one-conv live join {topic}`.")
         self.hub.send(NODE, {"id": hashlib.sha256(f"{ident}:{GENERAL}".encode()).hexdigest()[:32], "from": "user",
                              "to": f"#{GENERAL}", "text": announcement, "reply": "none", "mode": "push"},
                       join_sender=True)

@@ -18,6 +18,7 @@ from .auth import COOKIE, AuthStore
 from .store import HUMAN, ControlStore
 
 BODY_LIMIT = 65_536
+PAIRING_SECONDS = 600
 logger = logging.getLogger(__name__)
 SECURITY_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
@@ -164,7 +165,17 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         return JSONResponse({"authenticated": True, "csrf_token": current["csrf_token"],
                              "expires_at": current["expires_at"],
                              "human": {"address": "user", "route": HUMAN, "name": "You", "kind": "human"},
-                             "capabilities": {"workers": "workers" in provider_map, "accounting": "accounting" in provider_map}})
+                             "capabilities": {"workers": "workers" in provider_map, "accounting": "accounting" in provider_map,
+                                              "pairing": True}})
+
+    async def pair_device(request):
+        """An authenticated owner can connect another device without exporting its session cookie."""
+        if await bounded_json(request):
+            raise HubError(400, "Device pairing accepts an empty JSON object; access and origin are fixed.")
+        expires = auth.clock() + PAIRING_SECONDS
+        token = await run_in_threadpool(auth.issue_pairing_token, PAIRING_SECONDS)
+        return JSONResponse({"url": origin + "/#pair=" + token, "expires_at": expires,
+                             "single_use": True, "access": "owner"})
 
     async def login(request):
         check_origin(request)
@@ -236,6 +247,7 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         Route("/health", endpoint(health, public=True)),
         Route("/api/session", endpoint(session, public=True)),
         Route("/api/login", endpoint(login, public=True), methods=["POST"]),
+        Route("/api/devices/pair", endpoint(pair_device, write=True), methods=["POST"]),
         Route("/api/logout", endpoint(logout, write=True), methods=["POST"]),
         Route("/api/state", endpoint(state)), Route("/api/topics/{topic}", endpoint(topic)),
         Route("/api/direct", endpoint(direct)), Route("/api/messages", endpoint(message, write=True), methods=["POST"]),

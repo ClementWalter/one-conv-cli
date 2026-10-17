@@ -170,7 +170,92 @@ def test_pairing_tokens_are_not_logged(client, app, caplog):
 
 def test_provider_capabilities_reflect_configured_callbacks(paired):
     client, _ = paired
-    assert client.get("/api/session").json()["capabilities"] == {"workers": True, "accounting": False}
+    assert client.get("/api/session").json()["capabilities"] == {"workers": True, "accounting": False, "pairing": True}
+
+
+def test_anonymous_browser_cannot_create_a_device_invite(client):
+    assert client.post("/api/devices/pair", json={}, headers={"Origin": ORIGIN}).status_code == 401
+
+
+@pytest.mark.parametrize("headers", [{}, {"Origin": ORIGIN},
+                                    {"Origin": "https://evil.example.test", "X-One-Conv-Token": "wrong"}])
+def test_device_invites_require_origin_and_csrf(paired, headers):
+    client, _ = paired
+    assert client.post("/api/devices/pair", json={}, headers=headers).status_code == 403
+
+
+def test_node_bearer_cannot_create_a_browser_device_invite(client, app):
+    token = app.state.hub.add_token("worker")
+    assert client.post("/api/devices/pair", json={}, headers={"Origin": ORIGIN,
+                                                           "Authorization": "Bearer " + token}).status_code == 401
+
+
+@pytest.mark.parametrize("payload", [{"origin": "https://evil.example.test"}, {"access": "guest"}, {"ttl": 3600}])
+def test_device_invite_authority_cannot_be_changed_by_the_browser(paired, payload):
+    client, headers = paired
+    assert client.post("/api/devices/pair", json=payload, headers=headers).status_code == 400
+
+
+@pytest.fixture
+def device_invite(paired):
+    client, headers = paired
+    response = client.post("/api/devices/pair", json={}, headers=headers)
+    response.raise_for_status()
+    return client, headers, response
+
+
+def test_device_invite_uses_only_the_configured_origin(device_invite):
+    assert device_invite[2].json()["url"].startswith(ORIGIN + "/#pair=")
+
+
+def test_device_invite_explicitly_grants_owner_access(device_invite):
+    assert device_invite[2].json()["access"] == "owner"
+
+
+def test_device_invite_is_never_cacheable(device_invite):
+    assert device_invite[2].headers["cache-control"] == "no-store"
+
+
+def test_issuing_a_device_invite_keeps_the_current_browser_connected(device_invite):
+    assert device_invite[0].get("/api/session").json()["authenticated"] is True
+
+
+def test_device_invite_connects_a_second_browser(device_invite, app):
+    token = device_invite[2].json()["url"].split("#pair=", 1)[1]
+    with TestClient(app, base_url=ORIGIN) as second:
+        second.post("/api/login", json={"token": token}, headers={"Origin": ORIGIN}).raise_for_status()
+        assert second.get("/api/session").json()["authenticated"] is True
+
+
+def test_device_invite_cannot_connect_two_new_browsers(device_invite, app):
+    token = device_invite[2].json()["url"].split("#pair=", 1)[1]
+    with TestClient(app, base_url=ORIGIN) as second:
+        second.post("/api/login", json={"token": token}, headers={"Origin": ORIGIN}).raise_for_status()
+    assert device_invite[0].post("/api/login", json={"token": token}, headers={"Origin": ORIGIN}).status_code == 401
+
+
+def test_device_invite_expires_after_ten_minutes(paired, app):
+    client, headers = paired
+    app.state.auth.clock = lambda: 100.0
+    response = client.post("/api/devices/pair", json={}, headers=headers)
+    token = response.json()["url"].split("#pair=", 1)[1]
+    app.state.auth.clock = lambda: 700.0
+    assert app.state.auth.pair(token) is None
+
+
+def test_new_device_invite_supersedes_only_the_previous_unused_invite(device_invite):
+    client, headers, previous = device_invite
+    client.post("/api/devices/pair", json={}, headers=headers).raise_for_status()
+    token = previous.json()["url"].split("#pair=", 1)[1]
+    assert client.post("/api/login", json={"token": token}, headers={"Origin": ORIGIN}).status_code == 401
+
+
+def test_device_invite_token_is_not_logged(paired, caplog):
+    client, headers = paired
+    caplog.set_level(logging.DEBUG)
+    response = client.post("/api/devices/pair", json={}, headers=headers)
+    token = response.json()["url"].split("#pair=", 1)[1]
+    assert token not in caplog.text
 
 
 def test_browser_cookie_cannot_authenticate_the_node_api(paired):

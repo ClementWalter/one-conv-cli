@@ -2,6 +2,7 @@
 
 import builtins
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -310,6 +311,55 @@ def test_unresponsive_websocket_handshake_is_bounded(home, monkeypatch):
         elapsed = time.monotonic() - started
         thread.join(1)
     assert (result, elapsed < 0.5) == ({}, True)
+
+
+@pytest.mark.parametrize("frame", ["close", "ping"])
+def test_late_protocol_frames_expire_without_internal_error_logs(caplog, frame):
+    from websockets.exceptions import ConnectionClosed
+    from websockets.sync.server import unix_serve
+
+    caplog.set_level(logging.ERROR, logger="websockets.client")
+    with tempfile.TemporaryDirectory(prefix="ocx") as directory:
+        path = str(Path(directory) / "s")
+
+        def handle(connection):
+            time.sleep(0.1)
+            try:
+                if frame == "close":
+                    connection.close()
+                else:
+                    connection.ping(b"late-probe-control")
+                    time.sleep(0.1)
+            except ConnectionClosed:
+                pass
+
+        with unix_serve(handle, path=path, close_timeout=0) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            with codex_rpc._connect(path, time.monotonic() + 0.05) as connection:
+                connection.recv_events_thread.join(1)
+                alive = connection.recv_events_thread.is_alive()
+            server.shutdown()
+            thread.join(1)
+    errors = [record.getMessage() for record in caplog.records
+              if record.name == "websockets.client" and record.levelno >= logging.ERROR]
+    assert (alive, errors) == (False, [])
+
+
+def test_before_deadline_protocol_faults_are_not_suppressed(unix_daemon, monkeypatch):
+    from websockets.sync.client import ClientConnection
+
+    _, _, path = unix_daemon
+
+    def failed(connection):
+        raise RuntimeError("genuine protocol fault")
+
+    with codex_rpc._connect(path, time.monotonic() + 2) as connection:
+        with monkeypatch.context() as changed:
+            changed.setattr(ClientConnection, "send_data", failed)
+            with connection.protocol_mutex:
+                with pytest.raises(RuntimeError, match="genuine protocol fault"):
+                    connection.send_data()
 
 
 @pytest.mark.parametrize("transport,pressure", [("raw", "requests"), ("presence", "requests"), ("presence", "control-frames")])

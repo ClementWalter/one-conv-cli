@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import socket
 import stat
 import subprocess
 import time
@@ -120,7 +121,15 @@ def _connect(path, deadline):
         """Protocol replies share the absolute deadline of application RPC writes."""
 
         def send_data(self):
-            self.socket.settimeout(_remaining(deadline))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # EOF cleanup invokes this under the protocol lock and expects no deadline exception.
+                try:
+                    self.socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                return
+            self.socket.settimeout(remaining)
             super().send_data()
 
     return unix_connect(path, uri="ws://localhost", open_timeout=min(0.5, _remaining(deadline)),

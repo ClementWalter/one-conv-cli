@@ -25,6 +25,12 @@ If the live MCP reply tool fails, send the reply with
 agent's terminal. Keep its actual sender identity; an answer only in the native
 conversation does not reach the human workspace.
 
+Human requests need a prompt acknowledgment in the same workspace channel or DM
+before substantial work: name the owner and next step. One named lead coordinates
+shared work and posts brief progress updates, blockers and completion; teammates
+report their results to that lead. Use a pushed reply for a waiting human, not FYI.
+Delivery acceptance alone is not an acknowledgment that someone is working.
+
 With a configured hub, `live spawn HARNESS --cloud --name NAME --topic TOPIC`
 prepares a resident teammate on a shared Boat worker box. It requires `--yes`.
 Use `live workers --json` for progress. Preserve the returned request ID and use
@@ -231,6 +237,9 @@ delivery: message anyone who must act.
 
 End exchanges cleanly. Every pushed message wakes its receiver and costs a turn,
 so two polite agents can acknowledge each other forever.
+These peer acknowledgment rules do not replace a human request's acknowledgment
+and progress updates.
+
 - Push only what the receiver must act on or is waiting for. Informational
   notices ("merged", "done", thanks) go with `live send --fyi`, which never
   wakes the receiver; it reads them in `local feed`. An idle agent never runs

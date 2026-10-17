@@ -68,6 +68,11 @@ def _hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def _online(seen: float, published: float, now: float) -> bool:
+    """A polling bridge cannot keep an old session publication alive."""
+    return 0 <= now - seen <= LEASE_SECONDS and 0 <= now - published <= LEASE_SECONDS
+
+
 def split_address(address: str) -> tuple[str, str]:
     """Split an agent or a published human's canonical return route."""
     node, sep, local = address.partition("/")
@@ -162,16 +167,16 @@ class Hub:
         return len(rows)
 
     def directory(self) -> list[dict]:
-        """Every published session, with whether its node's bridge is still renewing its lease."""
+        """Every published session, with independent bridge and publication timestamps."""
         now = time.time()
         with self._db() as db:
             seen = dict(db.execute("SELECT node, seen FROM nodes"))
-            rows = db.execute("SELECT node, address, name, title, cwd, status FROM sessions "
+            rows = db.execute("SELECT node, address, name, title, cwd, status, updated FROM sessions "
                               "ORDER BY node, address").fetchall()
         return [{"address": f"{node}/{address}", "node": node, "local": address, "name": name, "title": title,
                  "cwd": cwd, "status": status, "seen": seen.get(node),
-                 "online": now - seen.get(node, 0.0) <= LEASE_SECONDS}
-                for node, address, name, title, cwd, status in rows]
+                 "published_at": published, "online": _online(seen.get(node, 0.0), published, now)}
+                for node, address, name, title, cwd, status, published in rows]
 
     def _published(self, db, node: str, address: str) -> bool:
         return db.execute("SELECT 1 FROM sessions WHERE node = ? AND address = ?", (node, address)).fetchone() is not None
@@ -201,7 +206,7 @@ class Hub:
         return {"id": msg_id, "duplicate": duplicate,
                 "recipients": [{"to": f"{n}/{a}", "delivery": d, "status": o or "stored"} for d, n, a, o in rows]}
 
-    def send(self, node: str, message: dict, *, join_sender: bool = False) -> dict:
+    def send(self, node: str, message: dict, *, join_sender: bool = False, require_online: bool = False) -> dict:
         """Store a post and one delivery per recipient; a retry of the same post returns its first receipt."""
         msg_id, sender, text = message.get("id"), message.get("from"), message.get("text")
         if not isinstance(msg_id, str) or not MESSAGE_ID.fullmatch(msg_id):
@@ -223,6 +228,8 @@ class Hub:
             raise HubError(400, "a topic is lowercase letters, digits and dashes")
         digest = hashlib.sha256(json.dumps([target, sender, topic, reply, mode, text]).encode()).hexdigest()
         with self.lock, self._db() as db:
+            # The lease check and durable claim share one snapshot across server instances.
+            db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT seq, digest FROM posts WHERE from_node = ? AND id = ?",
                                   (node, msg_id)).fetchone()
             if existing:
@@ -238,6 +245,14 @@ class Hub:
                     raise HubError(403, "joining a topic requires a published sender and a topic target")
                 db.execute("INSERT OR IGNORE INTO members VALUES (?, ?, ?, ?)", (topic, node, sender, time.time()))
             recipients = self._recipients(db, target, node, sender)
+            if require_online and not target.startswith("#"):
+                now = time.time()
+                for recipient_node, recipient_address in recipients:
+                    lease = db.execute("SELECT n.seen, s.updated FROM sessions s JOIN nodes n ON n.node = s.node "
+                                       "WHERE s.node = ? AND s.address = ?",
+                                       (recipient_node, recipient_address)).fetchone()
+                    if lease is None or not _online(*lease, now):
+                        raise HubError(409, "Recipient is offline; reconnect the agent before sending a new message.")
             seq = db.execute("INSERT INTO posts (from_node, id, digest, target, sender, topic, reply, mode, text, created)"
                              " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                              (node, msg_id, digest, target, sender, topic, reply, mode, text, time.time())).lastrowid

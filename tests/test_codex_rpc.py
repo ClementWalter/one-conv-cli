@@ -299,6 +299,57 @@ def test_unresponsive_websocket_handshake_is_bounded(home, monkeypatch):
     assert (result, elapsed < 0.5) == ({}, True)
 
 
+@pytest.mark.parametrize("transport,pressure", [("raw", "requests"), ("presence", "requests"), ("presence", "control-frames")])
+def test_real_unix_write_backpressure_cannot_exceed_probe_deadline(transport, pressure):
+    script = """
+import json
+import os
+import socket
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from websockets.sync.client import unix_connect
+from websockets.sync.server import unix_serve
+from one_conv.live.codex_rpc import _connect, _read
+ids = [f'00000000-0000-0000-0000-{index:012x}' for index in range(128)]
+def handler(connection):
+    try:
+        request = json.loads(connection.recv())
+        connection.send(json.dumps({'id': request['id'], 'result': {}}))
+        connection.recv()
+        request = json.loads(connection.recv())
+        connection.send(json.dumps({'id': request['id'], 'result': {'data': ids, 'nextCursor': None}}))
+        if sys.argv[2] == 'control-frames':
+            for index in range(1000):
+                connection.ping(str(index).encode())
+        for index, ident in enumerate(ids, 3):
+            connection.send(json.dumps({'id': index, 'result': {'thread': {'id': ident, 'status': {'type': 'active'}}}}))
+        time.sleep(3)
+    except Exception:
+        pass
+with tempfile.TemporaryDirectory(prefix='ocx') as directory:
+    path = str(Path(directory) / 's')
+    server = unix_serve(handler, path=path, max_queue=1, close_timeout=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    deadline = time.monotonic() + .15
+    connection = (_connect(path, deadline) if sys.argv[1] == 'presence' else
+                  unix_connect(path, uri='ws://localhost', close_timeout=0, max_queue=16, ping_interval=None, proxy=None))
+    connection.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+    try:
+        _read(connection, deadline)
+    except Exception:
+        pass
+    sys.stdout.write('finished')
+    sys.stdout.flush()
+    os._exit(0)
+"""
+    process = subprocess.run([sys.executable, "-O", "-c", script, transport, pressure],
+                             capture_output=True, text=True, timeout=2, check=False)
+    assert (process.returncode, process.stdout) == (0, "finished")
+
+
 def test_discovery_rejects_other_process_executable(home, unix_daemon, monkeypatch):
     monkeypatch.setattr(codex_rpc, "_run", lambda *args: f"{os.getuid()} /portable/bin/python\n")
     assert codex_rpc.threads(home) == {}

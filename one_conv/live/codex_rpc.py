@@ -82,6 +82,11 @@ class Reader:
     def __init__(self, connection, deadline):
         self.connection, self.deadline, self.ident = connection, deadline, 0
 
+    def _send(self, value):
+        # Socket writes can block even when response reads have their own deadline.
+        self.connection.socket.settimeout(_remaining(self.deadline))
+        self.connection.send(json.dumps(value))
+
     def call(self, method, params):
         allowed = (method == "initialize" and params == CLIENT_INFO or
                    method == "thread/loaded/list" and isinstance(params, dict) and set(params) <= {"cursor"}
@@ -93,7 +98,7 @@ class Reader:
             raise ValueError("Only read-only Codex presence requests are permitted")
         _remaining(self.deadline)
         self.ident += 1
-        self.connection.send(json.dumps({"id": self.ident, "method": method, "params": params}))
+        self._send({"id": self.ident, "method": method, "params": params})
         for _ in range(MAX_FRAMES):
             value = json.loads(self.connection.recv(timeout=_remaining(self.deadline)))
             if not isinstance(value, dict) or type(value.get("id")) is not int or value["id"] != self.ident:
@@ -105,7 +110,22 @@ class Reader:
 
     def initialized(self):
         _remaining(self.deadline)
-        self.connection.send(json.dumps({"method": "initialized", "params": {}}))
+        self._send({"method": "initialized", "params": {}})
+
+
+def _connect(path, deadline):
+    from websockets.sync.client import ClientConnection, unix_connect
+
+    class DeadlineConnection(ClientConnection):
+        """Protocol replies share the absolute deadline of application RPC writes."""
+
+        def send_data(self):
+            self.socket.settimeout(_remaining(deadline))
+            super().send_data()
+
+    return unix_connect(path, uri="ws://localhost", open_timeout=min(0.5, _remaining(deadline)),
+                        close_timeout=0, max_size=1_048_576, max_queue=16, ping_interval=None,
+                        proxy=None, create_connection=DeadlineConnection)
 
 
 def _text(value, maximum=4096):
@@ -164,7 +184,6 @@ def threads(home):
     """Return runtime state and native title/cwd evidence within one shared discovery/RPC deadline."""
     try:
         from websockets.exceptions import WebSocketException
-        from websockets.sync.client import unix_connect
     except ImportError:
         return {}
     deadline = time.monotonic() + TIMEOUT_SECONDS
@@ -174,8 +193,7 @@ def threads(home):
         return {}
     for path in paths:
         try:
-            with unix_connect(path, uri="ws://localhost", open_timeout=min(0.5, _remaining(deadline)),
-                              close_timeout=0, max_size=1_048_576, max_queue=16, ping_interval=None, proxy=None) as connection:
+            with _connect(path, deadline) as connection:
                 return _read(connection, deadline)
         except (OSError, ValueError, TypeError, RecursionError, WebSocketException, ReadUnavailable, TimeoutError):
             continue

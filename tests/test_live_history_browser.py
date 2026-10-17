@@ -26,8 +26,9 @@ def reported(phone):
         {"id": "2" * 32, "from": "omp:agent", "to": "codex:beta", "topic": "release", "text": "Beta, update the docs.",
          "at": at + 60, "outcome": "accepted"},
     ]}).raise_for_status()
-    page.goto(workspace["origin"] + "/#topic=release", wait_until="networkidle")
-    page.reload(wait_until="networkidle")  # A hash change alone would not reload the direct threads.
+    # A hash change alone would not reload the direct threads; the change feed rules out network idle.
+    page.goto(workspace["origin"] + "/#topic=release")
+    page.reload()
     page.locator(".message-body").filter(has_text="Beta, update the docs.").wait_for()
     return page
 
@@ -70,8 +71,8 @@ def long_recipient(browser, real_http_workspace, request):
     page.goto(workspace["origin"] + "/#pair=" + token, wait_until="networkidle")
     page.get_by_role("button", name="Connect this device", exact=True).click()
     page.locator("#pairing").wait_for(state="hidden")
-    page.goto(workspace["origin"] + "/#topic=release", wait_until="networkidle")
-    page.reload(wait_until="networkidle")
+    page.goto(workspace["origin"] + "/#topic=release")
+    page.reload()
     page.locator(".message-directed").wait_for()
     yield page
     context.close()

@@ -179,8 +179,27 @@ def test_lost_response_retry_keeps_its_id_after_sending_another_conversation(pag
     page.locator("#message-input").wait_for(state="visible")
     page.get_by_role("button", name="New message", exact=True).click()
     page.locator(".recipient-option").filter(has_text="builder").click()
+    # Once the stored copy is visible, the restored draft is cleared, so nothing can wake the agent twice.
+    page.locator(".message-body").filter(has_text="Keep the original send identity.").wait_for()
+    directory = workspace["home"] / "live" / "inbox" / "omp" / "browser-builder"
+    assert len(list(directory.glob("*.json"))) == 1
+
+
+def test_a_lost_response_retry_from_the_bubble_keeps_its_id(page, workspace):
+    """Retry on the bubble sends the same id, so the agent is woken once."""
+    def lose_first_response(route):
+        route.fetch()
+        route.abort()
+
+    page.route("**/api/messages", lose_first_response, times=1)
+    page.get_by_role("button", name="New message", exact=True).click()
+    page.locator(".recipient-option").filter(has_text="builder").click()
+    page.locator("#message-input").fill("Retry from the bubble.")
+    page.get_by_role("button", name="Send message as a human").click()
+    retry = page.locator("#messages li").filter(has_text="Retry from the bubble.").get_by_role("button", name="Retry")
+    retry.wait_for()
     with page.expect_response("**/api/messages"):
-        page.get_by_role("button", name="Send message as a human").click()
+        retry.click()
     directory = workspace["home"] / "live" / "inbox" / "omp" / "browser-builder"
     assert len(list(directory.glob("*.json"))) == 1
 

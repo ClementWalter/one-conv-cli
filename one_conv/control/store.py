@@ -290,6 +290,22 @@ class ControlStore:
         return {"threads": [{"pair": pair, "messages": rows, "last": rows[-1]["at"]}
                             for pair, rows in sorted(threads.items(), key=lambda item: -item[1][-1]["at"])]}
 
+    def fingerprint(self) -> str:
+        """A digest of everything the workspace shows; it changes when a post, receipt, member or agent does.
+
+        Read-only. The workspace's own human publication is left out, since reading state renews it.
+        """
+        with self.hub._db() as db:
+            values = db.execute(
+                "SELECT (SELECT IFNULL(MAX(seq), 0) FROM posts),"
+                " (SELECT COUNT(*) FROM deliveries WHERE outcome IS NOT NULL),"
+                " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT topic || '/' || node || '/' || address || '@'"
+                "  || joined AS row FROM members ORDER BY topic, node, address)),"
+                " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT node || '/' || address || '=' ||"
+                "  IFNULL(name, '') || ':' || IFNULL(status, '') || ':' || updated AS row FROM sessions"
+                "  WHERE node != ? ORDER BY node, address))", (NODE,)).fetchone()
+        return hashlib.sha256(json.dumps(values).encode()).hexdigest()[:32]
+
     def topic(self, topic: str):
         if not TOPIC.fullmatch(topic):
             raise HubError(400, "Choose a valid topic.")

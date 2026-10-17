@@ -41,7 +41,7 @@ def test_api_never_turns_channel_acceptance_into_a_read(accepted):
 def phone_view(phone):
     page, workspace = phone
     _post_and_accept(workspace)
-    page.goto(workspace["origin"] + "/#topic=release", wait_until="networkidle")
+    page.goto(workspace["origin"] + "/#topic=release")
     status = page.locator(".message-delivery").filter(has_text="Accepted by 1 of 1")
     status.wait_for()
     return status

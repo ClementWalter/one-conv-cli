@@ -144,8 +144,8 @@ body {
   width: min(540px, calc(100vw - 32px));
 }
 .dialog-description { margin: 4px 0 20px; }
-.field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
-.field-grid label { color: var(--text); font-weight: 600; font-size: 12px; display: grid; gap: 7px; }
+.field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px; }
+.field-grid label { min-width: 0; color: var(--text); font-weight: 600; font-size: 12px; display: grid; gap: 7px; }
 .field-grid input,
 .field-grid select,
 .field-grid textarea,
@@ -166,19 +166,19 @@ body {
 .staff-dialog .primary-button { width: 100%; }
 .worker-jobs { display: grid; gap: 10px; margin-top: 22px; }
 .worker-job { display: flex; gap: 10px; align-items: flex-start; padding: 12px 0; border-top: 1px solid var(--line); }
-.worker-job > div { min-width: 0; flex: 1; display: grid; gap: 5px; }
+.worker-job > div { min-width: 0; flex: 1; display: grid; grid-template-columns: minmax(0, 1fr); gap: 5px; overflow-wrap: anywhere; }
 .worker-job small { color: var(--muted); font-size: 12px; }
 .job-detail { font-size: 11px; line-height: 1.4; margin: 0; overflow-wrap: anywhere; }
-.costs-content { display: grid; gap: 14px; }
-.rate-card { border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+.costs-content { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+.rate-card { min-width: 0; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
 .rate-card h3 { font-size: 15px; margin: 0 0 13px; }
-.rate-amount { display: inline-block; font-size: 23px; font-weight: 650; letter-spacing: -0.7px; }
+.rate-amount { display: inline-block; max-width: 100%; font-size: 23px; font-weight: 650; letter-spacing: -0.7px; }
 .rate-basis { display: inline-block; margin-left: 10px; border-radius: 5px; background: var(--selected); color: var(--selected-text); padding: 4px 7px; font-size: 10px; }
 .text-button { border: 0; background: transparent; color: var(--selected-text); padding: 0; font: inherit; font-size: 12px; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
-.quote-form { display: flex; align-items: center; gap: 12px; margin-top: 17px; }
-.quote-form label { font-size: 11px; color: var(--muted); }
+.quote-form { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 17px; }
+.quote-form label { min-width: 0; font-size: 11px; color: var(--muted); }
 .quote-form input { display: inline-block; width: 70px; padding: 7px; margin-left: 6px; }
-.usage-row { display: grid; gap: 5px; padding: 12px 0; border-top: 1px solid var(--line); font-size: 12px; }
+.usage-row { display: grid; grid-template-columns: minmax(0, 1fr); overflow-wrap: anywhere; gap: 5px; padding: 12px 0; border-top: 1px solid var(--line); font-size: 12px; }
 .usage-row small { color: var(--muted); }
 .cost-empty { line-height: 1.6; padding: 20px; background: var(--soft); border-radius: 12px; }
 .device-dialog .secondary-button { margin-top: 18px; }
@@ -278,6 +278,7 @@ button {
   line-height: 1;
 }
 .workspace-search {
+  min-width: 0;
   height: 30px;
   display: flex;
   gap: 9px;
@@ -913,6 +914,7 @@ button {
   margin-bottom: 15px;
 }
 .conversation-intro h3 {
+  overflow-wrap: anywhere;
   margin: 0 0 9px;
   font-size: 27px;
   font-weight: 760;
@@ -998,6 +1000,8 @@ button {
   min-height: 22px;
 }
 .message-author {
+  max-width: 100%;
+  overflow-wrap: anywhere;
   font-size: 14px;
   font-weight: 730;
   letter-spacing: -0.1px;
@@ -1393,6 +1397,7 @@ button {
   background: var(--hover);
 }
 .member-row strong {
+  overflow-wrap: anywhere;
   display: block;
   font-size: 12px;
   font-weight: 650;
@@ -1425,6 +1430,7 @@ button {
   justify-content: space-between;
   padding: 25px 25px 19px;
 }
+.dialog-heading > div { min-width: 0; overflow-wrap: anywhere; }
 .eyebrow {
   font-size: 9px;
   font-weight: 700;
@@ -1474,6 +1480,8 @@ button {
 .recipient-option:hover {
   background: var(--sidebar);
 }
+.recipient-option > div { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.recipient-kind { flex: none; }
 .recipient-option strong {
   display: block;
   font-size: 13px;
@@ -1589,7 +1597,8 @@ button {
     display: none;
   }
   .topbar {
-    grid-template-columns: auto minmax(120px, 1fr) auto;
+    /* Search yields space to the fixed actions instead of expanding the phone viewport. */
+    grid-template-columns: auto minmax(0, 1fr) auto;
     gap: 13px;
     padding: 0 12px;
   }
@@ -1716,9 +1725,14 @@ button {
   .composer-area {
     padding: 8px 12px 10px;
   }
-  .composer textarea {
-    font-size: 13px;
-  }
+  /* iPhone keeps the page scale when focusing controls with readable native-sized text. */
+  input,
+  textarea,
+  select,
+  .workspace-search input,
+  .recipient-search input,
+  .composer textarea,
+  #device-invitation-url { font-size: 16px; }
   .composer-feedback {
     font-size: 8px;
   }

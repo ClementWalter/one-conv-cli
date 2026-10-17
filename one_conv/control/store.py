@@ -13,7 +13,12 @@ from pathlib import Path
 
 from ..live.hub import GENERAL, MESSAGE_ID, TOPIC, Hub, HubError, _online, split_address
 from ..live.hub import NODE as PEER_NODE
-from .presence import message_activity, message_delivery, session_presence
+from .presence import (
+    channel_delivery,
+    message_activity,
+    message_delivery,
+    session_presence,
+)
 
 NODE = "workspace"
 HUMAN = "workspace/user"
@@ -279,8 +284,21 @@ class ControlStore:
             rows = db.execute(
                 "SELECT seq,id,from_node,sender,target,topic,reply,mode,text,created,NULL "
                 "FROM posts WHERE topic=? ORDER BY seq DESC LIMIT ?", (topic, MESSAGES_SHOWN)).fetchall()
-        return {"topic": topic, "messages": [self._row(*row) for row in reversed(rows)],
-                "omitted": max(0, total - len(rows))}
+            recipients = defaultdict(list)
+            if rows:
+                for post, route, outcome, outcome_at in db.execute(
+                        "SELECT d.post, d.to_node || '/' || d.to_address, d.outcome, d.outcome_at FROM deliveries d "
+                        "JOIN posts p ON p.seq = d.post WHERE p.topic = ? AND p.seq >= ? ORDER BY d.rowid",
+                        (topic, rows[-1][0])):
+                    recipients[post].append((display_address(route), outcome, outcome_at))
+        messages = []
+        for row in reversed(rows):
+            message = self._row(*row)
+            # A channel post has one delivery per member, so its status is their rollup.
+            message["delivery"] = channel_delivery(recipients[row[0]])
+            message["status"] = message["delivery"]["state"]
+            messages.append(message)
+        return {"topic": topic, "messages": messages, "omitted": max(0, total - len(rows))}
 
     def send(self, payload):
         """Retrying after any crash reuses the hub's atomic (node, ID, payload) claim."""

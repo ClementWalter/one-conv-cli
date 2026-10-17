@@ -662,7 +662,9 @@ function renderRows(rows, force = false) {
     }
     if (isHuman(row.from)) {
       const delivery = row.delivery && typeof row.delivery === "object" ? row.delivery : null;
-      const label = delivery && { stored: "Saved · awaiting delivery", accepted: "Delivery accepted", unconfirmed: "Unconfirmed", refused: "Refused" }[delivery.state];
+      // Channel rollups carry their own counted label; direct messages keep the short forms.
+      const label = delivery && (Array.isArray(delivery.recipients) ? delivery.label :
+        { stored: "Saved · awaiting delivery", accepted: "Delivery accepted", unconfirmed: "Unconfirmed", refused: "Refused" }[delivery.state]);
       const status = el("small", label || (delivery ? delivery.label : "Stored on hub"), "message-delivery");
       status.title = delivery ? delivery.detail : "Stored in this conversation. No read receipt is available.";
       content.appendChild(status);

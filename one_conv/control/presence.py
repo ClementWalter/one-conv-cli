@@ -66,3 +66,31 @@ def message_delivery(outcome, outcome_at=None, *, human_inbox=False):
         label, detail = "Stored in your inbox", "The workspace stored this message in your inbox. This is not a read receipt."
     return {"state": state, "label": label, "detail": detail,
             "accepted_at": _timestamp(outcome_at) if state == "accepted" else None, "read_at": None}
+
+
+def channel_delivery(recipients):
+    """Roll up one channel post's per-member outcomes; adapter acceptance is never a read receipt.
+
+    `recipients` lists (route, outcome, outcome_at) for every member the hub addressed; outcome is None while pending.
+    """
+    rows = [{"to": route, "state": outcome or "stored", "at": _timestamp(at)} for route, outcome, at in recipients]
+    counts = {state: sum(row["state"] == state for row in rows) for state in ("accepted", "stored", "refused", "unconfirmed")}
+    total = len(rows)
+    if not total:
+        return {"state": "no_recipients", "label": "Saved · no other members",
+                "detail": "Saved in the channel. No other member was there to receive it; later members can read it.",
+                "total": 0, "counts": counts, "recipients": [], "accepted_at": None, "read_at": None}
+    uniform = next((state for state, count in counts.items() if count == total), None)
+    state = uniform or "mixed"
+    labels = {"accepted": f"Accepted by {total} of {total}", "stored": "Saved · awaiting delivery",
+              "refused": "Refused by every member", "unconfirmed": "Unconfirmed",
+              "mixed": " · ".join([f"Accepted by {counts['accepted']} of {total}"]
+                                  + [f"{counts[name]} {name}" for name in ("refused", "unconfirmed") if counts[name]])}
+    parts = [f"{count} {name}" for name, count in (("accepted", counts["accepted"]), ("awaiting delivery", counts["stored"]),
+                                                    ("refused", counts["refused"]), ("unconfirmed", counts["unconfirmed"])) if count]
+    detail = (f"{', '.join(parts)} of {total} member{'s' if total != 1 else ''}. "
+              "Acceptance means the receiving adapter took the message; reading and a reply are not confirmed.")
+    accepted = [row["at"] for row in rows if row["state"] == "accepted" and row["at"] is not None]
+    return {"state": state, "label": labels[state], "detail": detail, "total": total, "counts": counts,
+            "recipients": rows, "accepted_at": max(accepted) if state == "accepted" and accepted else None,
+            "read_at": None}

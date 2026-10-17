@@ -23,7 +23,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import hubclient, router, team, tunnel
+from . import history, hubclient, router, team, tunnel
 from .model import envelope, live_home, parse_address
 
 try:
@@ -227,6 +227,15 @@ class Bridge:
             logger.warning("the hub refused queued message %s: %s", row["id"], row["error"])
         return len(result["sent"]) + len(result["refused"])
 
+    def report_history(self) -> dict | None:
+        """Report same-machine messages as history; a hub without that route must not stop delivery."""
+        try:
+            return history.report(self.client)
+        except (hubclient.HubRefused, hubclient.HubUnavailable, OSError) as error:
+            # Unanswered ids stay pending for the next step; deliveries go on regardless.
+            logger.warning("local message history was not reported: %s", error)
+            return None
+
     def handle(self, item: dict) -> str:
         """Deliver one inbox item at most once, then ack its outcome."""
         fresh, recorded = self.ingress.claim(item)
@@ -246,6 +255,7 @@ class Bridge:
         if time.monotonic() - self.published_at >= PUBLISH_SECONDS:
             self.publish()
         self.drain_outbox()
+        self.report_history()
         for item in self.client.request("GET", f"/v1/inbox?wait={wait:g}").get("messages", []):
             self.handle(item)
 

@@ -648,6 +648,18 @@ function renderRows(rows, force = false) {
     }
     fill();
     content.appendChild(body);
+    if (row.reported === true) {
+      // Shown on every bubble, grouped or not: this copy is the sending machine's record.
+      const synced = el("span", "Synced history", "message-note message-synced");
+      synced.title = "From the sending machine's local message log; nobody was notified again.";
+      content.appendChild(synced);
+    }
+    if (row.directed === true) {
+      // A direct message tagged with this channel: only its recipient was notified.
+      const scope = el("span", "To " + person(row.to).name + " only", "message-note message-directed");
+      scope.title = "A direct message tagged with this channel. Other members were not notified.";
+      content.appendChild(scope);
+    }
     if (row.mode === "fyi") {
       const note = el("span", null, "message-note");
       note.append(

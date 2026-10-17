@@ -31,7 +31,8 @@ FYI_KEEP_SECONDS = 7 * 24 * 3600
 # messages.jsonl keeps this many of the latest messages, for `live web` and later reading.
 MESSAGE_LOG = 2000
 # Agent-to-agent diagnostic copies are shortened; human conversations keep complete text.
-MESSAGE_LOG_TEXT = 20_000
+# The hub's own limit (hub.MAX_TEXT), so a logged message can be reported to it whole.
+MESSAGE_LOG_TEXT = 200_000
 # Clock skew tolerated on an existing notice; anything further ahead is corrupt.
 FYI_MAX_SKEW_SECONDS = 3600
 
@@ -262,6 +263,8 @@ def log_message(row: dict) -> None:
                 for field in ("from", "to"))
     # This log is the human inbox, so its only copy must retain the full message.
     entry = {**row, "text": text if human else text[:MESSAGE_LOG_TEXT], "at": row.get("at") or time.time()}
+    if not human and len(text) > MESSAGE_LOG_TEXT:
+        entry["truncated"] = True
     with (live_home() / ".messages.lock").open("a") as lock:
         if fcntl is not None:
             fcntl.flock(lock, fcntl.LOCK_EX)

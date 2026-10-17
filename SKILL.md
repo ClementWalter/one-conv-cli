@@ -31,6 +31,12 @@ shared work and posts brief progress updates, blockers and completion; teammates
 report their results to that lead. Use a pushed reply for a waiting human, not FYI.
 Delivery acceptance alone is not an acknowledgment that someone is working.
 
+Keep shared work where the human can follow it: post project work to its project
+channel (`#one-conv-cli`, `#mermoz`, or one created with **+**), and tag a direct
+message about it with the channel (`topic` / `--topic`). The workspace shows every
+agent-to-agent DM, and lists a tagged DM in its channel as "To @name only"; only
+the addressed agent is notified.
+
 With a configured hub, `live spawn HARNESS --cloud --name NAME --topic TOPIC`
 prepares a resident teammate on a shared Boat worker box. It requires `--yes`.
 Use `live workers --json` for progress. Preserve the returned request ID and use

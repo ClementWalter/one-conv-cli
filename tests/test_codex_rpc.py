@@ -2,6 +2,7 @@
 
 import builtins
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -310,6 +311,98 @@ def test_unresponsive_websocket_handshake_is_bounded(home, monkeypatch):
         elapsed = time.monotonic() - started
         thread.join(1)
     assert (result, elapsed < 0.5) == ({}, True)
+
+
+@pytest.mark.parametrize("frame", ["close", "ping"])
+def test_late_protocol_frames_expire_without_internal_error_logs(caplog, frame):
+    from websockets.exceptions import ConnectionClosed
+    from websockets.sync.server import unix_serve
+
+    caplog.set_level(logging.ERROR, logger="websockets.client")
+    with tempfile.TemporaryDirectory(prefix="ocx") as directory:
+        path = str(Path(directory) / "s")
+
+        def handle(connection):
+            time.sleep(0.1)
+            try:
+                if frame == "close":
+                    connection.close()
+                else:
+                    connection.ping(b"late-probe-control")
+                    time.sleep(0.1)
+            except ConnectionClosed:
+                pass
+
+        with unix_serve(handle, path=path, close_timeout=0) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            with codex_rpc._connect(path, time.monotonic() + 0.05) as connection:
+                connection.recv_events_thread.join(1)
+                alive = connection.recv_events_thread.is_alive()
+            server.shutdown()
+            thread.join(1)
+    errors = [record.getMessage() for record in caplog.records
+              if record.name == "websockets.client" and record.levelno >= logging.ERROR]
+    assert (alive, errors) == (False, [])
+
+
+def test_early_socket_close_has_no_internal_error_logs(unix_daemon, caplog):
+    _, _, path = unix_daemon
+    caplog.set_level(logging.ERROR, logger="websockets.client")
+    with codex_rpc._connect(path, time.monotonic() + 2) as connection:
+        connection.close_socket()
+        connection.recv_events_thread.join(1)
+    errors = [record.getMessage() for record in caplog.records
+              if record.name == "websockets.client" and record.levelno >= logging.ERROR]
+    assert errors == []
+
+
+@pytest.mark.parametrize("attempt", range(20))
+def test_successful_early_context_close_has_no_internal_error_logs(unix_daemon, caplog, attempt):
+    _, _, path = unix_daemon
+    caplog.set_level(logging.ERROR, logger="websockets.client")
+    with codex_rpc._connect(path, time.monotonic() + 2):
+        pass
+    errors = [record.getMessage() for record in caplog.records
+              if record.name == "websockets.client" and record.levelno >= logging.ERROR]
+    assert errors == []
+
+
+def test_before_deadline_protocol_faults_are_not_suppressed(unix_daemon, monkeypatch):
+    from websockets.sync.client import ClientConnection
+
+    _, _, path = unix_daemon
+
+    def failed(connection):
+        raise RuntimeError("genuine protocol fault")
+
+    with codex_rpc._connect(path, time.monotonic() + 2) as connection, monkeypatch.context() as changed:
+        changed.setattr(ClientConnection, "send_data", failed)
+        with connection.protocol_mutex, pytest.raises(RuntimeError, match="genuine protocol fault"):
+            connection.send_data()
+
+
+def test_open_socket_timeout_faults_are_not_suppressed(unix_daemon):
+    _, _, path = unix_daemon
+    with codex_rpc._connect(path, time.monotonic() + 2) as connection:
+        original = connection.socket
+
+        class OpenSocketFault:
+            """The transport remains open while timeout setup fails for an unrelated reason."""
+
+            def __getattr__(self, name):
+                return getattr(original, name)
+
+            def settimeout(self, value):
+                raise OSError("genuine socket timeout fault")
+
+        with connection.protocol_mutex:
+            connection.socket = OpenSocketFault()
+            try:
+                with pytest.raises(OSError, match="genuine socket timeout fault"):
+                    connection.send_data()
+            finally:
+                connection.socket = original
 
 
 @pytest.mark.parametrize("transport,pressure", [("raw", "requests"), ("presence", "requests"), ("presence", "control-frames")])

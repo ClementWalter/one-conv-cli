@@ -141,10 +141,10 @@ def test_direct_route_survives_root_launch(direct_ui):
 
 
 def test_bridge_acceptance_is_not_a_read_receipt(direct_ui):
-    assert direct_ui[0].locator(".message-delivery").inner_text() == "Accepted by agent’s bridge"
+    assert direct_ui[0].locator(".message-delivery").inner_text() == "Delivery accepted"
 
 
-@pytest.mark.parametrize(("state", "label"), [("stored", "Stored on hub"), ("refused", "Refused"),
+@pytest.mark.parametrize(("state", "label"), [("stored", "Saved · awaiting delivery"), ("refused", "Refused"),
                                              ("unconfirmed", "Unconfirmed")])
 def test_bubble_delivery_uses_only_reported_evidence(direct_ui, state, label):
     page, _state, threads = direct_ui
@@ -238,6 +238,12 @@ def test_invitation_displays_one_use_and_expiry(generated_invitation):
 def test_invitation_is_cleared_when_settings_close(generated_invitation):
     page = generated_invitation[0]
     page.get_by_role("button", name="Close device settings").click()
+    assert page.locator("#device-invitation-url").input_value() == ""
+
+
+def test_invitation_is_cleared_when_settings_are_dismissed_with_escape(generated_invitation):
+    page = generated_invitation[0]
+    page.keyboard.press("Escape")
     assert page.locator("#device-invitation-url").input_value() == ""
 
 

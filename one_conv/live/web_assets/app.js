@@ -164,7 +164,7 @@ function freshness(seconds) {
 }
 function presenceText(p) {
   const presence = presenceOf(p);
-  const label = { idle: "Connected · idle report", busy: "Busy · bridge report", unverified: "Connection unverified", offline: "Offline" }[presence.state] || presence.label;
+  const label = { idle: "Connected · idle", busy: "Busy", unverified: "Connection unverified", offline: "Offline" }[presence.state] || presence.label;
   return label + (validDate(presence.last_seen) ? " · " + freshness(presence.last_seen) : "");
 }
 function personContext(p) {
@@ -662,7 +662,7 @@ function renderRows(rows, force = false) {
     }
     if (isHuman(row.from)) {
       const delivery = row.delivery && typeof row.delivery === "object" ? row.delivery : null;
-      const label = delivery && { stored: "Stored on hub", accepted: "Accepted by agent’s bridge", unconfirmed: "Unconfirmed", refused: "Refused" }[delivery.state];
+      const label = delivery && { stored: "Saved · awaiting delivery", accepted: "Delivery accepted", unconfirmed: "Unconfirmed", refused: "Refused" }[delivery.state];
       const status = el("small", label || (delivery ? delivery.label : "Stored on hub"), "message-delivery");
       status.title = delivery ? delivery.detail : "Stored in this conversation. No read receipt is available.";
       content.appendChild(status);
@@ -1355,7 +1355,7 @@ function renderDetails() {
     ),
     el(
       "p",
-      "Connection reports and recent hub messages. A busy report does not verify model availability.",
+      "See each teammate’s connection, project and latest message. Connected agents may still need model access or credits.",
     ),
   );
   content.append(
@@ -1380,10 +1380,10 @@ function renderDetails() {
       const presence = presenceOf(p);
       name.append(el("small", presenceText(p), "member-presence"), el("small", presence.detail), el("small", p.address, "member-address"));
       if (validDate(presence.last_seen)) {
-        const report = el("small", "Session report: " + validDate(presence.last_seen).toLocaleString());
+        const report = el("small", "Last checked: " + validDate(presence.last_seen).toLocaleString());
         name.appendChild(report);
       }
-      if (validDate(presence.bridge_last_seen)) name.appendChild(el("small", "Bridge heartbeat: " + freshness(presence.bridge_last_seen)));
+      if (validDate(presence.bridge_last_seen)) name.appendChild(el("small", "Machine connected: " + freshness(presence.bridge_last_seen)));
       if (p.session && p.session.title) name.appendChild(el("small", "Session context: " + p.session.title));
       const activity = p.session && p.session.activity;
       if (activity && activity.kind === "message") name.appendChild(el("small", "Latest hub message · " + freshness(activity.at) + ": “" + activity.summary + "”", "member-activity"));
@@ -1591,6 +1591,7 @@ $("generate-invitation").addEventListener("click", generateInvitation);
 $("copy-invitation").addEventListener("click", copyInvitation);
 $("share-invitation").addEventListener("click", shareInvitation);
 $("device-dialog").addEventListener("close", clearInvitation);
+$("device-dialog").addEventListener("cancel", clearInvitation);
 $("staff-team").addEventListener("click", () => {
   $("staff-dialog").showModal();
   if (model.view && model.view.kind === "topic") $("staff-topic").value = model.view.key;
@@ -1601,7 +1602,11 @@ $("staff-profile").addEventListener("change", renderStaffingDisclosure);
 $("staff-harness").addEventListener("change", renderStaffingDisclosure);
 $("show-costs").addEventListener("click", showCosts);
 for (const button of document.querySelectorAll("[data-close]")) {
-  button.addEventListener("click", () => $(button.dataset.close).close());
+  button.addEventListener("click", () => {
+    // Discard the secret before the browser queues its asynchronous dialog-close event.
+    if (button.dataset.close === "device-dialog") clearInvitation();
+    $(button.dataset.close).close();
+  });
 }
 window.addEventListener("beforeinstallprompt", (event) => {
   event.preventDefault(); installPrompt = event; $("install-app").hidden = false;

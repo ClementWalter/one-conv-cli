@@ -251,10 +251,16 @@
             >
               <svg class="icon tiny" aria-hidden="true">
                 <use href="#i-chevron" /></svg
-              ><span>Agents</span
+              ><span>Current connections</span
               ><span id="agent-count" class="section-count"></span>
             </button>
             <ul id="people" class="conversation-list"></ul>
+          </section>
+          <section id="offline-section" class="sidebar-section" hidden>
+            <button class="section-heading" data-section="offline-people" type="button" aria-expanded="false">
+              <svg class="icon tiny" aria-hidden="true"><use href="#i-chevron" /></svg><span>Offline history</span><span id="offline-count" class="section-count"></span>
+            </button>
+            <ul id="offline-people" class="conversation-list" hidden></ul>
           </section>
         </div>
         <div class="sidebar-footer">
@@ -312,6 +318,7 @@
           </div>
         </header>
         <div id="notice" class="notice" role="status" hidden></div>
+        <div id="conversation-response" class="conversation-response" role="status" hidden></div>
         <div id="message-scroll" class="message-scroll">
           <div id="conversation-intro" class="conversation-intro"></div>
           <ol
@@ -496,6 +503,18 @@
       <div class="dialog-heading"><div><span class="eyebrow">YOUR WORKSPACE, YOUR DEVICE</span><h2>Take your team with you.</h2></div><button class="icon-button" type="button" data-close="device-dialog" aria-label="Close device settings">×</button></div>
       <p class="dialog-description">On iPhone, open Safari’s Share menu and choose <strong>Add to Home Screen</strong>. OneConv opens as its own app.</p>
       <button id="install-app" class="primary-button" type="button" hidden>Install OneConv</button>
+      <section id="device-connect" class="device-connect" hidden>
+        <h3>Connect another device</h3>
+        <p class="quiet-copy">The link grants full owner access to your workspace. Share it privately with your own device. It works once and expires after 10 minutes; a new link replaces any unused link.</p>
+        <button id="generate-invitation" class="primary-button" type="button" hidden>Connect another device</button>
+        <div id="device-invitation" hidden>
+          <label for="device-invitation-url">Private invitation</label>
+          <input id="device-invitation-url" type="text" readonly autocomplete="off" spellcheck="false" />
+          <p id="invitation-expiry" class="quiet-copy"></p>
+          <div class="invitation-actions"><button id="copy-invitation" class="secondary-button" type="button">Copy link</button><button id="share-invitation" class="secondary-button" type="button" hidden>Share link</button></div>
+        </div>
+        <p id="invitation-feedback" class="quiet-copy" role="status"></p>
+      </section>
       <button id="logout-device" class="secondary-button" type="button" hidden>Disconnect this device</button>
       <p class="quiet-copy">Disconnecting removes this device’s access. It doesn’t stop your teammates.</p>
     </dialog>

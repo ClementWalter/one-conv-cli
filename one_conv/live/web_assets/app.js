@@ -22,6 +22,7 @@ const model = {
   workers: { jobs: [], pools: [], profiles: [] },
   costs: null,
   staffing: false,
+  reportReceivedAt: null,
 };
 const harnesses = {
   claude: "Claude",
@@ -36,6 +37,42 @@ let pairingToken = pairingFragment.get("pair");
 if (pairingFragment.has("pair")) history.replaceState(null, "", location.pathname + location.search);
 let installPrompt = null;
 let toastTimer;
+let deviceInvitation = null;
+let invitationGeneration = 0;
+let navigation = {};
+try {
+  const saved = JSON.parse(localStorage.getItem("oneconv:navigation"));
+  if (saved && typeof saved === "object" && !Array.isArray(saved)) {
+    if (validView(saved.view)) navigation.view = saved.view;
+    for (const kind of ["topic", "direct"])
+      if (validView({ kind, key: saved[kind] })) navigation[kind] = saved[kind];
+  }
+} catch (_) { /* Route restoration is optional when browser storage is unavailable. */ }
+
+function validView(value) {
+  return value && ["topic", "direct", "activity", "home"].includes(value.kind) &&
+    typeof value.key === "string" && value.key.length <= 2500 &&
+    (["activity", "home"].includes(value.kind) || value.key.length > 0);
+}
+function rememberView(view) {
+  if (!validView(view)) return;
+  navigation.view = { ...view };
+  if (view.kind === "topic" || view.kind === "direct") navigation[view.kind] = view.key;
+  // Only stable route IDs persist; message contents and drafts remain outside browser storage.
+  try { localStorage.setItem("oneconv:navigation", JSON.stringify(navigation)); } catch (_) { /* Storage can be unavailable. */ }
+}
+function requestedView() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  for (const kind of ["topic", "direct", "activity", "home"]) {
+    const view = { kind, key: params.get(kind) || "" };
+    if (params.has(kind) && validView(view)) return view;
+  }
+  return validView(navigation.view) ? navigation.view : null;
+}
+function savedRoute(kind) {
+  const view = { kind, key: navigation[kind] };
+  return validView(view) ? view : null;
+}
 
 function el(tag, text, cls) {
   const node = document.createElement(tag);
@@ -78,11 +115,9 @@ function person(address) {
   const alias = Object.entries(model.state.names || {}).find(
     ([, bound]) => bound === address || (localIdentity && bound === local),
   );
-  const name =
-    (session && session.name) ||
-    (alias && alias[0]) ||
-    harnesses[kind] ||
-    "Agent";
+  const boundName = (session && session.name) || (alias && alias[0]);
+  const name = boundName ? "@" + String(boundName).replace(/^@/, "") :
+    (harnesses[kind] || "Agent") + " · " + (local.split(":").slice(1).join(":") || local).slice(0, 8);
   return {
     address,
     name,
@@ -93,8 +128,47 @@ function person(address) {
       : { claude: "C", codex: "◈", omp: "π", cursor: "↗", boat: "B" }[kind] ||
         name.slice(0, 2).toUpperCase(),
     status: session && session.online !== false ? session.status : "offline",
+    machine: (session && session.node) || (slash > 0 ? address.slice(0, slash) : localNode) || "This machine",
+    project: session && session.cwd ? String(session.cwd).replace(/[\\/]+$/, "").split(/[\\/]/).pop() : "",
     session,
   };
+}
+function presenceOf(p) {
+  if (p.session && p.session.presence) {
+    const presence = p.session.presence;
+    const timestamps = [presence.last_seen, presence.bridge_last_seen].filter((value) => validDate(value));
+    // A cached report expires even when subsequent workspace polls cannot reach the server.
+    if (presence.state !== "offline" && timestamps.some((value) => reportTime() - Number(value) > 60))
+      return { ...presence, state: "offline", label: "Offline", can_message: false,
+        detail: "The last connection report expired. Check your connection or reconnect the bridge or agent." };
+    return presence;
+  }
+  // A directory entry alone cannot establish a live native agent connection.
+  const offline = !p.session || p.session.online === false;
+  return { state: offline ? "offline" : "unverified", label: offline ? "Offline" : "Connection unverified",
+    detail: offline ? "This session is not currently published." : "The agent connection has not been verified.",
+    can_message: !offline, last_seen: null, bridge_last_seen: null };
+}
+function reportTime() {
+  const at = Number(model.state.at);
+  // Monotonic elapsed time ages server evidence independently of the device wall clock.
+  return at > 0 && Number.isFinite(at) ? at + (model.reportReceivedAt === null ? 0 :
+    Math.max(0, performance.now() - model.reportReceivedAt) / 1000) : Date.now() / 1000;
+}
+function freshness(seconds) {
+  const date = validDate(seconds);
+  if (!date) return "time unknown";
+  const age = Math.max(0, Math.floor(reportTime() - date.getTime() / 1000));
+  return age < 60 ? age + "s ago" : age < 3600 ? Math.floor(age / 60) + "m ago" :
+    age < 86400 ? Math.floor(age / 3600) + "h ago" : Math.floor(age / 86400) + "d ago";
+}
+function presenceText(p) {
+  const presence = presenceOf(p);
+  const label = { idle: "Connected · idle", busy: "Busy", unverified: "Connection unverified", offline: "Offline" }[presence.state] || presence.label;
+  return label + (validDate(presence.last_seen) ? " · " + freshness(presence.last_seen) : "");
+}
+function personContext(p) {
+  return [p.kind, p.machine, p.project].filter(Boolean).join(" · ");
 }
 function avatar(address, size = "") {
   const p = person(address);
@@ -269,10 +343,13 @@ function sidebar() {
   $("direct-count").textContent = model.threads.length || "";
   const people = $("people");
   people.replaceChildren();
+  const offlinePeople = $("offline-people");
+  offlinePeople.replaceChildren();
   for (const session of model.state.sessions) {
     const p = person(session.address);
+    const state = presenceOf(p);
     const button = rowButton(
-      people,
+      state.state === "offline" ? offlinePeople : people,
       p.name,
       avatar(session.address, "tiny-avatar"),
       false,
@@ -280,42 +357,28 @@ function sidebar() {
     );
     const label = button.querySelector(".row-label");
     label.classList.add("agent-label");
-    const title =
-      session.title && !session.title.startsWith("one-conv-cli-")
-        ? session.title
-        : p.kind +
-          " · " +
-          (p.status === "busy"
-            ? "Working"
-            : p.status === "idle"
-              ? "Available"
-              : p.status === "loaded"
-                ? "Connected"
-                : p.status);
     label.replaceChildren(
       el("span", p.name, "agent-name"),
-      el("small", title, "agent-context"),
+      el("small", personContext(p), "agent-context"),
     );
+    if (session.title) label.appendChild(el("small", "Context: " + session.title, "agent-context agent-session-context"));
+    label.appendChild(el("small", presenceText(p), "agent-context agent-state"));
     const presence = el(
       "span",
       null,
-      "row-presence" +
-        (["idle", "busy", "loaded"].includes(p.status) ? " online" : ""),
+      "row-presence " + state.state,
     );
-    presence.title =
-      p.status === "busy"
-        ? "Working"
-        : p.status === "idle"
-          ? "Available"
-          : p.status;
+    presence.title = state.label;
     button.appendChild(presence);
-    button.title = p.name + " · " + p.kind + " · " + presence.title;
+    button.title = p.name + " · " + personContext(p) + " · " + presenceText(p) + "\n" + state.detail;
   }
   if (!people.children.length)
     people.appendChild(
-      el("li", "No agents are connected yet.", "sidebar-empty"),
+      el("li", "No current agent connections are reported.", "sidebar-empty"),
     );
-  $("agent-count").textContent = model.state.sessions.length || "";
+  $("agent-count").textContent = model.state.sessions.filter((s) => presenceOf(person(s.address)).state !== "offline").length || "";
+  $("offline-count").textContent = offlinePeople.children.length || "";
+  $("offline-section").hidden = !offlinePeople.children.length;
   $("all-activity").classList.toggle(
     "active",
     model.view && model.view.kind === "activity",
@@ -355,7 +418,7 @@ function header() {
         " · A shared space for your team"
       : view.kind === "direct"
         ? view.key.split(" ").includes("user")
-          ? "A direct line between you and your agent"
+          ? presenceText(person(view.key.split(" ").find((address) => address !== "user")))
           : "An agent-to-agent conversation"
         : view.kind === "search"
           ? "Across your workspace"
@@ -494,7 +557,8 @@ function messageText(container, text) {
   flush();
 }
 function renderRows(rows, force = false) {
-  const signature = JSON.stringify([model.view, rows, model.state.names]);
+  conversationResponse(rows);
+  const signature = JSON.stringify([model.view, rows, model.state.names, model.state.sessions.map((s) => [s.address, s.name])]);
   if (!force && signature === model.signature) return;
   const scroll = $("message-scroll");
   const follow =
@@ -596,6 +660,13 @@ function renderRows(rows, force = false) {
       const source = el("div", row.source, "message-source");
       content.appendChild(source);
     }
+    if (isHuman(row.from)) {
+      const delivery = row.delivery && typeof row.delivery === "object" ? row.delivery : null;
+      const label = delivery && { stored: "Saved · awaiting delivery", accepted: "Delivery accepted", unconfirmed: "Unconfirmed", refused: "Refused" }[delivery.state];
+      const status = el("small", label || (delivery ? delivery.label : "Stored on hub"), "message-delivery");
+      status.title = delivery ? delivery.detail : "Stored in this conversation. No read receipt is available.";
+      content.appendChild(status);
+    }
     item.appendChild(content);
     list.appendChild(item);
     previous = row;
@@ -618,6 +689,19 @@ function renderRows(rows, force = false) {
     if (rows.length > previousCount) $("new-messages").hidden = false;
   }
   model.first = false;
+}
+function conversationResponse(rows) {
+  const node = $("conversation-response");
+  node.hidden = true;
+  if (!model.view || model.view.kind !== "direct" || !model.view.key.split(" ").includes("user")) return;
+  const peer = model.view.key.split(" ").find((address) => address !== "user");
+  const pairRows = rows.filter((row) => (row.from === "user" && row.to === peer) || (row.from === peer && row.to === "user"));
+  const request = pairRows.filter((row) => row.from === "user").at(-1);
+  if (!request) return;
+  const later = pairRows.filter((row) => row.from === peer && Number(row.at) > Number(request.at)).at(-1);
+  node.textContent = later ? "Latest message from " + person(peer).name + " · " + freshness(later.at) +
+    ". Messages have no read or reply-to receipts." : "No later message from this agent yet.";
+  node.hidden = false;
 }
 async function refreshView(force = false) {
   const view = model.view;
@@ -655,11 +739,13 @@ function select(kind, key = "", updateHash = true) {
   if (previousTarget)
     model.drafts.set(previousTarget, $("message-input").value);
   model.view = { kind, key };
+  rememberView(model.view);
   $("message-input").value = model.drafts.get(target()) || "";
   $("message-input").style.height = "auto";
   model.signature = "";
   model.first = true;
   model.rows = [];
+  $("conversation-response").hidden = true;
   notice("");
   $("messages").replaceChildren();
   $("new-messages").hidden = true;
@@ -689,13 +775,18 @@ function select(kind, key = "", updateHash = true) {
 }
 async function refreshState() {
   if (!model.authenticated) return;
-  if (model.refreshing) return;
+  if (model.refreshing) {
+    sidebar();
+    header();
+    return;
+  }
   model.refreshing = true;
   try {
     const [state, direct] = await Promise.all([
       get("/api/state"),
       get("/api/direct"),
     ]);
+    model.reportReceivedAt = performance.now();
     model.state = {
       ...state,
       topics: state.topics || [],
@@ -705,13 +796,8 @@ async function refreshState() {
     model.threads = direct.threads || [];
     connected(true);
     if (!model.view) {
-      const params = new URLSearchParams(location.hash.slice(1));
-      if (
-        params.has("topic") &&
-        state.topics.some((t) => t.topic === params.get("topic"))
-      )
-        select("topic", params.get("topic"));
-      else if (params.has("direct")) select("direct", params.get("direct"));
+      const restored = requestedView();
+      if (restored) select(restored.kind, restored.key);
       else if (model.state.topics.length)
         select("topic", model.state.topics[0].topic);
       else select("home");
@@ -723,13 +809,16 @@ async function refreshState() {
     if (state.error) notice(state.error, true);
   } catch (error) {
     connected(false);
-    notice("The workspace is reconnecting. Your draft is safe.", true);
+    sidebar();
+    header();
+    notice("The workspace is reconnecting. Your draft is safe. An agent may have answered in its own app while its reply connection was unavailable.", true);
   } finally {
     model.refreshing = false;
   }
 }
 function updateComposer() {
   const destination = target();
+  const unavailable = destination && !destination.startsWith("#") && !presenceOf(person(destination)).can_message;
   $("composer").hidden = !destination;
   $("observer-note").hidden = Boolean(destination);
   $("observer-note").firstElementChild.textContent =
@@ -744,8 +833,10 @@ function updateComposer() {
   $("send-message").disabled =
     !destination ||
     !model.token ||
+    unavailable ||
     model.sending ||
     !$("message-input").value.trim();
+  $("send-message").title = unavailable ? "This agent is offline. Your draft stays here until it reconnects." : "Send message as a human";
 }
 function feedback(text, type = "") {
   const node = $("composer-feedback");
@@ -764,6 +855,8 @@ async function session() {
     $("staff-team").hidden = !model.capabilities.workers;
     $("show-costs").hidden = !model.capabilities.accounting;
     $("logout-device").hidden = !data.authenticated;
+    $("generate-invitation").hidden = !model.capabilities.pairing;
+    $("device-connect").hidden = !model.capabilities.pairing;
     updateComposer();
     return model.authenticated;
   } catch (error) {
@@ -779,6 +872,7 @@ function authentication(accepted) {
   document.body.classList.toggle("authentication-required", !accepted);
   $("pairing").hidden = accepted;
   if (!accepted) {
+    clearInvitation();
     model.token = null;
     for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
   }
@@ -819,6 +913,7 @@ async function connectDevice() {
 }
 
 async function disconnectDevice() {
+  clearInvitation();
   try {
     await post("/api/logout", {});
     model.state = { topics: [], sessions: [], names: {} };
@@ -828,6 +923,8 @@ async function disconnectDevice() {
     model.drafts.clear();
     model.pending.clear();
     try { sessionStorage.removeItem("oneconv:staffing"); } catch (_) { /* Some browsers disable storage. */ }
+    navigation = {};
+    try { localStorage.removeItem("oneconv:navigation"); } catch (_) { /* Storage can be unavailable. */ }
     model.costs = null;
     model.workers = { jobs: [], pools: [], profiles: [] };
     $("messages").replaceChildren();
@@ -839,6 +936,62 @@ async function disconnectDevice() {
     $("pair-device").hidden = true;
     $("pairing-feedback").textContent = "This device is disconnected. Open a new pairing link to return.";
   } catch (error) { toast(error.message); }
+}
+
+function clearInvitation() {
+  invitationGeneration += 1;
+  deviceInvitation = null;
+  $("device-invitation").hidden = true;
+  $("device-invitation-url").value = "";
+  $("invitation-feedback").textContent = "";
+  $("generate-invitation").disabled = false;
+  $("generate-invitation").textContent = "Connect another device";
+}
+async function generateInvitation() {
+  const generation = ++invitationGeneration;
+  deviceInvitation = null;
+  $("device-invitation").hidden = true;
+  $("device-invitation-url").value = "";
+  $("generate-invitation").disabled = true;
+  $("invitation-feedback").textContent = "Creating a private invitation…";
+  try {
+    const invitation = await post("/api/devices/pair", {});
+    // A closed dialog cannot redisplay a secret when an in-flight response arrives.
+    if (generation !== invitationGeneration || !model.authenticated || !$("device-dialog").open) return;
+    deviceInvitation = invitation;
+    $("device-invitation-url").value = invitation.url;
+    $("invitation-expiry").textContent = "One use · expires " + validDate(invitation.expires_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    $("device-invitation").hidden = false;
+    $("share-invitation").hidden = !navigator.share;
+    $("generate-invitation").textContent = "Create a new link";
+    $("invitation-feedback").textContent = "Open this link in Safari on your iPhone. This device stays connected.";
+  } catch (error) {
+    if (generation === invitationGeneration) $("invitation-feedback").textContent = error.message;
+  } finally {
+    if (generation === invitationGeneration) $("generate-invitation").disabled = false;
+  }
+}
+async function copyInvitation() {
+  if (!deviceInvitation) return;
+  if (Number(deviceInvitation.expires_at) <= reportTime()) {
+    clearInvitation();
+    $("invitation-feedback").textContent = "This invitation expired. Create a new link.";
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(deviceInvitation.url);
+    $("invitation-feedback").textContent = "Link copied. Share it privately with your other device.";
+  } catch (_) {
+    $("device-invitation-url").focus();
+    $("device-invitation-url").select();
+    $("invitation-feedback").textContent = "Select and copy the invitation above.";
+  }
+}
+async function shareInvitation() {
+  if (!deviceInvitation || !navigator.share) return;
+  if (Number(deviceInvitation.expires_at) <= reportTime()) return copyInvitation();
+  try { await navigator.share({ title: "Connect to OneConv", url: deviceInvitation.url }); }
+  catch (_) { /* Cancelling the share sheet leaves the invitation available. */ }
 }
 
 const jobLabels = {
@@ -867,10 +1020,11 @@ function renderJobs() {
       spec.profile && blockedPool.profile === spec.profile && !blockedOwner;
     item.append(el("span", (spec.name || "A").slice(0, 2).toUpperCase(), "avatar codex"));
     const text = el("div");
-    const online = job.status === "ready" && model.state.sessions.some(
-      (peer) => peer.address === job.address && peer.online !== false);
+    const jobPresence = presenceOf(person(job.address));
+    const online = job.status === "ready" && jobPresence.can_message;
     text.append(el("strong", spec.name || "Teammate"), el("small", allocationBlocked ? "Waiting for box recovery" :
-      job.status === "ready" && !online ? "Offline · check the connection" : jobLabels[job.status] || job.status || "Preparing"));
+      job.status === "ready" && !online ? "Offline · check the connection" :
+        job.status === "ready" && jobPresence.state === "unverified" ? "Connection unverified" : jobLabels[job.status] || job.status || "Preparing"));
     if (job.error || job.detail) text.append(el("p", job.error || job.detail, "job-detail"));
     if (job.status === "stopped" && job.phase === "pool-stopped") {
       text.append(el("p", restartable ? "The box is available. Choose Check again to reconnect this teammate." :
@@ -1112,6 +1266,10 @@ async function send(event) {
   const destination = target(),
     text = $("message-input").value.trim();
   if (!destination || !text || model.sending || !model.token) return;
+  if (!destination.startsWith("#") && !presenceOf(person(destination)).can_message) {
+    feedback("This agent is offline. Your draft stays here until it reconnects.", "error");
+    return;
+  }
   const draftKey = JSON.stringify([destination, text]);
   if (!model.pending.has(draftKey))
     model.pending.set(draftKey, {
@@ -1148,12 +1306,12 @@ async function send(event) {
     feedback(
       data.status === "unconfirmed"
         ? "Delivery isn't confirmed. Check the conversation before sending again."
-        : "Sent as You · Human.",
+        : "Stored on hub. Bridge acceptance and replies appear in the conversation.",
       data.status === "unconfirmed" ? "error" : "success",
     );
     model.first = true;
     await refreshState();
-    if (data.status !== "unconfirmed") toast("Your message is on its way");
+    if (data.status !== "unconfirmed") toast("Message stored on hub");
   } catch (error) {
     feedback(
       error.message ||
@@ -1197,7 +1355,7 @@ function renderDetails() {
     ),
     el(
       "p",
-      "A shared conversation between you and the agents doing the work. Choose a person below to send them a message.",
+      "See each teammate’s connection, project and latest message. Connected agents may still need model access or credits.",
     ),
   );
   content.append(
@@ -1215,14 +1373,22 @@ function renderDetails() {
       el("strong", p.name),
       el(
         "small",
-        p.kind +
-          (p.status === "busy"
-            ? " · Working"
-            : p.status === "idle"
-              ? " · Available"
-              : ""),
+        isHuman(address) ? "Human" : personContext(p),
       ),
     );
+    if (!isHuman(address)) {
+      const presence = presenceOf(p);
+      name.append(el("small", presenceText(p), "member-presence"), el("small", presence.detail), el("small", p.address, "member-address"));
+      if (validDate(presence.last_seen)) {
+        const report = el("small", "Last checked: " + validDate(presence.last_seen).toLocaleString());
+        name.appendChild(report);
+      }
+      if (validDate(presence.bridge_last_seen)) name.appendChild(el("small", "Machine connected: " + freshness(presence.bridge_last_seen)));
+      if (p.session && p.session.title) name.appendChild(el("small", "Session context: " + p.session.title));
+      const activity = p.session && p.session.activity;
+      if (activity && activity.kind === "message") name.appendChild(el("small", "Latest hub message · " + freshness(activity.at) + ": “" + activity.summary + "”", "member-activity"));
+      else name.appendChild(el("small", "Current task is not reported."));
+    }
     button.appendChild(name);
     if (isHuman(address)) button.disabled = true;
     else
@@ -1277,9 +1443,10 @@ function recipients() {
     );
   for (const agent of model.state.sessions) {
     const p = person(agent.address);
+    if (presenceOf(p).state === "offline" && !query) continue;
     option(
       p.name,
-      p.kind + (agent.title ? " · " + agent.title : ""),
+      personContext(p) + " · " + presenceOf(p).label,
       "Agent",
       avatar(agent.address),
       () => select("direct", pairOf(agent.address)),
@@ -1420,6 +1587,11 @@ $("pair-device").hidden = !pairingToken;
 $("pair-device").addEventListener("click", connectDevice);
 $("logout-device").addEventListener("click", disconnectDevice);
 $("device-menu").addEventListener("click", () => $("device-dialog").showModal());
+$("generate-invitation").addEventListener("click", generateInvitation);
+$("copy-invitation").addEventListener("click", copyInvitation);
+$("share-invitation").addEventListener("click", shareInvitation);
+$("device-dialog").addEventListener("close", clearInvitation);
+$("device-dialog").addEventListener("cancel", clearInvitation);
 $("staff-team").addEventListener("click", () => {
   $("staff-dialog").showModal();
   if (model.view && model.view.kind === "topic") $("staff-topic").value = model.view.key;
@@ -1430,7 +1602,11 @@ $("staff-profile").addEventListener("change", renderStaffingDisclosure);
 $("staff-harness").addEventListener("change", renderStaffingDisclosure);
 $("show-costs").addEventListener("click", showCosts);
 for (const button of document.querySelectorAll("[data-close]")) {
-  button.addEventListener("click", () => $(button.dataset.close).close());
+  button.addEventListener("click", () => {
+    // Discard the secret before the browser queues its asynchronous dialog-close event.
+    if (button.dataset.close === "device-dialog") clearInvitation();
+    $(button.dataset.close).close();
+  });
 }
 window.addEventListener("beforeinstallprompt", (event) => {
   event.preventDefault(); installPrompt = event; $("install-app").hidden = false;
@@ -1461,18 +1637,20 @@ $("members-toggle").addEventListener("click", () => toggleDetails());
 $("details-toggle").addEventListener("click", () => toggleDetails());
 $("details-close").addEventListener("click", () => toggleDetails(false));
 $("nav-people").addEventListener("click", () => toggleDetails());
-$("nav-home").addEventListener("click", () =>
-  select(
-    model.state.topics.length ? "topic" : "home",
-    model.state.topics.length ? model.state.topics[0].topic : "",
-  ),
-);
+$("nav-home").addEventListener("click", () => {
+  const previous = savedRoute("topic");
+  if (previous) select(previous.kind, previous.key);
+  else if (model.state.topics.length) select("topic", model.state.topics[0].topic);
+  else select("home");
+});
 $("workspace-home").addEventListener("click", (event) => {
   event.preventDefault();
   $("nav-home").click();
 });
 $("nav-direct").addEventListener("click", () => {
-  if (model.threads.length) select("direct", model.threads[0].pair);
+  const previous = savedRoute("direct");
+  if (previous) select(previous.kind, previous.key);
+  else if (model.threads.length) select("direct", model.threads[0].pair);
   else newMessage();
 });
 $("nav-activity").addEventListener("click", () => select("activity"));
@@ -1525,6 +1703,11 @@ document.addEventListener("keydown", (event) => {
     toggleDetails(false);
     $("emoji-picker").hidden = true;
   }
+});
+window.addEventListener("hashchange", () => {
+  if (!model.authenticated) return;
+  const view = requestedView();
+  if (view) select(view.kind, view.key, false);
 });
 try {
   theme(localStorage.getItem("oneconv:theme") === "dark" ? "dark" : "light");

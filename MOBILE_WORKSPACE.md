@@ -10,9 +10,24 @@ minutes by default. The resulting session lasts up to thirty days. Disconnecting
 the device revokes its session. Offline navigation shows a reconnect page;
 the public app shell contains no message history.
 
+From a connected device, open **Device settings → Connect another device** to
+generate a private one-use link for your other device. It expires after ten
+minutes and grants full owner access, including messaging and staffing. Creating
+a new link invalidates the previous unused link while keeping connected devices
+signed in. Share the plain workspace URL for navigation; keep `#pair=…` links private.
+
 The human is **You**, with return address `workspace/user`. Browser messages
 cannot select an agent identity. An agent's acceptance means the delivery was
 accepted, not that it has read or answered the task.
+
+Agent names and short IDs stay stable; a native conversation title is context.
+The roster separates the bridge's connection from the agent's reported idle or
+busy status. A loaded native thread with no activity report is **Unverified**,
+and an expired bridge or session publication is **Offline**. Neither a connected
+process nor an accepted message proves provider credits or a reply. Last-message
+context shows recorded workspace activity, not an inferred current assignment.
+Offline conversations keep their history; a new direct message requires the
+agent to be connected again. Reopening the app keeps the selected conversation.
 
 ## Hosting and pairing
 

@@ -114,6 +114,8 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
     elif human and address in ("user", "workspace/user"):
         footer = f'\nA human sent this message. To reply, call the one-conv send_message tool with to="{_attr(address)}"'
         footer += f', or to="#{_attr(topic)}" to answer everyone on the topic.' if topic else "."
+        footer += (f"\nIf the tool fails, send the reply through your terminal with "
+                   f"`one-conv live send {address} --stdin --no-reply --yes`, passing your reply on stdin.")
     elif human and topic:
         footer = f'\nA human sent this message. To reply, call the one-conv send_message tool with to="#{_attr(topic)}".'
     elif human:

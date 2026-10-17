@@ -235,7 +235,10 @@ def _hub_catch_up(hub, topic: str, address: str, everything: bool, peek: bool, l
     if not (isinstance(cursor, str) and cursor.isdigit()):
         cursor = None
     rows = [{"id": r["id"], "cursor": r.get("cursor"), "at": r.get("created") or 0, "from": r["from"],
-             "text": r["text"], "mode": r.get("mode", "push")}
+             "text": r["text"], "mode": r.get("mode", "push"),
+             # A tagged direct message keeps its one recipient, so it is not read as a broadcast.
+             **({"to": r["to"]} if isinstance(r.get("to"), str) and not r["to"].startswith("#") else {}),
+             **({"reported": True} if r.get("reported") is True else {})}
             for r in _hub_call(lambda: hub.history(topic, cursor, limit=TOPIC_HISTORY))]
     shown = rows[-limit:]
     current = members(topic)

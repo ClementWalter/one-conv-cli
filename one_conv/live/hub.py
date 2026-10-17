@@ -27,6 +27,9 @@ from contextlib import contextmanager
 NODE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 TOPIC = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 MESSAGE_ID = re.compile(r"[0-9a-f]{32}")
+# A session on the reporting node itself: harness:id, never a human or another node's route.
+LOCAL_AGENT = re.compile(r"[a-z]+:[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+REPORT_BATCH = 100
 # What the receiving bridge reports: the adapter accepted it (not that the agent read it),
 # the adapter refused it, or the bridge cannot tell (it crashed between claiming and reporting).
 OUTCOMES = ("accepted", "refused", "unconfirmed")
@@ -92,6 +95,9 @@ class Hub:
         self.general = general
         with self._db() as db:
             db.executescript(SCHEMA)
+            # Posts a node reported after delivering them itself; they never had a hub delivery to take.
+            if "reported" not in {row[1] for row in db.execute("PRAGMA table_info(posts)")}:
+                db.execute("ALTER TABLE posts ADD COLUMN reported INTEGER NOT NULL DEFAULT 0")
 
     @contextmanager
     def _db(self):
@@ -268,6 +274,69 @@ class Hub:
                            [(secrets.token_hex(16), seq, n, a) for n, a in recipients])
             return self._receipt(db, seq, msg_id, False)
 
+    @staticmethod
+    def _reported(item) -> tuple:
+        """Validate one reported message; the values a post and its settled delivery need."""
+        if not isinstance(item, dict):
+            raise HubError(400, "each reported message is an object")
+        msg_id, sender, target, topic = item.get("id"), item.get("from"), item.get("to"), item.get("topic")
+        text, at, outcome = item.get("text"), item.get("at"), item.get("outcome")
+        reply, mode = item.get("reply", "expected"), item.get("mode", "push")
+        if not isinstance(msg_id, str) or not MESSAGE_ID.fullmatch(msg_id):
+            raise HubError(400, "id must be 32 lowercase hex characters")
+        if not all(isinstance(a, str) and LOCAL_AGENT.fullmatch(a) for a in (sender, target)):
+            raise HubError(403, "a node reports only messages between its own agents (harness:id)")
+        if topic is not None and (not isinstance(topic, str) or not TOPIC.fullmatch(topic)):
+            raise HubError(400, "a topic is lowercase letters, digits and dashes")
+        if not isinstance(text, str) or not text or len(text) > MAX_TEXT:
+            raise HubError(400, f"text must be a non-empty string of at most {MAX_TEXT} characters")
+        try:
+            text.encode("utf-8")
+        except UnicodeError:
+            raise HubError(400, "text must be valid Unicode") from None
+        if reply not in ("expected", "none", "inline") or mode not in MODES or outcome not in OUTCOMES:
+            raise HubError(400, "reply, mode or outcome is not a known value")
+        if type(at) not in (int, float) or not 0 < at < 32_503_680_000:
+            raise HubError(400, "at is the original send time in epoch seconds")
+        return msg_id, sender, target, topic, text, float(at), outcome, reply, mode
+
+    def report(self, node: str, items) -> dict:
+        """Record messages this node already delivered between its own agents, as history only.
+
+        Each becomes a post with its original id, time and target, and one delivery whose outcome
+        is already set, so no inbox ever hands it out again. A retry is a duplicate; the same id
+        with other content is a conflict and changes nothing; an invalid item is refused alone.
+        """
+        if not isinstance(items, list) or not 1 <= len(items) <= REPORT_BATCH:
+            raise HubError(400, f"report between 1 and {REPORT_BATCH} messages")
+        results = []
+        with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for item in items:
+                try:
+                    msg_id, sender, target, topic, text, at, outcome, reply, mode = self._reported(item)
+                except HubError as error:
+                    ident = item.get("id") if isinstance(item, dict) and isinstance(item.get("id"), str) else None
+                    results.append({"id": ident, "status": "refused", "error": str(error)})
+                    continue
+                # The original time and outcome are part of the record: a changed observation is a conflict.
+                digest = hashlib.sha256(json.dumps(["reported", target, sender, topic, reply, mode, text, at,
+                                                    outcome]).encode()).hexdigest()
+                existing = db.execute("SELECT digest FROM posts WHERE from_node = ? AND id = ?",
+                                      (node, msg_id)).fetchone()
+                if existing:
+                    results.append({"id": msg_id, "status": "duplicate" if existing[0] == digest else "conflict"})
+                    continue
+                seq = db.execute("INSERT INTO posts (from_node, id, digest, target, sender, topic, reply, mode, text,"
+                                 " created, reported) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                                 (node, msg_id, digest, f"{node}/{target}", sender, topic, reply, mode, text,
+                                  at)).lastrowid
+                db.execute("INSERT INTO deliveries (delivery, post, to_node, to_address, taken, outcome, outcome_at)"
+                           " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                           (secrets.token_hex(16), seq, node, target, at, outcome, at))
+                results.append({"id": msg_id, "status": "recorded"})
+        return {"results": results}
+
     def inbox(self, node: str, wait: float) -> list[dict]:
         """Deliveries for this node without an outcome yet, waiting up to `wait` seconds for one.
 
@@ -339,6 +408,9 @@ class Hub:
         for topic, node, address in members:
             listing.setdefault(topic, {"topic": topic, "members": [], "last": last.get(topic)})["members"].append(
                 f"{node}/{address}")
+        # A topic whose members all left, or that only reported history names, is still readable.
+        for topic in sorted(set(last) - set(listing)):
+            listing[topic] = {"topic": topic, "members": [], "last": last[topic]}
         return list(listing.values())
 
     def history(self, topic: str, after: int = 0, limit: int = 100) -> list[dict]:
@@ -347,11 +419,12 @@ class Hub:
         The cursor is the hub's own post sequence: client ids are unique only per sending node.
         """
         with self._db() as db:
-            rows = db.execute("SELECT seq, id, from_node, sender, reply, mode, text, created FROM posts"
-                              " WHERE topic = ? AND seq > ? ORDER BY seq LIMIT ?",
+            rows = db.execute("SELECT seq, id, from_node, sender, target, reply, mode, text, created, reported"
+                              " FROM posts WHERE topic = ? AND seq > ? ORDER BY seq LIMIT ?",
                               (topic, after, max(1, min(limit, 500)))).fetchall()
-        return [{"cursor": str(q), "id": i, "from": f"{fn}/{s}", "reply": r, "mode": m, "text": x,
-                 "created": c} for q, i, fn, s, r, m, x, c in rows]
+        # `to` is the original target: "#topic" for a post to everyone, a route for a tagged direct message.
+        return [{"cursor": str(q), "id": i, "from": f"{fn}/{s}", "to": t, "reply": r, "mode": m, "text": x,
+                 "created": c, "reported": bool(rep)} for q, i, fn, s, t, r, m, x, c, rep in rows]
 
 
 def application(hub: Hub):
@@ -435,6 +508,9 @@ def application(hub: Hub):
             return {"messages": hub.history(req.path_params["topic"], min(int(after), 2**63 - 1), limit)}
         return await handle(request, work)
 
+    async def report(request):
+        return await handle(request, lambda node, body, _: hub.report(node, body.get("messages")))
+
     async def whoami(request):
         return await handle(request, lambda node, body, _: {"node": node})
 
@@ -442,6 +518,7 @@ def application(hub: Hub):
         Route("/v1/whoami", whoami, methods=["GET"]),
         Route("/v1/sessions", sessions, methods=["GET", "PUT"]),
         Route("/v1/messages", messages, methods=["POST"]),
+        Route("/v1/history", report, methods=["POST"]),
         Route("/v1/messages/{msg_id}", status, methods=["GET"]),
         Route("/v1/inbox", inbox, methods=["GET"]),
         Route("/v1/acks", acks, methods=["POST"]),

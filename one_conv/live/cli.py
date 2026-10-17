@@ -266,6 +266,8 @@ def build_live_group(launcher: list[str]) -> click.Group:
         for row in result["messages"]:
             name = team.name_for(row["from"])
             who = f"@{name} {row['from']}" if name else row["from"]
+            if row.get("to"):
+                who += f" → {row['to']} only"
             click.echo(f"\n[{time.strftime('%Y-%m-%d %H:%M', time.localtime(row['at']))}] {who}:\n{row['text']}")
 
     @live.command("join", context_settings=HELP, epilog=examples('one-conv live join release-4-2', 'one-conv live join release-4-2 --as codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03'))

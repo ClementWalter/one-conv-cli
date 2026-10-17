@@ -99,6 +99,15 @@ def validate_channel(payload: object) -> dict:
             "members": [split_address(member) for member in members]}
 
 
+def _provenance(row: dict) -> dict:
+    """Say where a reported row comes from: the sending machine's local message log."""
+    if row.get("reported"):
+        row["delivery"] = {**row["delivery"], "detail": row["delivery"]["detail"] + (
+            " From the sending machine's local message log; nobody was notified again. Older local copies may"
+            " be shortened to 20,000 characters.")}
+    return row
+
+
 class ControlStore:
     """The hub posts are the durable mailbox and the idempotent send journal."""
 
@@ -255,22 +264,27 @@ class ControlStore:
                 for node, local, ident, sender_node, sender, target, topic, text, created in rows}
 
     @staticmethod
-    def _row(seq, ident, node, sender, target, topic, reply, mode, text, created, outcome, outcome_at=None):
-        return {"cursor": str(seq), "id": ident, "from": display_address(f"{node}/{sender}"),
-                "to": display_address(target), "topic": topic, "reply": reply, "mode": mode,
-                "text": text, "at": created, "status": outcome or "stored",
-                "delivery": message_delivery(outcome, outcome_at, human_inbox=target == HUMAN)}
+    def _row(seq, ident, node, sender, target, topic, reply, mode, text, created, outcome, outcome_at=None, reported=0):
+        row = {"cursor": str(seq), "id": ident, "from": display_address(f"{node}/{sender}"),
+               "to": display_address(target), "topic": topic, "reply": reply, "mode": mode,
+               "text": text, "at": created, "status": outcome or "stored",
+               "delivery": message_delivery(outcome, outcome_at, human_inbox=target == HUMAN)}
+        if reported:
+            row["reported"] = True
+        return row
 
     def direct(self):
         self.drain_human()
         with self.hub._db() as db:
             rows = db.execute(
                 "SELECT p.seq,p.id,p.from_node,p.sender,d.to_node || '/' || d.to_address,p.topic,p.reply,p.mode,"
-                "p.text,p.created,d.outcome,d.outcome_at FROM posts p JOIN deliveries d ON d.post=p.seq "
-                "WHERE p.topic IS NULL ORDER BY p.seq DESC LIMIT ?", (MESSAGES_SHOWN,)).fetchall()
+                "p.text,p.created,d.outcome,d.outcome_at,p.reported FROM posts p JOIN deliveries d ON d.post=p.seq "
+                # Directness comes from the original target, so a topic-tagged DM stays in its pair's thread.
+                "WHERE p.target NOT LIKE '#%' ORDER BY p.created DESC, p.seq DESC LIMIT ?",
+                (MESSAGES_SHOWN,)).fetchall()
         threads = defaultdict(list)
         for values in reversed(rows):
-            row = self._row(*values)
+            row = _provenance(self._row(*values))
             pair = " ".join(sorted((row["from"], row["to"])))
             threads[pair].append(row)
         return {"threads": [{"pair": pair, "messages": rows, "last": rows[-1]["at"]}
@@ -282,14 +296,15 @@ class ControlStore:
         with self.hub._db() as db:
             total = db.execute("SELECT COUNT(*) FROM posts WHERE topic=?", (topic,)).fetchone()[0]
             rows = db.execute(
-                "SELECT seq,id,from_node,sender,target,topic,reply,mode,text,created,NULL "
-                "FROM posts WHERE topic=? ORDER BY seq DESC LIMIT ?", (topic, MESSAGES_SHOWN)).fetchall()
+                "SELECT seq,id,from_node,sender,target,topic,reply,mode,text,created,NULL,NULL,reported "
+                # Reported history keeps its original send time, so time orders the channel.
+                "FROM posts WHERE topic=? ORDER BY created DESC, seq DESC LIMIT ?", (topic, MESSAGES_SHOWN)).fetchall()
             recipients = defaultdict(list)
             if rows:
+                shown = [row[0] for row in rows]
                 for post, route, outcome, outcome_at in db.execute(
-                        "SELECT d.post, d.to_node || '/' || d.to_address, d.outcome, d.outcome_at FROM deliveries d "
-                        "JOIN posts p ON p.seq = d.post WHERE p.topic = ? AND p.seq >= ? ORDER BY d.rowid",
-                        (topic, rows[-1][0])):
+                        "SELECT post, to_node || '/' || to_address, outcome, outcome_at FROM deliveries "
+                        f"WHERE post IN ({','.join('?' * len(shown))}) ORDER BY rowid", shown):
                     recipients[post].append((display_address(route), outcome, outcome_at))
         messages = []
         for row in reversed(rows):
@@ -297,7 +312,9 @@ class ControlStore:
             # A channel post has one delivery per member, so its status is their rollup.
             message["delivery"] = channel_delivery(recipients[row[0]])
             message["status"] = message["delivery"]["state"]
-            messages.append(message)
+            # A topic-tagged direct message is listed here for context; only its target received it.
+            message["directed"] = not row[4].startswith("#")
+            messages.append(_provenance(message))
         return {"topic": topic, "messages": messages, "omitted": max(0, total - len(rows))}
 
     def send(self, payload):

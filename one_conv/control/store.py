@@ -10,7 +10,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 
-from ..live.hub import MESSAGE_ID, TOPIC, Hub, HubError, split_address
+from ..live.hub import GENERAL, MESSAGE_ID, TOPIC, Hub, HubError, split_address
 from ..live.hub import NODE as PEER_NODE
 from .presence import message_activity, message_delivery, session_presence
 
@@ -18,6 +18,7 @@ NODE = "workspace"
 HUMAN = "workspace/user"
 TEXT_LIMIT = 32_000
 MESSAGES_SHOWN = 300
+MEMBERS_LIMIT = 50
 
 
 @contextmanager
@@ -69,6 +70,29 @@ def validate_message(payload: object) -> dict:
     return {"id": ident, "target": target, "text": text}
 
 
+def validate_channel(payload: object) -> dict:
+    """A new channel: a stable retry ID, its name, a kickoff message and the agents to add."""
+    if not isinstance(payload, dict) or set(payload) != {"id", "topic", "purpose", "members"}:
+        raise HubError(400, "Provide only id, topic, purpose and members.")
+    ident, topic, purpose, members = (payload[key] for key in ("id", "topic", "purpose", "members"))
+    if not isinstance(ident, str) or not MESSAGE_ID.fullmatch(ident):
+        raise HubError(400, "id must be 32 lowercase hexadecimal characters, unchanged on retry")
+    if not isinstance(topic, str) or not TOPIC.fullmatch(topic):
+        raise HubError(400, "A channel name uses lowercase letters, digits and dashes.")
+    if topic == GENERAL:
+        raise HubError(409, "#general already includes everyone.")
+    if not isinstance(purpose, str) or not purpose.strip():
+        raise HubError(400, "Say what this channel is for; it is posted as the first message.")
+    if len(purpose) > TEXT_LIMIT:
+        raise HubError(413, "The channel purpose is too large.")
+    if (not isinstance(members, list) or len(members) > MEMBERS_LIMIT
+            or any(not isinstance(member, str) or member == HUMAN for member in members)
+            or len(set(members)) != len(members)):
+        raise HubError(400, f"members is a list of at most {MEMBERS_LIMIT} distinct agent routes.")
+    return {"id": ident, "topic": topic, "purpose": purpose,
+            "members": [split_address(member) for member in members]}
+
+
 class ControlStore:
     """The hub posts are the durable mailbox and the idempotent send journal."""
 
@@ -87,6 +111,7 @@ class ControlStore:
             with private_database(path):
                 pass
         self.hub = hub
+        hub.general = GENERAL
         with self.hub._db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS staffing_grants "
                        "(node TEXT PRIMARY KEY, token_hash TEXT NOT NULL, granted REAL NOT NULL)")
@@ -269,3 +294,41 @@ class ControlStore:
                            for row in recipients],
             **({"topic": payload["target"][1:]} if payload["target"].startswith("#") else {}),
             "notice": "Stored durably; delivery acceptance does not mean the recipient has read it."}}
+
+    def create_channel(self, payload):
+        """Add the human and the chosen agents, post the kickoff in the channel and announce it in #general.
+
+        Every step is idempotent under the request ID, so a retry after any failure finishes the same channel.
+        """
+        payload = validate_channel(payload)
+        topic, ident = payload["topic"], payload["id"]
+        with self.hub.lock, self.hub._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            retry = db.execute("SELECT 1 FROM posts WHERE from_node = ? AND id = ?", (NODE, ident)).fetchone()
+            exists = (db.execute("SELECT 1 FROM members WHERE topic = ?", (topic,)).fetchone()
+                      or db.execute("SELECT 1 FROM posts WHERE topic = ?", (topic,)).fetchone())
+            if exists and not retry:
+                raise HubError(409, f"#{topic} already exists; open it from Channels.")
+            for node, local in payload["members"]:
+                if not self.hub._published(db, node, local):
+                    raise HubError(404, f"{node}/{local} is not connected; reconnect it or leave it out.")
+            names = {(node, address): name for node, address, name in
+                     db.execute("SELECT node, address, name FROM sessions WHERE name IS NOT NULL")}
+            now = time.time()
+            # The workspace owner places agents directly; they can still leave on their own.
+            db.executemany("INSERT OR IGNORE INTO members VALUES (?, ?, ?, ?)",
+                           [(topic, NODE, "user", now)] + [(topic, node, local, now) for node, local in payload["members"]])
+        kickoff = self.hub.send(NODE, {"id": ident, "from": "user", "to": f"#{topic}", "text": payload["purpose"],
+                                       "reply": "expected", "mode": "push"}, join_sender=True)
+        who = ", ".join("@" + names[member] if member in names else f"{member[0]}/{member[1]}"
+                        for member in payload["members"]) or "only you so far"
+        summary = payload["purpose"].strip().splitlines()[0][:200]
+        announcement = (f"You created #{topic}: {summary}\nMembers: {who}.\n"
+                        f"Anyone else can join with the join_topic tool or `one-conv live join {topic}`.")
+        self.hub.send(NODE, {"id": hashlib.sha256(f"{ident}:{GENERAL}".encode()).hexdigest()[:32], "from": "user",
+                             "to": f"#{GENERAL}", "text": announcement, "reply": "none", "mode": "push"},
+                      join_sender=True)
+        return {"id": ident, "topic": topic, "duplicate": kickoff["duplicate"],
+                "members": [display_address(f"{node}/{local}") for node, local in payload["members"]],
+                "deliveries": [{"to": display_address(row["to"]), "status": row["status"]}
+                               for row in kickoff["recipients"]]}

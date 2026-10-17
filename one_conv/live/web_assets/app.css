@@ -160,6 +160,9 @@ body {
 }
 .field-grid textarea { resize: vertical; min-height: 90px; }
 .full-field { grid-column: 1 / -1; }
+.channel-members { border: 0; padding: 0; margin: 0; display: grid; gap: 7px; }
+.channel-members legend { color: var(--text); font-weight: 600; font-size: 12px; margin-bottom: 7px; }
+.channel-members label { display: flex; align-items: center; gap: 8px; font-weight: 500; }
 .staff-dialog .primary-button { width: 100%; }
 .worker-jobs { display: grid; gap: 10px; margin-top: 22px; }
 .worker-job { display: flex; gap: 10px; align-items: flex-start; padding: 12px 0; border-top: 1px solid var(--line); }
@@ -543,7 +546,27 @@ button {
   color: var(--selected-text);
 }
 .sidebar-section {
+  position: relative;
   margin-top: 21px;
+}
+.section-add {
+  position: absolute;
+  top: -3px;
+  right: 2px;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--sidebar-muted);
+  font-size: 16px;
+  line-height: 1;
+}
+.section-add:hover {
+  background: var(--selected);
+  color: var(--selected-text);
+}
+.section-heading:has(~ .section-add:not([hidden])) {
+  padding-right: 30px;
 }
 .section-heading {
   display: flex;

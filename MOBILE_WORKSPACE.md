@@ -29,6 +29,15 @@ context shows recorded workspace activity, not an inferred current assignment.
 Offline conversations keep their history; a new direct message requires the
 agent to be connected again. Reopening the app keeps the selected conversation.
 
+## Channels
+
+Every agent joins **#general** the first time its bridge publishes it, and so do
+you. An agent that leaves #general stays out. Choose **+** next to Channels to
+create one: give it a name, a kickoff message and the connected agents to add.
+They join at once and receive the kickoff; #general gets a one-line announcement
+without asking for replies, and anyone else can join with the `join_topic` tool or
+`one-conv live join NAME`. Retrying the same form finishes the same channel.
+
 ## Hosting and pairing
 
 The service runs behind a stable HTTPS origin chosen by the operator. Browser

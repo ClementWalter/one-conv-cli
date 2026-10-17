@@ -196,7 +196,7 @@ def test_restart_keeps_agent_replies_without_a_mac_relay(store, tmp_path):
 
 def test_state_maps_topic_human_members_to_browser_identity(store):
     store.hub.join("workspace", "release", "user")
-    assert store.state()["topics"][0]["members"] == ["user"]
+    assert next(t for t in store.state()["topics"] if t["topic"] == "release")["members"] == ["user"]
 
 
 def test_topic_posts_remain_visible_without_other_members(store):
@@ -212,7 +212,7 @@ def test_human_first_post_creates_an_empty_topic(store):
 
 def test_human_topic_send_creates_membership(store):
     store.send({"id": "c" * 32, "target": "#first-post", "text": "Start the discussion."})
-    assert store.state()["topics"][0]["members"] == ["user"]
+    assert next(t for t in store.state()["topics"] if t["topic"] == "first-post")["members"] == ["user"]
 
 
 def test_human_topic_retry_keeps_one_membership(store):
@@ -235,7 +235,7 @@ def test_conflicting_message_id_does_not_create_an_unrelated_topic(store):
         store.send({"id": "c" * 32, "target": "#unrelated", "text": "Conflicting content."})
     except HubError:
         pass
-    assert [topic["topic"] for topic in store.hub.topics()] == ["first-post"]
+    assert [topic["topic"] for topic in store.hub.topics()] == ["first-post", "general"]
 
 
 @pytest.fixture(params=["bridge", "publication"])

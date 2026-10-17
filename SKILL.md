@@ -20,6 +20,10 @@ The Python launcher resolves its dependencies through `uv`.
 The paired cloud workspace has a human mailbox at `workspace/user`; reply there
 when that is the attributed sender. A laptop is an ordinary node, not the host of
 the human mailbox. Browser login and machine bearer credentials are separate.
+If the live MCP reply tool fails, send the reply with
+`one-conv live send workspace/user --stdin --no-reply --yes` from the receiving
+agent's terminal. Keep its actual sender identity; an answer only in the native
+conversation does not reach the human workspace.
 
 With a configured hub, `live spawn HARNESS --cloud --name NAME --topic TOPIC`
 prepares a resident teammate on a shared Boat worker box. It requires `--yes`.

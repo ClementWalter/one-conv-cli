@@ -77,6 +77,14 @@ def test_cloud_human_envelope_offers_a_direct_return_route():
     assert 'to="workspace/user"' in envelope("Review this.", None, "workspace/user")
 
 
+def test_cloud_human_envelope_provides_a_terminal_reply_if_the_tool_fails():
+    assert "one-conv live send workspace/user --stdin --no-reply --yes" in envelope("Review this.", None, "workspace/user")
+
+
+def test_a_no_reply_human_message_has_no_terminal_reply_invitation():
+    assert "one-conv live send" not in envelope("Finished.", None, "workspace/user", "none")
+
+
 def test_cloud_human_envelope_never_claims_an_agent_kind():
     assert 'from="workspace/user" kind="human"' in envelope("Review this.", bridge.RemoteSender("workspace/user"))
 

@@ -17,6 +17,11 @@ from ..live.hub import application as hub_application
 from .auth import COOKIE, AuthStore
 from .store import HUMAN, ControlStore
 
+# A change feed request waits at most this long, checking the store this often.
+CHANGES_WAIT = 25.0
+CHANGES_STEP = 0.25
+CHANGES_AUTH_CHECK = 1.0
+
 BODY_LIMIT = 65_536
 PAIRING_SECONDS = 600
 logger = logging.getLogger(__name__)
@@ -166,7 +171,7 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
                              "expires_at": current["expires_at"],
                              "human": {"address": "user", "route": HUMAN, "name": "You", "kind": "human"},
                              "capabilities": {"workers": "workers" in provider_map, "accounting": "accounting" in provider_map,
-                                              "pairing": True, "channels": True}})
+                                              "pairing": True, "channels": True, "changes": True}})
 
     async def pair_device(request):
         """An authenticated owner can connect another device without exporting its session cookie."""
@@ -199,6 +204,29 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
 
     async def state(_request):
         return JSONResponse(await run_in_threadpool(store.state))
+
+    async def changes(request):
+        """Answer once the workspace differs from `since`, or after `wait` seconds; never changes state."""
+        since, raw = request.query_params.get("since", ""), request.query_params.get("wait", str(CHANGES_WAIT))
+        if not re.fullmatch(r"[0-9a-f]{0,32}", since):
+            raise HubError(400, "since is a fingerprint from an earlier answer")
+        if not re.fullmatch(r"[0-9]{1,2}(\.[0-9]{1,3})?", raw) or float(raw) > CHANGES_WAIT:
+            raise HubError(400, f"wait is a number of seconds up to {CHANGES_WAIT:g}")
+        loop = asyncio.get_running_loop()
+        deadline, checked = loop.time() + float(raw), loop.time()
+        while True:
+            current = await run_in_threadpool(store.fingerprint)
+            if since and current != since:
+                break
+            if not since or loop.time() >= deadline or await request.is_disconnected():
+                break
+            if loop.time() - checked >= CHANGES_AUTH_CHECK:
+                # A device disconnected while this request waits stops getting answers within a second.
+                await run_in_threadpool(session_for, request)
+                checked = loop.time()
+            await asyncio.sleep(CHANGES_STEP)
+        await run_in_threadpool(session_for, request)
+        return JSONResponse({"fp": current, "changed": bool(since) and current != since})
 
     async def topic(request):
         return JSONResponse(await run_in_threadpool(store.topic, request.path_params["topic"]))
@@ -253,7 +281,7 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         Route("/api/login", endpoint(login, public=True), methods=["POST"]),
         Route("/api/devices/pair", endpoint(pair_device, write=True), methods=["POST"]),
         Route("/api/logout", endpoint(logout, write=True), methods=["POST"]),
-        Route("/api/state", endpoint(state)), Route("/api/topics/{topic}", endpoint(topic)),
+        Route("/api/state", endpoint(state)), Route("/api/changes", endpoint(changes)), Route("/api/topics/{topic}", endpoint(topic)),
         Route("/api/direct", endpoint(direct)), Route("/api/messages", endpoint(message, write=True), methods=["POST"]),
         Route("/api/channels", endpoint(channel, write=True), methods=["POST"]),
         Route("/api/providers/{name}", endpoint(provider), methods=["GET", "POST"]),

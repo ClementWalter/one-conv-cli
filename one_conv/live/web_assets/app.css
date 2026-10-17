@@ -1798,3 +1798,16 @@ button {
   .topbar { padding-top: env(safe-area-inset-top); height: calc(46px + env(safe-area-inset-top)); }
   .workspace { height: calc(100dvh - 46px - env(safe-area-inset-top)); padding-bottom: max(5px, env(safe-area-inset-bottom)); }
 }
+/* A send this tab started: honest states until the workspace's own copy replaces it. */
+.message-delivery.local-sending { color: var(--muted); font-style: italic; }
+.message-delivery.local-uncertain,
+.message-delivery.local-refused { color: #be514f; overflow-wrap: anywhere; }
+.message-retry {
+  margin-left: 4px;
+  padding: 2px 8px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+}

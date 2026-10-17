@@ -10,9 +10,18 @@ const model = {
   token: null,
   sending: false,
   pending: new Map(),
+  // Sends this tab started, by message id, until the server's copy replaces them. Memory only.
+  outbox: new Map(),
+  // Bumped when the session ends, so an older request can never touch the new session's state.
+  generation: 0,
+  dirty: false,
+  lastRefresh: 0,
+  changeLoop: null,
+  feedAbort: null,
+  viewSequence: 0,
   signature: "",
   first: true,
-  refreshing: false,
+  refreshing: null,
   expanded: new Set(),
   drafts: new Map(),
   details: false,
@@ -244,12 +253,17 @@ function dayLabel(seconds) {
     day: "numeric",
   });
 }
+class StaleSession extends Error {}
 async function get(path) {
+  const generation = model.generation;
   const response = await fetch(path, {
     headers: { Accept: "application/json" },
     cache: "no-store",
   });
-  const result = await response.json();
+  let result = await response.json().catch(() => ({}));
+  if (!result || typeof result !== "object" || Array.isArray(result)) result = {};
+  // An answer meant for an ended session never changes the current one, not even to sign it out.
+  if (generation !== model.generation) throw new StaleSession("stale session");
   if (response.status === 401) authentication(false);
   if (!response.ok || result.error)
     throw new Error(result.error || "The workspace could not be reached.");
@@ -556,7 +570,45 @@ function messageText(container, text) {
     container.appendChild(el("pre")).appendChild(el("code", code.join("\n")));
   flush();
 }
+const LOCAL_DELIVERY = {
+  sending: ["Sending…", "Not yet confirmed by the workspace."],
+  saved: ["Saved", "The workspace has your message. An agent reply may take longer. (Stored on the hub.)"],
+  unconfirmed: ["Delivery unconfirmed", "The workspace stored this message but could not confirm delivery."],
+  uncertain: ["Not confirmed — retry checks the same send",
+    "The connection ended before the workspace answered. It may already have this message; retrying cannot duplicate it."],
+  refused: ["Refused", "The workspace refused this message."],
+};
+function localRow(entry) {
+  const [label, detail] = LOCAL_DELIVERY[entry.state];
+  return {
+    id: entry.id, from: "user", to: entry.target, text: entry.text, at: entry.at, local: entry,
+    delivery: { state: entry.state, label: entry.state === "refused" && entry.error ? "Refused · " + entry.error : label, detail },
+  };
+}
+function withOutbox(rows) {
+  // The server's copy of a send replaces this tab's; its own sends stay in their own conversation.
+  // Ids are unique per sending node, so only the workspace human's own post to the same place counts.
+  for (const row of rows) {
+    const entry = row.from === "user" && model.outbox.get(row.id);
+    if (entry && row.to === entry.target) {
+      model.outbox.delete(row.id);
+      model.pending.delete(entry.draftKey);
+      // A draft restored only because the answer was lost is now known to be stored: nothing is left to resend.
+      // Only a draft the app restored for this send, and nobody has edited since, is cleared.
+      if (entry.restored) {
+        if (entry.target === target() && $("message-input").value === entry.text) $("message-input").value = "";
+        else if (entry.target !== target() && model.drafts.get(entry.target) === entry.text)
+          model.drafts.delete(entry.target);
+      }
+    }
+  }
+  const destination = target();
+  const local = [...model.outbox.values()].filter((entry) => entry.target === destination).map(localRow);
+  return local.length ? [...rows, ...local] : rows;
+}
 function renderRows(rows, force = false) {
+  model.serverRows = rows;
+  rows = withOutbox(rows);
   conversationResponse(rows);
   const signature = JSON.stringify([model.view, rows, model.state.names, model.state.sessions.map((s) => [s.address, s.name])]);
   if (!force && signature === model.signature) return;
@@ -677,8 +729,15 @@ function renderRows(rows, force = false) {
       // Channel rollups carry their own counted label; direct messages keep the short forms.
       const label = delivery && (Array.isArray(delivery.recipients) ? delivery.label :
         { stored: "Saved · awaiting delivery", accepted: "Delivery accepted", unconfirmed: "Unconfirmed", refused: "Refused" }[delivery.state]);
-      const status = el("small", label || (delivery ? delivery.label : "Stored on hub"), "message-delivery");
+      const status = el("small", row.local ? delivery.label : label || (delivery ? delivery.label : "Stored on hub"),
+        "message-delivery" + (row.local ? " local-" + row.local.state : ""));
       status.title = delivery ? delivery.detail : "Stored in this conversation. No read receipt is available.";
+      if (row.local && row.local.state === "uncertain") {
+        const retry = el("button", "Retry", "message-retry");
+        retry.type = "button";
+        retry.addEventListener("click", () => transmit(row.local));
+        status.append(" ", retry);
+      }
       content.appendChild(status);
     }
     item.appendChild(content);
@@ -721,10 +780,15 @@ async function refreshView(force = false) {
   const view = model.view;
   if (!view || ["search", "home"].includes(view.kind)) return;
   if (view.kind === "activity") return activity(force);
+  // Only the newest read of a view may render it; an older answer arriving late is dropped.
+  const sequence = ++model.viewSequence;
+  const generation = model.generation;
+  const current = () => sequence === model.viewSequence && view === model.view && generation === model.generation;
   try {
     let rows;
     if (view.kind === "topic") {
       const data = await get("/api/topics/" + encodeURIComponent(view.key));
+      if (!current()) return;
       rows = data.messages || [];
       notice(
         data.omitted
@@ -738,10 +802,10 @@ async function refreshView(force = false) {
       rows = thread ? thread.messages : [];
       notice("");
     }
-    if (view !== model.view) return;
+    if (!current()) return;
     renderRows(rows, force);
   } catch (error) {
-    notice(error.message, true);
+    if (current() && !(error instanceof StaleSession)) notice(error.message, true);
   }
 }
 function select(kind, key = "", updateHash = true) {
@@ -754,11 +818,14 @@ function select(kind, key = "", updateHash = true) {
     model.drafts.set(previousTarget, $("message-input").value);
   model.view = { kind, key };
   rememberView(model.view);
+  // Feedback belongs to the conversation it was about.
+  feedback(DEFAULT_FEEDBACK);
   $("message-input").value = model.drafts.get(target()) || "";
   $("message-input").style.height = "auto";
   model.signature = "";
   model.first = true;
   model.rows = [];
+  model.serverRows = [];
   $("conversation-response").hidden = true;
   notice("");
   $("messages").replaceChildren();
@@ -789,17 +856,24 @@ function select(kind, key = "", updateHash = true) {
 }
 async function refreshState() {
   if (!model.authenticated) return;
-  if (model.refreshing) {
+  // The refresh in flight belongs to one session; a newer session never waits behind it.
+  const generation = model.generation;
+  if (model.refreshing === generation) {
+    // A change arrived during a refresh: read again once it ends, so nothing is skipped.
+    model.dirty = true;
     sidebar();
     header();
     return;
   }
-  model.refreshing = true;
+  model.refreshing = generation;
+  model.dirty = false;
+  model.lastRefresh = Date.now();
   try {
     const [state, direct] = await Promise.all([
       get("/api/state"),
       get("/api/direct"),
     ]);
+    if (generation !== model.generation) return;
     model.reportReceivedAt = performance.now();
     model.state = {
       ...state,
@@ -822,12 +896,14 @@ async function refreshState() {
     }
     if (state.error) notice(state.error, true);
   } catch (error) {
+    if (error instanceof StaleSession || generation !== model.generation) return;
     connected(false);
     sidebar();
     header();
     notice("The workspace is reconnecting. Your draft is safe. An agent may have answered in its own app while its reply connection was unavailable.", true);
   } finally {
-    model.refreshing = false;
+    if (model.refreshing === generation) model.refreshing = null;
+    if (generation === model.generation && model.dirty && model.authenticated) refreshState();
   }
 }
 function updateComposer() {
@@ -852,6 +928,8 @@ function updateComposer() {
     !$("message-input").value.trim();
   $("send-message").title = unavailable ? "This agent is offline. Your draft stays here until it reconnects." : "Send message as a human";
 }
+const DEFAULT_FEEDBACK =
+  "Messages from you are always labelled Human. Saved means the workspace has it; agent replies can take longer than a second.";
 function feedback(text, type = "") {
   const node = $("composer-feedback");
   node.className = "composer-feedback" + (type ? " " + type : "");
@@ -875,6 +953,8 @@ async function session() {
     updateComposer();
     return model.authenticated;
   } catch (error) {
+    // A stale answer from an ended session never signs out the current one.
+    if (error instanceof StaleSession) return model.authenticated;
     model.token = null;
     authentication(false);
     feedback("Message sending is reconnecting. Your draft is safe.", "error");
@@ -889,6 +969,10 @@ function authentication(accepted) {
   if (!accepted) {
     clearInvitation();
     model.token = null;
+    model.generation += 1;
+    if (model.feedAbort) model.feedAbort.abort();
+    model.outbox.clear();
+    model.pending.clear();
     for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
   }
 }
@@ -920,7 +1004,7 @@ async function connectDevice() {
   try {
     await post("/api/login", { token: pairingToken }, true);
     pairingToken = null;
-    if (await session()) await refreshState();
+    if (await session()) { await refreshState(); changeFeed(); }
   } catch (error) {
     $("pairing-feedback").textContent = error.message;
     $("pair-device").disabled = false;
@@ -1324,63 +1408,102 @@ async function send(event) {
   event.preventDefault();
   const destination = target(),
     text = $("message-input").value.trim();
-  if (!destination || !text || model.sending || !model.token) return;
+  if (!destination || !text || !model.token) return;
   if (!destination.startsWith("#") && !presenceOf(person(destination)).can_message) {
     feedback("This agent is offline. Your draft stays here until it reconnects.", "error");
     return;
   }
+  if (navigator.onLine === false) {
+    // No request leaves the device, so this one can truthfully say it was not sent.
+    feedback("Offline — not sent. Your draft is kept.", "error");
+    return;
+  }
   const draftKey = JSON.stringify([destination, text]);
   if (!model.pending.has(draftKey))
-    model.pending.set(draftKey, {
-      id: crypto.randomUUID().replaceAll("-", ""),
-      target: destination,
-      text,
-    });
-  const message = { ...model.pending.get(draftKey) };
-  model.sending = true;
+    model.pending.set(draftKey, { id: crypto.randomUUID().replaceAll("-", ""), target: destination, text });
+  const { id } = model.pending.get(draftKey);
+  const entry = model.outbox.get(id) || { id, target: destination, text, draftKey, at: Date.now() / 1000 };
+  entry.state = "sending";
+  model.outbox.set(id, entry);
+  model.drafts.delete(destination);
+  $("message-input").value = "";
+  $("message-input").style.height = "auto";
+  model.first = true;
+  renderRows(model.serverRows || [], true);
   updateComposer();
-  feedback("Sending as You · Human…");
+  feedback("Sending as You · Human… Saved appears once the workspace stores it.");
+  $("message-input").focus();
+  await transmit(entry);
+}
+
+function provesStored(data, entry) {
+  // A receipt counts only when it names this send, its sender and destination, with a known outcome.
+  const r = data.receipt;
+  if (data.id !== entry.id || !["sent", "unconfirmed"].includes(data.status)) return false;
+  if (!r || typeof r !== "object" || Array.isArray(r) || r.id !== entry.id || r.from !== "user") return false;
+  if (r.to !== entry.target && !(typeof r.topic === "string" && "#" + r.topic === entry.target)) return false;
+  if (typeof r.status !== "string") return false;
+  return r.deliveries === undefined || (Array.isArray(r.deliveries) && r.deliveries.every((d) =>
+    d && typeof d === "object" && typeof d.to === "string" && typeof d.status === "string"));
+}
+
+async function transmit(entry) {
+  const generation = model.generation;
+  entry.state = "sending";
+  if (target() === entry.target) renderRows(model.serverRows || [], true);
+  let response, data;
   try {
-    const response = await fetch("/api/messages", {
+    response = await fetch("/api/messages", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-One-Conv-Token": model.token,
-      },
-      body: JSON.stringify(message),
+      headers: { "Content-Type": "application/json", "X-One-Conv-Token": model.token || "" },
+      body: JSON.stringify({ id: entry.id, target: entry.target, text: entry.text }),
     });
-    const data = await response.json();
-    if (!response.ok) {
-      if (response.status === 403) await session();
-      throw new Error(
-        data.error || "Couldn't confirm this send. Your draft has been kept.",
-      );
+    data = await response.json().catch(() => ({}));
+  } catch (_) {
+    response = null;
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
+  // A send from an ended session never changes the current one.
+  if (generation !== model.generation || !model.outbox.has(entry.id)) return;
+  const here = () => target() === entry.target;
+  // Only a receipt naming this send proves the workspace stored it.
+  const receipt = response && response.ok && provesStored(data, entry);
+  if (receipt) {
+    entry.state = data.status === "unconfirmed" ? "unconfirmed" : "saved";
+    model.pending.delete(entry.draftKey);
+    if (here()) {
+      renderRows(model.serverRows || [], true);
+      feedback(entry.state === "saved" ? "The workspace has your message. An agent reply may take longer."
+        : "Delivery isn't confirmed. Check the conversation before sending again.",
+      entry.state === "saved" ? "success" : "error");
     }
-    model.drafts.delete(destination);
-    if (target() === destination) {
-      $("message-input").value = "";
-      $("message-input").style.height = "auto";
-    }
-    model.pending.delete(draftKey);
-    feedback(
-      data.status === "unconfirmed"
-        ? "Delivery isn't confirmed. Check the conversation before sending again."
-        : "Stored on hub. Bridge acceptance and replies appear in the conversation.",
-      data.status === "unconfirmed" ? "error" : "success",
-    );
-    model.first = true;
-    await refreshState();
-    if (data.status !== "unconfirmed") toast("Message stored on hub");
-  } catch (error) {
-    feedback(
-      error.message ||
-        "Couldn't confirm delivery. Try this draft again to check the same send.",
-      "error",
-    );
-  } finally {
-    model.sending = false;
+    refreshState();
+    return;
+  }
+  if (response && response.status === 401) return authentication(false);
+  if (response && !response.ok && response.status >= 400 && response.status < 500 && ![403, 408, 409, 425, 429].includes(response.status)) {
+    entry.state = "refused";
+    entry.error = data.error || "";
+    model.pending.delete(entry.draftKey);
+  } else {
+    if (response && response.status === 403) await session();
+    // Uncertain: the draft keeps its id (model.pending), so sending it again checks the same send.
+    entry.state = "uncertain";
+  }
+  if (generation !== model.generation) return;
+  // The text returns to an empty composer only; a newer draft is never replaced.
+  if (here() && !$("message-input").value) {
+    $("message-input").value = entry.text;
+    entry.restored = true;
+  } else if (!here() && !model.drafts.get(entry.target)) {
+    model.drafts.set(entry.target, entry.text);
+    entry.restored = true;
+  }
+  if (here()) {
+    renderRows(model.serverRows || [], true);
+    feedback(entry.state === "refused" ? "The workspace refused this message. Your text is back in the box."
+      : "Not confirmed — Retry checks the same send without duplicating it.", "error");
     updateComposer();
-    $("message-input").focus();
   }
 }
 function format(kind) {
@@ -1618,6 +1741,11 @@ function theme(value) {
 
 $("composer").addEventListener("submit", send);
 $("message-input").addEventListener("input", () => {
+  // Editing a conversation's composer makes its draft the person's own, for that conversation only.
+  const destination = target();
+  for (const entry of model.outbox.values()) if (entry.target === destination) entry.restored = false;
+});
+$("message-input").addEventListener("input", () => {
   const input = $("message-input");
   input.style.height = "auto";
   input.style.height = Math.min(input.scrollHeight, 180) + "px";
@@ -1775,12 +1903,67 @@ try {
 } catch (_) {
   theme("light");
 }
-session().then((ready) => { if (ready) refreshState(); });
+session().then((ready) => { if (ready) { refreshState(); changeFeed(); } });
 if ("serviceWorker" in navigator && window.isSecureContext) {
   navigator.serviceWorker.register("/sw.js").catch(() => { /* Messaging also works without offline assets. */ });
 }
-setInterval(refreshState, 4000);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function visible() {
+  return document.hidden ? new Promise((resolve) => document.addEventListener("visibilitychange", function wake() {
+    if (!document.hidden) { document.removeEventListener("visibilitychange", wake); resolve(); }
+  })) : Promise.resolve();
+}
+async function changeFeed() {
+  // One loop per session: it waits for the server to report a change, then refreshes once.
+  const generation = model.generation;
+  if (model.changeLoop === generation || !model.authenticated || !model.capabilities.changes) return;
+  model.changeLoop = generation;
+  let fingerprint = "", delay = 1000;
+  try {
+    while (model.authenticated && generation === model.generation) {
+      await visible();
+      const controller = new AbortController();
+      model.feedAbort = controller;
+      try {
+        const response = await fetch("/api/changes?since=" + fingerprint + "&wait=25",
+          { headers: { Accept: "application/json" }, cache: "no-store", signal: controller.signal });
+        // An answer for an ended session never touches the current one.
+        if (generation !== model.generation) return;
+        if (response.status === 401) return authentication(false);
+        let data = await response.json().catch(() => null);
+        if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
+        if (!response.ok) throw new Error(data.error || "change feed unavailable");
+        // A malformed answer takes the bounded back-off path, never an immediate new request.
+        if (typeof data.fp !== "string" || !/^[0-9a-f]{32}$/.test(data.fp) || typeof data.changed !== "boolean")
+          throw new Error("malformed change feed answer");
+        // The first fingerprint may already include changes the initial snapshot missed: read again
+        // after it, and wait from that fingerprint so anything during the read is detected next.
+        const first = fingerprint === "";
+        fingerprint = data.fp;
+        if (data.changed || first) await refreshState();
+        delay = 1000;
+      } catch (_) {
+        if (generation !== model.generation) return;
+        await sleep(delay);
+        delay = Math.min(delay * 2, 10000);
+      }
+    }
+  } finally {
+    if (model.changeLoop === generation) model.changeLoop = null;
+  }
+}
+// With the change feed these are a 30 s safety net, which keeps presence expiry honest while idle.
 setInterval(() => {
-  if (model.authenticated && model.view && !model.refreshing) refreshView();
+  if (!model.capabilities.changes || Date.now() - model.lastRefresh >= 30000) refreshState();
+  else if (model.authenticated) {
+    // Cached presence still ages every 4 s without a network read.
+    sidebar();
+    header();
+    updateComposer();
+  }
+}, 4000);
+setInterval(() => {
+  if (!model.capabilities.changes && model.authenticated && model.view && model.refreshing !== model.generation)
+    refreshView();
 }, 3000);
 setInterval(() => { if ($("staff-dialog").open) refreshWorkers(); }, 4000);

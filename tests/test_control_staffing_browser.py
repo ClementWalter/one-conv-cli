@@ -104,8 +104,9 @@ def test_unavailable_provider_does_not_look_online(staffed_phone):
 
 def test_phone_can_reopen_a_cloud_job_after_reload(staffed_phone):
     page, _app = staffed_phone
-    page.reload(wait_until="networkidle")
-    page.locator("#staff-team").click()
+    # The change feed keeps a request open, so wait for the button rather than network idle.
+    page.reload()
+    page.locator("#staff-team:not([hidden])").click()
     page.locator(".worker-job").first.wait_for()
     assert "jack" in page.locator(".worker-job").first.inner_text()
 

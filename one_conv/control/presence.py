@@ -6,7 +6,8 @@ from ..live.hub import LEASE_SECONDS
 
 
 def _timestamp(value):
-    return value if type(value) in (int, float) and math.isfinite(value) and value > 0 else None
+    """Bound epoch values before floating-point conversion or browser date rendering."""
+    return value if type(value) in (int, float) and 0 < value < 32_503_680_000 and math.isfinite(value) else None
 
 
 def session_presence(row, now):

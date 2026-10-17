@@ -53,7 +53,7 @@ def test_history_only_route_has_no_invented_session_timestamp(row):
     assert session_presence({**row, "history_only": True}, NOW)["last_seen"] is None
 
 
-@pytest.mark.parametrize("value", [None, True, float("inf"), float("nan"), 0])
+@pytest.mark.parametrize("value", [None, True, float("inf"), float("nan"), 0, 10**1000, -10**1000])
 def test_missing_or_invalid_heartbeat_is_not_availability(row, value):
     assert session_presence({**row, "seen": value}, NOW)["can_message"] is False
 

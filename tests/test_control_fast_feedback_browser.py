@@ -218,11 +218,18 @@ def seen_first(phone):
     """The feed shows the committed post before the POST answer, which then fails."""
     page, workspace = phone
 
-    def commit_then_fail_late(route):
-        route.fetch()
-        time.sleep(2.5)  # Long enough for the change feed to show the stored post.
-        route.fulfill(status=503, content_type="application/json", body='{"error": "late failure"}')
-    page.route("**/api/messages", commit_then_fail_late, times=1)
+    # The post is stored at once; its answer is replaced by a failure 2.5 s later, inside the page.
+    page.evaluate("""() => {
+      const original = window.fetch;
+      let first = true;
+      window.fetch = async (url, options) => {
+        const response = await original(url, options);
+        if (!first || !String(url).includes('/api/messages')) return response;
+        first = false;
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        return new Response('{"error": "late failure"}', { status: 503, headers: { 'Content-Type': 'application/json' } });
+      };
+    }""")
     page.locator("#message-input").fill("Same words.")
     page.locator("#composer").evaluate("form => form.requestSubmit()")
     page.wait_for_timeout(4000)
@@ -238,10 +245,10 @@ def test_a_late_failure_does_not_downgrade_a_stored_post(seen_first):
 def sent_again(seen_first):
     page, workspace = seen_first
     page.locator("#message-input").fill("Same words.")
-    page.locator("#composer").evaluate("form => form.requestSubmit()")
-    page.wait_for_function("document.querySelectorAll('#messages li').length >= 2 && "
-                           "[...document.querySelectorAll('#messages li')].filter(li => "
-                           "li.textContent.includes('Same words.')).length === 2", timeout=10000)
+    # A second bubble can be the optimistic one; wait for the server's answer before reading storage.
+    with page.expect_response("**/api/messages") as answer:
+        page.locator("#composer").evaluate("form => form.requestSubmit()")
+    answer.value.finished()
     return workspace
 
 
@@ -287,3 +294,186 @@ def test_the_new_session_gets_its_own_change_feed(repaired):
                                                   "text": "Back online."}).raise_for_status()
     page.locator(".message-body").filter(has_text="Back online.").wait_for(timeout=10000)
     assert time.monotonic() - started < 2.0
+
+
+# --- review regressions: races inside one open page ------------------------------------------------------
+
+
+# Delays answers inside the page: Playwright routes would queue every later matching request behind a held one.
+HOLD_FIRST = """(pattern) => {
+  const original = window.fetch;
+  let held = true;
+  window.__release = null;
+  const gate = new Promise((resolve) => { window.__release = resolve; });
+  window.fetch = async (url, options) => {
+    if (held && String(url).includes(pattern)) { held = false; await gate; }
+    return original(url, options);
+  };
+}"""
+
+
+@pytest.fixture
+def held_first_feed(browser, real_http_workspace):
+    """The first change-feed request leaves only after an agent's reply is committed."""
+    workspace = real_http_workspace
+    workspace["worker"].put("/v1/topics/release/members/omp:agent").raise_for_status()
+    context = browser.new_context(viewport={"width": 390, "height": 740}, is_mobile=True, has_touch=True,
+                                  ignore_https_errors=True, service_workers="block")
+    context.add_init_script(f"({HOLD_FIRST})('/api/changes')")
+    page = context.new_page()
+    token = AuthStore(workspace["directory"]).issue_pairing_token()
+    page.goto(workspace["origin"] + "/#topic=release")
+    page.evaluate("""async (token) => {
+      await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ token }) });
+    }""", token)
+    page.reload()
+    page.locator("#composer:not([hidden]) #message-input").wait_for()
+    page.wait_for_timeout(1000)  # The initial snapshot, without the reply, is on screen.
+    workspace["worker"].post("/v1/messages", json={"id": "f" * 32, "from": "omp:agent", "to": "#release",
+                                                  "text": "Committed while the feed was held."}).raise_for_status()
+    page.evaluate("window.__release()")
+    released = time.monotonic()
+    page.locator(".message-body").filter(has_text="Committed while the feed was held.").wait_for(timeout=40000)
+    yield time.monotonic() - released
+    context.close()
+
+
+def test_a_reply_committed_while_the_first_feed_was_held_appears_promptly(held_first_feed):
+    assert held_first_feed < 3
+
+
+@pytest.mark.parametrize("answer", [
+    lambda i: {"id": i, "status": "refused", "receipt": {"id": i}},
+    lambda i: {"id": i, "status": "sent"},
+    lambda i: {"id": i, "status": "sent", "receipt": {"id": i, "from": "user", "to": "#other", "status": "stored"}},
+    lambda i: {"id": i, "status": "sent", "receipt": {"id": i, "from": "codex:x", "to": "#release", "status": "s"}},
+    lambda i: {"id": i, "status": "sent", "receipt": {"id": i, "from": "user", "to": "#release", "status": 1}},
+    lambda i: {"id": i, "status": "sent", "receipt": {"id": i, "from": "user", "to": "#release", "status": "s",
+                                                      "deliveries": [{"to": 1}]}},
+    lambda i: [],
+    lambda i: None,
+])
+def test_a_receipt_that_does_not_prove_storage_is_not_saved(phone, answer):
+    page, _ = phone
+    import json as _json
+    page.route("**/api/messages", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body=_json.dumps(answer(route.request.post_data_json["id"]))))
+    page.locator("#message-input").fill("Unproven receipt.")
+    page.locator("#composer").evaluate("form => form.requestSubmit()")
+    page.locator("#messages li").filter(has_text="Unproven receipt.").locator(".message-delivery") \
+        .filter(has_text="Not confirmed").wait_for()
+    assert page.locator("#messages li").filter(has_text="Unproven receipt.").filter(has_text="Saved").count() == 0
+
+
+DELAY_FIRST_ANSWER = """([pattern, ms]) => {
+  const original = window.fetch;
+  let first = true;
+  window.fetch = async (url, options) => {
+    const response = await original(url, options);
+    if (!first || !String(url).includes(pattern)) return response;
+    first = false;
+    const body = await response.text();
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    return new Response(body, { status: response.status, headers: response.headers });
+  };
+}"""
+
+
+@pytest.fixture
+def stale_view_read(phone):
+    """An old read of #beta, taken before the send, arrives after a newer read that shows it."""
+    page, _ = phone
+    page.evaluate(DELAY_FIRST_ANSWER, ["/api/topics/beta", 3000])
+    page.evaluate("""() => {
+      location.hash = 'topic=beta';
+      setTimeout(() => {
+        const input = document.getElementById('message-input');
+        input.value = 'Kept after a stale read.';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        document.getElementById('composer').requestSubmit();
+      }, 800);
+    }""")
+    page.wait_for_timeout(5000)
+    return page
+
+
+def test_an_older_read_of_the_same_view_does_not_erase_a_stored_send(stale_view_read):
+    assert stale_view_read.locator("#messages li").filter(has_text="Kept after a stale read.").count() == 1
+
+
+@pytest.fixture
+def stale_unauthorized(phone):
+    """A read from the old session answers 401 after the same page has signed in again."""
+    page, workspace = phone
+    token = AuthStore(workspace["directory"]).issue_pairing_token()
+
+    def late_unauthorized(route):
+        time.sleep(3)
+        route.fulfill(status=401, content_type="application/json", body='{"error": "Pair this browser."}')
+
+    page.route("**/api/topics/release", late_unauthorized, times=1)
+    page.evaluate("""async (token) => {
+      refreshView();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await disconnectDevice();
+      await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ token }) });
+      if (await session()) { refreshState(); changeFeed(); }
+    }""", token)
+    page.wait_for_timeout(4000)
+    return page
+
+
+def test_a_stale_unauthorized_read_does_not_sign_out_the_new_session(stale_unauthorized):
+    assert stale_unauthorized.evaluate("model.authenticated") is True
+
+
+@pytest.mark.parametrize("body", ["{}", '{"fp": "abc", "changed": true}', '{"fp": "' + "a" * 32 + '", "changed": "yes"}',
+                                  "[]", "null"])
+def test_a_malformed_feed_answer_backs_off(phone, body):
+    page, _ = phone
+    calls = []
+
+    def malformed(route):
+        calls.append(time.monotonic())
+        route.fulfill(status=200, content_type="application/json", body=body)
+
+    page.route("**/api/changes*", malformed)
+    page.evaluate("() => { if (model.feedAbort) model.feedAbort.abort(); }")
+    page.wait_for_timeout(3000)
+    assert len(calls) <= 4
+
+
+def test_sending_feedback_stays_with_its_conversation(phone):
+    page, _ = phone
+    _slow(page, 2)
+    page.locator("#message-input").fill("For release only.")
+    page.locator("#composer").evaluate("form => form.requestSubmit()")
+    page.evaluate("location.hash = 'topic=beta'")
+    page.locator("#message-input").fill("An unsent draft for beta.")
+    page.wait_for_timeout(2500)
+    assert "Sending" not in page.locator("#composer-feedback").inner_text()
+
+
+@pytest.fixture
+def repaired_behind_a_slow_refresh(phone):
+    """The old session's state read is still in flight when the same page signs in again."""
+    page, workspace = phone
+    token = AuthStore(workspace["directory"]).issue_pairing_token()
+    page.evaluate(DELAY_FIRST_ANSWER, ["/api/state", 6000])
+    page.evaluate("""async (token) => {
+      refreshState();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await disconnectDevice();
+      await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ token }) });
+      if (await session()) refreshState();
+    }""", token)
+    page.wait_for_timeout(2500)
+    return page
+
+
+def test_a_new_session_does_not_wait_behind_the_old_sessions_refresh(repaired_behind_a_slow_refresh):
+    assert repaired_behind_a_slow_refresh.evaluate("model.state.topics.length") >= 1

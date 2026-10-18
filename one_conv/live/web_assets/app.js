@@ -497,6 +497,9 @@ function header() {
   $("member-count").textContent = current.length || "";
   $("members-toggle").hidden = !current.length;
   const waiting = totalUnread();
+  // On a phone the sidebar is closed, so its menu button carries the unread mark.
+  $("sidebar-toggle").classList.toggle("has-unread", waiting > 0);
+  $("sidebar-toggle").title = waiting ? waiting + " unread" : "";
   document.title = (waiting ? "(" + waiting + ") " : "") + (view.kind === "topic" ? "# " : "") + title + " · OneConv";
   if (model.details) renderDetails();
   updateComposer();

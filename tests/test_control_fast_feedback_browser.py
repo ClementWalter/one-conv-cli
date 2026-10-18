@@ -8,6 +8,8 @@ from one_conv.control.auth import AuthStore
 from tests import test_control_messages as https_tests
 from tests import test_pwa_browser as browser_tests
 
+PlaywrightError = pytest.importorskip("playwright.sync_api").Error
+
 tls_certificate = https_tests.tls_certificate
 real_http_workspace = https_tests.real_http_workspace
 browser = browser_tests.browser
@@ -43,9 +45,14 @@ def phone(browser, real_http_workspace, request):
     page.goto(workspace["origin"] + "/#pair=" + token, wait_until="networkidle")
     page.get_by_role("button", name="Connect this device", exact=True).click()
     page.locator("#pairing").wait_for(state="hidden")
-    # The change feed keeps one request open, so "network idle" never comes; wait for the composer instead.
+    # A full navigation to the channel, so no refresh left over from pairing can pick the view; a
+    # hash change plus reload could race it under load.
+    page.goto("about:blank")
     page.goto(workspace["origin"] + "/#topic=release")
-    page.reload()
+    # The destination is a checked precondition: a navigation problem fails here, not as a message
+    # stored in another channel. The change feed keeps a request open, so "network idle" never comes.
+    page.wait_for_function("() => location.hash === '#topic=release' && typeof model !== 'undefined'"
+                           " && model.view && model.view.kind === 'topic' && model.view.key === 'release'")
     page.locator("#composer:not([hidden]) #message-input").wait_for()
     yield page, workspace
     context.close()
@@ -106,11 +113,18 @@ def lost_answer(phone):
         route.fetch()  # The workspace stores the message …
         route.abort()  # … but the phone never hears back.
     page.route("**/api/messages", commit_then_drop)
+    # Freeze what could show the stored post: the change feed, and the channel snapshot the safety
+    # refresh reads. Once the post is stored, either would rightly replace the uncertain bubble (and
+    # its Retry button) before these tests can read it. The uncertain state itself is local.
+    held = []
+    page.route("**/api/changes*", lambda route: held.append(route))
+    page.route("**/api/topics/release", lambda route: held.append(route))
+    page.evaluate("() => model.feedAbort && model.feedAbort.abort()")
     page.locator("#message-input").fill("Did this arrive?")
     page.locator("#composer").evaluate("form => form.requestSubmit()")
     status = page.locator("#messages li").filter(has_text="Did this arrive?").locator(".message-delivery")
     status.filter(has_text="Not confirmed").wait_for()
-    return page, workspace, status
+    return page, workspace, status, held
 
 
 def test_a_lost_answer_is_not_claimed_as_not_sent(lost_answer):
@@ -123,10 +137,23 @@ def test_a_lost_answer_offers_a_retry(lost_answer):
 
 @pytest.fixture
 def retried(lost_answer):
-    page, workspace, status = lost_answer
+    page, workspace, status, held = lost_answer
     page.unroute("**/api/messages")
     status.get_by_role("button", name="Retry").click()
     page.locator("#messages li").filter(has_text="Did this arrive?").filter(has_text="Saved").first.wait_for()
+    # The stored copy reaches the phone again, so one bubble means the retry and the stored post merged.
+    page.unroute("**/api/changes*")
+    page.unroute("**/api/topics/release")
+    for route in held:
+        try:
+            route.continue_()
+        except PlaywrightError:
+            pass  # The page already cancelled this read (the aborted feed); there is nothing to release.
+    with page.expect_response("**/api/topics/release"):
+        page.evaluate("() => refreshState()")
+    # The server's row has replaced this tab's local copy of the send.
+    page.locator("#messages li").filter(has_text="Did this arrive?").locator(".message-delivery[class*='local-']") \
+        .wait_for(state="detached")
     page.wait_for_timeout(500)
     return page, workspace
 

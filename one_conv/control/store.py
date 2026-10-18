@@ -13,6 +13,7 @@ from pathlib import Path
 
 from ..live.hub import GENERAL, MESSAGE_ID, TOPIC, Hub, HubError, _online, split_address
 from ..live.hub import NODE as PEER_NODE
+from ..live import unread
 from .presence import (
     channel_delivery,
     message_activity,
@@ -132,6 +133,7 @@ class ControlStore:
                        "(node TEXT PRIMARY KEY, token_hash TEXT NOT NULL, granted REAL NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS channel_requests (id TEXT PRIMARY KEY, digest TEXT NOT NULL, "
                        "topic TEXT NOT NULL, announcement TEXT NOT NULL, created REAL NOT NULL)")
+            unread.ensure(db)
         self.refresh_human()
 
     @staticmethod
@@ -223,6 +225,12 @@ class ControlStore:
         with self.hub._db() as db:
             activity = self._activity(db)
             seen = dict(db.execute("SELECT node, seen FROM nodes"))
+            baseline, _ = unread.marks(db)
+            # Channel posts after each topic's mark that someone other than the human sent.
+            unseen = dict(db.execute(
+                "SELECT p.topic, COUNT(*) FROM posts p WHERE p.topic IS NOT NULL AND p.target LIKE '#%' "
+                "AND p.sender != 'user' AND p.created > IFNULL((SELECT r.at FROM read_marks r "
+                "WHERE r.conversation = '#' || p.topic), ?) GROUP BY p.topic", (baseline,)))
             contacts = db.execute(
                 "SELECT p.from_node,p.sender FROM posts p JOIN deliveries d ON d.post=p.seq "
                 "WHERE p.topic IS NULL AND d.to_node=? AND d.to_address='user' "
@@ -244,8 +252,8 @@ class ControlStore:
              "presence": session_presence(row, now), "activity": message_activity(activity.get(row["address"]))}
             for row in directory if row["address"] != HUMAN],
             "names": {row["name"]: display_address(row["address"]) for row in directory if row["name"]},
-            "topics": [{**topic, "members": [display_address(member) for member in topic["members"]]}
-                       for topic in self.hub.topics()],
+            "topics": [{**topic, "members": [display_address(member) for member in topic["members"]],
+                        "unread": unseen.get(topic["topic"], 0)} for topic in self.hub.topics()],
             "bridge": {"node": NODE, "running": True, "mode": "cloud"}, "error": None}
 
     @staticmethod
@@ -282,16 +290,27 @@ class ControlStore:
                 # Directness comes from the original target, so a topic-tagged DM stays in its pair's thread.
                 "WHERE p.target NOT LIKE '#%' ORDER BY p.created DESC, p.seq DESC LIMIT ?",
                 (MESSAGES_SHOWN,)).fetchall()
+            baseline, marks = unread.marks(db)
         threads = defaultdict(list)
         for values in reversed(rows):
             row = _provenance(self._row(*values))
             pair = " ".join(sorted((row["from"], row["to"])))
             threads[pair].append(row)
-        return {"threads": [{"pair": pair, "messages": rows, "last": rows[-1]["at"]}
+        return {"threads": [{"pair": pair, "messages": rows, "last": rows[-1]["at"],
+                             "unread": unread.count(rows, marks.get(pair, baseline))}
                             for pair, rows in sorted(threads.items(), key=lambda item: -item[1][-1]["at"])]}
 
+    def mark_read(self, payload):
+        """Record that the human has seen a conversation up to a send time, on every device."""
+        try:
+            payload = unread.validate(payload)
+        except unread.ReadError as error:
+            raise HubError(400, str(error)) from None
+        with self.hub.lock, self.hub._db() as db:
+            return {"conversation": payload["conversation"], "at": unread.mark(db, payload)}
+
     def fingerprint(self) -> str:
-        """A digest of everything the workspace shows; it changes when a post, receipt, member or agent does.
+        """A digest of everything the workspace shows; it changes when a post, receipt, member, agent or read mark does.
 
         Read-only. The workspace's own human publication is left out, since reading state renews it.
         """
@@ -303,7 +322,9 @@ class ControlStore:
                 "  || joined AS row FROM members ORDER BY topic, node, address)),"
                 " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT node || '/' || address || '=' ||"
                 "  IFNULL(name, '') || ':' || IFNULL(status, '') || ':' || updated AS row FROM sessions"
-                "  WHERE node != ? ORDER BY node, address))", (NODE,)).fetchone()
+                "  WHERE node != ? ORDER BY node, address)),"
+                " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT conversation || '=' || at AS row"
+                "  FROM read_marks ORDER BY conversation))", (NODE,)).fetchone()
         return hashlib.sha256(json.dumps(values).encode()).hexdigest()[:32]
 
     def topic(self, topic: str):

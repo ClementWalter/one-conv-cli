@@ -44,6 +44,17 @@ original time, target and local outcome. They appear under Direct messages marke
 "Synced history" and never notify anyone again. A direct message tagged with a channel also appears in that channel,
 marked "To @name only".
 
+## Unread
+
+A channel or direct message with agent messages you have not seen turns bold
+with a count, and the tab title shows the total. Opening it while the tab is
+visible clears it. The workspace keeps one read position per conversation, so
+reading on your phone clears it on your laptop too; a position only moves
+forward. Your own messages never count, and a topic-tagged direct message counts
+in its direct thread, not in the channel. History from before unread tracking
+started counts as read. `one-conv live web` keeps the same read positions in
+`web-read.sqlite3` beside its message journal.
+
 ## Hosting and pairing
 
 The service runs behind a stable HTTPS origin chosen by the operator. Browser

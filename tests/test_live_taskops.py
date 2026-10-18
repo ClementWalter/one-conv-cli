@@ -145,6 +145,27 @@ def test_a_local_grant_wakes_the_collaborator(local, local_request):
     assert pushed[-1][0] == "codex:peer"
 
 
+@pytest.fixture
+def bridged(local):
+    """What the bridge does with a hub delivery for an observer and for the owner."""
+    from one_conv.live import bridge
+    base = {"from": "workspace/user", "reply": "expected", "topic": "general", "text": "Book the train",
+            "id": "1" * 32, "task": TASK}
+    bridge.deliver_inbound({**base, "to": "codex:peer", "mode": "fyi", "role": "observer"})
+    bridge.deliver_inbound({**base, "to": "claude:lead", "mode": "push", "role": "owner"})
+    return local
+
+
+def test_the_bridge_files_an_observer_copy_as_context(bridged):
+    _, filed = bridged
+    assert "Context only" in filed[-1][1]
+
+
+def test_the_bridge_wakes_the_owner_with_its_instructions(bridged):
+    pushed, _ = bridged
+    assert "You own this request" in pushed[-1][1]
+
+
 # --- the CLI ------------------------------------------------------------------------------------
 
 

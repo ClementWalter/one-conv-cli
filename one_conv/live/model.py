@@ -114,6 +114,9 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
     attrs = f'from="{_attr(address)}"'
     if human:
         attrs += ' kind="human"'
+    elif address == "system":
+        # The hub's own instruction about a task: not the human, not an agent.
+        attrs += ' kind="system"'
     elif sender is not None:
         if handle:
             attrs += f' from-handle="@{_attr(handle)}"'

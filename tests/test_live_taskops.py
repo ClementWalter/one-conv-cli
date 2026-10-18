@@ -194,6 +194,24 @@ def bridged(local):
     return local
 
 
+@pytest.fixture
+def system_delivery(local):
+    """An assignment the hub issued itself, as the bridge hands it to the new owner."""
+    from one_conv.live import bridge
+    bridge.deliver_inbound({"from": "workspace/user", "reply": "expected", "topic": "general", "system": True,
+                            "text": "Assigned to you", "id": "2" * 32, "task": TASK, "to": "claude:lead",
+                            "mode": "push", "role": "owner"})
+    return local[0][-1][1]
+
+
+def test_a_hub_instruction_is_labelled_as_system(system_delivery):
+    assert 'kind="system"' in system_delivery
+
+
+def test_a_hub_instruction_is_not_labelled_as_from_the_human(system_delivery):
+    assert 'kind="human"' not in system_delivery
+
+
 def test_the_bridge_files_an_observer_copy_as_context(bridged):
     _, filed = bridged
     assert "Context only" in filed[-1][1]

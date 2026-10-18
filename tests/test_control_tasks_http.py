@@ -86,6 +86,38 @@ def test_assign_moves_the_version_forward(reassigned):
     assert shown_task(reassigned[0])["version"] == before["version"] + 1
 
 
+def test_the_channel_shows_no_message_the_human_did_not_write(reassigned):
+    workspace = reassigned[0]
+    assert [m["text"] for m in workspace["browser"].get("/api/topics/release").json()["messages"]] == \
+        ["Ship the release."]
+
+
+def test_direct_threads_show_no_assignment_notice(reassigned):
+    workspace = reassigned[0]
+    threads = workspace["browser"].get("/api/direct").json()["threads"]
+    assert [m["text"] for thread in threads for m in thread["messages"]] == []
+
+
+def test_the_topic_history_agents_read_has_no_assignment_notice(reassigned):
+    workspace = reassigned[0]
+    history = workspace["worker"].get("/v1/topics/release/messages").json()["messages"]
+    assert [row["text"] for row in history] == ["Ship the release."]
+
+
+def test_the_new_owner_receives_the_assignment_marked_as_from_the_hub(reassigned):
+    workspace = reassigned[0]
+    inbox = workspace["worker"].get("/v1/inbox").json()["messages"]
+    assert [item.get("system", False) for item in inbox if item["to"] == "omp:agent" and item.get("role") == "owner"] \
+        == [True]
+
+
+def test_an_agent_cannot_hide_its_post_by_calling_it_system(workspace):
+    workspace["worker"].post("/v1/messages", json={"id": "c" * 32, "from": "omp:agent", "to": "#release",
+                                                  "text": "visible", "kind": "system"}).raise_for_status()
+    history = workspace["worker"].get("/v1/topics/release/messages").json()["messages"]
+    assert [row["text"] for row in history] == ["visible"]
+
+
 def test_a_stale_version_is_refused(reassigned):
     workspace, before, _ = reassigned
     response = assign(workspace, {"key": before["key"], "version": before["version"], "to": LEAD})

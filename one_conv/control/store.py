@@ -302,8 +302,10 @@ class ControlStore:
     def _activity(db):
         """Use the last persisted interaction per route without interpreting message contents as a task."""
         rows = db.execute(
-            "WITH routes AS (SELECT from_node AS node,sender AS local,seq FROM posts UNION ALL "
-            "SELECT to_node,to_address,post FROM deliveries), "
+            # The hub's own assignment notices are nobody's activity.
+            "WITH routes AS (SELECT from_node AS node,sender AS local,seq FROM posts WHERE kind IS NOT 'system' "
+            "UNION ALL SELECT d.to_node,d.to_address,d.post FROM deliveries d JOIN posts p ON p.seq=d.post "
+            "WHERE p.kind IS NOT 'system'), "
             "latest AS (SELECT node,local,MAX(seq) AS seq FROM routes GROUP BY node,local) "
             "SELECT l.node,l.local,p.id,p.from_node,p.sender,p.target,p.topic,substr(p.text,1,241),p.created "
             "FROM latest l JOIN posts p ON p.seq=l.seq").fetchall()
@@ -330,7 +332,7 @@ class ControlStore:
                 "SELECT p.seq,p.id,p.from_node,p.sender,d.to_node || '/' || d.to_address,p.topic,p.reply,p.mode,"
                 "p.text,p.created,d.outcome,d.outcome_at,p.reported FROM posts p JOIN deliveries d ON d.post=p.seq "
                 # Directness comes from the original target, so a topic-tagged DM stays in its pair's thread.
-                "WHERE p.target NOT LIKE '#%' ORDER BY p.created DESC, p.seq DESC LIMIT ?",
+                "WHERE p.target NOT LIKE '#%' AND p.kind IS NOT 'system' ORDER BY p.created DESC, p.seq DESC LIMIT ?",
                 (MESSAGES_SHOWN,)).fetchall()
             baseline, marks = unread.marks(db)
             shown = [values[0] for values in rows]
@@ -381,11 +383,14 @@ class ControlStore:
         if not TOPIC.fullmatch(topic):
             raise HubError(400, "Choose a valid topic.")
         with self.hub._db() as db:
-            total = db.execute("SELECT COUNT(*) FROM posts WHERE topic=?", (topic,)).fetchone()[0]
+            # The hub's own assignment notices are shown through the request's task, not as messages.
+            total = db.execute("SELECT COUNT(*) FROM posts WHERE topic=? AND kind IS NOT 'system'",
+                               (topic,)).fetchone()[0]
             rows = db.execute(
                 "SELECT seq,id,from_node,sender,target,topic,reply,mode,text,created,NULL,NULL,reported "
                 # Reported history keeps its original send time, so time orders the channel.
-                "FROM posts WHERE topic=? ORDER BY created DESC, seq DESC LIMIT ?", (topic, MESSAGES_SHOWN)).fetchall()
+                "FROM posts WHERE topic=? AND kind IS NOT 'system' ORDER BY created DESC, seq DESC LIMIT ?",
+                (topic, MESSAGES_SHOWN)).fetchall()
             recipients = defaultdict(list)
             shown = [row[0] for row in rows]
             task_views, links = self._tasks_for(db, shown), self._links(db, shown)

@@ -87,6 +87,36 @@ def test_a_reassigned_chip_does_not_overflow(reassigned):
     assert page.evaluate(OVERFLOW) is True
 
 
+def test_reassigning_adds_no_message_the_human_did_not_write(reassigned):
+    page, _ = reassigned
+    page.wait_for_timeout(1500)  # The change feed has delivered the hub's notices, if it were to show them.
+    assert page.locator("#messages .message-body").all_inner_texts() == ["Ship the release notes today."]
+
+
+@pytest.fixture
+def picking(phone):
+    """The human has the reassign picker open while the owner reports progress."""
+    page, workspace = phone
+    task = workspace["browser"].get("/api/topics/release").json()["messages"][0]["task"]
+    page.locator(".task-chip select").focus()
+    workspace["worker"].post("/v1/tasks/update", json={"key": task["key"], "actor": "omp:lead",
+                                                       "version": task["version"], "state": "working",
+                                                       "note": "drafting the notes"}).raise_for_status()
+    page.wait_for_timeout(3000)  # The change feed has brought the update to this page.
+    return page
+
+
+def test_a_progress_update_keeps_the_open_picker(picking):
+    assert picking.evaluate("() => document.activeElement.classList.contains('task-assign')"
+                            " && document.activeElement.isConnected") is True
+
+
+def test_closing_the_picker_shows_the_current_progress(picking):
+    picking.evaluate("() => document.activeElement.blur()")
+    picking.locator(".task-chip .task-note").filter(has_text="drafting the notes").wait_for(timeout=5000)
+    assert picking.locator(".task-chip .task-note").inner_text() == "drafting the notes"
+
+
 @pytest.fixture
 def stale(phone):
     """Someone else reassigns the request first; this phone still holds the old version."""

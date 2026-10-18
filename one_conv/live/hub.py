@@ -124,6 +124,9 @@ class Hub:
             # The task an agent's post answers or reports on, checked against its current owner.
             if "task" not in posts:
                 db.execute("ALTER TABLE posts ADD COLUMN task TEXT")
+            # "system" for an instruction the hub issued itself, which no human or agent wrote.
+            if "kind" not in posts:
+                db.execute("ALTER TABLE posts ADD COLUMN kind TEXT")
             deliveries = {row[1] for row in db.execute("PRAGMA table_info(deliveries)")}
             # A delivery can wake its recipient while the same post only informs the others.
             for column in ("role", "mode", "task"):
@@ -279,12 +282,16 @@ class Hub:
         return route if self._available(db, route, time.time()) else None
 
     def _insert(self, db, node: str, msg_id: str, digest: str, target: str, sender: str, topic: str | None,
-                reply: str, mode: str, text: str, deliveries, task: str | None = None) -> int:
-        """One post and its deliveries; `deliveries` is (node, address, role, mode, task) per recipient."""
+                reply: str, mode: str, text: str, deliveries, task: str | None = None, kind: str | None = None) -> int:
+        """One post and its deliveries; `deliveries` is (node, address, role, mode, task) per recipient.
+
+        `kind="system"` marks an instruction the hub itself issued (an assignment, a release): it
+        is delivered like any post but is never shown as something the human or an agent wrote.
+        """
         seq = db.execute("INSERT INTO posts (from_node, id, digest, target, sender, topic, reply, mode, text, created,"
-                         " task) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         " task, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                          (node, msg_id, digest, target, sender, topic, reply, mode, text, time.time(),
-                          task)).lastrowid
+                          task, kind)).lastrowid
         db.executemany("INSERT INTO deliveries (delivery, post, to_node, to_address, role, mode, task)"
                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
                        [(secrets.token_hex(16), seq, n, a, role, m, t) for n, a, role, m, t in deliveries])
@@ -490,7 +497,7 @@ class Hub:
                 rows = db.execute(
                     "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.topic, p.reply,"
                     " COALESCE(d.mode, p.mode), p.text, p.created, d.role, k.key, k.version, k.state, k.owner,"
-                    " k.kind, k.parent"
+                    " k.kind, k.parent, p.kind"
                     " FROM deliveries d JOIN posts p ON p.seq = d.post LEFT JOIN tasks k ON k.key = d.task"
                     " WHERE d.to_node = ? AND d.outcome IS NULL ORDER BY d.post LIMIT 50", (node,)).fetchall()
                 if rows:
@@ -504,11 +511,13 @@ class Hub:
     def _handed(node: str, row) -> dict:
         """One inbox item. An instruction is handed out as such only to the task's current holder of an
         open task; anyone else gets it as context, whatever was recorded when it was queued."""
-        d, i, a, fn, s, t, r, m, x, c, role, key, version, state, owner, kind, parent = row
+        d, i, a, fn, s, t, r, m, x, c, role, key, version, state, owner, kind, parent, post_kind = row
         if role in ("owner", "collaborator") and (owner != f"{node}/{a}" or state in tasks.FINISHED):
             role, m = "observer", "fyi"
+        # An instruction the hub issued is labelled as such, never as a message from the human or an agent.
         return {"delivery": d, "id": i, "to": a, "from": f"{fn}/{s}", "topic": t, "reply": r, "mode": m,
                 "text": x, "created": c, **({"role": role} if role else {}),
+                **({"system": True} if post_kind == "system" else {}),
                 **({"task": {"key": key, "version": version, "state": state, "owner": owner, "kind": kind,
                              "parent": parent}} if key else {})}
 
@@ -643,7 +652,7 @@ class Hub:
             return
         digest = hashlib.sha256(json.dumps(["task", task["key"], task["version"], role]).encode()).hexdigest()
         self._insert(db, node, msg_id, digest, task["owner"], sender, task["topic"], "expected", "push", text,
-                     [(owner_node, owner, role, "push", task["key"])], task=task["key"])
+                     [(owner_node, owner, role, "push", task["key"])], task=task["key"], kind="system")
 
     def assign(self, key: object, to: str | None, authority: str, version: object, note: object = None) -> dict:
         """The human gives a task to an agent, or unassigns it. Not exposed to nodes.
@@ -676,7 +685,7 @@ class Hub:
                     self._insert(db, node, msg_id, msg_id, before["owner"], sender, task["topic"], "none", "fyi",
                                  f"Task {task['key']} is no longer yours ({'now ' + route if route else 'unassigned'})."
                                  " Stop working on it.", [(old_node, old, "observer", "fyi", task["key"])],
-                                 task=task["key"])
+                                 task=task["key"], kind="system")
             return task
         return self._task_call(work)
 
@@ -730,7 +739,9 @@ class Hub:
             rows = db.execute("SELECT p.seq, p.id, p.from_node, p.sender, p.target, p.reply, p.mode, p.text, p.created,"
                               " p.reported, COALESCE(p.task, k.key)"
                               " FROM posts p LEFT JOIN tasks k ON k.post_seq = p.seq AND k.parent IS NULL"
-                              " WHERE p.topic = ? AND p.seq > ? ORDER BY p.seq LIMIT ?",
+                              # The hub's own instructions reach their recipient through its inbox only;
+                              # nobody wrote them, so a topic's history never shows them.
+                              " WHERE p.topic = ? AND p.seq > ? AND p.kind IS NOT 'system' ORDER BY p.seq LIMIT ?",
                               (topic, after, max(1, min(limit, 500)))).fetchall()
         # `to` is the original target: "#topic" for a post to everyone, a route for a tagged direct message.
         # `task` is the request a post made or answers; replaying history never creates or wakes work.

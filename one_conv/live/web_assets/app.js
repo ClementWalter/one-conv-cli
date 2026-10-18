@@ -694,6 +694,9 @@ async function assignTask(task, to) {
   // One assignment per task at a time; the chip says so until the workspace answers.
   if (model.assigning.has(task.key)) return;
   model.assigning.add(task.key);
+  // The choice is made: release the picker so the list can show "Assigning…" right away.
+  const focused = document.activeElement;
+  if (focused && focused.classList && focused.classList.contains("task-assign")) focused.blur();
   renderRows(model.serverRows || [], true);
   try {
     await post("/api/tasks/assign", { key: task.key, version: task.version, to });
@@ -774,6 +777,17 @@ function renderRows(rows, force = false) {
   conversationResponse(rows);
   const signature = JSON.stringify([model.view, rows, model.state.names, model.state.sessions.map((s) => [s.address, s.name])]);
   if (!force && signature === model.signature) return;
+  const picking = document.activeElement;
+  if (picking && picking.classList && picking.classList.contains("task-assign") && $("messages").contains(picking)) {
+    // Rebuilding now would detach the picker the human is using. The newest snapshot is kept in
+    // model.serverRows and drawn once the picker loses focus; a choice made from an older version
+    // is refused by the workspace and the view refreshes.
+    if (!picking.dataset.deferred) {
+      picking.dataset.deferred = "1";
+      picking.addEventListener("blur", () => renderRows(model.serverRows || [], true), { once: true });
+    }
+    return;
+  }
   const scroll = $("message-scroll");
   const follow =
     model.first ||

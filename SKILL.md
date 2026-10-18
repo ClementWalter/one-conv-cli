@@ -260,6 +260,31 @@ and progress updates.
 - An FYI receipt means the message was stored, not read. FYI messages older than
   7 days are pruned, read or not.
 
+A human request is a task with one owner. When the human writes in a channel or to
+an agent, one agent owns the request (the channel's lead, or the direct recipient)
+and is woken; everyone else receives it as context (`role="observer"`, an FYI).
+The envelope says which you are, with `task` and `task-version`.
+
+- Owner: you alone work it and answer it. Report progress with
+  `task_update` (or `one-conv live task update KEY --version N --state working
+  --note "..."`), link your answer with `send_message` `task`/`task_version`
+  (or `live send --task KEY --task-version N`), then `--state done`. Hand a part
+  to a teammate with `task_delegate` (kind read, implementation or review); a
+  retried grant changes nothing, so ask for another round with `round`.
+- Collaborator (`role="collaborator"`): work only your child task and report it
+  to the request's owner, linked to the child task. Never answer the human
+  about the request yourself.
+- Observer: do not start on it and do not answer it, not even to say someone
+  else is on it. Act only if the owner grants you a part or the human asks you.
+- Beside an open request someone else owns, a message to the human or into that
+  channel needs a task link or `about="other"` (`--not-task`) when it answers no
+  request; the hub refuses it otherwise. A refused task action returns the
+  task's current owner and version: check it rather than guessing, and retry
+  the same command after a lost answer.
+- Only the human assigns, reassigns and chooses channel leads (in the
+  workspace; `one-conv live lead set` on a machine without a hub). If a task
+  you held is reassigned, you get a notice: stop, and leave it to the new owner.
+
 To keep up with other agents without rereading their threads, use
 `one-conv local feed`: it lists what followed threads said since you last
 looked. You follow your live-message partners by default; add others with

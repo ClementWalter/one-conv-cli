@@ -1,5 +1,6 @@
 """List live sessions across harnesses, identify the sender, resolve a target and deliver."""
 
+import hashlib
 import json
 import logging
 import math
@@ -297,16 +298,21 @@ def _logged(receipt: dict, text: str, topic: str | None, fyi: bool, reply: str) 
 
 def send(target: str, text: str, sender: LiveSession | None, origin: str = "unknown",
          fyi: bool = False, reply: str = "expected", topic: str | None = None,
-         message_id: str | None = None) -> dict:
+         message_id: str | None = None, task: dict | None = None, about: str | None = None) -> dict:
     """Deliver to one session, or to every member of a topic for a `#topic` target.
 
     `message_id` is chosen once and reused on retry, so a receiver can drop a duplicate.
+    `task` ({key, version}) links the post to a task the sender holds, and the hub checks it;
+    `about="other"` says the post answers no open request. Through a hub, a post to the human
+    or into a channel with an open request someone else owns needs one of the two.
     """
     message_id = message_id or uuid.uuid4().hex
+    extra = {**({"task": task} if task else {}), **({"about": about} if about else {})}
     named = topic_of(target)
     try:
         if named is not None:
-            return _logged(_send_topic(named, text, sender, origin, fyi, reply, message_id), text, None, fyi, reply)
+            return _logged(_send_topic(named, text, sender, origin, fyi, reply, message_id, extra), text, None,
+                           fyi, reply)
         if topic is not None:
             topic = team._check("topic", topic)
     except team.TeamError as error:
@@ -319,10 +325,19 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
                             "(`one-conv live serve --hub ...`).")
         if node != hub.node:
             receipt = _post_remote(hub, target, text, sender.address if sender else origin, fyi, reply, topic,
-                                   message_id)
+                                   message_id, extra)
             return _logged(receipt, text, topic, fyi, reply)
         target = local  # This machine's own NODE/ prefix: deliver here.
-    receipt = _send_one(target, text, sender, origin, fyi, reply, topic, message_id)
+    task = None
+    if sender is None and origin == "user" and not fyi and reply == "expected" and target != "user":
+        # A direct request from the person at this machine: its recipient owns it.
+        task = _local_request(message_id, text, topic, resolve(target).address)
+    elif sender is not None:
+        _local_policy(sender.address, target, topic, extra)
+    receipt = _send_one(target, text, sender, origin, fyi, reply, topic, message_id, task,
+                        "owner" if task else None)
+    if task is not None:
+        receipt["task"] = task
     if topic is not None:
         team.record(topic, message_id, receipt["from"], text)
     return _logged(receipt, text, topic, fyi, reply)
@@ -341,14 +356,15 @@ def remote_address(target: str) -> tuple[str | None, str]:
 
 
 def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str, topic: str | None,
-                 message_id: str) -> dict:
+                 message_id: str, extra: dict | None = None) -> dict:
     """Post a direct message to a session on another machine; the hub hands it to that machine's bridge.
 
     The message sits in the bridge's outbox from before the request until the hub answers,
     so a crash or an unreachable hub leaves it for the bridge to repost under the same id.
     """
     message = {"id": message_id, "to": target, "from": sender, "reply": "none" if fyi else reply,
-               "mode": "fyi" if fyi else "push", "text": text, **({"topic": topic} if topic else {})}
+               "mode": "fyi" if fyi else "push", "text": text, **({"topic": topic} if topic else {}),
+               **(extra or {})}
     try:
         receipt = hubclient.submit(hub, message)
     except (hubclient.HubRefused, hubclient.PendingConflict) as error:
@@ -362,7 +378,7 @@ def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str
 
 
 def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
-                reply: str, message_id: str) -> dict:
+                reply: str, message_id: str, extra: dict | None = None) -> dict:
     """Record the message on the topic, then deliver it to each member but the sender."""
     topic = team._check("topic", topic)
     sender_label = sender.address if sender else origin
@@ -372,22 +388,97 @@ def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, 
         raise LiveError(str(error)) from error
     if hub is not None:
         return _post_topic(hub, topic, text, sender_label, "none" if fyi else reply, message_id,
-                           "fyi" if fyi else "push")
+                           "fyi" if fyi else "push", extra)
+    members = team.members(topic)
+    task = None
+    if sender is None and origin == "user" and not fyi and reply == "expected":
+        # A request from the person at this machine: the topic's lead owns it, the others observe.
+        task = _local_request(message_id, text, topic, _local_lead(topic, members))
+    elif sender is not None:
+        _local_policy(sender.address, f"#{topic}", topic, extra or {})
     team.record(topic, message_id, sender_label, text)
     deliveries = []
-    for member in team.members(topic):
+    for member in members:
         if member == sender_label:
             continue
+        owner = task is not None and member == task["owner"]
         try:
-            deliveries.append(_send_one(member, text, sender, origin, fyi, reply, topic, message_id))
+            deliveries.append(_send_one(member, text, sender, origin, fyi or (task is not None and not owner),
+                                        reply, topic, message_id, task,
+                                        None if task is None else "owner" if owner else "observer"))
         except (LiveError, RuntimeError, OSError, ValueError) as error:
             # A member that cannot be reached now still finds the message when it catches up.
             deliveries.append({"to": member, "status": f"not delivered: {error}"})
-    return {"topic": topic, "id": message_id, "from": sender_label, "deliveries": deliveries}
+    receipt = {"topic": topic, "id": message_id, "from": sender_label, "deliveries": deliveries}
+    if task is not None:
+        receipt["task"] = task
+    return receipt
+
+
+def _is_live(address: str) -> bool:
+    return any(session.address == address for session in list_all(address.partition(":")[0]))
+
+
+def _local_request(message_id: str, text: str, topic: str | None, owner: str | None) -> dict:
+    """The task a request from the person at this machine makes, in this machine's task store."""
+    from . import taskops, tasks
+    return taskops.local_call(lambda db: tasks.create(db, tasks.key_for("local", message_id), post_seq=None,
+                                                      topic=topic, owner=owner, created_by="user", title=text)[0])
+
+
+def _local_lead(topic: str, members: list[str]) -> str | None:
+    """This machine's lead for the topic, when it is a live member; None leaves the request unassigned."""
+    from . import taskops, tasks
+    lead = taskops.local_call(lambda db: tasks.lead_for(db, topic))
+    # A local lead route is stored as local/harness:id; members are plain harness:id here.
+    route = team.address_for(lead[1:]) if lead.startswith("@") else lead.removeprefix("local/")
+    return route if route in members and _is_live(route) else None
+
+
+def _local_policy(sender: str, target: str, topic: str | None, extra: dict) -> None:
+    """Without a hub, the same publisher rules as the hub's, checked against this machine's tasks."""
+    from . import taskops, tasks
+    link = extra.get("task")
+
+    def check(db):
+        if link is not None:
+            task = tasks.require(db, link.get("key"))
+            tasks._fence(task, sender, link.get("version"))
+            if task["parent"] and target != (tasks.get(db, task["parent"]) or {}).get("owner"):
+                raise tasks.TaskError(403, f"{task['key']} is a part of {task['parent']}: report it to that request's "
+                                           "owner, who answers the human")
+            return
+        if extra.get("about") == "other" or not (target == "user" or target.startswith("#")):
+            return
+        mine = set(team_topics_of(sender))
+        for task in tasks.listing(db, open_only=True):
+            if task["parent"] or task["owner"] == sender or task["created_by"] != "user":
+                continue
+            if (target == "user" and task["topic"] in mine) or (target.startswith("#") and task["topic"] == topic):
+                raise tasks.TaskError(409, f"{target} has an open request owned by {task['owner'] or 'nobody yet'}"
+                                           f" (task {task['key']}). Only its owner answers it. Link a task you hold"
+                                           " with --task KEY --task-version N, or send with --not-task if this is"
+                                           " about something else.")
+    try:
+        taskops.local_call(check)
+    except taskops.TaskOpError as error:
+        raise LiveError(str(error)) from error
+
+
+def team_topics_of(address: str) -> list[str]:
+    return [row["topic"] for row in team.topics() if address in row.get("members", [])]
+
+
+def deliver_task(route: str, text: str, giver: str, task: dict, role: str) -> dict:
+    """Wake an agent on this machine with a task it now holds, under a stable id per grant."""
+    sender = next((s for s in list_all(giver.partition(":")[0]) if s.address == giver), None) if ":" in giver else None
+    message_id = hashlib.sha256(f"{task['key']}@{task['version']}:{role}".encode()).hexdigest()[:32]
+    return _send_one(route, text, sender, "user" if sender is None else "unknown", False, "expected",
+                     task.get("topic"), message_id, task, role)
 
 
 def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id: str,
-                mode: str = "push") -> dict:
+                mode: str = "push", extra: dict | None = None) -> dict:
     """Post once; the hub records the message and fans it out to every member on every machine.
 
     The message sits in the bridge's outbox from before the request until the hub answers,
@@ -397,7 +488,7 @@ def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id:
     """
     # mode is the delivery mode (wake the receiver or not), kept apart from the reply policy.
     message = {"id": message_id, "to": f"#{topic}", "from": sender, "topic": topic,
-               "mode": mode, "reply": reply, "text": text}
+               "mode": mode, "reply": reply, "text": text, **(extra or {})}
     if ":" in sender:
         message["join_topic"] = True
     try:
@@ -413,7 +504,8 @@ def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id:
 
 
 def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
-              reply: str, topic: str | None, message_id: str) -> dict:
+              reply: str, topic: str | None, message_id: str, task: dict | None = None,
+              role: str | None = None) -> dict:
     if target == "user":
         # The human workspace reads the shared log and has no harness to wake.
         return {"to": "user", "title": "You", "cwd": "", "delivery": "human workspace",
@@ -428,7 +520,7 @@ def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, f
     if session.harness == "boat" and reply == "expected":
         reply = "inline"
     handle = team.name_for(sender.address) if sender is not None else None
-    wrapped = envelope(text, sender, origin, "none" if fyi else reply, message_id, topic, handle)
+    wrapped = envelope(text, sender, origin, "none" if fyi else reply, message_id, topic, handle, task, role)
     with _rate_slot(sender_label, session.address):
         if fyi:
             _append_fyi(session.address, sender_label, wrapped)

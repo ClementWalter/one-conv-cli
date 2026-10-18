@@ -304,6 +304,11 @@ class Hub:
         try:
             task = tasks.require(db, link["key"])
             tasks._fence(task, actor, link["version"])
+            if task["state"] in tasks.FINISHED:
+                # The answer belongs before the task is closed; a finished task takes no more output.
+                raise tasks.TaskError(409, f"{task['key']} is already {task['state']}: post the answer before "
+                                           "marking it done, or send without --task if it is about something else",
+                                      task)
         except tasks.TaskError as error:
             raise TaskRefused(error) from None
         if task["parent"]:
@@ -314,20 +319,20 @@ class Hub:
         return task["key"]
 
     def _unanswered(self, db, sender_route: str, target: str, topic: str | None) -> list[dict]:
-        """Open human requests this sender only observes, that this post would answer by its target.
+        """Open human requests someone else owns, that this post would answer by its target.
 
-        A post to the human, or into the channel of such a request, must say what it is about,
-        so an observer never becomes a second responder by leaving the task out.
+        A post to the human (beside any open request) or into the channel of an open request
+        must say what it is about, so no agent becomes a second responder by leaving the task
+        out, whether it received the request, joined later, or never saw it.
         """
         human = target.partition("/")[0] in self.trusted_humans and target.endswith("/user")
         if not human and not target.startswith("#"):
             return []
-        node, _, address = sender_route.partition("/")
         rows = db.execute(
-            f"SELECT DISTINCT k.key, k.owner, k.topic FROM tasks k JOIN deliveries d ON d.task = k.key"
-            f" WHERE d.role = 'observer' AND d.to_node = ? AND d.to_address = ? AND k.parent IS NULL"
-            f" AND k.state NOT IN ({','.join('?' * len(tasks.FINISHED))}) AND IFNULL(k.owner, '') != ?",
-            (node, address, *tasks.FINISHED, sender_route)).fetchall()
+            f"SELECT key, owner, topic FROM tasks WHERE parent IS NULL"
+            f" AND state NOT IN ({','.join('?' * len(tasks.FINISHED))}) AND IFNULL(owner, '') != ?"
+            f" AND created_by IN ({','.join('?' * len(self.trusted_humans))}) ORDER BY created",
+            (*tasks.FINISHED, sender_route, *(f"{node}/user" for node in self.trusted_humans))).fetchall()
         return [{"key": key, "owner": owner, "topic": t} for key, owner, t in rows if human or t == topic]
 
     def send(self, node: str, message: dict, *, join_sender: bool = False, require_online: bool = False) -> dict:
@@ -400,6 +405,10 @@ class Hub:
                                     (n, a, "observer", "fyi", key) for n, a in recipients])
                 tasks.create(db, key, post_seq=seq, topic=topic, owner=owner, created_by=f"{node}/{sender}",
                              title=text)
+            elif human:
+                # A human post that asks for nothing (an announcement) informs everyone and wakes nobody.
+                seq = self._insert(db, node, msg_id, digest, target, sender, topic, reply, mode, text,
+                                   [(n, a, None, "fyi", None) for n, a in recipients])
             else:
                 seq = self._insert(db, node, msg_id, digest, target, sender, topic, reply, mode, text,
                                    [(n, a, None, None, linked) for n, a in recipients], task=linked)
@@ -576,8 +585,14 @@ class Hub:
             return tasks.listing(db, topic=topic, owner=owner, open_only=open_only)
 
     def claim(self, node: str, body: dict) -> dict:
-        return self._task_call(lambda db: tasks.claim(db, body.get("key"), self._actor(db, node, body.get("actor")),
-                                                      body.get("version")))
+        """Take an unowned task; the claimer's delivery of the request becomes the owner's."""
+        def work(db):
+            actor = self._actor(db, node, body.get("actor"))
+            task = tasks.claim(db, body.get("key"), actor, body.get("version"))
+            db.execute("UPDATE deliveries SET role = 'owner' WHERE task = ? AND to_node = ? AND to_address = ?"
+                       " AND role = 'observer'", (task["key"], node, body.get("actor")))
+            return task
+        return self._task_call(work)
 
     def update_task(self, node: str, body: dict) -> dict:
         return self._task_call(lambda db: tasks.update(db, body.get("key"), self._actor(db, node, body.get("actor")),

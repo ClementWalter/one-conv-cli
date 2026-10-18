@@ -304,11 +304,45 @@ def test_the_owner_posts_without_a_link(hub, request_task):
     assert receipt["duplicate"] is False
 
 
+@pytest.mark.parametrize("state", ["done", "cancelled"])
+def test_a_finished_task_takes_no_more_linked_answers(hub, request_task, state):
+    hub.update_task("mac", {"key": request_task["key"], "actor": "claude:lead",
+                            "version": request_task["version"], "state": state})
+    with pytest.raises(HubError):
+        post(hub, "c", to=f"{HUMAN}/user", sender="claude:lead", node="mac",
+             task={"key": request_task["key"], "version": request_task["version"]})
+
+
 def test_an_observer_posts_freely_once_the_request_is_done(hub, request_task):
     hub.update_task("mac", {"key": request_task["key"], "actor": "claude:lead",
                             "version": request_task["version"], "state": "done"})
     receipt = post(hub, "e", to="#general", sender="codex:peer", node="mac")
     assert receipt["duplicate"] is False
+
+
+@pytest.fixture
+def late_joiner(hub, request_task):
+    """A session published after the request; it auto-joins #general and never received the request."""
+    hub.publish("box", [{"address": "claude:new"}])
+    return hub
+
+
+@pytest.mark.parametrize("to", ["#general", f"{HUMAN}/user"])
+def test_a_late_joiner_cannot_answer_an_open_request(late_joiner, to):
+    with pytest.raises(HubError):
+        post(late_joiner, "f", to=to, sender="claude:new", node="box")
+
+
+def test_a_claim_makes_the_claimer_delivery_the_owner(hub):
+    hub.set_lead("general", "@nobody", f"{HUMAN}/user")
+    key = post(hub, "9")["task"]["key"]
+    hub.claim("mac", {"key": key, "actor": "codex:peer"})
+    assert (PEER, "owner", "fyi") in deliveries(hub, key)
+
+
+def test_a_human_announcement_wakes_nobody(hub):
+    post(hub, "8", reply="none")
+    assert {mode for _, _, mode in deliveries(hub)} == {"fyi"}
 
 
 def test_replaying_history_creates_no_work(hub, request_task):

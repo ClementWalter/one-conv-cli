@@ -323,16 +323,25 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
         if hub is None:
             raise LiveError(f"{target} is on machine {node}; reaching it needs this machine's bridge "
                             "(`one-conv live serve --hub ...`).")
-        if node != hub.node:
+        # A post linked to a task goes through the hub that holds the task, even to a session here.
+        if node != hub.node or extra.get("task"):
             receipt = _post_remote(hub, target, text, sender.address if sender else origin, fyi, reply, topic,
                                    message_id, extra)
             return _logged(receipt, text, topic, fyi, reply)
         target = local  # This machine's own NODE/ prefix: deliver here.
     task = None
-    if sender is None and origin == "user" and not fyi and reply == "expected" and target != "user":
+    try:
+        hub_here = hubclient.configured()
+    except hubclient.HubRefused as error:
+        raise LiveError(str(error)) from error
+    if hub_here is not None and extra.get("task"):
+        raise LiveError("a post linked to a task goes through the hub: address the task owner as NODE/harness:id")
+    if hub_here is None and sender is None and origin == "user" and not fyi and reply == "expected" \
+            and target != "user":
         # A direct request from the person at this machine: its recipient owns it.
         task = _local_request(message_id, text, topic, resolve(target).address)
-    elif sender is not None:
+    elif hub_here is None and sender is not None:
+        # Without a hub this machine's task store is the authority; with one, the hub is.
         _local_policy(sender.address, target, topic, extra)
     receipt = _send_one(target, text, sender, origin, fyi, reply, topic, message_id, task,
                         "owner" if task else None)
@@ -444,6 +453,9 @@ def _local_policy(sender: str, target: str, topic: str | None, extra: dict) -> N
         if link is not None:
             task = tasks.require(db, link.get("key"))
             tasks._fence(task, sender, link.get("version"))
+            if task["state"] in tasks.FINISHED:
+                raise tasks.TaskError(409, f"{task['key']} is already {task['state']}: post the answer before "
+                                           "marking it done, or send without --task if it is about something else")
             if task["parent"] and target != (tasks.get(db, task["parent"]) or {}).get("owner"):
                 raise tasks.TaskError(403, f"{task['key']} is a part of {task['parent']}: report it to that request's "
                                            "owner, who answers the human")

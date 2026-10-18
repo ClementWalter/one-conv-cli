@@ -352,6 +352,38 @@ def test_a_human_announcement_wakes_nobody(hub):
     assert {mode for _, _, mode in deliveries(hub)} == {"fyi"}
 
 
+def handed(hub, node="mac"):
+    """(to, mode, role) of every item the node's inbox hands out now."""
+    return [(item["to"], item["mode"], item.get("role")) for item in hub.inbox(node, 0)]
+
+
+def test_reassigned_before_pickup_the_former_owner_gets_only_context(hub, request_task, reassigned):
+    assert ("claude:lead", "push", "owner") not in handed(hub)
+
+
+def test_reassigned_before_pickup_the_new_owner_is_woken(hub, request_task, reassigned):
+    assert ("codex:peer", "push", "owner") in handed(hub)
+
+
+def test_cancelled_before_pickup_the_owner_gets_only_context(hub, request_task):
+    hub.update_task("mac", {"key": request_task["key"], "actor": "claude:lead",
+                            "version": request_task["version"], "state": "cancelled"})
+    assert {mode for _, mode, _ in handed(hub)} == {"fyi"}
+
+
+def test_a_round_trip_before_pickup_leaves_one_instruction_for_the_final_owner(hub, request_task):
+    to_peer = hub.assign(request_task["key"], "@peer", f"{HUMAN}/user", request_task["version"])
+    hub.assign(request_task["key"], "@coordinator", f"{HUMAN}/user", to_peer["version"])
+    assert [to for to, mode, _ in handed(hub) if mode == "push"] == ["claude:lead"]
+
+
+def test_a_lead_outside_the_channel_is_not_available(hub):
+    hub.publish("pc", [{"address": "omp:other", "name": "other"}, {"address": "omp:outsider", "name": "outsider"}])
+    hub.leave("pc", "general", "omp:outsider")
+    hub.set_lead("general", "@outsider", f"{HUMAN}/user")
+    assert hub.lead("general")["available"] is False
+
+
 def test_replaying_history_creates_no_work(hub, request_task):
     hub.history("general")
     assert task_count(hub) == 1

@@ -208,6 +208,15 @@ def test_a_late_answer_keeps_a_newer_draft(phone):
 # --- replies arrive through the change feed -----------------------------------------------------------------
 
 
+def owned_request(workspace) -> dict:
+    """The agent claims the open human request in #release, as the one agent that answers it."""
+    open_tasks = workspace["worker"].get("/v1/tasks", params={"topic": "release", "open": "1"}).json()["tasks"]
+    claimed = workspace["worker"].post("/v1/tasks/claim", json={"key": open_tasks[0]["key"], "actor": "omp:agent"})
+    claimed.raise_for_status()
+    task = claimed.json()["task"]
+    return {"key": task["key"], "version": task["version"]}
+
+
 @pytest.fixture
 def replied(phone):
     page, workspace = phone
@@ -215,10 +224,11 @@ def replied(phone):
     page.locator("#message-input").fill("Status?")
     page.locator("#composer").evaluate("form => form.requestSubmit()")
     page.locator("#messages li").filter(has_text="Status?").filter(has_text="Saved").first.wait_for()
+    link = owned_request(workspace)
     page.wait_for_timeout(1000)  # Let the feed settle into a wait.
     started = time.monotonic()
     workspace["worker"].post("/v1/messages", json={"id": "f" * 32, "from": "omp:agent", "to": "#release",
-                                                  "text": "All green."}).raise_for_status()
+                                                  "text": "All green.", "task": link}).raise_for_status()
     page.locator(".message-body").filter(has_text="All green.").wait_for(timeout=10000)
     return time.monotonic() - started
 
@@ -315,10 +325,11 @@ def test_the_new_session_gets_its_own_change_feed(repaired):
     workspace["worker"].put("/v1/topics/release/members/omp:agent").raise_for_status()
     workspace["browser"].post("/api/messages", json={"id": "e" * 32, "target": "#release", "text": "Kickoff."},
                               headers=workspace["headers"]).raise_for_status()
+    link = owned_request(workspace)
     page.wait_for_timeout(1000)
     started = time.monotonic()
     workspace["worker"].post("/v1/messages", json={"id": "f" * 32, "from": "omp:agent", "to": "#release",
-                                                  "text": "Back online."}).raise_for_status()
+                                                  "text": "Back online.", "task": link}).raise_for_status()
     page.locator(".message-body").filter(has_text="Back online.").wait_for(timeout=10000)
     assert time.monotonic() - started < 2.0
 

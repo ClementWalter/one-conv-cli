@@ -497,13 +497,20 @@ class Hub:
                     db.executemany("UPDATE deliveries SET taken = ? WHERE delivery = ?",
                                    [(time.time(), r[0]) for r in rows])
             if rows or time.monotonic() >= deadline:
-                return [{"delivery": d, "id": i, "to": a, "from": f"{fn}/{s}", "topic": t, "reply": r, "mode": m,
-                         "text": x, "created": c,
-                         **({"role": role} if role else {}),
-                         **({"task": {"key": key, "version": version, "state": state, "owner": owner,
-                                      "kind": kind, "parent": parent}} if key else {})}
-                        for d, i, a, fn, s, t, r, m, x, c, role, key, version, state, owner, kind, parent in rows]
+                return [self._handed(node, row) for row in rows]
             time.sleep(0.25)
+
+    @staticmethod
+    def _handed(node: str, row) -> dict:
+        """One inbox item. An instruction is handed out as such only to the task's current holder of an
+        open task; anyone else gets it as context, whatever was recorded when it was queued."""
+        d, i, a, fn, s, t, r, m, x, c, role, key, version, state, owner, kind, parent = row
+        if role in ("owner", "collaborator") and (owner != f"{node}/{a}" or state in tasks.FINISHED):
+            role, m = "observer", "fyi"
+        return {"delivery": d, "id": i, "to": a, "from": f"{fn}/{s}", "topic": t, "reply": r, "mode": m,
+                "text": x, "created": c, **({"role": role} if role else {}),
+                **({"task": {"key": key, "version": version, "state": state, "owner": owner, "kind": kind,
+                             "parent": parent}} if key else {})}
 
     def ack(self, node: str, delivery: str, outcome: str) -> dict:
         """Record the outcome of one of this node's deliveries; the first outcome reported stands."""
@@ -601,8 +608,14 @@ class Hub:
         return self._task_call(work)
 
     def update_task(self, node: str, body: dict) -> dict:
-        return self._task_call(lambda db: tasks.update(db, body.get("key"), self._actor(db, node, body.get("actor")),
-                                                       body.get("version"), body.get("state"), body.get("note")))
+        def work(db):
+            task = tasks.update(db, body.get("key"), self._actor(db, node, body.get("actor")), body.get("version"),
+                                body.get("state"), body.get("note"))
+            if task["state"] in tasks.FINISHED:
+                # A finished task gives nobody an instruction still waiting to be delivered.
+                self._retire(db, task["key"])
+            return task
+        return self._task_call(work)
 
     def delegate(self, node: str, body: dict) -> dict:
         """Grant a child task and wake its collaborator with it; a retry finds the same child."""
@@ -649,6 +662,7 @@ class Hub:
             task = tasks.transfer(db, before["key"], authority, route, version, note)
             if task["version"] == before["version"]:
                 return task
+            self._retire(db, task["key"])
             original = db.execute("SELECT text FROM posts WHERE seq = ?", (task["post"],)).fetchone()
             request = original[0] if original else task["title"]
             if route is not None:
@@ -674,11 +688,24 @@ class Hub:
         return self.lead(topic)
 
     def lead(self, topic: str) -> dict:
+        """The lead and whether it would own a request now: a connected member of the topic."""
         with self._db() as db:
             lead = tasks.lead_for(db, topic)
             route = self._resolve(db, lead)
-            return {"topic": topic, "lead": lead, "route": route,
-                    "available": route is not None and self._available(db, route, time.time())}
+            member = route is not None and db.execute(
+                "SELECT 1 FROM members WHERE topic = ? AND node || '/' || address = ?", (topic, route)).fetchone() \
+                is not None
+            return {"topic": topic, "lead": lead, "route": route, "member": member,
+                    "available": member and self._available(db, route, time.time())}
+
+    def _retire(self, db, key: str) -> None:
+        """Make an owner's or collaborator's still-undelivered instructions for this task context only.
+
+        Called before a new owner is notified and when a task finishes, so an instruction from an
+        earlier ownership never reaches an agent as "you own this". Plain linked posts keep their mode.
+        """
+        db.execute("UPDATE deliveries SET role = 'observer', mode = 'fyi' WHERE task = ? AND outcome IS NULL"
+                   " AND role IN ('owner', 'collaborator')", (key,))
 
     def adopt_trusted_human(self, node: str) -> None:
         """Trust this node's "user" as the human, and stop old queued human broadcasts from becoming work.

@@ -138,6 +138,44 @@ def test_the_local_owner_reports_progress(local, local_request):
     assert task["state"] == "working"
 
 
+@pytest.mark.parametrize("state", ["done", "cancelled"])
+def test_a_finished_local_task_takes_no_more_linked_answers(local, local_request, state):
+    task = local_request["task"]
+    taskops.update(task["key"], "claude:lead", task["version"], state)
+    lead = LiveSession("claude", "lead")
+    with pytest.raises(router.LiveError):
+        router.send("user", "here it is", lead, message_id="e" * 32,
+                    task={"key": task["key"], "version": task["version"]})
+
+
+class SameNodeHub:
+    """A hub this machine reaches as node mac; records what the router posts to it."""
+
+    node = "mac"
+    posted = []
+
+
+@pytest.fixture
+def same_node(monkeypatch, tmp_path):
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path))
+    SameNodeHub.posted = []
+    monkeypatch.setattr(hubclient, "configured", lambda: SameNodeHub())
+    monkeypatch.setattr(hubclient, "submit", lambda hub, message: SameNodeHub.posted.append(message) or {
+        "id": message["id"], "duplicate": False, "recipients": [{"to": message["to"], "status": "stored"}]})
+    collaborator = LiveSession("codex", "peer")
+    router.send("mac/claude:lead", "review done", collaborator, message_id="f" * 32,
+                task={"key": KEY + "/review-0123abcd", "version": 1})
+    return SameNodeHub.posted
+
+
+def test_a_linked_post_to_a_session_on_this_machine_goes_through_the_hub(same_node):
+    assert [message["to"] for message in same_node] == ["mac/claude:lead"]
+
+
+def test_a_linked_post_through_the_hub_carries_its_task(same_node):
+    assert same_node[0]["task"]["key"] == KEY + "/review-0123abcd"
+
+
 def test_a_local_grant_wakes_the_collaborator(local, local_request):
     pushed, _ = local
     taskops.delegate(local_request["task"]["key"], "claude:lead", local_request["task"]["version"], "codex:peer",

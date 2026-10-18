@@ -171,15 +171,19 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None) -> tup
     # A sender that is not a session (the person at that node's terminal) has no return address.
     sender = RemoteSender(sender_route, remote.get("title") or "", remote.get("cwd") or "") if ":" in local else None
     mode, reply, topic = item.get("mode", "push"), item.get("reply", "expected"), item.get("topic")
+    # A task delivery says whether this session owns the request, works a part of it, or only observes.
+    task, role = item.get("task"), item.get("role")
     if mode == "fyi":
         if harness == "boat":
             return "refused", "an fyi cannot reach a Boat conversation: a sandbox has no feed on this machine"
-        wrapped = envelope(item["text"], sender, sender_route, "none", item.get("id"), topic, remote.get("name"))
+        wrapped = envelope(item["text"], sender, sender_route, "none", item.get("id"), topic, remote.get("name"),
+                           task, role)
         router._append_fyi(target, sender_route, wrapped)
         return "accepted", "stored FYI"
     if harness == "boat" and reply == "expected":
         reply = "inline"
-    wrapped = envelope(item["text"], sender, sender_route, reply, item.get("id"), topic, remote.get("name"))
+    wrapped = envelope(item["text"], sender, sender_route, reply, item.get("id"), topic, remote.get("name"),
+                       task, role)
     try:
         with router._rate_slot(sender_route, target):
             try:

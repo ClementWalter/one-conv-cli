@@ -290,8 +290,12 @@ class Hub:
                        [(secrets.token_hex(16), seq, n, a, role, m, t) for n, a, role, m, t in deliveries])
         return seq
 
-    def _linked(self, db, message: dict, actor: str) -> str | None:
-        """The task a post answers; only its current owner or a granted collaborator may link one."""
+    def _linked(self, db, message: dict, actor: str, target: str) -> str | None:
+        """The task a post answers; only its current owner or a granted collaborator may link one.
+
+        A collaborator's output goes to the owner of the request it works on, never straight to
+        the human or the channel: the owner is the request's one publisher.
+        """
         link = message.get("task")
         if link is None:
             return None
@@ -301,8 +305,30 @@ class Hub:
             task = tasks.require(db, link["key"])
             tasks._fence(task, actor, link["version"])
         except tasks.TaskError as error:
-            raise HubError(error.status, str(error)) from None
+            raise TaskRefused(error) from None
+        if task["parent"]:
+            owner = (tasks.get(db, task["parent"]) or {}).get("owner")
+            if target != owner:
+                raise HubError(403, f"{task['key']} is a part of {task['parent']}: report it to that request's owner "
+                                    f"({owner or 'nobody yet'}), who answers the human")
         return task["key"]
+
+    def _unanswered(self, db, sender_route: str, target: str, topic: str | None) -> list[dict]:
+        """Open human requests this sender only observes, that this post would answer by its target.
+
+        A post to the human, or into the channel of such a request, must say what it is about,
+        so an observer never becomes a second responder by leaving the task out.
+        """
+        human = target.partition("/")[0] in self.trusted_humans and target.endswith("/user")
+        if not human and not target.startswith("#"):
+            return []
+        node, _, address = sender_route.partition("/")
+        rows = db.execute(
+            f"SELECT DISTINCT k.key, k.owner, k.topic FROM tasks k JOIN deliveries d ON d.task = k.key"
+            f" WHERE d.role = 'observer' AND d.to_node = ? AND d.to_address = ? AND k.parent IS NULL"
+            f" AND k.state NOT IN ({','.join('?' * len(tasks.FINISHED))}) AND IFNULL(k.owner, '') != ?",
+            (node, address, *tasks.FINISHED, sender_route)).fetchall()
+        return [{"key": key, "owner": owner, "topic": t} for key, owner, t in rows if human or t == topic]
 
     def send(self, node: str, message: dict, *, join_sender: bool = False, require_online: bool = False) -> dict:
         """Store a post and one delivery per recipient; a retry of the same post returns its first receipt."""
@@ -324,9 +350,12 @@ class Hub:
         topic = target[1:] if target.startswith("#") else message.get("topic")
         if topic is not None and (not isinstance(topic, str) or not TOPIC.fullmatch(topic)):
             raise HubError(400, "a topic is lowercase letters, digits and dashes")
-        link = message.get("task")
+        link, about = message.get("task"), message.get("about")
+        if about not in (None, "other"):
+            raise HubError(400, 'about is "other" for a post that answers no open request')
         digest = hashlib.sha256(json.dumps([target, sender, topic, reply, mode, text]
-                                           + ([link] if link is not None else [])).encode()).hexdigest()
+                                           + ([link] if link is not None else [])
+                                           + ([about] if about else [])).encode()).hexdigest()
         with self.lock, self._db() as db:
             # The lease check and durable claim share one snapshot across server instances.
             db.execute("BEGIN IMMEDIATE")
@@ -350,8 +379,18 @@ class Hub:
                 for recipient_node, recipient_address in recipients:
                     if not self._available(db, f"{recipient_node}/{recipient_address}", now):
                         raise HubError(409, "Recipient is offline; reconnect the agent before sending a new message.")
-            linked = self._linked(db, message, f"{node}/{sender}")
-            if node in self.trusted_humans and sender == "user" and reply == "expected" and mode == "push":
+            human = node in self.trusted_humans and sender == "user"
+            linked = self._linked(db, message, f"{node}/{sender}", target)
+            if not human and linked is None and about is None:
+                pending = self._unanswered(db, f"{node}/{sender}", target, topic)
+                if pending:
+                    first = pending[0]
+                    raise HubError(409, f"{target} has an open request owned by {first['owner'] or 'nobody yet'}"
+                                        f" (task {first['key']}). Only its owner answers it. If you own a task, link"
+                                        " your post with --task KEY --task-version N (send_message: task, task_version);"
+                                        " if this is about something else, send it with --not-task"
+                                        " (send_message: about=\"other\").")
+            if human and reply == "expected" and mode == "push":
                 # A human request: one owner is woken, everyone else receives it as context.
                 owner = self._lead(db, topic, recipients) if target.startswith("#") else (
                     f"{recipients[0][0]}/{recipients[0][1]}" if len(recipients) == 1 else None)

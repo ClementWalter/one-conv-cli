@@ -269,6 +269,48 @@ def test_a_former_owner_reply_linked_to_the_task_is_refused(hub, request_task, r
              task={"key": request_task["key"], "version": request_task["version"]})
 
 
+def test_a_collaborator_cannot_answer_the_human_directly(hub, child):
+    with pytest.raises(HubError):
+        post(hub, "e", to=f"{HUMAN}/user", sender="omp:other", node="pc",
+             task={"key": child["key"], "version": child["version"]})
+
+
+def test_a_collaborator_reports_to_the_request_owner(hub, child):
+    receipt = post(hub, "e", to=LEAD, sender="omp:other", node="pc",
+                   task={"key": child["key"], "version": child["version"]})
+    assert receipt["duplicate"] is False
+
+
+@pytest.mark.parametrize("to", ["#general", f"{HUMAN}/user"])
+def test_an_observer_cannot_answer_by_leaving_the_task_out(hub, request_task, to):
+    with pytest.raises(HubError):
+        post(hub, "e", to=to, sender="codex:peer", node="mac")
+
+
+def test_an_observer_can_post_about_something_else_when_it_says_so(hub, request_task):
+    receipt = post(hub, "e", to="#general", sender="codex:peer", node="mac", about="other")
+    assert receipt["duplicate"] is False
+
+
+def test_an_observer_posts_freely_in_another_channel(hub, request_task):
+    hub.join("mac", "elsewhere", "codex:peer")
+    hub.join("mac", "elsewhere", "claude:lead")
+    receipt = post(hub, "e", to="#elsewhere", sender="codex:peer", node="mac")
+    assert receipt["duplicate"] is False
+
+
+def test_the_owner_posts_without_a_link(hub, request_task):
+    receipt = post(hub, "e", to="#general", sender="claude:lead", node="mac")
+    assert receipt["duplicate"] is False
+
+
+def test_an_observer_posts_freely_once_the_request_is_done(hub, request_task):
+    hub.update_task("mac", {"key": request_task["key"], "actor": "claude:lead",
+                            "version": request_task["version"], "state": "done"})
+    receipt = post(hub, "e", to="#general", sender="codex:peer", node="mac")
+    assert receipt["duplicate"] is False
+
+
 def test_replaying_history_creates_no_work(hub, request_task):
     hub.history("general")
     assert task_count(hub) == 1

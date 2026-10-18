@@ -149,23 +149,23 @@ def test_a_finished_local_task_takes_no_more_linked_answers(local, local_request
 
 
 class SameNodeHub:
-    """A hub this machine reaches as node mac; records what the router posts to it."""
+    """A hub this machine reaches as node mac."""
 
     node = "mac"
-    posted = []
 
 
 @pytest.fixture
 def same_node(monkeypatch, tmp_path):
+    """What the router posts to the hub for a collaborator reporting to an owner on this machine."""
     monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path))
-    SameNodeHub.posted = []
+    posted = []
     monkeypatch.setattr(hubclient, "configured", lambda: SameNodeHub())
-    monkeypatch.setattr(hubclient, "submit", lambda hub, message: SameNodeHub.posted.append(message) or {
+    monkeypatch.setattr(hubclient, "submit", lambda hub, message: posted.append(message) or {
         "id": message["id"], "duplicate": False, "recipients": [{"to": message["to"], "status": "stored"}]})
     collaborator = LiveSession("codex", "peer")
     router.send("mac/claude:lead", "review done", collaborator, message_id="f" * 32,
                 task={"key": KEY + "/review-0123abcd", "version": 1})
-    return SameNodeHub.posted
+    return posted
 
 
 def test_a_linked_post_to_a_session_on_this_machine_goes_through_the_hub(same_node):

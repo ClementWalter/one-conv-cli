@@ -668,6 +668,29 @@ button {
   font-size: 10px;
   font-weight: 400;
 }
+.conversation-row.unread {
+  color: var(--selected-text);
+  font-weight: 750;
+}
+.conversation-row.unread .hash {
+  color: inherit;
+}
+.row-unread {
+  margin-left: auto;
+  flex: none;
+  min-width: 18px;
+  padding: 1px 6px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: var(--surface);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+.row-unread + .row-presence {
+  margin-left: 6px;
+}
 .row-presence {
   width: 7px;
   height: 7px;

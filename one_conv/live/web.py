@@ -9,13 +9,15 @@ require a localhost Host header. The page renders messages as text, never as mar
 import hmac
 import json
 import logging
+import os
 import secrets
 import sqlite3
 import time
 from collections import defaultdict
+from contextlib import closing
 from pathlib import Path
 
-from . import pwa, router, team, web_send
+from . import pwa, router, team, unread, web_send
 from .model import live_home
 
 # The viewer is a reader of its own: it never moves an agent's catch-up position.
@@ -35,6 +37,43 @@ def _bridge_state() -> dict | None:
     return {key: value for key, value in state.items() if "token" not in key.lower()}
 
 
+def _reads() -> sqlite3.Connection:
+    """Open the human's read marks, private to the owner like the send journal."""
+    directory = live_home()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "web-read.sqlite3"
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+    db = sqlite3.connect(path, timeout=10)
+    with db:
+        unread.ensure(db)
+    return db
+
+
+def read_marks() -> tuple[float, dict[str, float]]:
+    with closing(_reads()) as db:
+        return unread.marks(db)
+
+
+def mark_read(payload: object) -> dict:
+    payload = unread.validate(payload)
+    with closing(_reads()) as db, db:
+        return {"conversation": payload["conversation"], "at": unread.mark(db, payload)}
+
+
+def _topic_unread(topic: dict, baseline: float, marks: dict[str, float]) -> int:
+    mark = marks.get("#" + topic["topic"], baseline)
+    # Reading a topic only to count it is skipped when nothing was posted after the mark.
+    if not isinstance(topic.get("last"), (int, float)) or topic["last"] <= mark:
+        return 0
+    rows = topic_messages(topic["topic"])["messages"]
+    # A topic-tagged direct message counts in its pair's thread, not in the channel.
+    return unread.count([row for row in rows if not row.get("to")], mark)
+
+
 def state() -> dict:
     names = team.names()
     by_address = {address: name for name, address in names.items()}
@@ -47,6 +86,8 @@ def state() -> dict:
         error_text = None
     try:
         topics = team.topics()
+        baseline, marks = read_marks()
+        topics = [{**topic, "unread": _topic_unread(topic, baseline, marks)} for topic in topics]
     except team.TeamError as error:
         topics, error_text = [], str(error)
     return {"at": time.time(), "sessions": sessions, "names": names, "topics": topics,
@@ -82,7 +123,9 @@ def direct() -> dict:
             continue
         pair = " ".join(sorted((str(row.get("from")), str(row.get("to")))))
         threads[pair].append(row)
-    return {"threads": [{"pair": pair, "messages": rows, "last": rows[-1].get("at")}
+    baseline, marks = read_marks()
+    return {"threads": [{"pair": pair, "messages": rows, "last": rows[-1].get("at"),
+                         "unread": unread.count(rows, marks.get(pair, baseline))}
                         for pair, rows in sorted(threads.items(), key=lambda item: -(item[1][-1].get("at") or 0))]}
 
 
@@ -119,18 +162,22 @@ def application(port: int):
             return Response(body, media_type=media_type, headers=SECURITY_HEADERS)
         return endpoint
 
+    def check_write(request):
+        """Writes come only from the workspace's own tab holding this server's token."""
+        if request.headers.get("origin") != f"http://{request.headers.get('host')}":
+            raise web_send.SendError("Send from the workspace's own browser tab.", 403)
+        supplied = request.headers.get("x-one-conv-token", "")
+        if not hmac.compare_digest(supplied.encode(), token.encode()):
+            raise web_send.SendError("Refresh the workspace before sending; its session token is missing or expired.",
+                                     403)
+
     async def message(request):
         host = request.headers.get("host")
         if host not in allowed:
             return JSONResponse({"error": "Open the workspace through its localhost address."},
                                 status_code=421, headers=SECURITY_HEADERS)
         try:
-            if request.headers.get("origin") != f"http://{host}":
-                raise web_send.SendError("Send from the workspace's own browser tab.", 403)
-            supplied = request.headers.get("x-one-conv-token", "")
-            if not hmac.compare_digest(supplied.encode(), token.encode()):
-                raise web_send.SendError("Refresh the workspace before sending; its session token is missing or expired.",
-                                         403)
+            check_write(request)
             content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
             if content_type != "application/json" or request.headers.get("content-encoding", "identity") != "identity":
                 raise web_send.SendError("Send a JSON message using Content-Type: application/json.", 415)
@@ -166,6 +213,37 @@ def application(port: int):
                                 status_code=503, headers=SECURITY_HEADERS)
         return JSONResponse(result, status_code=status, headers=SECURITY_HEADERS)
 
+    async def read(request):
+        if request.headers.get("host") not in allowed:
+            return JSONResponse({"error": "Open the workspace through its localhost address."},
+                                status_code=421, headers=SECURITY_HEADERS)
+        try:
+            check_write(request)
+            if request.headers.get("content-type", "").partition(";")[0].strip().lower() != "application/json":
+                raise web_send.SendError("Send JSON using Content-Type: application/json.", 415)
+            body = bytearray()
+            async for chunk in request.stream():
+                if len(body) + len(chunk) > unread.CONVERSATION_LIMIT * 2:
+                    raise web_send.SendError("This read mark is too large.", 413)
+                body.extend(chunk)
+            try:
+                payload = json.loads(body.decode("utf-8"))
+            except (UnicodeError, ValueError, RecursionError):
+                raise web_send.SendError("The read mark must be valid UTF-8 JSON.") from None
+            result = await run_in_threadpool(mark_read, payload)
+        except web_send.SendError as error:
+            return JSONResponse({"error": str(error)}, status_code=error.status, headers=SECURITY_HEADERS)
+        except unread.ReadError as error:
+            return JSONResponse({"error": str(error)}, status_code=400, headers=SECURITY_HEADERS)
+        except ClientDisconnect:
+            return JSONResponse({"error": "The connection closed before the read mark was saved."},
+                                status_code=400, headers=SECURITY_HEADERS)
+        except (OSError, sqlite3.Error):
+            logger.exception("Could not save a read mark")
+            return JSONResponse({"error": "Read marks are unavailable. Check local disk access."},
+                                status_code=503, headers=SECURITY_HEADERS)
+        return JSONResponse(result, headers=SECURITY_HEADERS)
+
     assets = [Route(path, guarded(lambda request, body=body: body, media_type))
               for path, (body, media_type) in pwa.ASSETS.items()]
     return Starlette(routes=[
@@ -176,8 +254,10 @@ def application(port: int):
         Route("/api/topics/{topic}", guarded(lambda request: topic_messages(request.path_params["topic"]))),
         Route("/api/direct", guarded(lambda request: direct())),
         Route("/api/session", guarded(lambda request: {"csrf_token": token,
-              "human": {"address": "user", "name": "You", "kind": "human"}})),
+              "human": {"address": "user", "name": "You", "kind": "human"},
+              "capabilities": {"unread": True}})),
         Route("/api/messages", message, methods=["POST"]),
+        Route("/api/read", read, methods=["POST"]),
         *assets,
     ])
 

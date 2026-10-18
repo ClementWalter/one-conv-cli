@@ -32,6 +32,9 @@ const model = {
   costs: null,
   staffing: false,
   reportReceivedAt: null,
+  // Read marks the workspace accepted from this tab, per conversation, and the saves in flight.
+  readMarks: new Map(),
+  reading: new Set(),
 };
 const harnesses = {
   claude: "Claude",
@@ -288,7 +291,47 @@ function connected(ok) {
   node.lastElementChild.textContent = ok ? "Workspace live" : "Reconnecting";
   $("live-badge").hidden = !ok;
 }
-function rowButton(list, label, mark, active, action, count) {
+function conversationKey(view = model.view) {
+  if (!view) return null;
+  if (view.kind === "topic") return "#" + view.key;
+  return view.kind === "direct" ? view.key : null;
+}
+function unreadOf(conversation, count) {
+  // The open, visible conversation is being read: it never turns bold while its mark is saved.
+  if (!document.hidden && conversation === conversationKey()) return 0;
+  return Number(count) > 0 ? Math.floor(Number(count)) : 0;
+}
+function threadUnread(pair) {
+  const thread = model.threads.find((item) => item.pair === pair);
+  return thread ? unreadOf(pair, thread.unread) : 0;
+}
+function totalUnread() {
+  return model.state.topics.reduce((sum, topic) => sum + unreadOf("#" + topic.topic, topic.unread), 0) +
+    model.threads.reduce((sum, thread) => sum + unreadOf(thread.pair, thread.unread), 0);
+}
+async function markRead() {
+  const conversation = conversationKey();
+  if (!conversation || document.hidden || !model.capabilities.unread || !model.token) return;
+  const times = (model.serverRows || []).map((row) => Number(row.at)).filter(Number.isFinite);
+  const newest = times.length ? Math.max(...times) : 0;
+  if (!newest || newest <= (model.readMarks.get(conversation) || 0) || model.reading.has(conversation)) return;
+  const generation = model.generation;
+  model.reading.add(conversation);
+  try {
+    const data = await post("/api/read", { conversation, at: newest });
+    if (generation !== model.generation) return;
+    model.readMarks.set(conversation, Math.max(Number(data.at) || 0, newest));
+    for (const item of [...model.state.topics.filter((topic) => "#" + topic.topic === conversation),
+      ...model.threads.filter((thread) => thread.pair === conversation)]) item.unread = 0;
+    sidebar();
+    header();
+  } catch (_) {
+    /* The next refresh retries; another device can also clear it. */
+  } finally {
+    model.reading.delete(conversation);
+  }
+}
+function rowButton(list, label, mark, active, action, count, unread = 0) {
   const li = el("li");
   const button = el(
     "button",
@@ -299,7 +342,13 @@ function rowButton(list, label, mark, active, action, count) {
   if (active) button.setAttribute("aria-current", "page");
   if (mark) button.appendChild(mark);
   button.appendChild(el("span", label, "row-label"));
-  if (count !== undefined) {
+  if (unread > 0) {
+    button.classList.add("unread");
+    const badge = el("span", unread > 99 ? "99+" : String(unread), "row-unread");
+    badge.title = unread + " unread";
+    badge.setAttribute("aria-label", unread + " unread");
+    button.appendChild(badge);
+  } else if (count !== undefined) {
     const amount = el("span", count, "row-count");
     amount.title = count + " members";
     button.appendChild(amount);
@@ -322,6 +371,7 @@ function sidebar() {
         model.view.key === topic.topic,
       () => select("topic", topic.topic),
       (topic.members || []).length,
+      unreadOf("#" + topic.topic, topic.unread),
     );
   if (!topics.children.length)
     topics.appendChild(
@@ -348,6 +398,8 @@ function sidebar() {
         model.view.kind === "direct" &&
         model.view.key === thread.pair,
       () => select("direct", thread.pair),
+      undefined,
+      unreadOf(thread.pair, thread.unread),
     );
   }
   if (!threads.children.length)
@@ -368,6 +420,8 @@ function sidebar() {
       avatar(session.address, "tiny-avatar"),
       false,
       () => select("direct", pairOf(session.address)),
+      undefined,
+      threadUnread(pairOf(session.address)),
     );
     const label = button.querySelector(".row-label");
     label.classList.add("agent-label");
@@ -442,7 +496,8 @@ function header() {
   );
   $("member-count").textContent = current.length || "";
   $("members-toggle").hidden = !current.length;
-  document.title = (view.kind === "topic" ? "# " : "") + title + " · OneConv";
+  const waiting = totalUnread();
+  document.title = (waiting ? "(" + waiting + ") " : "") + (view.kind === "topic" ? "# " : "") + title + " · OneConv";
   if (model.details) renderDetails();
   updateComposer();
 }
@@ -804,6 +859,7 @@ async function refreshView(force = false) {
     }
     if (!current()) return;
     renderRows(rows, force);
+    markRead();
   } catch (error) {
     if (current() && !(error instanceof StaleSession)) notice(error.message, true);
   }
@@ -973,6 +1029,8 @@ function authentication(accepted) {
     if (model.feedAbort) model.feedAbort.abort();
     model.outbox.clear();
     model.pending.clear();
+    model.readMarks.clear();
+    model.reading.clear();
     for (const dialog of document.querySelectorAll("dialog[open]")) dialog.close();
   }
 }
@@ -1913,6 +1971,13 @@ function visible() {
     if (!document.hidden) { document.removeEventListener("visibilitychange", wake); resolve(); }
   })) : Promise.resolve();
 }
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden || !model.authenticated) return;
+  // Returning to the tab reads the open conversation; until then its new messages stay unread.
+  sidebar();
+  header();
+  markRead();
+});
 async function changeFeed() {
   // One loop per session: it waits for the server to report a change, then refreshes once.
   const generation = model.generation;

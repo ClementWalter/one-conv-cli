@@ -328,7 +328,8 @@ async function markRead() {
   } catch (_) {
     /* The next refresh retries; another device can also clear it. */
   } finally {
-    model.reading.delete(conversation);
+    // A save from an ended session never releases the same conversation's save in the current one.
+    if (generation === model.generation) model.reading.delete(conversation);
   }
 }
 function rowButton(list, label, mark, active, action, count, unread = 0) {
@@ -1039,6 +1040,7 @@ function authentication(accepted) {
 }
 
 async function post(path, body, login = false) {
+  const generation = model.generation;
   let response, data;
   try {
     response = await fetch(path, {
@@ -1051,8 +1053,11 @@ async function post(path, body, login = false) {
     });
     data = await response.json();
   } catch (_) {
+    if (generation !== model.generation) throw new StaleSession("stale session");
     throw new Error("The connection ended before a receipt arrived. Retry the same request to check its outcome.");
   }
+  // An answer meant for an ended session never changes the current one, not even to sign it out.
+  if (generation !== model.generation) throw new StaleSession("stale session");
   if (response.status === 401) authentication(false);
   if (!response.ok) throw new Error(data.error || "The workspace could not complete that request.");
   return data;

@@ -57,3 +57,49 @@ def test_reading_on_one_device_clears_the_other(devices):
     first.locator(".message-body").filter(has_text="Release notes are ready.").wait_for()
     second.locator(".conversation-row.unread").wait_for(state="detached", timeout=15000)
     assert second.locator(".conversation-row.unread").count() == 0
+
+
+# Holds this tab's first read mark, then answers it with 401 once the page lets it go.
+HOLD_READ = """() => {
+  const original = window.fetch;
+  let held = false;
+  window.fetch = async (url, options) => {
+    if (!held && String(url).includes("/api/read")) {
+      held = true;
+      window.__readStarted = true;
+      await new Promise((resolve) => { window.__releaseRead = resolve; });
+      return new Response(JSON.stringify({ error: "Pair this browser with the workspace." }),
+        { status: 401, headers: { "Content-Type": "application/json" } });
+    }
+    return original(url, options);
+  };
+}"""
+
+# Disconnects, pairs the same tab again, then releases the old session's read mark.
+REPAIR_THEN_RELEASE = """async (token) => {
+  await disconnectDevice();
+  await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }) });
+  if (await session()) { refreshState(); changeFeed(); }
+  window.__releaseRead();
+}"""
+
+
+@pytest.fixture
+def repaired(browser, real_http_workspace, width):
+    """A read mark from the ended session is rejected only after the same tab paired again."""
+    workspace = real_http_workspace
+    context, page = paired(browser, workspace, "topic=release", width)
+    page.evaluate(HOLD_READ)
+    workspace["worker"].put("/v1/topics/release/members/omp:agent").raise_for_status()
+    workspace["worker"].post("/v1/messages", json={"id": "8" * 32, "from": "omp:agent", "to": "#release",
+                                                   "text": "Starts a read mark."}).raise_for_status()
+    page.wait_for_function("() => window.__readStarted === true", timeout=15000)
+    page.evaluate(REPAIR_THEN_RELEASE, AuthStore(workspace["directory"]).issue_pairing_token())
+    page.wait_for_timeout(300)
+    yield page
+    context.close()
+
+
+def test_an_old_read_mark_rejection_does_not_sign_out_a_new_pairing(repaired):
+    assert repaired.evaluate("model.authenticated") is True

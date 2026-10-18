@@ -12,6 +12,12 @@ post is kept even when no other member is there yet.
 A node token vouches for the sessions its bridge publishes, not for each process on that
 machine. Only token hashes are stored. Delivery is at least once to the bridge; the bridge's
 ingress log is what keeps a retried delivery from prompting an agent twice.
+
+A request from a trusted human (a node in `trusted_humans`, sending as "user") becomes a task
+in the same commit as its post (see `tasks`). One agent owns it and is woken; every other
+recipient gets the request as context (an fyi) and no instruction to act. Ownership changes
+only through the owner itself (claim, delegate) or the human (assign), never through the node
+API on another agent's behalf.
 """
 
 import hashlib
@@ -24,6 +30,8 @@ import threading
 import time
 from contextlib import contextmanager
 
+from . import tasks
+
 NODE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 TOPIC = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 MESSAGE_ID = re.compile(r"[0-9a-f]{32}")
@@ -34,6 +42,9 @@ REPORT_BATCH = 100
 # the adapter refused it, or the bridge cannot tell (it crashed between claiming and reporting).
 OUTCOMES = ("accepted", "refused", "unconfirmed")
 MODES = ("push", "fyi")
+# Why a delivery reached its recipient: the task's owner, a collaborator on a child task, or an
+# observer who receives the request as context only. Agent-to-agent messages have no role.
+ROLES = ("owner", "collaborator", "observer")
 MAX_TEXT = 200_000
 # A JSON-escaped text can take up to six bytes per character, plus the envelope fields.
 MAX_BODY = MAX_TEXT * 6 + 4096
@@ -69,6 +80,14 @@ class HubError(Exception):
         self.status = status
 
 
+class TaskRefused(HubError):
+    """A refused task action, carrying the task's current state so the caller never guesses it."""
+
+    def __init__(self, error: tasks.TaskError):
+        super().__init__(error.status, str(error))
+        self.task = error.task
+
+
 def _hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -93,11 +112,26 @@ class Hub:
         self.path, self.lock = path, threading.Lock()
         # A channel every session joins the first time it is published; leaving it afterwards sticks.
         self.general = general
+        # Nodes whose "user" is an authenticated human, whose requests become tasks (the workspace).
+        self.trusted_humans: set[str] = set()
         with self._db() as db:
             db.executescript(SCHEMA)
+            tasks.ensure(db)
+            posts = {row[1] for row in db.execute("PRAGMA table_info(posts)")}
             # Posts a node reported after delivering them itself; they never had a hub delivery to take.
-            if "reported" not in {row[1] for row in db.execute("PRAGMA table_info(posts)")}:
+            if "reported" not in posts:
                 db.execute("ALTER TABLE posts ADD COLUMN reported INTEGER NOT NULL DEFAULT 0")
+            # The task an agent's post answers or reports on, checked against its current owner.
+            if "task" not in posts:
+                db.execute("ALTER TABLE posts ADD COLUMN task TEXT")
+            # "system" for an instruction the hub issued itself, which no human or agent wrote.
+            if "kind" not in posts:
+                db.execute("ALTER TABLE posts ADD COLUMN kind TEXT")
+            deliveries = {row[1] for row in db.execute("PRAGMA table_info(deliveries)")}
+            # A delivery can wake its recipient while the same post only informs the others.
+            for column in ("role", "mode", "task"):
+                if column not in deliveries:
+                    db.execute(f"ALTER TABLE deliveries ADD COLUMN {column} TEXT")
 
     @contextmanager
     def _db(self):
@@ -215,10 +249,98 @@ class Hub:
         return [(node, address)]
 
     def _receipt(self, db, seq: int, msg_id: str, duplicate: bool) -> dict:
-        rows = db.execute("SELECT delivery, to_node, to_address, outcome FROM deliveries WHERE post = ? "
+        rows = db.execute("SELECT delivery, to_node, to_address, outcome, role FROM deliveries WHERE post = ? "
                           "ORDER BY rowid", (seq,)).fetchall()
-        return {"id": msg_id, "duplicate": duplicate,
-                "recipients": [{"to": f"{n}/{a}", "delivery": d, "status": o or "stored"} for d, n, a, o in rows]}
+        receipt = {"id": msg_id, "duplicate": duplicate,
+                   "recipients": [{"to": f"{n}/{a}", "delivery": d, "status": o or "stored",
+                                   **({"role": role} if role else {})} for d, n, a, o, role in rows]}
+        task = db.execute(f"SELECT {tasks.COLUMNS} FROM tasks WHERE post_seq = ? AND parent IS NULL",
+                          (seq,)).fetchone()
+        if task:
+            receipt["task"] = tasks._row(task)
+        return receipt
+
+    def _available(self, db, route: str, now: float) -> bool:
+        node, _, address = route.partition("/")
+        lease = db.execute("SELECT n.seen, s.updated FROM sessions s JOIN nodes n ON n.node = s.node "
+                           "WHERE s.node = ? AND s.address = ?", (node, address)).fetchone()
+        return lease is not None and _online(*lease, now)
+
+    def _resolve(self, db, who: str) -> str | None:
+        """A full route for @name or a route, if that session is published; otherwise None."""
+        if who.startswith("@"):
+            row = db.execute("SELECT node, address FROM sessions WHERE name = ?", (who[1:],)).fetchone()
+            return f"{row[0]}/{row[1]}" if row else None
+        node, _, address = who.partition("/")
+        return who if self._published(db, node, address) else None
+
+    def _lead(self, db, topic: str, recipients: list[tuple[str, str]]) -> str | None:
+        """The channel lead's route, when it is a connected member who receives this post."""
+        route = self._resolve(db, tasks.lead_for(db, topic))
+        if route is None or tuple(route.split("/", 1)) not in recipients:
+            return None
+        return route if self._available(db, route, time.time()) else None
+
+    def _insert(self, db, node: str, msg_id: str, digest: str, target: str, sender: str, topic: str | None,
+                reply: str, mode: str, text: str, deliveries, task: str | None = None, kind: str | None = None) -> int:
+        """One post and its deliveries; `deliveries` is (node, address, role, mode, task) per recipient.
+
+        `kind="system"` marks an instruction the hub itself issued (an assignment, a release): it
+        is delivered like any post but is never shown as something the human or an agent wrote.
+        """
+        seq = db.execute("INSERT INTO posts (from_node, id, digest, target, sender, topic, reply, mode, text, created,"
+                         " task, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (node, msg_id, digest, target, sender, topic, reply, mode, text, time.time(),
+                          task, kind)).lastrowid
+        db.executemany("INSERT INTO deliveries (delivery, post, to_node, to_address, role, mode, task)"
+                       " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       [(secrets.token_hex(16), seq, n, a, role, m, t) for n, a, role, m, t in deliveries])
+        return seq
+
+    def _linked(self, db, message: dict, actor: str, target: str) -> str | None:
+        """The task a post answers; only its current owner or a granted collaborator may link one.
+
+        A collaborator's output goes to the owner of the request it works on, never straight to
+        the human or the channel: the owner is the request's one publisher.
+        """
+        link = message.get("task")
+        if link is None:
+            return None
+        if not isinstance(link, dict) or set(link) != {"key", "version"}:
+            raise HubError(400, "task is {key, version}, as the delivery gave them")
+        try:
+            task = tasks.require(db, link["key"])
+            tasks._fence(task, actor, link["version"])
+            if task["state"] in tasks.FINISHED:
+                # The answer belongs before the task is closed; a finished task takes no more output.
+                raise tasks.TaskError(409, f"{task['key']} is already {task['state']}: post the answer before "
+                                           "marking it done, or send without --task if it is about something else",
+                                      task)
+        except tasks.TaskError as error:
+            raise TaskRefused(error) from None
+        if task["parent"]:
+            owner = (tasks.get(db, task["parent"]) or {}).get("owner")
+            if target != owner:
+                raise HubError(403, f"{task['key']} is a part of {task['parent']}: report it to that request's owner "
+                                    f"({owner or 'nobody yet'}), who answers the human")
+        return task["key"]
+
+    def _unanswered(self, db, sender_route: str, target: str, topic: str | None) -> list[dict]:
+        """Open human requests someone else owns, that this post would answer by its target.
+
+        A post to the human (beside any open request) or into the channel of an open request
+        must say what it is about, so no agent becomes a second responder by leaving the task
+        out, whether it received the request, joined later, or never saw it.
+        """
+        human = target.partition("/")[0] in self.trusted_humans and target.endswith("/user")
+        if not human and not target.startswith("#"):
+            return []
+        rows = db.execute(
+            f"SELECT key, owner, topic FROM tasks WHERE parent IS NULL"
+            f" AND state NOT IN ({','.join('?' * len(tasks.FINISHED))}) AND IFNULL(owner, '') != ?"
+            f" AND created_by IN ({','.join('?' * len(self.trusted_humans))}) ORDER BY created",
+            (*tasks.FINISHED, sender_route, *(f"{node}/user" for node in self.trusted_humans))).fetchall()
+        return [{"key": key, "owner": owner, "topic": t} for key, owner, t in rows if human or t == topic]
 
     def send(self, node: str, message: dict, *, join_sender: bool = False, require_online: bool = False) -> dict:
         """Store a post and one delivery per recipient; a retry of the same post returns its first receipt."""
@@ -240,7 +362,12 @@ class Hub:
         topic = target[1:] if target.startswith("#") else message.get("topic")
         if topic is not None and (not isinstance(topic, str) or not TOPIC.fullmatch(topic)):
             raise HubError(400, "a topic is lowercase letters, digits and dashes")
-        digest = hashlib.sha256(json.dumps([target, sender, topic, reply, mode, text]).encode()).hexdigest()
+        link, about = message.get("task"), message.get("about")
+        if about not in (None, "other"):
+            raise HubError(400, 'about is "other" for a post that answers no open request')
+        digest = hashlib.sha256(json.dumps([target, sender, topic, reply, mode, text]
+                                           + ([link] if link is not None else [])
+                                           + ([about] if about else [])).encode()).hexdigest()
         with self.lock, self._db() as db:
             # The lease check and durable claim share one snapshot across server instances.
             db.execute("BEGIN IMMEDIATE")
@@ -262,16 +389,36 @@ class Hub:
             if require_online and not target.startswith("#"):
                 now = time.time()
                 for recipient_node, recipient_address in recipients:
-                    lease = db.execute("SELECT n.seen, s.updated FROM sessions s JOIN nodes n ON n.node = s.node "
-                                       "WHERE s.node = ? AND s.address = ?",
-                                       (recipient_node, recipient_address)).fetchone()
-                    if lease is None or not _online(*lease, now):
+                    if not self._available(db, f"{recipient_node}/{recipient_address}", now):
                         raise HubError(409, "Recipient is offline; reconnect the agent before sending a new message.")
-            seq = db.execute("INSERT INTO posts (from_node, id, digest, target, sender, topic, reply, mode, text, created)"
-                             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                             (node, msg_id, digest, target, sender, topic, reply, mode, text, time.time())).lastrowid
-            db.executemany("INSERT INTO deliveries (delivery, post, to_node, to_address) VALUES (?, ?, ?, ?)",
-                           [(secrets.token_hex(16), seq, n, a) for n, a in recipients])
+            human = node in self.trusted_humans and sender == "user"
+            linked = self._linked(db, message, f"{node}/{sender}", target)
+            if not human and linked is None and about is None:
+                pending = self._unanswered(db, f"{node}/{sender}", target, topic)
+                if pending:
+                    first = pending[0]
+                    raise HubError(409, f"{target} has an open request owned by {first['owner'] or 'nobody yet'}"
+                                        f" (task {first['key']}). Only its owner answers it. If you own a task, link"
+                                        " your post with --task KEY --task-version N (send_message: task, task_version);"
+                                        " if this is about something else, send it with --not-task"
+                                        " (send_message: about=\"other\").")
+            if human and reply == "expected" and mode == "push":
+                # A human request: one owner is woken, everyone else receives it as context.
+                owner = self._lead(db, topic, recipients) if target.startswith("#") else (
+                    f"{recipients[0][0]}/{recipients[0][1]}" if len(recipients) == 1 else None)
+                key = tasks.key_for(node, msg_id)
+                seq = self._insert(db, node, msg_id, digest, target, sender, topic, reply, mode, text,
+                                   [(n, a, "owner", "push", key) if f"{n}/{a}" == owner else
+                                    (n, a, "observer", "fyi", key) for n, a in recipients])
+                tasks.create(db, key, post_seq=seq, topic=topic, owner=owner, created_by=f"{node}/{sender}",
+                             title=text)
+            elif human:
+                # A human post that asks for nothing (an announcement) informs everyone and wakes nobody.
+                seq = self._insert(db, node, msg_id, digest, target, sender, topic, reply, mode, text,
+                                   [(n, a, None, "fyi", None) for n, a in recipients])
+            else:
+                seq = self._insert(db, node, msg_id, digest, target, sender, topic, reply, mode, text,
+                                   [(n, a, None, None, linked) for n, a in recipients], task=linked)
             return self._receipt(db, seq, msg_id, False)
 
     @staticmethod
@@ -348,17 +495,31 @@ class Hub:
             with self.lock, self._db() as db:
                 self._seen(db, node)
                 rows = db.execute(
-                    "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.topic, p.reply, p.mode, p.text,"
-                    " p.created"
-                    " FROM deliveries d JOIN posts p ON p.seq = d.post WHERE d.to_node = ? AND d.outcome IS NULL"
-                    " ORDER BY d.post LIMIT 50", (node,)).fetchall()
+                    "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.topic, p.reply,"
+                    " COALESCE(d.mode, p.mode), p.text, p.created, d.role, k.key, k.version, k.state, k.owner,"
+                    " k.kind, k.parent, p.kind"
+                    " FROM deliveries d JOIN posts p ON p.seq = d.post LEFT JOIN tasks k ON k.key = d.task"
+                    " WHERE d.to_node = ? AND d.outcome IS NULL ORDER BY d.post LIMIT 50", (node,)).fetchall()
                 if rows:
                     db.executemany("UPDATE deliveries SET taken = ? WHERE delivery = ?",
                                    [(time.time(), r[0]) for r in rows])
             if rows or time.monotonic() >= deadline:
-                return [{"delivery": d, "id": i, "to": a, "from": f"{fn}/{s}", "topic": t, "reply": r, "mode": m,
-                         "text": x, "created": c} for d, i, a, fn, s, t, r, m, x, c in rows]
+                return [self._handed(node, row) for row in rows]
             time.sleep(0.25)
+
+    @staticmethod
+    def _handed(node: str, row) -> dict:
+        """One inbox item. An instruction is handed out as such only to the task's current holder of an
+        open task; anyone else gets it as context, whatever was recorded when it was queued."""
+        d, i, a, fn, s, t, r, m, x, c, role, key, version, state, owner, kind, parent, post_kind = row
+        if role in ("owner", "collaborator") and (owner != f"{node}/{a}" or state in tasks.FINISHED):
+            role, m = "observer", "fyi"
+        # An instruction the hub issued is labelled as such, never as a message from the human or an agent.
+        return {"delivery": d, "id": i, "to": a, "from": f"{fn}/{s}", "topic": t, "reply": r, "mode": m,
+                "text": x, "created": c, **({"role": role} if role else {}),
+                **({"system": True} if post_kind == "system" else {}),
+                **({"task": {"key": key, "version": version, "state": state, "owner": owner, "kind": kind,
+                             "parent": parent}} if key else {})}
 
     def ack(self, node: str, delivery: str, outcome: str) -> dict:
         """Record the outcome of one of this node's deliveries; the first outcome reported stands."""
@@ -413,18 +574,180 @@ class Hub:
             listing[topic] = {"topic": topic, "members": [], "last": last[topic]}
         return list(listing.values())
 
+    # ── tasks ────────────────────────────────────────────────────────────────────────────────────────
+
+    def _actor(self, db, node: str, address: object) -> str:
+        """An agent acting on a task is a session this node published; the node vouches for it."""
+        if not isinstance(address, str) or not LOCAL_AGENT.fullmatch(address) or not self._published(db, node, address):
+            raise HubError(403, "actor must be a session this node published (harness:id)")
+        return f"{node}/{address}"
+
+    def _task_call(self, work):
+        try:
+            with self.lock, self._db() as db:
+                db.execute("BEGIN IMMEDIATE")
+                return work(db)
+        except tasks.TaskError as error:
+            raise TaskRefused(error) from None
+
+    def task(self, key: object) -> dict:
+        def work(db):
+            task = tasks.require(db, tasks.check_key(key))
+            return {**task, "children": tasks.children(db, task["key"]), "events": tasks.events(db, task["key"])}
+        return self._task_call(work)
+
+    def task_list(self, topic: str | None = None, owner: str | None = None, open_only: bool = False) -> list[dict]:
+        with self._db() as db:
+            return tasks.listing(db, topic=topic, owner=owner, open_only=open_only)
+
+    def claim(self, node: str, body: dict) -> dict:
+        """Take an unowned task; the claimer's delivery of the request becomes the owner's."""
+        def work(db):
+            actor = self._actor(db, node, body.get("actor"))
+            before = tasks.require(db, tasks.check_key(body.get("key")))
+            task = tasks.claim(db, before["key"], actor, body.get("version"))
+            if task["version"] != before["version"]:
+                db.execute("UPDATE deliveries SET role = 'owner' WHERE task = ? AND to_node = ? AND to_address = ?"
+                           " AND role = 'observer'", (task["key"], node, body.get("actor")))
+                # The claimer only had the request as context; it now gets the owner's instructions.
+                original = db.execute("SELECT text FROM posts WHERE seq = ?", (task["post"],)).fetchone()
+                self._notify(db, task, task["created_by"], f"You claimed task {task['key']} (version {task['version']})."
+                             f"\n{original[0] if original else task['title']}", "owner")
+            return task
+        return self._task_call(work)
+
+    def update_task(self, node: str, body: dict) -> dict:
+        def work(db):
+            task = tasks.update(db, body.get("key"), self._actor(db, node, body.get("actor")), body.get("version"),
+                                body.get("state"), body.get("note"))
+            if task["state"] in tasks.FINISHED:
+                # A finished task gives nobody an instruction still waiting to be delivered.
+                self._retire(db, task["key"])
+            return task
+        return self._task_call(work)
+
+    def delegate(self, node: str, body: dict) -> dict:
+        """Grant a child task and wake its collaborator with it; a retry finds the same child."""
+        def work(db):
+            actor = self._actor(db, node, body.get("actor"))
+            to = body.get("to")
+            route = self._resolve(db, to) if isinstance(to, str) and tasks.LEAD.fullmatch(to) else None
+            if route is None:
+                raise tasks.TaskError(404, f"{to!r} is not a published session; use @name or NODE/harness:id")
+            child, created = tasks.delegate(db, body.get("key"), actor, body.get("version"), route,
+                                            body.get("kind"), body.get("note"), body.get("round", 1))
+            if created:
+                self._notify(db, child, actor, f"Child task {child['key']} ({child['kind']}) from {actor}:\n"
+                             f"{child['note'] or '(no note)'}\nRequest: {child['title']}\n"
+                             "Work only this part and report to the task owner.", "collaborator")
+            return child
+        return self._task_call(work)
+
+    def _notify(self, db, task: dict, sender_route: str, text: str, role: str) -> None:
+        """Wake a task's owner with its assignment; an internal post that never creates a task itself."""
+        node, _, sender = sender_route.partition("/")
+        owner_node, _, owner = task["owner"].partition("/")
+        msg_id = hashlib.sha256(f"{task['key']}@{task['version']}:{role}".encode()).hexdigest()[:32]
+        if db.execute("SELECT 1 FROM posts WHERE from_node = ? AND id = ?", (node, msg_id)).fetchone():
+            return
+        digest = hashlib.sha256(json.dumps(["task", task["key"], task["version"], role]).encode()).hexdigest()
+        self._insert(db, node, msg_id, digest, task["owner"], sender, task["topic"], "expected", "push", text,
+                     [(owner_node, owner, role, "push", task["key"])], task=task["key"], kind="system")
+
+    def assign(self, key: object, to: str | None, authority: str, version: object, note: object = None) -> dict:
+        """The human gives a task to an agent, or unassigns it. Not exposed to nodes.
+
+        `version` is the one the human saw, so a delayed reassignment never overwrites a newer
+        one. The new owner is woken with the request even if it had only received it as
+        context; the former owner gets a notice that the task left it.
+        """
+        def work(db):
+            route = None
+            if to is not None:
+                route = self._resolve(db, tasks.check_lead(to))
+                if route is None:
+                    raise tasks.TaskError(404, f"{to} is not a published session")
+            before = tasks.require(db, tasks.check_key(key))
+            task = tasks.transfer(db, before["key"], authority, route, version, note)
+            if task["version"] == before["version"]:
+                return task
+            self._retire(db, task["key"])
+            original = db.execute("SELECT text FROM posts WHERE seq = ?", (task["post"],)).fetchone()
+            request = original[0] if original else task["title"]
+            if route is not None:
+                self._notify(db, task, authority, f"Assigned to you: task {task['key']} (version {task['version']}).\n"
+                             f"{request}", "owner")
+            if before["owner"]:
+                old_node, _, old = before["owner"].partition("/")
+                node, _, sender = authority.partition("/")
+                msg_id = hashlib.sha256(f"{task['key']}@{task['version']}:released".encode()).hexdigest()[:32]
+                if not db.execute("SELECT 1 FROM posts WHERE from_node = ? AND id = ?", (node, msg_id)).fetchone():
+                    self._insert(db, node, msg_id, msg_id, before["owner"], sender, task["topic"], "none", "fyi",
+                                 f"Task {task['key']} is no longer yours ({'now ' + route if route else 'unassigned'})."
+                                 " Stop working on it.", [(old_node, old, "observer", "fyi", task["key"])],
+                                 task=task["key"], kind="system")
+            return task
+        return self._task_call(work)
+
+    def set_lead(self, topic: str, lead: str | None, authority: str) -> dict:
+        """Who owns new human requests in a channel. Not exposed to nodes."""
+        if not TOPIC.fullmatch(topic):
+            raise HubError(400, "a topic is lowercase letters, digits and dashes")
+        self._task_call(lambda db: tasks.set_lead(db, topic, lead, authority))
+        return self.lead(topic)
+
+    def lead(self, topic: str) -> dict:
+        """The lead and whether it would own a request now: a connected member of the topic."""
+        with self._db() as db:
+            lead = tasks.lead_for(db, topic)
+            route = self._resolve(db, lead)
+            member = route is not None and db.execute(
+                "SELECT 1 FROM members WHERE topic = ? AND node || '/' || address = ?", (topic, route)).fetchone() \
+                is not None
+            return {"topic": topic, "lead": lead, "route": route, "member": member,
+                    "available": member and self._available(db, route, time.time())}
+
+    def _retire(self, db, key: str) -> None:
+        """Make an owner's or collaborator's still-undelivered instructions for this task context only.
+
+        Called before a new owner is notified and when a task finishes, so an instruction from an
+        earlier ownership never reaches an agent as "you own this". Plain linked posts keep their mode.
+        """
+        db.execute("UPDATE deliveries SET role = 'observer', mode = 'fyi' WHERE task = ? AND outcome IS NULL"
+                   " AND role IN ('owner', 'collaborator')", (key,))
+
+    def adopt_trusted_human(self, node: str) -> None:
+        """Trust this node's "user" as the human, and stop old queued human broadcasts from becoming work.
+
+        Human posts queued before tasks existed are delivered as context (fyi), not as fresh
+        requests: they predate ownership, so nobody owns them. History is kept as it is.
+        """
+        self.trusted_humans.add(node)
+        with self.lock, self._db() as db:
+            db.execute("CREATE TABLE IF NOT EXISTS hub_migrations (name TEXT PRIMARY KEY, at REAL NOT NULL)")
+            name = f"human-tasks:{node}"
+            if db.execute("INSERT OR IGNORE INTO hub_migrations VALUES (?, ?)", (name, time.time())).rowcount:
+                db.execute("UPDATE deliveries SET mode = 'fyi', role = 'observer' WHERE outcome IS NULL AND task IS NULL"
+                           " AND post IN (SELECT seq FROM posts WHERE from_node = ? AND sender = 'user')", (node,))
+
     def history(self, topic: str, after: int = 0, limit: int = 100) -> list[dict]:
         """A topic's posts, oldest first, after the row whose `cursor` is `after`.
 
         The cursor is the hub's own post sequence: client ids are unique only per sending node.
         """
         with self._db() as db:
-            rows = db.execute("SELECT seq, id, from_node, sender, target, reply, mode, text, created, reported"
-                              " FROM posts WHERE topic = ? AND seq > ? ORDER BY seq LIMIT ?",
+            rows = db.execute("SELECT p.seq, p.id, p.from_node, p.sender, p.target, p.reply, p.mode, p.text, p.created,"
+                              " p.reported, COALESCE(p.task, k.key)"
+                              " FROM posts p LEFT JOIN tasks k ON k.post_seq = p.seq AND k.parent IS NULL"
+                              # The hub's own instructions reach their recipient through its inbox only;
+                              # nobody wrote them, so a topic's history never shows them.
+                              " WHERE p.topic = ? AND p.seq > ? AND p.kind IS NOT 'system' ORDER BY p.seq LIMIT ?",
                               (topic, after, max(1, min(limit, 500)))).fetchall()
         # `to` is the original target: "#topic" for a post to everyone, a route for a tagged direct message.
+        # `task` is the request a post made or answers; replaying history never creates or wakes work.
         return [{"cursor": str(q), "id": i, "from": f"{fn}/{s}", "to": t, "reply": r, "mode": m, "text": x,
-                 "created": c, "reported": bool(rep)} for q, i, fn, s, t, r, m, x, c, rep in rows]
+                 "created": c, "reported": bool(rep), **({"task": k} if k else {})}
+                for q, i, fn, s, t, r, m, x, c, rep, k in rows]
 
 
 def application(hub: Hub):
@@ -445,7 +768,10 @@ def application(hub: Hub):
                     raise HubError(400, "the request body must be a JSON object")
             return JSONResponse(await run_in_threadpool(work, node, body, request))
         except HubError as error:
-            return JSONResponse({"error": str(error)}, status_code=error.status)
+            # A refused task action says who holds the task now, so a lost receipt is never guessed.
+            current = getattr(error, "task", None)
+            return JSONResponse({"error": str(error), **({"task": current} if current else {})},
+                                status_code=error.status)
         except ValueError:
             return JSONResponse({"error": "invalid JSON"}, status_code=400)
 
@@ -514,6 +840,20 @@ def application(hub: Hub):
     async def whoami(request):
         return await handle(request, lambda node, body, _: {"node": node})
 
+    async def task_list(request):
+        def work(node, body, req):
+            params = req.query_params
+            if params.get("key"):
+                return {"task": hub.task(params["key"])}
+            return {"tasks": hub.task_list(params.get("topic") or None, params.get("owner") or None,
+                                           params.get("open") == "1")}
+        return await handle(request, work)
+
+    def task_action(action):
+        async def endpoint(request):
+            return await handle(request, lambda node, body, _: {"task": action(node, body)})
+        return endpoint
+
     return Starlette(routes=[
         Route("/v1/whoami", whoami, methods=["GET"]),
         Route("/v1/sessions", sessions, methods=["GET", "PUT"]),
@@ -525,4 +865,9 @@ def application(hub: Hub):
         Route("/v1/topics", topics, methods=["GET"]),
         Route("/v1/topics/{topic}/members/{address:path}", membership, methods=["PUT", "DELETE"]),
         Route("/v1/topics/{topic}/messages", history, methods=["GET"]),
+        # Agents act on tasks they hold; assigning and choosing leads belongs to the human workspace.
+        Route("/v1/tasks", task_list, methods=["GET"]),
+        Route("/v1/tasks/claim", task_action(hub.claim), methods=["POST"]),
+        Route("/v1/tasks/update", task_action(hub.update_task), methods=["POST"]),
+        Route("/v1/tasks/delegate", task_action(hub.delegate), methods=["POST"]),
     ])

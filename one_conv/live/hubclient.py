@@ -112,6 +112,20 @@ class HubClient:
     def post(self, message: dict) -> dict:
         return self.request("POST", "/v1/messages", message)
 
+    # Tasks ----------------------------------------------------------------------------------
+
+    def task(self, key: str) -> dict:
+        return self.request("GET", f"/v1/tasks?key={quote(key, safe='')}")["task"]
+
+    def tasks(self, topic: str | None = None, owner: str | None = None, open_only: bool = False) -> list[dict]:
+        query = "&".join(part for part in (f"topic={quote(topic)}" if topic else "",
+                                           f"owner={quote(owner, safe='')}" if owner else "",
+                                           "open=1" if open_only else "") if part)
+        return self.request("GET", "/v1/tasks" + (f"?{query}" if query else "")).get("tasks", [])
+
+    def task_action(self, action: str, body: dict) -> dict:
+        return self.request("POST", f"/v1/tasks/{action}", body)["task"]
+
 
 def configured() -> HubClient | None:
     """The hub this machine reaches, or None when none is set up."""

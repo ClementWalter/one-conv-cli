@@ -1,9 +1,9 @@
 """Local MCP readers share CLI semantics through isolated, bounded processes; live tools relay messages."""
 
-from pathlib import Path
 import json
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any, Literal
 
 from mcp.server import MCPServer
@@ -49,7 +49,8 @@ def read_cli(namespace: Namespace, command: str, *, query: str | None = None,
     if query is not None:
         args += ["--", query]
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=300 if refresh else 60)
+        # A failing reader is reported from its exit code and stderr below, not raised here.
+        result = subprocess.run(args, capture_output=True, text=True, timeout=300 if refresh else 60, check=False)
     except subprocess.TimeoutExpired as error:
         raise ValueError("History request timed out. Retry with a source filter or without refresh.") from error
     if result.returncode:
@@ -116,21 +117,72 @@ def create_server() -> MCPServer:
     @server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=False),
                  structured_output=True)
     def send_message(to: str, text: str, ctx: Context, fyi: bool = False,
-                     expect_reply: bool = True, topic: str | None = None) -> dict[str, Any]:
+                     expect_reply: bool = True, topic: str | None = None, task: str | None = None,
+                     task_version: int | None = None, about: str | None = None) -> dict[str, Any]:
         """Send text as a new user turn to `to`: an address, id prefix, title, @name or #topic.
 
         A #topic reaches every member except you. `topic` files a direct message under a
         topic too. Use fyi=true for acknowledgments, sign-offs and completion notices: they
         wait in the receiver's `local feed` and do not wake it. expect_reply=false marks a
         pushed message as needing no answer. Never answer a message marked reply="none".
+
+        A human request is a task with one owner, who alone answers it: pass `task` and
+        `task_version` as the delivery gave them. A collaborator reports its child task to
+        the request's owner the same way. Beside an open request someone else owns, a message
+        to the human or into that channel needs `task`, or about="other" when it answers none.
         """
         from .live import router, team
         meta = dict(ctx.request_context.meta or {})
+        if (task is None) != (task_version is None):
+            raise ValueError("task and task_version go together, as the delivery gave them")
         try:
             return router.send(to, text, router.whoami(meta=meta), fyi=fyi,
-                               reply="expected" if expect_reply else "none", topic=topic)
+                               reply="expected" if expect_reply else "none", topic=topic,
+                               task={"key": task, "version": task_version} if task else None, about=about)
         except (router.LiveError, team.TeamError, RuntimeError, OSError) as error:
             raise ValueError(str(error)) from error
+
+    def _task(work):
+        from .live import taskops
+        try:
+            return work(taskops)
+        except taskops.TaskOpError as error:
+            current = f" Now: {error.task}" if error.task else ""
+            raise ValueError(f"{error}{current}") from error
+
+    @server.tool(annotations=readonly, structured_output=True)
+    def task_show(key: str) -> dict[str, Any]:
+        """Show a human request's task: owner, state, version, note and child tasks."""
+        return _task(lambda ops: ops.show(key))
+
+    @server.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True, openWorldHint=False),
+                 structured_output=True)
+    def task_claim(key: str, ctx: Context, version: int | None = None) -> dict[str, Any]:
+        """Take an unassigned task, or confirm one you own; never takes a task from its owner.
+
+        Safe to retry: a claim you hold answers with the task as it is.
+        """
+        me = _caller(ctx)
+        return _task(lambda ops: ops.claim(key, me.address, version))
+
+    @server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=False), structured_output=True)
+    def task_update(key: str, version: int, ctx: Context, state: str | None = None,
+                    note: str | None = None) -> dict[str, Any]:
+        """Report progress on a task you own: state working, blocked, done or cancelled, and a short note."""
+        me = _caller(ctx)
+        return _task(lambda ops: ops.update(key, me.address, version, state, note))
+
+    @server.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True, openWorldHint=False),
+                 structured_output=True)
+    def task_delegate(key: str, version: int, to: str, kind: str, ctx: Context, note: str | None = None,
+                      round: int = 1) -> dict[str, Any]:
+        """Grant part of a task you own (kind read, implementation or review) to `to` (@name or route).
+
+        The collaborator is woken with only that part and reports to you. Retrying the same
+        grant changes nothing, even after it finished; use the next `round` for another round.
+        """
+        me = _caller(ctx)
+        return _task(lambda ops: ops.delegate(key, me.address, version, to, kind, note, round))
 
     def _caller(ctx: Context):
         from .live import router

@@ -69,13 +69,23 @@ def build_live_group(launcher: list[str]) -> click.Group:
                   help="Leave a notice for the target's `local feed` instead of waking it; no reply expected.")
     @click.option("--no-reply", is_flag=True, help="Push, but mark the message as needing no reply.")
     @click.option("--topic", help="File a direct message under this topic too.")
+    @click.option("--task", "task_key", metavar="KEY", help="Link the message to a task you hold (as delivered).")
+    @click.option("--task-version", type=int, metavar="N", help="The task version you were given; with --task.")
+    @click.option("--not-task", is_flag=True,
+                  help="Say the message answers no open request (needed beside a request someone else owns).")
     @click.option("--json", "as_json", is_flag=True, help="Emit the delivery receipt as JSON.")
-    def send_command(target, message, from_stdin, sender, fyi, no_reply, topic, yes, as_json):
+    def send_command(target, message, from_stdin, sender, fyi, no_reply, topic, task_key, task_version, not_task,
+                     yes, as_json):
         """Send MESSAGE to TARGET: an address, id prefix, title, NODE/address, @name or #topic.
 
         The message arrives as a new user turn wrapped with the sender's address, name and
         topic, so the receiver can answer with the one-conv send_message tool. A #topic
         target reaches every member except you, and records the message for catch-up.
+
+        A human request is a task with one owner. Its owner answers it with --task and
+        --task-version; a collaborator reports its part to that owner the same way. Beside an
+        open request someone else owns, a message to the human or into that channel needs
+        --task or --not-task.
 
         \b
         Examples:
@@ -85,11 +95,19 @@ def build_live_group(launcher: list[str]) -> click.Group:
           one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes
           one-conv live send @reviewer 'build is green' --fyi --yes
           one-conv live send codex:019a --stdin --yes < findings.md
+          one-conv live send workspace/user 'done, see the PR' --task workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7 --task-version 2 --yes
+          one-conv live send '#general' 'lunch at noon?' --not-task --yes
         """
         if from_stdin:
             message = sys.stdin.read()
         if not message:
             raise click.UsageError("Give MESSAGE or --stdin.")
+        if (task_key is None) != (task_version is None):
+            raise click.UsageError("--task and --task-version go together, as the delivery gave them:\n"
+                                   "  one-conv live send TARGET 'text' --task KEY --task-version N --yes")
+        if task_key and not_task:
+            raise click.UsageError("Use --task or --not-task, not both.")
+        link = {"key": task_key, "version": task_version} if task_key else None
         try:
             me = router.whoami(sender)
             origin = "user" if sys.stdin.isatty() and not from_stdin else "unknown"
@@ -107,9 +125,17 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 click.echo(f"  from:     {me.address if me else origin}")
                 return
             receipt = router.send(target, message, me, origin, fyi=fyi,
-                                  reply="none" if no_reply else "expected", topic=topic)
+                                  reply="none" if no_reply else "expected", topic=topic, task=link,
+                                  about="other" if not_task else None)
         except (router.LiveError, team.TeamError, RuntimeError, OSError) as error:
             raise click.ClickException(str(error)) from None
+        if receipt.get("task") and not as_json:
+            task = receipt["task"]
+            if task.get("owner"):
+                click.echo(f"task {task['key']}: owned by {task['owner']}; the others received it as context")
+            else:
+                click.echo(f"task {task['key']}: unassigned, nobody was woken; choose a lead with "
+                           f"`one-conv live lead set '#{task.get('topic') or 'topic'}' @name`")
         if as_json:
             click.echo(json.dumps(receipt))
         elif "deliveries" in receipt:
@@ -122,6 +148,178 @@ def build_live_group(launcher: list[str]) -> click.Group:
             click.echo(f"  follow it with: one-conv live status {receipt['id']}")
         if receipt.get("warning") and not as_json:
             click.echo(f"warning: {receipt['warning']}", err=True)
+
+    def _me(address):
+        me = router.whoami(address)
+        if me is None or me.id.startswith("?"):
+            raise click.ClickException("This command acts as the calling agent, which could not be identified; "
+                                       "pass --as harness:id, e.g. --as codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03")
+        return me.address
+
+    def _show_task(task, as_json):
+        if as_json:
+            click.echo(json.dumps(task, ensure_ascii=False))
+            return
+        owner = task.get("owner") or "nobody"
+        click.echo(f"{task['key']}  v{task['version']}  {task['state']}  owner {owner}  {task.get('kind', '')}")
+        if task.get("title"):
+            click.echo(f"  request: {task['title']}")
+        if task.get("note"):
+            click.echo(f"  note: {task['note']}")
+        for child in task.get("children", []):
+            click.echo(f"  child {child['key']}  {child['kind']}  {child['state']}  {child.get('owner') or 'nobody'}")
+
+    def _task_call(work):
+        from . import taskops
+        try:
+            return work(taskops)
+        except taskops.TaskOpError as error:
+            current = f"\n  now: {error.task['state']}, owner {error.task.get('owner') or 'nobody'}, " \
+                      f"version {error.task['version']}" if error.task else ""
+            raise click.ClickException(f"{error}{current}") from None
+
+    @live.group("task", context_settings=HELP, epilog=examples(
+        "one-conv live task list --mine --open", "one-conv live task show workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7",
+        "one-conv live task update workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7 --version 2 --state working --note 'reading the logs'",
+        "one-conv live task delegate workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7 --version 2 --to @reviewer --kind review"))
+    def task_group():
+        """Work a human request you own: report progress, grant parts to teammates, finish it.
+
+        A human request is a task with one owner, who alone works it and answers it. The
+        others receive it as context. Every owner action carries the version you were given,
+        so an agent the task was taken from is refused instead of acting on it.
+        """
+
+    @task_group.command("list", context_settings=HELP, epilog=examples(
+        "one-conv live task list", "one-conv live task list --mine --open", "one-conv live task list --topic general --json"))
+    @click.option("--topic", help="Only this topic's tasks.")
+    @click.option("--mine", is_flag=True, help="Only tasks the calling agent owns.")
+    @click.option("--open", "open_only", is_flag=True, help="Only tasks not done or cancelled.")
+    @click.option("--as", "address", help="Act as this session (harness:id); detected by default.")
+    @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+    def task_list_command(topic, mine, open_only, address, as_json):
+        """List tasks, newest first."""
+        owner = None
+        if mine:
+            owner = _me(address)
+            hub = hubclient.configured()
+            if hub is not None and hub.node:
+                owner = f"{hub.node}/{owner}"
+        found = _task_call(lambda ops: ops.listing(topic, owner, open_only))
+        if as_json:
+            click.echo(json.dumps(found, ensure_ascii=False))
+            return
+        if not found:
+            click.echo("No tasks.")
+        for task in found:
+            click.echo(f"{task['key']}  v{task['version']}  {task['state']:<10}  {task.get('owner') or 'nobody':<40}  "
+                       f"{task.get('title', '')[:60]}")
+
+    @task_group.command("show", context_settings=HELP, epilog=examples(
+        "one-conv live task show workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7",
+        "one-conv live task show workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7 --json"))
+    @click.argument("key")
+    @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+    def task_show_command(key, as_json):
+        """Show a task: owner, state, version, note, child tasks."""
+        _show_task(_task_call(lambda ops: ops.show(key)), as_json)
+
+    @task_group.command("claim", context_settings=HELP, epilog=examples(
+        "one-conv live task claim workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7",
+        "one-conv live task claim workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7 --version 1 --json"))
+    @click.argument("key")
+    @click.option("--version", type=int, help="Claim only at this version.")
+    @click.option("--as", "address", help="Act as this session (harness:id); detected by default.")
+    @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+    def task_claim_command(key, version, address, as_json):
+        """Take an unassigned task, or confirm one you own. Never takes a task from its owner.
+
+        Retrying is safe: a claim you already hold answers with the task as it is. If the
+        answer is lost, run it again rather than guessing.
+        """
+        _show_task(_task_call(lambda ops: ops.claim(key, _me(address), version)), as_json)
+
+    @task_group.command("update", context_settings=HELP, epilog=examples(
+        "one-conv live task update workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7 --version 2 --state working --note 'reading the logs'",
+        "one-conv live task update workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7 --version 2 --state blocked --note 'need the API key'",
+        "one-conv live task update workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7 --version 2 --state done --note 'answered in #general'"))
+    @click.argument("key")
+    @click.option("--version", type=int, required=True, help="The version you were given.")
+    @click.option("--state", type=click.Choice(["working", "blocked", "done", "cancelled"]), help="New state.")
+    @click.option("--note", help="A short progress note the human sees.")
+    @click.option("--as", "address", help="Act as this session (harness:id); detected by default.")
+    @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+    def task_update_command(key, version, state, note, address, as_json):
+        """Report progress on a task you own: working, blocked, done or cancelled, with a note."""
+        if state is None and note is None:
+            raise click.UsageError("Give --state, --note, or both:\n  one-conv live task update KEY --version N "
+                                   "--state working --note 'what you are doing'")
+        _show_task(_task_call(lambda ops: ops.update(key, _me(address), version, state, note)), as_json)
+
+    @task_group.command("delegate", context_settings=HELP, epilog=examples(
+        "one-conv live task delegate workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7 --version 2 --to @reviewer --kind review",
+        "one-conv live task delegate workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7 --version 2 --to @builder --kind implementation --note 'the migration only'",
+        "one-conv live task delegate workspace:9f2c0a1b2c3d4e5f60718293a4b5c6d7 --version 2 --to @reviewer --kind review --round 2"))
+    @click.argument("key")
+    @click.option("--version", type=int, required=True, help="The version you were given.")
+    @click.option("--to", "to", required=True, help="The collaborator: @name or NODE/harness:id.")
+    @click.option("--kind", type=click.Choice(["read", "implementation", "review"]), required=True, help="The part.")
+    @click.option("--note", help="What exactly to do.")
+    @click.option("--round", "round_", type=int, default=1, show_default=True,
+                  help="Another round of the same part for the same agent is the next number.")
+    @click.option("--as", "address", help="Act as this session (harness:id); detected by default.")
+    @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+    def task_delegate_command(key, version, to, kind, note, round_, address, as_json):
+        """Grant part of a task you own to a teammate, who is woken with it and reports to you.
+
+        The same grant retried, even after the child finished, changes nothing; ask for
+        another round with --round.
+        """
+        _show_task(_task_call(lambda ops: ops.delegate(key, _me(address), version, to, kind, note, round_)), as_json)
+
+    @live.group("lead", context_settings=HELP, epilog=examples(
+        "one-conv live lead show '#general'", "one-conv live lead set '#general' @coordinator",
+        "one-conv live lead set '#release' --default"))
+    def lead_group():
+        """Who owns new human requests in a topic on this machine (without a hub).
+
+        With a hub, the human chooses leads in the workspace instead. The default lead is
+        @coordinator; a request with no live lead stays unassigned and wakes nobody.
+        """
+
+    def _local_leads_only():
+        if hubclient.configured() is not None:
+            raise click.ClickException("This machine uses a hub: the human chooses channel leads in the workspace "
+                                       "(channel details, Lead).")
+
+    @lead_group.command("show", context_settings=HELP, epilog=examples("one-conv live lead show '#general'"))
+    @click.argument("topic")
+    def lead_show_command(topic):
+        """Show a topic's lead."""
+        from . import tasks
+        _local_leads_only()
+        name = team._check("topic", topic)
+        lead = _task_call(lambda ops: ops.local_call(lambda db: tasks.lead_for(db, name)))
+        click.echo(f"#{name}: {lead}")
+
+    @lead_group.command("set", context_settings=HELP, epilog=examples(
+        "one-conv live lead set '#general' @coordinator", "one-conv live lead set '#release' claude:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03",
+        "one-conv live lead set '#release' --default"))
+    @click.argument("topic")
+    @click.argument("lead", required=False)
+    @click.option("--default", "use_default", is_flag=True, help="Go back to @coordinator.")
+    def lead_set_command(topic, lead, use_default):
+        """Choose who owns new human requests in TOPIC: @name or harness:id."""
+        from . import tasks
+        _local_leads_only()
+        if (lead is None) == (not use_default):
+            raise click.UsageError("Give a LEAD or --default:\n  one-conv live lead set '#general' @coordinator")
+        name = team._check("topic", topic)
+        if lead and not lead.startswith("@") and ":" not in lead:
+            raise click.UsageError("A lead is @name or harness:id, e.g. @coordinator")
+        chosen = _task_call(lambda ops: ops.local_call(lambda db: tasks.set_lead(
+            db, name, None if use_default else lead if lead.startswith("@") else f"local/{lead}", "user")))
+        click.echo(f"#{name}: {chosen or tasks.DEFAULT_LEAD}")
 
     @live.command("pull", context_settings=HELP, epilog=examples('one-conv live pull boat:bx_ab12/2ab1', 'one-conv live pull boat:bx_ab12/2ab1 --json'))
     @click.argument("address")

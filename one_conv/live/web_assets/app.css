@@ -1848,3 +1848,80 @@ button {
   color: inherit;
   font-size: 11px;
 }
+/* A human request's owner and progress, under its bubble; long names and notes wrap inside it. */
+.task-chip {
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  margin-top: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--soft);
+  font-size: 11px;
+  color: var(--text);
+}
+.task-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.task-head .tiny-avatar { flex: none; }
+.task-state {
+  min-width: 0;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+.task-working .task-state { color: var(--green); }
+.task-blocked .task-state { color: #be514f; }
+.task-done .task-state,
+.task-cancelled .task-state { color: var(--muted); }
+.task-offline {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--selected);
+  color: var(--selected-text);
+  font-size: 10px;
+}
+.task-assign,
+.lead-picker {
+  max-width: 100%;
+  min-width: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--input);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+}
+.task-assign { margin-left: auto; }
+.task-note {
+  margin: 4px 0 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.task-children {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+/* The channel lead: who owns new requests in this channel. */
+.channel-lead { padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+.lead-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 18px 8px;
+  min-width: 0;
+}
+.lead-row > div { min-width: 0; }
+.lead-row strong { display: block; font-size: 12px; overflow-wrap: anywhere; }
+.lead-row small { display: block; margin-top: 4px; font-size: 10px; color: var(--muted); line-height: 1.5; }
+.channel-lead .lead-picker { display: block; margin: 0 18px 10px; max-width: calc(100% - 36px); }
+.task-updated { color: var(--muted); font-size: 10px; }
+.lead-row small.lead-warning { color: #be514f; font-weight: 650; }

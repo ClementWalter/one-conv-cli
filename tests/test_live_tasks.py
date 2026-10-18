@@ -340,6 +340,13 @@ def test_a_claim_makes_the_claimer_delivery_the_owner(hub):
     assert (PEER, "owner", "fyi") in deliveries(hub, key)
 
 
+def test_a_claim_wakes_the_claimer_as_owner(hub):
+    hub.set_lead("general", "@nobody", f"{HUMAN}/user")
+    key = post(hub, "7")["task"]["key"]
+    hub.claim("mac", {"key": key, "actor": "codex:peer"})
+    assert (PEER, "owner", "push") in deliveries(hub, key)
+
+
 def test_a_human_announcement_wakes_nobody(hub):
     post(hub, "8", reply="none")
     assert {mode for _, _, mode in deliveries(hub)} == {"fyi"}

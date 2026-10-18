@@ -588,9 +588,15 @@ class Hub:
         """Take an unowned task; the claimer's delivery of the request becomes the owner's."""
         def work(db):
             actor = self._actor(db, node, body.get("actor"))
-            task = tasks.claim(db, body.get("key"), actor, body.get("version"))
-            db.execute("UPDATE deliveries SET role = 'owner' WHERE task = ? AND to_node = ? AND to_address = ?"
-                       " AND role = 'observer'", (task["key"], node, body.get("actor")))
+            before = tasks.require(db, tasks.check_key(body.get("key")))
+            task = tasks.claim(db, before["key"], actor, body.get("version"))
+            if task["version"] != before["version"]:
+                db.execute("UPDATE deliveries SET role = 'owner' WHERE task = ? AND to_node = ? AND to_address = ?"
+                           " AND role = 'observer'", (task["key"], node, body.get("actor")))
+                # The claimer only had the request as context; it now gets the owner's instructions.
+                original = db.execute("SELECT text FROM posts WHERE seq = ?", (task["post"],)).fetchone()
+                self._notify(db, task, task["created_by"], f"You claimed task {task['key']} (version {task['version']})."
+                             f"\n{original[0] if original else task['title']}", "owner")
             return task
         return self._task_call(work)
 

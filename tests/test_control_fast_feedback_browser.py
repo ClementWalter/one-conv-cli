@@ -46,6 +46,9 @@ def phone(browser, real_http_workspace, request):
     # The change feed keeps one request open, so "network idle" never comes; wait for the composer instead.
     page.goto(workspace["origin"] + "/#topic=release")
     page.reload()
+    # A navigation race under load must fail here, not as a message stored in another channel.
+    page.wait_for_function("() => location.hash === '#topic=release' && typeof model !== 'undefined'"
+                           " && model.view && model.view.kind === 'topic' && model.view.key === 'release'")
     page.locator("#composer:not([hidden]) #message-input").wait_for()
     yield page, workspace
     context.close()

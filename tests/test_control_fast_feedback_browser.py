@@ -43,9 +43,14 @@ def phone(browser, real_http_workspace, request):
     page.goto(workspace["origin"] + "/#pair=" + token, wait_until="networkidle")
     page.get_by_role("button", name="Connect this device", exact=True).click()
     page.locator("#pairing").wait_for(state="hidden")
-    # The change feed keeps one request open, so "network idle" never comes; wait for the composer instead.
+    # A full navigation to the channel, so no refresh left over from pairing can pick the view; a
+    # hash change plus reload could race it under load.
+    page.goto("about:blank")
     page.goto(workspace["origin"] + "/#topic=release")
-    page.reload()
+    # The destination is a checked precondition: a navigation problem fails here, not as a message
+    # stored in another channel. The change feed keeps a request open, so "network idle" never comes.
+    page.wait_for_function("() => location.hash === '#topic=release' && typeof model !== 'undefined'"
+                           " && model.view && model.view.kind === 'topic' && model.view.key === 'release'")
     page.locator("#composer:not([hidden]) #message-input").wait_for()
     yield page, workspace
     context.close()
@@ -106,6 +111,12 @@ def lost_answer(phone):
         route.fetch()  # The workspace stores the message …
         route.abort()  # … but the phone never hears back.
     page.route("**/api/messages", commit_then_drop)
+    # Freeze what could show the stored post: the change feed, and the channel snapshot the safety
+    # refresh reads. Once the post is stored, either would rightly replace the uncertain bubble (and
+    # its Retry button) before these tests can read it. The uncertain state itself is local.
+    page.route("**/api/changes*", lambda route: None)
+    page.route("**/api/topics/release", lambda route: None)
+    page.evaluate("() => model.feedAbort && model.feedAbort.abort()")
     page.locator("#message-input").fill("Did this arrive?")
     page.locator("#composer").evaluate("form => form.requestSubmit()")
     status = page.locator("#messages li").filter(has_text="Did this arrive?").locator(".message-delivery")

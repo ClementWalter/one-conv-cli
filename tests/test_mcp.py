@@ -6,9 +6,9 @@ import os
 import subprocess
 import sys
 
+import pytest
 from mcp import Client
 from mcp.client.stdio import StdioServerParameters
-import pytest
 
 from one_conv import mcp_server
 

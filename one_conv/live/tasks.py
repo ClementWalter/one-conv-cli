@@ -228,42 +228,46 @@ def update(db: sqlite3.Connection, key: str, actor: str, version: object, state:
     return task
 
 
-def child_key(parent: str, kind: str, to: str) -> str:
-    return f"{parent}/{kind}-{hashlib.sha256(to.encode()).hexdigest()[:8]}"
+def child_key(parent: str, kind: str, to: str, round_: int = 1) -> str:
+    return f"{parent}/{kind}-{hashlib.sha256(f'{to}#{round_}'.encode()).hexdigest()[:8]}"
 
 
 def delegate(db: sqlite3.Connection, key: str, actor: str, version: object, to: str, kind: str,
-             note: object) -> tuple[dict, bool]:
+             note: object, round_: object = 1) -> tuple[dict, bool]:
     """The owner grants part of the work to a collaborator as a child task; (child, created).
 
-    The collaborator works only that child and reports to the owner. The same grant retried
-    returns the same child. A finished child of the same kind for the same agent is reopened
-    as a new grant only if the owner asks again after it finished.
+    The collaborator works only that child and reports to the owner. A grant is identified by
+    (kind, collaborator, round): retrying it, even after the child finished, returns that same
+    child and dispatches nothing. Another round of the same work is an explicit new grant with
+    the next `round`.
     """
     task = require(db, key)
     _fence(task, actor, version)
     if kind not in CHILD_KINDS:
         raise TaskError(400, f"a child task kind is one of {', '.join(CHILD_KINDS)}")
+    if type(round_) is not int or not 1 <= round_ <= 99:
+        raise TaskError(400, "round is a number from 1 to 99; use the next one for a new round of the same work")
     if to == actor:
         raise TaskError(400, "you already own this task; delegate to another agent")
+    existing = get(db, child_key(key, kind, to, round_))
+    if existing is not None:
+        return existing, False
     if task["state"] in FINISHED:
         raise TaskError(409, f"{key} is already {task['state']}", task)
-    child = child_key(key, kind, to)
-    existing = get(db, child)
-    if existing is not None and existing["state"] not in FINISHED:
-        return existing, False
-    if existing is not None:
-        existing.update(owner=to, state="assigned", version=existing["version"] + 1, note=_note(note),
-                        updated=time.time())
-        _event(db, _save(db, existing), actor, "regrant")
-        return existing, True
-    return create(db, child, post_seq=task["post"], topic=task["topic"], owner=to, created_by=actor,
-                  title=task["title"], kind=kind, parent=key, note=_note(note))
+    return create(db, child_key(key, kind, to, round_), post_seq=task["post"], topic=task["topic"], owner=to,
+                  created_by=actor, title=task["title"], kind=kind, parent=key, note=_note(note))
 
 
-def transfer(db: sqlite3.Connection, key: str, authority: str, to: str | None, note: object = None) -> dict:
-    """The human gives the task to another agent, or unassigns it; the old owner's version stops working."""
+def transfer(db: sqlite3.Connection, key: str, authority: str, to: str | None, version: object,
+             note: object = None) -> dict:
+    """The human gives the task to another agent, or unassigns it; the old owner's version stops working.
+
+    `version` is the one the human saw: a delayed reassignment never overwrites a newer one.
+    """
     task = require(db, key)
+    if type(version) is not int or version != task["version"]:
+        raise TaskError(409, f"{key} changed since you looked (version {task['version']}, not {version!r}); "
+                             "refresh and choose again", task)
     if task["state"] in FINISHED:
         raise TaskError(409, f"{key} is already {task['state']}", task)
     if to == task["owner"]:

@@ -553,7 +553,7 @@ class Hub:
             if route is None:
                 raise tasks.TaskError(404, f"{to!r} is not a published session; use @name or NODE/harness:id")
             child, created = tasks.delegate(db, body.get("key"), actor, body.get("version"), route,
-                                            body.get("kind"), body.get("note"))
+                                            body.get("kind"), body.get("note"), body.get("round", 1))
             if created:
                 self._notify(db, child, actor, f"Child task {child['key']} ({child['kind']}) from {actor}:\n"
                              f"{child['note'] or '(no note)'}\nRequest: {child['title']}\n"
@@ -572,11 +572,12 @@ class Hub:
         self._insert(db, node, msg_id, digest, task["owner"], sender, task["topic"], "expected", "push", text,
                      [(owner_node, owner, role, "push", task["key"])], task=task["key"])
 
-    def assign(self, key: object, to: str | None, authority: str, note: object = None) -> dict:
+    def assign(self, key: object, to: str | None, authority: str, version: object, note: object = None) -> dict:
         """The human gives a task to an agent, or unassigns it. Not exposed to nodes.
 
-        The new owner is woken with the request even if it had only received it as context;
-        the former owner gets a notice that the task left it.
+        `version` is the one the human saw, so a delayed reassignment never overwrites a newer
+        one. The new owner is woken with the request even if it had only received it as
+        context; the former owner gets a notice that the task left it.
         """
         def work(db):
             route = None
@@ -585,7 +586,7 @@ class Hub:
                 if route is None:
                     raise tasks.TaskError(404, f"{to} is not a published session")
             before = tasks.require(db, tasks.check_key(key))
-            task = tasks.transfer(db, before["key"], authority, route, note)
+            task = tasks.transfer(db, before["key"], authority, route, version, note)
             if task["version"] == before["version"]:
                 return task
             original = db.execute("SELECT text FROM posts WHERE seq = ?", (task["post"],)).fetchone()

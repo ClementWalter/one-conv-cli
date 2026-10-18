@@ -13,7 +13,7 @@ from pathlib import Path
 
 from ..live.hub import GENERAL, MESSAGE_ID, TOPIC, Hub, HubError, _online, split_address
 from ..live.hub import NODE as PEER_NODE
-from ..live import unread
+from ..live import tasks, unread
 from .presence import (
     channel_delivery,
     message_activity,
@@ -128,6 +128,8 @@ class ControlStore:
                 pass
         self.hub = hub
         hub.general = GENERAL
+        # The paired human is the only authority whose requests become tasks, and who assigns them.
+        hub.adopt_trusted_human(NODE)
         with self.hub._db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS staffing_grants "
                        "(node TEXT PRIMARY KEY, token_hash TEXT NOT NULL, granted REAL NOT NULL)")
@@ -253,8 +255,48 @@ class ControlStore:
             for row in directory if row["address"] != HUMAN],
             "names": {row["name"]: display_address(row["address"]) for row in directory if row["name"]},
             "topics": [{**topic, "members": [display_address(member) for member in topic["members"]],
-                        "unread": unseen.get(topic["topic"], 0)} for topic in self.hub.topics()],
+                        "unread": unseen.get(topic["topic"], 0), "lead": self.hub.lead(topic["topic"])}
+                       for topic in self.hub.topics()],
             "bridge": {"node": NODE, "running": True, "mode": "cloud"}, "error": None}
+
+    @staticmethod
+    def _task_view(task: dict, children: list[dict], online: set[str]) -> dict:
+        """What the human sees on a request: who owns it, its real progress, and who helps."""
+        return {"key": task["key"], "owner": display_address(task["owner"]) if task["owner"] else None,
+                "owner_online": task["owner"] in online if task["owner"] else False,
+                "state": task["state"], "note": task["note"], "version": task["version"], "updated": task["updated"],
+                "children": [{"key": child["key"], "kind": child["kind"], "owner": display_address(child["owner"]),
+                              "state": child["state"], "note": child["note"]} for child in children]}
+
+    def _tasks_for(self, db, seqs: list[int]) -> dict[int, dict]:
+        """The task view for each post that made one, by post sequence."""
+        roots = tasks.for_posts(db, seqs)
+        if not roots:
+            return {}
+        now = time.time()
+        online = {f"{node}/{address}" for node, address, seen, updated in db.execute(
+            "SELECT s.node, s.address, n.seen, s.updated FROM sessions s JOIN nodes n ON n.node = s.node")
+            if _online(seen, updated, now)}
+        return {seq: self._task_view(task, tasks.children(db, task["key"]), online) for seq, task in roots.items()}
+
+    def assign(self, payload):
+        """The human gives a request to an agent (or unassigns it); the new owner is woken."""
+        if (not isinstance(payload, dict) or set(payload) - {"key", "to", "version", "note"}
+                or not {"key", "version"} <= set(payload)):
+            raise HubError(400, "Provide key, version (as shown), and to (an agent route, @name, or null to unassign).")
+        to = payload.get("to")
+        if to is not None and not isinstance(to, str):
+            raise HubError(400, "to is an agent route, @name, or null to unassign.")
+        task = self.hub.assign(payload["key"], to, HUMAN, payload["version"], payload.get("note"))
+        return {"task": {**task, "owner": display_address(task["owner"]) if task["owner"] else None}}
+
+    def set_lead(self, payload):
+        """The human chooses who owns new requests in a channel; null goes back to @coordinator."""
+        if not isinstance(payload, dict) or set(payload) != {"topic", "lead"}:
+            raise HubError(400, "Provide topic and lead (an agent route, @name, or null for the default).")
+        if payload["lead"] is not None and not isinstance(payload["lead"], str):
+            raise HubError(400, "lead is an agent route, @name, or null for the default.")
+        return self.hub.set_lead(payload["topic"], payload["lead"], HUMAN)
 
     @staticmethod
     def _activity(db):
@@ -291,9 +333,12 @@ class ControlStore:
                 "WHERE p.target NOT LIKE '#%' ORDER BY p.created DESC, p.seq DESC LIMIT ?",
                 (MESSAGES_SHOWN,)).fetchall()
             baseline, marks = unread.marks(db)
+            shown = [values[0] for values in rows]
+            task_views, links = self._tasks_for(db, shown), self._links(db, shown)
         threads = defaultdict(list)
         for values in reversed(rows):
             row = _provenance(self._row(*values))
+            self._attach(row, values[0], task_views, links)
             pair = " ".join(sorted((row["from"], row["to"])))
             threads[pair].append(row)
         return {"threads": [{"pair": pair, "messages": rows, "last": rows[-1]["at"],
@@ -324,7 +369,12 @@ class ControlStore:
                 "  IFNULL(name, '') || ':' || IFNULL(status, '') || ':' || updated AS row FROM sessions"
                 "  WHERE node != ? ORDER BY node, address)),"
                 " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT conversation || '=' || at AS row"
-                "  FROM read_marks ORDER BY conversation))", (NODE,)).fetchone()
+                "  FROM read_marks ORDER BY conversation)),"
+                # A claim, progress note, grant or reassignment changes what the human sees.
+                " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT key || '=' || state || ':' || version"
+                "  || ':' || IFNULL(owner, '') || ':' || updated AS row FROM tasks ORDER BY key)),"
+                " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT topic || '=' || lead AS row"
+                "  FROM channel_leads ORDER BY topic))", (NODE,)).fetchone()
         return hashlib.sha256(json.dumps(values).encode()).hexdigest()[:32]
 
     def topic(self, topic: str):
@@ -337,8 +387,9 @@ class ControlStore:
                 # Reported history keeps its original send time, so time orders the channel.
                 "FROM posts WHERE topic=? ORDER BY created DESC, seq DESC LIMIT ?", (topic, MESSAGES_SHOWN)).fetchall()
             recipients = defaultdict(list)
+            shown = [row[0] for row in rows]
+            task_views, links = self._tasks_for(db, shown), self._links(db, shown)
             if rows:
-                shown = [row[0] for row in rows]
                 for post, route, outcome, outcome_at in db.execute(
                         "SELECT post, to_node || '/' || to_address, outcome, outcome_at FROM deliveries "
                         f"WHERE post IN ({','.join('?' * len(shown))}) ORDER BY rowid", shown):
@@ -351,8 +402,24 @@ class ControlStore:
             message["status"] = message["delivery"]["state"]
             # A topic-tagged direct message is listed here for context; only its target received it.
             message["directed"] = not row[4].startswith("#")
+            self._attach(message, row[0], task_views, links)
             messages.append(_provenance(message))
         return {"topic": topic, "messages": messages, "omitted": max(0, total - len(rows))}
+
+    @staticmethod
+    def _links(db, seqs: list[int]) -> dict[int, str]:
+        """The task each of these posts answers or reports on, when its sender linked one."""
+        if not seqs:
+            return {}
+        return dict(db.execute(f"SELECT seq, task FROM posts WHERE task IS NOT NULL AND seq IN "
+                               f"({','.join('?' * len(seqs))})", seqs))
+
+    @staticmethod
+    def _attach(message: dict, seq: int, task_views: dict, links: dict) -> None:
+        if seq in task_views:
+            message["task"] = task_views[seq]
+        elif seq in links:
+            message["answers"] = links[seq]
 
     def send(self, payload):
         """Retrying after any crash reuses the hub's atomic (node, ID, payload) claim."""

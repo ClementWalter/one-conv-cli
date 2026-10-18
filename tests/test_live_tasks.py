@@ -144,7 +144,20 @@ def test_an_observer_cannot_update_the_task(hub, request_task):
 
 @pytest.fixture
 def reassigned(hub, request_task):
-    return hub.assign(request_task["key"], "@peer", f"{HUMAN}/user")
+    return hub.assign(request_task["key"], "@peer", f"{HUMAN}/user", request_task["version"])
+
+
+def test_a_delayed_reassignment_is_refused(hub, request_task, reassigned):
+    with pytest.raises(HubError):
+        hub.assign(request_task["key"], "@other", f"{HUMAN}/user", request_task["version"])
+
+
+def test_a_delayed_reassignment_does_not_overwrite_the_newer_one(hub, request_task, reassigned):
+    try:
+        hub.assign(request_task["key"], "@other", f"{HUMAN}/user", request_task["version"])
+    except HubError:
+        pass
+    assert hub.task(request_task["key"])["owner"] == PEER
 
 
 def test_reassigning_changes_the_owner(reassigned):
@@ -199,6 +212,31 @@ def test_a_retried_grant_returns_the_same_child(hub, request_task, child):
                                  "version": request_task["version"], "to": "@other", "kind": "review",
                                  "note": "review the plan"})
     assert again["key"] == child["key"]
+
+
+@pytest.fixture
+def finished_child(hub, child):
+    return hub.update_task("pc", {"key": child["key"], "actor": "omp:other", "version": child["version"],
+                                  "state": "done", "note": "looks right"})
+
+
+def grant_again(hub, request_task, **extra):
+    return hub.delegate("mac", {"key": request_task["key"], "actor": "claude:lead",
+                                "version": request_task["version"], "to": "@other", "kind": "review",
+                                "note": "review the plan", **extra})
+
+
+def test_a_grant_retried_after_the_child_finished_keeps_it_finished(hub, request_task, finished_child):
+    assert grant_again(hub, request_task)["state"] == "done"
+
+
+def test_a_grant_retried_after_the_child_finished_dispatches_nothing(hub, request_task, finished_child):
+    grant_again(hub, request_task)
+    assert len(deliveries(hub, finished_child["key"])) == 1
+
+
+def test_a_new_round_is_an_explicit_new_grant(hub, request_task, finished_child):
+    assert grant_again(hub, request_task, round=2)["key"] != finished_child["key"]
 
 
 def test_a_collaborator_cannot_update_the_parent_request(hub, request_task, child):

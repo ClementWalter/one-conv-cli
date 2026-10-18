@@ -35,6 +35,10 @@ const model = {
   // Read marks the workspace accepted from this tab, per conversation, and the saves in flight.
   readMarks: new Map(),
   reading: new Set(),
+  // Task keys whose assignment this tab is saving, and the channel lead panel's rendered state.
+  assigning: new Set(),
+  leadSignature: "",
+  leadSaving: false,
 };
 const harnesses = {
   claude: "Claude",
@@ -665,6 +669,105 @@ function withOutbox(rows) {
   const local = [...model.outbox.values()].filter((entry) => entry.target === destination).map(localRow);
   return local.length ? [...rows, ...local] : rows;
 }
+const TASK_FINISHED = ["done", "cancelled"];
+function connectedAgents() {
+  return model.state.sessions.filter((s) => !s.history_only && presenceOf(person(s.address)).state !== "offline");
+}
+function taskLabel(task) {
+  // Progress comes only from the task's own state, never from delivery receipts.
+  const owner = task.owner ? person(task.owner).name : "";
+  switch (task.state) {
+    case "unassigned": return "Unassigned";
+    case "assigned": return owner ? "Assigned to " + owner : "Assigned";
+    case "working": return owner ? owner + " is working" : "Working";
+    case "blocked": return owner ? "Blocked · " + owner : "Blocked";
+    case "done": return owner ? "Done · " + owner : "Done";
+    case "cancelled": return "Cancelled";
+    default: return String(task.state || "Unknown");
+  }
+}
+function shortText(text, limit) {
+  text = String(text || "").replace(/\s+/g, " ").trim();
+  return text.length > limit ? text.slice(0, limit - 1).trimEnd() + "…" : text;
+}
+async function assignTask(task, to) {
+  // One assignment per task at a time; the chip says so until the workspace answers.
+  if (model.assigning.has(task.key)) return;
+  model.assigning.add(task.key);
+  renderRows(model.serverRows || [], true);
+  try {
+    await post("/api/tasks/assign", { key: task.key, version: task.version, to });
+    toast(to ? "Assigned to " + person(to).name : "Request unassigned");
+  } catch (error) {
+    if (error instanceof StaleSession) return;
+    // A stale version means someone changed it first: say so, then show the current owner.
+    toast(error.message);
+  } finally {
+    model.assigning.delete(task.key);
+  }
+  model.signature = "";
+  await refreshState();
+}
+function taskChip(task) {
+  const chip = el("div", null, "task-chip task-" + String(task.state || "unknown"));
+  const open = !TASK_FINISHED.includes(task.state);
+  const head = el("div", null, "task-head");
+  if (task.owner) head.appendChild(avatar(task.owner, "tiny-avatar"));
+  const busy = model.assigning.has(task.key);
+  const state = el("span", busy ? "Assigning…" : taskLabel(task), "task-state");
+  if (task.owner) state.title = task.owner;
+  head.appendChild(state);
+  if (validDate(task.updated)) head.appendChild(el("span", "updated " + freshness(task.updated), "task-updated"));
+  if (task.owner && open && task.owner_online === false) {
+    const away = el("span", "Offline", "task-offline");
+    away.title = "The owner is not connected. The request waits for it, or reassign it.";
+    head.appendChild(away);
+  }
+  if (model.capabilities.tasks && open) {
+    const picker = el("select", null, "task-assign");
+    picker.setAttribute("aria-label", (task.owner ? "Reassign" : "Assign") + " this request");
+    const prompt = el("option", task.owner ? "Reassign…" : "Assign…");
+    prompt.value = "";
+    prompt.disabled = true;
+    prompt.selected = true;
+    picker.appendChild(prompt);
+    for (const agent of connectedAgents()) {
+      if (agent.address === task.owner) continue;
+      const option = el("option", person(agent.address).name);
+      option.value = agent.address;
+      picker.appendChild(option);
+    }
+    if (task.owner) {
+      const none = el("option", "Unassign");
+      none.value = "__unassign";
+      picker.appendChild(none);
+    }
+    picker.disabled = busy || picker.options.length < 2;
+    picker.addEventListener("change", () => {
+      const choice = picker.value;
+      if (choice) assignTask(task, choice === "__unassign" ? null : choice);
+    });
+    head.appendChild(picker);
+  }
+  chip.appendChild(head);
+  if (task.note) {
+    const note = el("p", shortText(task.note, 140), "task-note");
+    note.title = task.note;
+    chip.appendChild(note);
+  }
+  const children = Array.isArray(task.children) ? task.children : [];
+  if (children.length) {
+    const list = el("ul", null, "task-children");
+    for (const child of children) {
+      const line = el("li", String(child.kind || "part") + ": " + (child.owner ? person(child.owner).name : "nobody") +
+        " " + String(child.state || ""));
+      if (child.note) line.title = child.note;
+      list.appendChild(line);
+    }
+    chip.appendChild(list);
+  }
+  return chip;
+}
 function renderRows(rows, force = false) {
   model.serverRows = rows;
   rows = withOutbox(rows);
@@ -798,6 +901,7 @@ function renderRows(rows, force = false) {
         status.append(" ", retry);
       }
       content.appendChild(status);
+      if (row.task && typeof row.task === "object") content.appendChild(taskChip(row.task));
     }
     item.appendChild(content);
     list.appendChild(item);
@@ -1590,7 +1694,88 @@ function format(kind) {
     input.setSelectionRange(start + before.length, start + before.length);
   updateComposer();
 }
+const DEFAULT_LEAD = "@coordinator";
+function renderLead() {
+  // Its own box outside the member list, so the 4 s details refresh never closes an open picker.
+  let box = $("channel-lead");
+  if (!box) {
+    box = el("section", null, "channel-lead");
+    box.id = "channel-lead";
+    $("details-content").before(box);
+  }
+  const topic = model.view && model.view.kind === "topic" ? currentTopic() : null;
+  const info = topic && topic.lead && typeof topic.lead === "object" ? topic.lead : null;
+  if (!info || !model.capabilities.tasks) {
+    box.hidden = true;
+    box.replaceChildren();
+    model.leadSignature = "";
+    return;
+  }
+  box.hidden = false;
+  // Only a connected member of this channel can own its new requests.
+  const members = new Set(topic.members || []);
+  const agents = connectedAgents().filter((agent) => members.has(agent.address));
+  const signature = JSON.stringify([topic.topic, info, model.leadSaving,
+    agents.map((agent) => [agent.address, person(agent.address).name])]);
+  if (signature === model.leadSignature || box.contains(document.activeElement)) return;
+  model.leadSignature = signature;
+  box.replaceChildren(el("h3", "CHANNEL LEAD", "details-section-label"));
+  const row = el("div", null, "lead-row");
+  if (info.route) row.appendChild(avatar(info.route, "small-avatar"));
+  const text = el("div");
+  const name = info.route ? person(info.route).name : String(info.lead || DEFAULT_LEAD);
+  const outside = Boolean(info.route) && info.member === false;
+  const status = el("small", info.available ? "Owns new requests in this channel." :
+    outside ? "Not a member of #" + topic.topic + "; new requests stay unassigned until you assign them." :
+      "Not connected; new requests stay unassigned until you assign them.", outside ? "lead-warning" : "");
+  text.append(el("strong", name + (info.lead === DEFAULT_LEAD ? " · default" : ""), "lead-name"), status);
+  row.appendChild(text);
+  box.appendChild(row);
+  const picker = el("select", null, "lead-picker");
+  picker.setAttribute("aria-label", "Channel lead for #" + topic.topic);
+  const fallback = el("option", "Default (" + DEFAULT_LEAD + ")");
+  fallback.value = "__default";
+  picker.appendChild(fallback);
+  for (const agent of agents) {
+    const option = el("option", person(agent.address).name);
+    option.value = agent.address;
+    picker.appendChild(option);
+  }
+  // The default stays selected even when @coordinator is connected.
+  let current = "__default";
+  const isDefault = info.lead === DEFAULT_LEAD;
+  if (!isDefault && info.route && agents.some((agent) => agent.address === info.route)) current = info.route;
+  else if (!isDefault && info.lead) {
+    const option = el("option", name);
+    option.value = String(info.lead);
+    picker.appendChild(option);
+    current = option.value;
+  }
+  picker.value = current;
+  picker.disabled = model.leadSaving;
+  picker.addEventListener("change", () => setLead(topic.topic, picker.value === "__default" ? null : picker.value));
+  box.appendChild(picker);
+}
+async function setLead(topic, lead) {
+  if (model.leadSaving) return;
+  model.leadSaving = true;
+  if (document.activeElement) document.activeElement.blur();
+  renderLead();
+  try {
+    await post("/api/leads", { topic, lead });
+    toast(lead ? "New requests in #" + topic + " go to " + (lead.startsWith("@") ? lead : person(lead).name) : "#" + topic + " uses the default lead");
+  } catch (error) {
+    if (error instanceof StaleSession) return;
+    toast(error.message);
+  } finally {
+    model.leadSaving = false;
+    model.leadSignature = "";
+  }
+  await refreshState();
+  renderLead();
+}
 function renderDetails() {
+  renderLead();
   const content = $("details-content");
   content.replaceChildren();
   const summary = el("div", null, "details-summary");

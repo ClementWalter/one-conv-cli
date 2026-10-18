@@ -12,8 +12,8 @@ import pytest
 uvicorn = pytest.importorskip("uvicorn")
 pytest.importorskip("starlette")
 
-from one_conv.control.store import ControlStore  # noqa: E402
-from one_conv.live.hub import Hub, application  # noqa: E402
+from one_conv.control.store import ControlStore
+from one_conv.live.hub import Hub, application
 
 
 def serve(app):
@@ -68,13 +68,13 @@ def key(workspace):
 
 def test_an_agent_reads_its_task_over_http(workspace, key):
     _, url, token, _ = workspace
-    status, body = call(url, f"/v1/tasks?key={key}", token)
+    _status, body = call(url, f"/v1/tasks?key={key}", token)
     assert body["task"]["owner"] == "mac/claude:lead"
 
 
 def test_the_owner_reports_progress_over_http(workspace, key):
     _, url, token, _ = workspace
-    status, body = call(url, "/v1/tasks/update", token, "POST",
+    _status, body = call(url, "/v1/tasks/update", token, "POST",
                         {"key": key, "actor": "claude:lead", "version": 1, "state": "working", "note": "on it"})
     assert body["task"]["state"] == "working"
 
@@ -100,21 +100,21 @@ def test_the_node_api_has_no_assign_route(workspace, key):
 
 def test_the_inbox_hands_the_owner_its_task(workspace, key):
     _, url, token, _ = workspace
-    status, body = call(url, "/v1/inbox", token)
-    owner = [item for item in body["messages"] if item["to"] == "claude:lead"][0]
+    _status, body = call(url, "/v1/inbox", token)
+    owner = next(item for item in body["messages"] if item["to"] == "claude:lead")
     assert (owner["role"], owner["mode"], owner["task"]["key"]) == ("owner", "push", key)
 
 
 def test_the_inbox_hands_an_observer_context_only(workspace, key):
     _, url, token, _ = workspace
-    status, body = call(url, "/v1/inbox", token)
-    observer = [item for item in body["messages"] if item["to"] == "codex:peer"][0]
+    _status, body = call(url, "/v1/inbox", token)
+    observer = next(item for item in body["messages"] if item["to"] == "codex:peer")
     assert (observer["role"], observer["mode"]) == ("observer", "fyi")
 
 
 def test_the_workspace_shows_the_owner_on_the_request(workspace, key):
     store, *_ = workspace
-    request = [m for m in store.topic("general")["messages"] if m.get("task")][0]
+    request = next(m for m in store.topic("general")["messages"] if m.get("task"))
     assert request["task"]["owner"] == "mac/claude:lead"
 
 

@@ -1,9 +1,9 @@
 """Local MCP readers share CLI semantics through isolated, bounded processes; live tools relay messages."""
 
-from pathlib import Path
 import json
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any, Literal
 
 from mcp.server import MCPServer
@@ -49,7 +49,8 @@ def read_cli(namespace: Namespace, command: str, *, query: str | None = None,
     if query is not None:
         args += ["--", query]
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=300 if refresh else 60)
+        # A failing reader is reported from its exit code and stderr below, not raised here.
+        result = subprocess.run(args, capture_output=True, text=True, timeout=300 if refresh else 60, check=False)
     except subprocess.TimeoutExpired as error:
         raise ValueError("History request timed out. Retry with a source filter or without refresh.") from error
     if result.returncode:

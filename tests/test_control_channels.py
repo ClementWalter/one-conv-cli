@@ -1,4 +1,4 @@
-"""#general membership and channels the workspace owner creates from the phone."""
+"""#general and the channels the workspace owner creates from the phone; no session joins any by itself."""
 
 import time
 
@@ -40,18 +40,8 @@ def _texts(store, topic):
 # --- #general -----------------------------------------------------------------------------------
 
 
-def test_a_published_session_joins_general(tmp_path):
-    hub = Hub(str(tmp_path / "hub.sqlite3"), general="general")
-    hub.publish("laptop", [{"address": "claude:c1"}])
-    assert hub.topics() == [{"topic": "general", "members": ["laptop/claude:c1"], "last": None}]
-
-
-def test_republishing_does_not_undo_leaving_general(tmp_path):
-    hub = Hub(str(tmp_path / "hub.sqlite3"), general="general")
-    hub.publish("laptop", [{"address": "claude:c1"}])
-    hub.leave("laptop", "general", "claude:c1")
-    hub.publish("laptop", [{"address": "claude:c1"}])
-    assert hub.topics() == []
+def test_a_published_session_does_not_join_general(store):
+    assert "worker/omp:agent" not in _members(store, "general")
 
 
 def test_a_plain_hub_has_no_general(tmp_path):
@@ -87,9 +77,12 @@ def test_general_announcement_expects_no_reply(store, created):
     assert store.topic("general")["messages"][-1]["reply"] == "none"
 
 
-def test_general_announcement_reaches_agents_outside_the_channel(store, created):
+def test_general_announcement_reaches_the_sessions_in_general(store, created):
+    store.hub.join("worker", "general", "codex:other")
+    store.hub.send("workspace", {"id": "e" * 32, "from": "user", "to": "#general", "text": "Lunch?",
+                                 "reply": "none", "mode": "push"})
     pending = {row["to"] for row in store.hub.inbox("worker", 0) if row["topic"] == "general"}
-    assert pending == {"omp:agent", "codex:other"}
+    assert pending == {"codex:other"}
 
 
 def test_retry_with_the_same_id_finishes_the_same_channel(store, channel, created):
@@ -107,7 +100,7 @@ def test_an_existing_channel_is_not_created_again(store, channel, created):
 
 
 def test_general_cannot_be_created(store, channel):
-    with pytest.raises(HubError, match="everyone"):
+    with pytest.raises(HubError, match="already exists"):
         store.create_channel({**channel, "topic": "general"})
 
 
@@ -196,19 +189,6 @@ def test_same_id_with_other_members_does_not_enlarge_the_channel(store, channel,
 # --- credential rotation --------------------------------------------------------------------------------
 
 
-def test_a_revoked_hub_node_rejoins_general_when_published_again(tmp_path):
-    hub = Hub(str(tmp_path / "hub.sqlite3"), general="general")
-    hub.publish("laptop", [{"address": "claude:c1"}])
-    hub.revoke("laptop")
-    hub.publish("laptop", [{"address": "claude:c1"}])
-    assert _members_of(hub, "general") == ["laptop/claude:c1"]
-
-
-def test_a_revoked_workspace_node_rejoins_general_when_published_again(store):
+def test_a_revoked_node_leaves_its_channels(store, created):
     store.revoke_node("worker")
-    store.hub.publish("worker", [{"address": "omp:agent"}])
-    assert "worker/omp:agent" in _members(store, "general")
-
-
-def _members_of(hub, topic):
-    return next(row["members"] for row in hub.topics() if row["topic"] == topic)
+    assert "worker/omp:agent" not in _members(store, "release")

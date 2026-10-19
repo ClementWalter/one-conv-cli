@@ -87,6 +87,11 @@ def _task_footer(task: dict, role: str | None) -> str:
         return (f"\nYou were granted child task {key} (version {version}) of a request owned by another agent."
                 " Work only this part, and report to its owner with "
                 f"`one-conv live task update {key} --version {version} --state done --note \"...\"`.")
+    if role == "candidate":
+        return (f"\nUnclaimed request (task {key}, version {version}), offered to every session in this channel."
+                f" To take it, claim it before any work: `one-conv live task claim {key} --version {version}`"
+                " (or the task_claim tool). Only the session whose claim succeeds works and answers it;"
+                " if your claim is refused, another session has it: do not work on it.")
     owner = _attr(str(task.get("owner") or "nobody yet"))
     return (f"\nContext only: this request is task {key}, owned by {owner}. Do not act on it or answer the human"
             " about it unless its owner grants you a part or the human asks you.")
@@ -152,6 +157,6 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
         attrs += f' task="{_attr(str(task.get("key")))}" task-version="{_attr(str(task.get("version")))}"'
         if role:
             attrs += f' role="{_attr(role)}"'
-        # An observer gets context, never an instruction to answer.
-        footer = _task_footer(task, role) if role == "observer" else _task_footer(task, role) + footer
+        # An observer gets context and a candidate must claim first: neither is told how to answer yet.
+        footer = _task_footer(task, role) if role in ("observer", "candidate") else _task_footer(task, role) + footer
     return f"<one-conv-message {attrs}>\n{text}\n</one-conv-message>{footer}"

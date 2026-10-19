@@ -134,8 +134,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             if task.get("owner"):
                 click.echo(f"task {task['key']}: owned by {task['owner']}; the others received it as context")
             else:
-                click.echo(f"task {task['key']}: unassigned, nobody was woken; choose a lead with "
-                           f"`one-conv live lead set '#{task.get('topic') or 'topic'}' @name`")
+                click.echo(f"task {task['key']}: unclaimed, offered to every running member of the channel")
         if as_json:
             click.echo(json.dumps(receipt))
         elif "deliveries" in receipt:
@@ -276,50 +275,6 @@ def build_live_group(launcher: list[str]) -> click.Group:
         another round with --round.
         """
         _show_task(_task_call(lambda ops: ops.delegate(key, _me(address), version, to, kind, note, round_)), as_json)
-
-    @live.group("lead", context_settings=HELP, epilog=examples(
-        "one-conv live lead show '#general'", "one-conv live lead set '#general' @coordinator",
-        "one-conv live lead set '#release' --default"))
-    def lead_group():
-        """Who owns new human requests in a topic on this machine (without a hub).
-
-        With a hub, the human chooses leads in the workspace instead. The default lead is
-        @coordinator; a request with no live lead stays unassigned and wakes nobody.
-        """
-
-    def _local_leads_only():
-        if hubclient.configured() is not None:
-            raise click.ClickException("This machine uses a hub: the human chooses channel leads in the workspace "
-                                       "(channel details, Lead).")
-
-    @lead_group.command("show", context_settings=HELP, epilog=examples("one-conv live lead show '#general'"))
-    @click.argument("topic")
-    def lead_show_command(topic):
-        """Show a topic's lead."""
-        from . import tasks
-        _local_leads_only()
-        name = team._check("topic", topic)
-        lead = _task_call(lambda ops: ops.local_call(lambda db: tasks.lead_for(db, name)))
-        click.echo(f"#{name}: {lead}")
-
-    @lead_group.command("set", context_settings=HELP, epilog=examples(
-        "one-conv live lead set '#general' @coordinator", "one-conv live lead set '#release' claude:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03",
-        "one-conv live lead set '#release' --default"))
-    @click.argument("topic")
-    @click.argument("lead", required=False)
-    @click.option("--default", "use_default", is_flag=True, help="Go back to @coordinator.")
-    def lead_set_command(topic, lead, use_default):
-        """Choose who owns new human requests in TOPIC: @name or harness:id."""
-        from . import tasks
-        _local_leads_only()
-        if (lead is None) == (not use_default):
-            raise click.UsageError("Give a LEAD or --default:\n  one-conv live lead set '#general' @coordinator")
-        name = team._check("topic", topic)
-        if lead and not lead.startswith("@") and ":" not in lead:
-            raise click.UsageError("A lead is @name or harness:id, e.g. @coordinator")
-        chosen = _task_call(lambda ops: ops.local_call(lambda db: tasks.set_lead(
-            db, name, None if use_default else lead if lead.startswith("@") else f"local/{lead}", "user")))
-        click.echo(f"#{name}: {chosen or tasks.DEFAULT_LEAD}")
 
     @live.command("pull", context_settings=HELP, epilog=examples('one-conv live pull boat:bx_ab12/2ab1', 'one-conv live pull boat:bx_ab12/2ab1 --json'))
     @click.argument("address")

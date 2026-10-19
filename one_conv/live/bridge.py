@@ -10,6 +10,10 @@ its outcome. A delivery seen again (a lost ack) is acked with the recorded outco
 delivered twice. One claimed but without an outcome (the bridge stopped mid-delivery) is
 reported `unconfirmed` and not retried, since the agent may already have it. Outcomes say
 what the adapter did: `accepted` is not `read`.
+
+With spawn settings (`live spawner`), the bridge also starts a session here when the hub has
+a request that no running session can take: a delivery to `spawn:<harness>` carries the
+first prompt, and the new session claims the request itself.
 """
 
 import json
@@ -26,7 +30,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import history, hubclient, router, team, tunnel
+from . import history, hubclient, router, spawn, team, tunnel
 from .model import envelope, live_home, parse_address
 
 try:
@@ -66,6 +70,51 @@ def _read(path: Path) -> dict:
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def spawn_settings() -> dict | None:
+    """How this machine starts a session for the hub ({harness, cwd, model, args}), or None if it starts none."""
+    data = _read(bridge_dir() / "spawn.json")
+    return data if data.get("harness") in spawn.HARNESSES and data.get("cwd") else None
+
+
+def save_spawn_settings(data: dict | None) -> None:
+    if data is None:
+        (bridge_dir() / "spawn.json").unlink(missing_ok=True)
+    else:
+        _write_private(bridge_dir() / "spawn.json", data)
+
+
+def _start_for_hub(harness: str, prompt: str, config: dict) -> None:
+    """Start the session in tmux and wait for it to register; failures are only logged.
+
+    The hub moves a request whose spawned session never claims it to the cloud, so a failure
+    here never leaves the request waiting.
+    """
+    try:
+        started = spawn.start(harness, prompt, Path(config["cwd"]), config.get("model"),
+                              tuple(config.get("args") or ()), trust_folder=True)
+        logger.info("started %s for the hub in tmux session %s", started.address, started.tmux)
+    except (spawn.SpawnError, OSError) as error:
+        logger.warning("could not start a %s session for the hub: %s", harness, error)
+
+
+def deliver_spawn(item: dict) -> tuple[str, str]:
+    """Start a session for a request the hub could not give to a running one."""
+    harness = str(item.get("to", "")).partition(":")[2]
+    config = spawn_settings()
+    if config is None or config["harness"] != harness:
+        return "refused", f"this machine does not start {harness} sessions"
+    if item.get("role") != "candidate":
+        # Someone claimed the request before this order was handed out.
+        return "accepted", "not started: the request already has an owner"
+    try:
+        spawn.preflight(harness)
+    except spawn.SpawnError as error:
+        return "refused", str(error)
+    # Registration takes up to a minute; deliveries go on meanwhile.
+    threading.Thread(target=_start_for_hub, args=(harness, item["text"], config), daemon=True).start()
+    return "accepted", f"starting a {harness} session in {config['cwd']}"
 
 
 def settings() -> dict:
@@ -167,6 +216,8 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None) -> tup
     and never wakes the session.
     """
     target, sender_route = str(item.get("to", "")), str(item.get("from", ""))
+    if target.startswith("spawn:"):
+        return deliver_spawn(item)
     harness, _ = parse_address(target)
     if harness is None:
         return "refused", f"{target!r} is not a session address"
@@ -220,16 +271,18 @@ class Bridge:
         """Replace this node's entries in the hub directory, renewing its lease."""
         rows = [{"address": s.address, "name": team.name_for(s.address), "title": s.title, "cwd": s.cwd,
                  "status": s.status} for s in router.list_all()]
+        config = spawn_settings()
+        offer = {"spawn": config["harness"]} if config else {}
         try:
-            count = self.client.request("PUT", "/v1/sessions", {"sessions": rows})["published"]
+            count = self.client.request("PUT", "/v1/sessions", {"sessions": rows, **offer})["published"]
             self.notes = []
         except hubclient.HubRefused as error:
             if error.status != 409:
                 raise
             # A name taken on another node must not keep every session here unreachable.
             self.notes = [f"names not published: {error}"]
-            count = self.client.request("PUT", "/v1/sessions", {"sessions": [{**r, "name": None} for r in rows]})[
-                "published"]
+            count = self.client.request("PUT", "/v1/sessions", {"sessions": [{**r, "name": None} for r in rows],
+                                                                **offer})["published"]
         self.directory = {row["address"]: row for row in self.client.request("GET", "/v1/sessions")["sessions"]}
         self.published_at = time.monotonic()
         return count

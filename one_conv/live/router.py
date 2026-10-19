@@ -401,8 +401,8 @@ def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, 
     members = team.members(topic)
     task = None
     if sender is None and origin == "user" and not fyi and reply == "expected":
-        # A request from the person at this machine: the topic's lead owns it, the others observe.
-        task = _local_request(message_id, text, topic, _local_lead(topic, members))
+        # A request from the person at this machine is offered to every member; the first claim owns it.
+        task = _local_request(message_id, text, topic, None)
     elif sender is not None:
         _local_policy(sender.address, f"#{topic}", topic, extra or {})
     team.record(topic, message_id, sender_label, text)
@@ -410,11 +410,9 @@ def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, 
     for member in members:
         if member == sender_label:
             continue
-        owner = task is not None and member == task["owner"]
         try:
-            deliveries.append(_send_one(member, text, sender, origin, fyi or (task is not None and not owner),
-                                        reply, topic, message_id, task,
-                                        None if task is None else "owner" if owner else "observer"))
+            deliveries.append(_send_one(member, text, sender, origin, fyi, reply, topic, message_id, task,
+                                        None if task is None else "candidate"))
         except (LiveError, RuntimeError, OSError, ValueError) as error:
             # A member that cannot be reached now still finds the message when it catches up.
             deliveries.append({"to": member, "status": f"not delivered: {error}"})
@@ -424,24 +422,11 @@ def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, 
     return receipt
 
 
-def _is_live(address: str) -> bool:
-    return any(session.address == address for session in list_all(address.partition(":")[0]))
-
-
 def _local_request(message_id: str, text: str, topic: str | None, owner: str | None) -> dict:
     """The task a request from the person at this machine makes, in this machine's task store."""
     from . import taskops, tasks
     return taskops.local_call(lambda db: tasks.create(db, tasks.key_for("local", message_id), post_seq=None,
                                                       topic=topic, owner=owner, created_by="user", title=text)[0])
-
-
-def _local_lead(topic: str, members: list[str]) -> str | None:
-    """This machine's lead for the topic, when it is a live member; None leaves the request unassigned."""
-    from . import taskops, tasks
-    lead = taskops.local_call(lambda db: tasks.lead_for(db, topic))
-    # A local lead route is stored as local/harness:id; members are plain harness:id here.
-    route = team.address_for(lead[1:]) if lead.startswith("@") else lead.removeprefix("local/")
-    return route if route in members and _is_live(route) else None
 
 
 def _local_policy(sender: str, target: str, topic: str | None, extra: dict) -> None:

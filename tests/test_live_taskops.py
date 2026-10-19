@@ -271,3 +271,9 @@ def test_the_cli_refuses_an_update_from_a_non_owner(cli, local_request):
 def test_send_requires_task_and_version_together(cli):
     runner, group = cli
     assert runner.invoke(group, ["send", "#release", "hi", "--task", KEY, "--yes"]).exit_code == 2
+
+
+def test_the_cli_claims_an_offered_task(cli, offered):
+    runner, group = cli
+    result = runner.invoke(group, ["task", "claim", offered["task"]["key"], "--version", "1", "--as", "codex:peer"])
+    assert result.exit_code == 0

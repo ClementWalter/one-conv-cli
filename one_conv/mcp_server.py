@@ -9,6 +9,7 @@ from typing import Any, Literal
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from .namespaces import CLOUD_PRODUCTS, LOCAL_SOURCES
@@ -25,22 +26,22 @@ def read_cli(namespace: Namespace, command: str, *, query: str | None = None,
              context: int = 5) -> dict:
     """Capture JSON and diagnostics separately without sharing Click's global state."""
     if namespace not in ("cloud", "local"):
-        raise ValueError("namespace must be cloud or local")
+        raise ToolError("namespace must be cloud or local")
     if command not in ("chats", "read", "search", "find", "cached-accounts"):
-        raise ValueError("Unsupported reader")
+        raise ToolError("Unsupported reader")
     sources = CLOUD_PRODUCTS.values() if namespace == "cloud" else LOCAL_SOURCES
     if source is not None and source not in sources:
-        raise ValueError(f"source must be one of: {', '.join(sources)}")
+        raise ToolError(f"source must be one of: {', '.join(sources)}")
     if not 1 <= limit <= 1000:
-        raise ValueError("limit must be between 1 and 1000")
+        raise ToolError("limit must be between 1 and 1000")
     if refresh and (namespace != "cloud" or command not in ("chats", "read")):
-        raise ValueError("Refresh is supported only for cloud listing and reading")
+        raise ToolError("Refresh is supported only for cloud listing and reading")
     if session and (namespace != "local" or command != "read"):
-        raise ValueError("session selects a local conversation within a project")
+        raise ToolError("session selects a local conversation within a project")
     if around is not None and (namespace != "local" or command != "read"):
-        raise ValueError("around selects turns within one local conversation")
+        raise ToolError("around selects turns within one local conversation")
     if not 0 <= context <= 100:
-        raise ValueError("context must be between 0 and 100")
+        raise ToolError("context must be between 0 and 100")
     actual = "thread" if namespace == "local" and command == "read" else command
     args = [sys.executable, "-O", str(LAUNCHER), namespace, actual, "--json"]
     # The turns around one message replace the last-N window.
@@ -62,13 +63,13 @@ def read_cli(namespace: Namespace, command: str, *, query: str | None = None,
         # A failing reader is reported from its exit code and stderr below, not raised here.
         result = subprocess.run(args, capture_output=True, text=True, timeout=300 if refresh else 60, check=False)
     except subprocess.TimeoutExpired as error:
-        raise ValueError("History request timed out. Retry with a source filter or without refresh.") from error
+        raise ToolError("History request timed out. Retry with a source filter or without refresh.") from error
     if result.returncode:
-        raise ValueError(result.stderr.strip() or "History reader failed")
+        raise ToolError(result.stderr.strip() or "History reader failed")
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError as error:
-        raise ValueError("History reader returned invalid JSON") from error
+        raise ToolError("History reader returned invalid JSON") from error
     return {"data": data, "freshness": "refreshed" if refresh else "saved",
             "notices": result.stderr.strip()}
 
@@ -156,13 +157,13 @@ def create_server() -> MCPServer:
         from .live import router, team
         meta = dict(ctx.request_context.meta or {})
         if (task is None) != (task_version is None):
-            raise ValueError("task and task_version go together, as the delivery gave them")
+            raise ToolError("task and task_version go together, as the delivery gave them")
         try:
             return router.send(to, text, router.whoami(meta=meta), fyi=fyi,
                                reply="expected" if expect_reply else "none", topic=topic,
                                task={"key": task, "version": task_version} if task else None, about=about)
         except (router.LiveError, team.TeamError, RuntimeError, OSError) as error:
-            raise ValueError(str(error)) from error
+            raise ToolError(str(error)) from error
 
     def _task(work):
         from .live import taskops
@@ -170,7 +171,7 @@ def create_server() -> MCPServer:
             return work(taskops)
         except taskops.TaskOpError as error:
             current = f" Now: {error.task}" if error.task else ""
-            raise ValueError(f"{error}{current}") from error
+            raise ToolError(f"{error}{current}") from error
 
     @server.tool(annotations=readonly, structured_output=True)
     def task_show(key: str) -> dict[str, Any]:
@@ -210,7 +211,7 @@ def create_server() -> MCPServer:
         from .live import router
         me = router.whoami(meta=dict(ctx.request_context.meta or {}))
         if me is None or me.id.startswith("?"):
-            raise ValueError("This tool needs the calling agent's session, which could not be identified.")
+            raise ToolError("This tool needs the calling agent's session, which could not be identified.")
         return me
 
     @server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=False),
@@ -223,7 +224,7 @@ def create_server() -> MCPServer:
             chosen = team.set_name(name, me.address, lambda a: any(
                 s.address == a for s in router.list_all(a.partition(":")[0])))
         except team.TeamError as error:
-            raise ValueError(str(error)) from error
+            raise ToolError(str(error)) from error
         return {"name": f"@{chosen}", "address": me.address}
 
     @server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=False),
@@ -240,7 +241,7 @@ def create_server() -> MCPServer:
             # "history" marks these as already exchanged, so they are not acted on as new requests.
             return {"members": team.members(joined), "kind": "history", **team.catch_up(joined, me.address)}
         except team.TeamError as error:
-            raise ValueError(str(error)) from error
+            raise ToolError(str(error)) from error
 
     @server.tool(annotations=readonly, structured_output=True)
     def list_topics() -> dict[str, Any]:

@@ -9,6 +9,7 @@ import sys
 import pytest
 from mcp import Client
 from mcp.client.stdio import StdioServerParameters
+from mcp.server.mcpserver.exceptions import ToolError
 
 from one_conv import mcp_server
 
@@ -53,7 +54,7 @@ def test_local_read_uses_thread(reader_stub):
     {"namespace": "local", "refresh": True}, {"session": "abc"},
 ])
 def test_invalid_request_is_rejected(fields):
-    with pytest.raises(ValueError):
+    with pytest.raises(ToolError):
         mcp_server.read_cli(**({"namespace": "cloud", "command": "chats"} | fields))
 
 
@@ -62,14 +63,14 @@ def test_reader_reports_timeout(monkeypatch):
         raise subprocess.TimeoutExpired("reader", 60)
 
     monkeypatch.setattr(mcp_server.subprocess, "run", run)
-    with pytest.raises(ValueError, match="timed out"):
+    with pytest.raises(ToolError, match="timed out"):
         mcp_server.read_cli("cloud", "chats")
 
 
 def test_reader_reports_cli_error(monkeypatch):
     monkeypatch.setattr(mcp_server.subprocess, "run", lambda *a, **kw:
                         subprocess.CompletedProcess(a, 1, "", "No conversation matches"))
-    with pytest.raises(ValueError, match="No conversation matches"):
+    with pytest.raises(ToolError, match="No conversation matches"):
         mcp_server.read_cli("cloud", "read", query="missing")
 
 
@@ -171,3 +172,17 @@ def test_stdio_send_message_fyi_leaves_notice(tmp_path):
 
     asyncio.run(send())
     assert json.loads((live / "fyi" / "omp-o1.jsonl").read_text())["from"] == "codex:t-123"
+
+
+def call_in_process(tool, arguments):
+    """Call one tool on an in-process server, as a client sees it: (is_error, text)."""
+    async def call():
+        async with Client(mcp_server.create_server()) as client:
+            result = await client.call_tool(tool, arguments)
+            return result.is_error, " ".join(getattr(item, "text", "") for item in result.content)
+    return asyncio.run(call())
+
+
+def test_a_refused_task_action_tells_the_agent_why():
+    _, text = call_in_process("task_show", {"key": "not a key"})
+    assert "a task key is NODE:message-id" in text

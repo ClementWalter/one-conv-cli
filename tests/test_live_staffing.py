@@ -345,3 +345,10 @@ def test_the_spawner_command_turns_spawning_off(cli, tmp_path):
 def test_the_spawner_command_needs_harness_and_cwd_together(cli):
     runner, group = cli
     assert runner.invoke(group, ["spawner", "--harness", "claude", "--yes"]).exit_code != 0
+
+
+def test_a_started_session_is_published_at_once(started):
+    published = []
+    bridge.deliver_inbound(order(), on_started=lambda: published.append(True))
+    wait_for(published)
+    assert published == [True]

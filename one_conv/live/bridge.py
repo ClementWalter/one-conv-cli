@@ -85,21 +85,24 @@ def save_spawn_settings(data: dict | None) -> None:
         _write_private(bridge_dir() / "spawn.json", data)
 
 
-def _start_for_hub(harness: str, prompt: str, config: dict) -> None:
-    """Start the session in tmux and wait for it to register; failures are only logged.
+def _start_for_hub(harness: str, prompt: str, config: dict, on_started=None) -> None:
+    """Start the session in tmux, wait for it to register, then call `on_started`; failures are only logged.
 
     The hub moves a request whose spawned session never claims it to the cloud, so a failure
-    here never leaves the request waiting.
+    here never leaves the request waiting. `on_started` publishes the session at once: the hub
+    accepts a claim only from a session this node published.
     """
     try:
         started = spawn.start(harness, prompt, Path(config["cwd"]), config.get("model"),
                               tuple(config.get("args") or ()), trust_folder=True)
         logger.info("started %s for the hub in tmux session %s", started.address, started.tmux)
-    except (spawn.SpawnError, OSError) as error:
-        logger.warning("could not start a %s session for the hub: %s", harness, error)
+        if on_started is not None:
+            on_started()
+    except (spawn.SpawnError, OSError, hubclient.HubRefused, hubclient.HubUnavailable) as error:
+        logger.warning("could not start or publish a %s session for the hub: %s", harness, error)
 
 
-def deliver_spawn(item: dict) -> tuple[str, str]:
+def deliver_spawn(item: dict, on_started=None) -> tuple[str, str]:
     """Start a session for a request the hub could not give to a running one."""
     harness = str(item.get("to", "")).partition(":")[2]
     config = spawn_settings()
@@ -113,7 +116,7 @@ def deliver_spawn(item: dict) -> tuple[str, str]:
     except spawn.SpawnError as error:
         return "refused", str(error)
     # Registration takes up to a minute; deliveries go on meanwhile.
-    threading.Thread(target=_start_for_hub, args=(harness, item["text"], config), daemon=True).start()
+    threading.Thread(target=_start_for_hub, args=(harness, item["text"], config, on_started), daemon=True).start()
     return "accepted", f"starting a {harness} session in {config['cwd']}"
 
 
@@ -208,7 +211,7 @@ class _AdapterFailed(Exception):
     pass
 
 
-def deliver_inbound(item: dict, directory: dict[str, dict] | None = None) -> tuple[str, str]:
+def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, on_started=None) -> tuple[str, str]:
     """Hand one hub delivery to the session here it is addressed to; returns (outcome, detail).
 
     Only a session listed live on this machine receives it: a stored-only Codex thread or a
@@ -217,7 +220,7 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None) -> tup
     """
     target, sender_route = str(item.get("to", "")), str(item.get("from", ""))
     if target.startswith("spawn:"):
-        return deliver_spawn(item)
+        return deliver_spawn(item, on_started)
     harness, _ = parse_address(target)
     if harness is None:
         return "refused", f"{target!r} is not a session address"
@@ -266,9 +269,15 @@ class Bridge:
         self.directory: dict[str, dict] = {}
         self.published_at = 0.0
         self.notes: list[str] = []
+        # A session started for the hub publishes from its spawn thread while the loop may publish too.
+        self.publishing = threading.Lock()
 
     def publish(self) -> int:
         """Replace this node's entries in the hub directory, renewing its lease."""
+        with self.publishing:
+            return self._publish()
+
+    def _publish(self) -> int:
         rows = [{"address": s.address, "name": team.name_for(s.address), "title": s.title, "cwd": s.cwd,
                  "status": s.status} for s in router.list_all()]
         config = spawn_settings()
@@ -307,7 +316,7 @@ class Bridge:
         """Deliver one inbox item at most once, then ack its outcome."""
         fresh, recorded = self.ingress.claim(item)
         if fresh:
-            outcome, detail = deliver_inbound(item, self.directory)
+            outcome, detail = deliver_inbound(item, self.directory, self.publish)
             self.ingress.finish(item["delivery"], outcome, detail)
         elif recorded is None:
             outcome = "unconfirmed"

@@ -373,7 +373,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
         name = team.name_for(me.address)
         click.echo(f"{me.address}  @{name}" if name else me.address)
 
-    def _me(as_address):
+    def _session(as_address):
         me = router.whoami(as_address)
         if me is None or me.id.startswith("?"):
             raise click.UsageError("Not inside an identifiable agent session; pass --as ADDRESS.")
@@ -393,7 +393,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
         Messages still route and reply by address, so renaming never breaks a reply.
         """
         try:
-            chosen = team.set_name(name, _me(as_address).address, _live, replace)
+            chosen = team.set_name(name, _session(as_address).address, _live, replace)
         except (team.TeamError, router.LiveError) as error:
             raise click.ClickException(str(error)) from None
         click.echo(f"you are @{chosen}")
@@ -432,7 +432,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
         Members receive every message sent to #TOPIC from then on.
         """
         try:
-            me = _me(as_address)
+            me = _session(as_address)
             joined = team.join(topic, me.address)
             result = team.catch_up(joined, me.address)
         except (team.TeamError, router.LiveError) as error:
@@ -446,7 +446,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
     def leave_command(topic, as_address):
         """Stop receiving messages sent to TOPIC."""
         try:
-            left = team.leave(topic, _me(as_address).address)
+            left = team.leave(topic, _session(as_address).address)
         except (team.TeamError, router.LiveError) as error:
             raise click.ClickException(str(error)) from None
         click.echo(f"left #{left}")

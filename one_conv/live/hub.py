@@ -319,7 +319,8 @@ class Hub:
         where = f" in #{task['topic']}" if task["topic"] else " as a direct message"
         steps = [(f"Claim it first: the task_claim tool with key=\"{task['key']}\" and version={task['version']}"
                   f" (CLI: `one-conv live task claim {task['key']} --version {task['version']}`). If the claim is"
-                  " refused, another session has it: stop there and do nothing else.")]
+                  " refused because another session has it, stop there and do nothing else; if it is refused because"
+                  " this session is not published yet, wait five seconds and claim again.")]
         if task["topic"]:
             steps.append(f"Join #{task['topic']} with the join_topic tool to catch up on the channel. To dig into an"
                          " earlier session, read it with read_conversation using a message's sender address.")

@@ -1,4 +1,5 @@
-"""Human requests as tasks: one owner is woken, the rest observe, and ownership is fenced by version."""
+"""Human requests as tasks: a channel request is offered to every running member, the first claim owns it,
+ownership is fenced by version, and a task whose owner stopped running is released and offered again."""
 
 import sqlite3
 import threading
@@ -21,17 +22,26 @@ def post(hub, ident, text="Book the train", to="#general", sender="user", node=H
 
 @pytest.fixture
 def hub(tmp_path):
-    state = Hub(str(tmp_path / "hub.db"), general="general")
+    state = Hub(str(tmp_path / "hub.db"))
     state.publish("mac", [{"address": "claude:lead", "name": "coordinator"}, {"address": "codex:peer", "name": "peer"}])
     state.publish("pc", [{"address": "omp:other", "name": "other"}])
     state.publish(HUMAN, [{"address": "user"}])
+    for node, address in [("mac", "claude:lead"), ("mac", "codex:peer"), ("pc", "omp:other")]:
+        state.join(node, "general", address)
     state.adopt_trusted_human(HUMAN)
     return state
 
 
 @pytest.fixture
-def request_task(hub):
+def offered(hub):
+    """A channel request nobody has claimed yet."""
     return post(hub, "a")["task"]
+
+
+@pytest.fixture
+def request_task(hub, offered):
+    """The same request once LEAD claimed it."""
+    return hub.claim("mac", {"key": offered["key"], "actor": "claude:lead", "version": offered["version"]})
 
 
 def deliveries(hub, task_key=None):
@@ -46,14 +56,21 @@ def task_count(hub):
         return db.execute("SELECT COUNT(*) FROM tasks WHERE parent IS NULL").fetchone()[0]
 
 
-def test_a_human_channel_request_is_owned_by_the_channel_lead(request_task):
-    assert request_task["owner"] == LEAD
+def test_a_human_channel_request_starts_unclaimed(offered):
+    assert offered["owner"] is None
 
 
-@pytest.mark.parametrize("route, role, mode", [(LEAD, "owner", "push"), (PEER, "observer", "fyi"),
-                                                (OTHER, "observer", "fyi")])
-def test_only_the_owner_is_woken_by_a_channel_request(hub, request_task, route, role, mode):
-    assert (route, role, mode) in deliveries(hub, request_task["key"])
+@pytest.mark.parametrize("route", [LEAD, PEER, OTHER])
+def test_every_running_member_is_offered_a_channel_request(hub, offered, route):
+    assert (route, "candidate", "push") in deliveries(hub, offered["key"])
+
+
+def test_the_claimer_delivery_becomes_the_owner(hub, request_task):
+    assert (LEAD, "owner", "push") in deliveries(hub, request_task["key"])
+
+
+def test_a_claim_moves_the_task_to_the_next_version(offered, request_task):
+    assert request_task["version"] == offered["version"] + 1
 
 
 def test_a_retried_request_finds_the_same_task(hub, request_task):
@@ -80,15 +97,17 @@ def test_an_untrusted_node_user_creates_no_task(hub):
     assert task_count(hub) == 0
 
 
-def test_a_channel_without_an_available_lead_is_visibly_unassigned(hub):
-    hub.set_lead("general", "@nobody", f"{HUMAN}/user")
-    assert post(hub, "b")["task"]["state"] == "unassigned"
+def test_a_channel_request_is_visibly_unassigned(offered):
+    assert offered["state"] == "unassigned"
 
 
-def test_an_unassigned_request_wakes_nobody(hub):
-    hub.set_lead("general", "@nobody", f"{HUMAN}/user")
-    key = post(hub, "b")["task"]["key"]
-    assert {mode for _, _, mode in deliveries(hub, key)} == {"fyi"}
+def test_a_request_in_a_channel_with_nobody_running_is_stored_without_deliveries(hub):
+    key = post(hub, "b", to="#empty")["task"]["key"]
+    assert deliveries(hub, key) == []
+
+
+def test_a_request_in_a_channel_with_nobody_running_is_unassigned(hub):
+    assert post(hub, "b", to="#empty")["task"]["state"] == "unassigned"
 
 
 def test_a_human_direct_message_is_owned_by_its_recipient(hub):
@@ -96,7 +115,6 @@ def test_a_human_direct_message_is_owned_by_its_recipient(hub):
 
 
 def test_two_simultaneous_claims_leave_one_owner(hub):
-    hub.set_lead("general", "@nobody", f"{HUMAN}/user")
     key = post(hub, "b")["task"]["key"]
     winners = []
 
@@ -322,8 +340,9 @@ def test_an_observer_posts_freely_once_the_request_is_done(hub, request_task):
 
 @pytest.fixture
 def late_joiner(hub, request_task):
-    """A session published after the request; it auto-joins #general and never received the request."""
+    """A session that joined #general after the request, so it never received it."""
     hub.publish("box", [{"address": "claude:new"}])
+    hub.join("box", "general", "claude:new")
     return hub
 
 
@@ -333,18 +352,14 @@ def test_a_late_joiner_cannot_answer_an_open_request(late_joiner, to):
         post(late_joiner, "f", to=to, sender="claude:new", node="box")
 
 
-def test_a_claim_makes_the_claimer_delivery_the_owner(hub):
-    hub.set_lead("general", "@nobody", f"{HUMAN}/user")
-    key = post(hub, "9")["task"]["key"]
-    hub.claim("mac", {"key": key, "actor": "codex:peer"})
-    assert (PEER, "owner", "fyi") in deliveries(hub, key)
-
-
 def test_a_claim_wakes_the_claimer_as_owner(hub):
-    hub.set_lead("general", "@nobody", f"{HUMAN}/user")
     key = post(hub, "7")["task"]["key"]
     hub.claim("mac", {"key": key, "actor": "codex:peer"})
     assert (PEER, "owner", "push") in deliveries(hub, key)
+
+
+def test_an_offer_already_claimed_is_handed_out_as_context(hub, request_task):
+    assert ("codex:peer", "fyi", "observer") in handed(hub)
 
 
 def test_a_human_announcement_wakes_nobody(hub):
@@ -377,13 +392,6 @@ def test_a_round_trip_before_pickup_leaves_one_instruction_for_the_final_owner(h
     assert [to for to, mode, _ in handed(hub) if mode == "push"] == ["claude:lead"]
 
 
-def test_a_lead_outside_the_channel_is_not_available(hub):
-    hub.publish("pc", [{"address": "omp:other", "name": "other"}, {"address": "omp:outsider", "name": "outsider"}])
-    hub.leave("pc", "general", "omp:outsider")
-    hub.set_lead("general", "@outsider", f"{HUMAN}/user")
-    assert hub.lead("general")["available"] is False
-
-
 def test_replaying_history_creates_no_work(hub, request_task):
     hub.history("general")
     assert task_count(hub) == 1
@@ -397,11 +405,12 @@ def test_history_names_the_task_a_request_made(hub, request_task):
 def old_hub(tmp_path):
     """A hub with a human broadcast queued before tasks existed."""
     path = str(tmp_path / "old.db")
-    state = Hub(path, general="general")
+    state = Hub(path)
     state.publish("mac", [{"address": "claude:lead", "name": "coordinator"}, {"address": "codex:peer"}])
     state.publish(HUMAN, [{"address": "user"}])
+    state.join("mac", "general", "claude:lead")
     post(state, "d")
-    upgraded = Hub(path, general="general")
+    upgraded = Hub(path)
     upgraded.adopt_trusted_human(HUMAN)
     return upgraded
 

@@ -86,8 +86,6 @@ def validate_channel(payload: object) -> dict:
         raise HubError(400, "id must be 32 lowercase hexadecimal characters, unchanged on retry")
     if not isinstance(topic, str) or not TOPIC.fullmatch(topic):
         raise HubError(400, "A channel name uses lowercase letters, digits and dashes.")
-    if topic == GENERAL:
-        raise HubError(409, "#general already includes everyone.")
     if not isinstance(purpose, str) or not purpose.strip():
         raise HubError(400, "Say what this channel is for; it is posted as the first message.")
     if len(purpose) > TEXT_LIMIT:
@@ -127,7 +125,6 @@ class ControlStore:
             with private_database(path):
                 pass
         self.hub = hub
-        hub.general = GENERAL
         # The paired human is the only authority whose requests become tasks, and who assigns them.
         hub.adopt_trusted_human(NODE)
         with self.hub._db() as db:
@@ -136,6 +133,9 @@ class ControlStore:
             db.execute("CREATE TABLE IF NOT EXISTS channel_requests (id TEXT PRIMARY KEY, digest TEXT NOT NULL, "
                        "topic TEXT NOT NULL, announcement TEXT NOT NULL, created REAL NOT NULL)")
             unread.ensure(db)
+            # #general is the human's default channel; sessions join it like any other.
+            db.execute("INSERT OR IGNORE INTO members (topic, node, address, joined) VALUES (?, ?, 'user', ?)",
+                       (GENERAL, NODE, time.time()))
         self.refresh_human()
 
     @staticmethod
@@ -255,14 +255,16 @@ class ControlStore:
             for row in directory if row["address"] != HUMAN],
             "names": {row["name"]: display_address(row["address"]) for row in directory if row["name"]},
             "topics": [{**topic, "members": [display_address(member) for member in topic["members"]],
-                        "unread": unseen.get(topic["topic"], 0), "lead": self.hub.lead(topic["topic"])}
+                        "participants": [display_address(route) for route in topic["participants"]],
+                        "unread": unseen.get(topic["topic"], 0)}
                        for topic in self.hub.topics()],
             "bridge": {"node": NODE, "running": True, "mode": "cloud"}, "error": None}
 
     @staticmethod
-    def _task_view(task: dict, children: list[dict], online: set[str]) -> dict:
-        """What the human sees on a request: who owns it, its real progress, and who helps."""
+    def _task_view(task: dict, children: list[dict], online: set[str], staffing: dict | None = None) -> dict:
+        """What the human sees on a request: who owns it, its real progress, who helps, and who is starting."""
         return {"key": task["key"], "owner": display_address(task["owner"]) if task["owner"] else None,
+                "staffing": staffing,
                 "owner_online": task["owner"] in online if task["owner"] else False,
                 "state": task["state"], "note": task["note"], "version": task["version"], "updated": task["updated"],
                 "children": [{"key": child["key"], "kind": child["kind"], "owner": display_address(child["owner"]),
@@ -277,7 +279,11 @@ class ControlStore:
         online = {f"{node}/{address}" for node, address, seen, updated in db.execute(
             "SELECT s.node, s.address, n.seen, s.updated FROM sessions s JOIN nodes n ON n.node = s.node")
             if _online(seen, updated, now)}
-        return {seq: self._task_view(task, tasks.children(db, task["key"]), online) for seq, task in roots.items()}
+        staffing = {key: {"route": route, "state": state, "detail": detail} for key, route, state, detail in db.execute(
+            "SELECT task, route, state, detail FROM staffing s WHERE version = (SELECT MAX(version) FROM staffing"
+            " WHERE task = s.task)")}
+        return {seq: self._task_view(task, tasks.children(db, task["key"]), online, staffing.get(task["key"]))
+                for seq, task in roots.items()}
 
     def assign(self, payload):
         """The human gives a request to an agent (or unassigns it); the new owner is woken."""
@@ -289,14 +295,6 @@ class ControlStore:
             raise HubError(400, "to is an agent route, @name, or null to unassign.")
         task = self.hub.assign(payload["key"], to, HUMAN, payload["version"], payload.get("note"))
         return {"task": {**task, "owner": display_address(task["owner"]) if task["owner"] else None}}
-
-    def set_lead(self, payload):
-        """The human chooses who owns new requests in a channel; null goes back to @coordinator."""
-        if not isinstance(payload, dict) or set(payload) != {"topic", "lead"}:
-            raise HubError(400, "Provide topic and lead (an agent route, @name, or null for the default).")
-        if payload["lead"] is not None and not isinstance(payload["lead"], str):
-            raise HubError(400, "lead is an agent route, @name, or null for the default.")
-        return self.hub.set_lead(payload["topic"], payload["lead"], HUMAN)
 
     @staticmethod
     def _activity(db):
@@ -375,8 +373,9 @@ class ControlStore:
                 # A claim, progress note, grant or reassignment changes what the human sees.
                 " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT key || '=' || state || ':' || version"
                 "  || ':' || IFNULL(owner, '') || ':' || updated AS row FROM tasks ORDER BY key)),"
-                " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT topic || '=' || lead AS row"
-                "  FROM channel_leads ORDER BY topic))", (NODE,)).fetchone()
+                # Staffing progress (a session starting on a machine or in the cloud) changes the request chip.
+                " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT task || '@' || version || '=' || state"
+                "  AS row FROM staffing ORDER BY task, version))", (NODE,)).fetchone()
         return hashlib.sha256(json.dumps(values).encode()).hexdigest()[:32]
 
     def topic(self, topic: str):
@@ -476,7 +475,7 @@ class ControlStore:
                                 f"Anyone else can join with the join_topic tool or `one-conv live join {topic}`.")
                 db.execute("INSERT INTO channel_requests VALUES (?, ?, ?, ?, ?)", (ident, digest, topic, announcement, now))
                 # The workspace owner places agents directly; they can still leave on their own.
-                db.executemany("INSERT OR IGNORE INTO members VALUES (?, ?, ?, ?)",
+                db.executemany("INSERT OR IGNORE INTO members (topic, node, address, joined) VALUES (?, ?, ?, ?)",
                                [(topic, NODE, "user", now)]
                                + [(topic, node, local, now) for node, local in payload["members"]])
             else:

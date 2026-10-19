@@ -72,7 +72,7 @@ def test_an_invalid_time_is_refused(hub, item, at):
 
 def test_reporting_creates_no_membership(hub, item):
     hub.report("mac", [{**item, "topic": "release"}])
-    assert hub.topics() == [{"topic": "release", "members": [], "last": AT}]
+    assert hub.topics()[0]["members"] == []
 
 
 def test_history_names_a_tagged_dms_recipient(hub, item):

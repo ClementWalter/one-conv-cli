@@ -34,6 +34,7 @@ from one_conv.archive import (
     SYNC_STATE,
     ArchiveError,
     configured_client,
+    configured_origin,
     conversation_key,
     digest,
     encode,
@@ -583,7 +584,9 @@ def main():
     if args.restore:
         print(json.dumps(restore(reader, client, args.restore)))
         return 0
-    origin = origin_id(reader)
+    # A live node uploads under its node name, which its NODE/harness:id addresses carry.
+    origin = configured_origin() or origin_id(reader)
+    reader.STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock = reader.STATE_DIR / SYNC_LOCK
     if not acquire_lock(lock):
         print(json.dumps({"skipped": "another sync is running"}))

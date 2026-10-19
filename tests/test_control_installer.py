@@ -149,7 +149,18 @@ def test_boat_login_uses_the_documented_stdin_flag(installed):
 
 def test_dependencies_are_explicitly_pinned(installed):
     call = next(argv for argv, kwargs in installed[1].calls if kwargs["stage"] == "python-dependencies")
-    assert tuple(call[-3:]) == installer.DEPENDENCIES
+    assert tuple(call[-len(installer.DEPENDENCIES):]) == installer.DEPENDENCIES
+
+
+@pytest.mark.parametrize("dependency", ["sqlalchemy==2.1.4", "pydantic==2.12.5"])
+def test_archive_storage_dependencies_are_installed(installed, dependency):
+    call = next(argv for argv, kwargs in installed[1].calls if kwargs["stage"] == "python-dependencies")
+    assert dependency in call
+
+
+def test_archive_imports_are_checked_before_the_service_starts(installed):
+    imports = [argv[-1] for argv, kwargs in installed[1].calls if kwargs["stage"] == "runtime-imports"]
+    assert "import archive.server, archive.store" in imports
 
 
 def test_runtime_import_check_uses_optimized_python(installed):

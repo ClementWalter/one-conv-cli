@@ -32,7 +32,8 @@ log = logging.getLogger(__name__)
 UNIT = "one-conv-control.service"
 REPOSITORY = "https://github.com/ClementWalter/one-conv-cli.git"
 BOAT_URL = "https://boat.dev/api/boat/cli/download?platform=linux-x64&channel=prod"
-DEPENDENCIES = ("click==8.3.3", "starlette==1.8.0", "uvicorn==0.54.0")
+# sqlalchemy and pydantic back the conversation archive the controller serves to every node.
+DEPENDENCIES = ("click==8.3.3", "starlette==1.8.0", "uvicorn==0.54.0", "sqlalchemy==2.1.4", "pydantic==2.12.5")
 PAYLOAD_LIMIT = 256_000
 DOWNLOAD_LIMIT = 256 * 1024 * 1024
 STAGES = frozenset({
@@ -280,6 +281,7 @@ def _install(payload, home, runner, downloader, health):
     source = ("import json,sys; from pathlib import Path; from one_conv.control.runtime import application; "
               "application(Path(sys.argv[1]),sys.argv[2],worker_config=json.loads(Path(sys.argv[3]).read_text()))")
     runner([str(python), "-O", "-c", source, str(state), payload["public_origin"], str(config)], stage="runtime-imports")
+    runner([str(python), "-O", "-c", "import archive.server, archive.store"], stage="runtime-imports")
     def content(user):
         return service_unit(python, repository, state, config, payload["public_origin"], home, user=user)
 

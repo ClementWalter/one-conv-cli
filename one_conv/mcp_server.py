@@ -1,6 +1,7 @@
 """Local MCP readers share CLI semantics through isolated, bounded processes; live tools relay messages."""
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -14,11 +15,14 @@ from .namespaces import CLOUD_PRODUCTS, LOCAL_SOURCES
 
 Namespace = Literal["cloud", "local"]
 LAUNCHER = Path(__file__).resolve().parents[1] / "bin" / "one-conv"
+# A live session's address, NODE/harness:id, names a local conversation on whichever machine ran it.
+LIVE_ADDRESS = re.compile(r"(?:[a-z0-9][a-z0-9-]{0,31}/)?(?:claude|codex|omp|cursor):[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def read_cli(namespace: Namespace, command: str, *, query: str | None = None,
              source: str | None = None, limit: int = 30, refresh: bool = False,
-             raw: bool = False, session: str | None = None) -> dict:
+             raw: bool = False, session: str | None = None, around: str | None = None,
+             context: int = 5) -> dict:
     """Capture JSON and diagnostics separately without sharing Click's global state."""
     if namespace not in ("cloud", "local"):
         raise ValueError("namespace must be cloud or local")
@@ -33,8 +37,14 @@ def read_cli(namespace: Namespace, command: str, *, query: str | None = None,
         raise ValueError("Refresh is supported only for cloud listing and reading")
     if session and (namespace != "local" or command != "read"):
         raise ValueError("session selects a local conversation within a project")
+    if around is not None and (namespace != "local" or command != "read"):
+        raise ValueError("around selects turns within one local conversation")
+    if not 0 <= context <= 100:
+        raise ValueError("context must be between 0 and 100")
     actual = "thread" if namespace == "local" and command == "read" else command
-    args = [sys.executable, "-O", str(LAUNCHER), namespace, actual, "--json", "--limit", str(limit)]
+    args = [sys.executable, "-O", str(LAUNCHER), namespace, actual, "--json"]
+    # The turns around one message replace the last-N window.
+    args += ["--around", around, "--context", str(context)] if around is not None else ["--limit", str(limit)]
     if source:
         args += ["--source", source]
     if command == "read":
@@ -86,15 +96,27 @@ def create_server() -> MCPServer:
     @server.tool(annotations=ToolAnnotations(destructiveHint=False), structured_output=True)
     def read_conversation(query: str, namespace: Namespace = "cloud", source: str | None = None,
                           limit: int = 100, raw: bool = False, refresh: bool = False,
-                          session: str | None = None) -> dict[str, Any]:
-        """Read cloud ID/title, or a local project plus optional session ID. Tools/thinking require raw."""
+                          session: str | None = None, around: str | None = None,
+                          context: int = 5) -> dict[str, Any]:
+        """Read cloud ID/title, a local project plus optional session ID, or a live address.
+
+        A live address NODE/harness:id reads that agent session from whichever machine ran it,
+        through the live hub's archive. `around` (an ISO time, or text such as a message id)
+        returns `context` turns before and after the matching turn instead of the last `limit`.
+        Tools/thinking require raw.
+        """
+        if LIVE_ADDRESS.fullmatch(query):
+            namespace = "local"
         return read_cli(namespace, "read", query=query, source=source, limit=limit,
-                        raw=raw, refresh=refresh, session=session)
+                        raw=raw, refresh=refresh, session=session, around=around, context=context)
 
     @server.tool(annotations=readonly, structured_output=True)
     def search_conversations(query: str, namespace: Namespace = "cloud",
                              source: str | None = None, limit: int = 30) -> dict[str, Any]:
-        """Search saved message text, including configured archives."""
+        """Search saved message text, including every machine's archived agent sessions.
+
+        Agent session hits carry `address`, which read_conversation accepts with `around`.
+        """
         return read_cli(namespace, "search", query=query, source=source, limit=limit)
 
     @server.tool(annotations=readonly, structured_output=True)

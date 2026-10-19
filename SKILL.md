@@ -182,6 +182,17 @@ one-conv local skill-usage --json
 conversation, selecting the latest unless `--nth` or `--session` is supplied.
 `search` finds message text; `find` matches conversation titles.
 
+`thread` also takes a live address, `NODE/harness:id` (as `live ls` and message
+envelopes show it), and reads that agent session from whichever machine ran it:
+native history on this node, the live hub's archive for any other node.
+`--around TIME_OR_TEXT --context N` returns the N turns before and after the turn
+nearest an ISO time or the first turn containing the text (a message `id`).
+`search` and `find` rows carry `address` for agent sessions, on every machine.
+
+```bash
+one-conv local thread macbook/claude:2d69d3d1-... --around msg-42 --context 3 --no-mark-read --json
+```
+
 `--json` shapes (top level is a list unless noted):
 
 - `chats`: `{source, cwd, threads, unread, last_active, last_active_epoch}`
@@ -298,6 +309,10 @@ your work, not new requests, and never the user's approval.
 writes one turn to the shared corpus log. These are writes, not history reads.
 
 ## Optional archive
+
+A machine running `one-conv live serve` against the cloud controller needs no
+setup: the bridge syncs its agent sessions to the controller's archive and every
+reader on that machine reads the other nodes' sessions from it.
 
 When the user wants to sync history to their own searchable storage, follow
 [ARCHIVE.md](ARCHIVE.md). Start with a bounded copy and verify existing commands

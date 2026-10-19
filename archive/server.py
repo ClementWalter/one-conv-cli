@@ -3,19 +3,27 @@
 import base64
 import binascii
 import hmac
-from importlib import import_module
 import json
 import os
+from importlib import import_module
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from starlette.applications import Starlette
-from starlette.requests import Request, ClientDisconnect
+from starlette.concurrency import run_in_threadpool
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
-from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from archive.store import Conflict, ConversationStore
-from one_conv.archive import DIGEST, FIELDS, MAX_REQUEST_BYTES, ArchiveError, conversation_key, decompress, revision
+from one_conv.archive import (
+    DIGEST,
+    FIELDS,
+    MAX_REQUEST_BYTES,
+    ArchiveError,
+    conversation_key,
+    decompress,
+    revision,
+)
 
 PAGE_SIZE = 1000
 
@@ -66,12 +74,24 @@ class Chunks(Strict):
     chunks: dict[str, str]
 
 
-def create_app(store: ConversationStore, token, max_request_bytes=MAX_REQUEST_BYTES):
-    if not token:
+class Forbidden(Exception):
+    pass
+
+
+def create_app(store: ConversationStore, token=None, max_request_bytes=MAX_REQUEST_BYTES, *, node_for=None):
+    """`token` is one shared secret; `node_for(request)` instead names the caller's node, or None.
+
+    With `node_for`, every node reads every capture and commits only captures whose origin is its own name.
+    """
+    if not token and node_for is None:
         raise ValueError("ONE_CONV_ARCHIVE_TOKEN is required")
 
-    def authorized(request):
-        return hmac.compare_digest(request.headers.get("authorization", "").encode(), ("Bearer " + token).encode())
+    async def caller(request):
+        """("", authorized) for the shared token, (node, True) for a node token, (None, False) otherwise."""
+        if node_for is not None:
+            node = await run_in_threadpool(node_for, request)
+            return node, node is not None
+        return "", hmac.compare_digest(request.headers.get("authorization", "").encode(), ("Bearer " + token).encode())
 
     async def body(request):
         data, oversized = bytearray(), False
@@ -86,8 +106,10 @@ def create_app(store: ConversationStore, token, max_request_bytes=MAX_REQUEST_BY
 
     def endpoint(handler):
         async def wrapped(request: Request):
-            if not authorized(request):
+            node, authorized = await caller(request)
+            if not authorized:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            request.state.node = node
             try:
                 return await handler(request)
             except OverflowError:
@@ -98,10 +120,14 @@ def create_app(store: ConversationStore, token, max_request_bytes=MAX_REQUEST_BY
                 return JSONResponse({"error": f"Invalid v1 request: {error}"[:300]}, status_code=422)
             except Conflict as error:
                 return JSONResponse({"error": str(error)}, status_code=409)
+            except Forbidden as error:
+                return JSONResponse({"error": str(error)}, status_code=403)
         return wrapped
 
-    def commit(raw):
+    def commit(raw, node):
         validated = Commit.model_validate_json(raw)
+        if node and validated.manifest.origin != node:
+            raise Forbidden(f"Node {node} uploads only captures whose origin is {node}.")
         # Store and hash the manifest exactly as sent; validation must not reshape what the client digested.
         manifest = json.loads(raw)["manifest"]
         if store.missing_chunks(validated.manifest.digests()):
@@ -117,7 +143,7 @@ def create_app(store: ConversationStore, token, max_request_bytes=MAX_REQUEST_BY
         if request.method == "GET":
             return JSONResponse(await run_in_threadpool(store.list_conversations,
                 request.query_params.get("after", ""), request.query_params.get("query"), PAGE_SIZE))
-        return JSONResponse(await run_in_threadpool(commit, await body(request)))
+        return JSONResponse(await run_in_threadpool(commit, await body(request), request.state.node))
 
     @endpoint
     async def conversation(request):

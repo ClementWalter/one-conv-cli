@@ -1,6 +1,7 @@
 """Wire cloud messaging, durable worker jobs and shared accounting into one service."""
 
 import asyncio
+import hashlib
 import logging
 import re
 from contextlib import asynccontextmanager, suppress
@@ -159,6 +160,36 @@ class Workers:
             raise HubError(404, "No such tracked worker or pool") from None
 
 
+# Who the hub starts in the cloud for a request no running session can take.
+STAFF_HARNESS = "claude"
+STAFF_PROFILE = "default"
+
+
+def staff_from_cloud(hub, workers) -> list[dict]:
+    """Submit one cloud worker per request the hub could not staff on a machine; the jobs submitted.
+
+    The job id comes from the task and its version, so a retry after a lost answer finds the
+    same job instead of paying for a second worker.
+    """
+    submitted = []
+    for due in hub.staffing_due():
+        if workers is None:
+            hub.staffing_mark(due["task"], due["version"], "unavailable", "cloud workers are not configured")
+            continue
+        digest = hashlib.sha256(f"{due['task']}@{due['version']}".encode()).hexdigest()
+        spec = {"name": f"req-{digest[:8]}", "harness": STAFF_HARNESS, "model": None,
+                "topic": due["topic"] or "general", "profile": STAFF_PROFILE, "prompt": due["prompt"]}
+        try:
+            job = workers.manager.submit(spec, f"staff-{digest[:24]}")
+        except ValueError as error:
+            hub.staffing_mark(due["task"], due["version"], "unavailable", str(error))
+            continue
+        workers.rate_card(job)
+        hub.staffing_mark(due["task"], due["version"], "submitted", f"cloud worker job {job['id']}")
+        submitted.append(job)
+    return submitted
+
+
 def application(directory, public_origin, *, worker_config=None, session_seconds=30 * 86400):
     """Keep browser cookies and agent bearer authorization on separate API routes."""
     from starlette.concurrency import run_in_threadpool
@@ -225,14 +256,24 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
                 log.error("Worker supervisor could not complete a step")
             await asyncio.sleep(2)
 
+    async def staff_requests():
+        while True:
+            try:
+                await run_in_threadpool(staff_from_cloud, store.hub, workers)
+            except (OSError, RuntimeError, ValueError, HubError):
+                log.error("Cloud staffing could not complete a step")
+            await asyncio.sleep(2)
+
     @asynccontextmanager
     async def lifespan(current):
         async with original_lifespan(current):
-            task = asyncio.create_task(advance_workers()) if workers is not None else None
+            loops = [asyncio.create_task(staff_requests())]
+            if workers is not None:
+                loops.append(asyncio.create_task(advance_workers()))
             try:
                 yield
             finally:
-                if task is not None:
+                for task in loops:
                     task.cancel()
                     with suppress(asyncio.CancelledError):
                         await task

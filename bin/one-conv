@@ -2229,6 +2229,9 @@ def _archive_sync_in_background():
     raw = read_json(state_path)
     state = sync_record(raw)
     _archive_sync_health(state, minutes)
+    # The live bridge (`one-conv live serve`) syncs its hub's archive; commands start only an explicit one.
+    if not os.environ.get("ONE_CONV_ARCHIVE_URL"):
+        return
     if minutes <= 0 or time.time() - (state["started"] or 0) < minutes * 60:
         return
     script = Path(__file__).resolve().parents[1] / "scripts" / "archive-sync.py"
@@ -2356,6 +2359,95 @@ def _recency_order(handle: SessionHandle) -> tuple[float, tuple[str, str, str, s
     return handle.mtime, _record_identity(handle)
 
 
+def _archive_handle(row: dict) -> SessionHandle:
+    return SessionHandle(source=row["source"], uuid=row["session"], project_cwd=row["cwd"], mtime=row["mtime"],
+                         title_hint=row["summary"]["title"], unread_native=row["unread_native"], archive=row)
+
+
+# Live sessions are addressed NODE/harness:id across machines; a bare harness:id is this machine's.
+LIVE_ADDRESS = re.compile(r"(?:(?P<node>[a-z0-9][a-z0-9-]{0,31})/)?(?P<harness>claude|codex|omp|cursor):"
+                          r"(?P<session>[A-Za-z0-9][A-Za-z0-9._-]{0,127})")
+HARNESS_SOURCES = {"claude": ("claude",), "codex": ("codex",), "omp": ("omp",), "cursor": ("cursor", "cursor-cli")}
+SOURCE_HARNESS = {source: harness for harness, sources in HARNESS_SOURCES.items() for source in sources}
+
+
+def _this_node() -> str | None:
+    """This machine's node name on its live hub, read once per command; None without a hub."""
+    context = click.get_current_context(silent=True)
+    if context is not None and "this_node" in context.meta:
+        return context.meta["this_node"]
+    from one_conv.live import hubclient
+    try:
+        hub = hubclient.configured()
+    except hubclient.HubRefused:
+        hub = None
+    node = hub.node if hub else None
+    if context is not None:
+        context.meta["this_node"] = node
+    return node
+
+
+def _handle_address(handle: SessionHandle) -> str | None:
+    """The live address naming this conversation on every machine, or None for non-agent sources."""
+    from one_conv.archive import NODE_NAME
+    harness = SOURCE_HARNESS.get(handle.source)
+    if harness is None:
+        return None
+    node = handle.archive.get("origin") if handle.archive else _this_node()
+    if not (isinstance(node, str) and NODE_NAME.fullmatch(node)):
+        return f"{harness}:{handle.uuid}"  # No hub, or an archive copy uploaded under an installation ID.
+    return f"{node}/{harness}:{handle.uuid}"
+
+
+def _address_handle(address: str) -> SessionHandle:
+    """Resolve NODE/harness:id: native history when NODE is this machine, else the archive's copy from NODE."""
+    from one_conv.archive import NODE_NAME
+    match = LIVE_ADDRESS.fullmatch(address)
+    node, sources, session = match["node"], HARNESS_SOURCES[match["harness"]], match["session"]
+    here = _this_node()
+    origin = node or here
+    newest: dict[tuple[str, str, str, str], SessionHandle] = {}
+    if node is None or here is None or node == here:
+        for project in _native_projects(sources):
+            for handle in _native_project_sessions(project):
+                if handle.uuid.startswith(session):
+                    newest[_record_identity(handle)] = handle
+    archive = _archive_state()
+    for row in archive["rows"] if archive else ():
+        uploader = row.get("origin")
+        # A bare harness:id also covers copies uploaded under an installation ID rather than a node name.
+        owned = origin in (None, uploader) or (node is None and not NODE_NAME.fullmatch(str(uploader)))
+        if row["source"] in sources and row["session"].startswith(session) and owned:
+            handle = _archive_handle(row)
+            existing = newest.get(_record_identity(handle))
+            if not existing or existing.mtime < handle.mtime:
+                newest[_record_identity(handle)] = handle
+    if not newest:
+        where = "this machine" if node is None or node == here else f"the archive for node {node}"
+        hint = "" if archive else " (no archive is configured: run `one-conv live serve` against the controller)"
+        raise click.ClickException(f"No conversation {address} on {where}{hint}.")
+    if len({handle.uuid for handle in newest.values()}) > 1:
+        choices = ", ".join(sorted({handle.uuid for handle in newest.values()})[:10])
+        raise click.ClickException(f"Several conversations match {address}; use the full id: {choices}")
+    return max(newest.values(), key=_recency_order)
+
+
+def _around_index(turns: list[dict], around: str) -> int:
+    """The turn nearest an ISO time, or else the first whose text contains `around` (a live message id)."""
+    moment = _parse_iso_ts(around)
+    if moment is not None:
+        stamped = [(abs(stamp - moment), index) for index, turn in enumerate(turns)
+                   if (stamp := _parse_iso_ts(turn["ts"])) is not None]
+        if not stamped:
+            raise click.ClickException("This conversation's turns carry no timestamps; use text with --around.")
+        return min(stamped)[1]
+    needle = around.casefold()
+    for index, turn in enumerate(turns):
+        if needle in turn["text"].casefold():
+            return index
+    raise click.ClickException(f"No turn contains {around!r}; with --raw, tool calls and thinking are searched too.")
+
+
 def _project_sessions(project: ProjectHandle) -> list[SessionHandle]:
     native = _native_project_sessions(project)
     archive = _archive_state()
@@ -2365,9 +2457,7 @@ def _project_sessions(project: ProjectHandle) -> list[SessionHandle]:
     # Machines or reset state directories can upload one record under several origins; show its newest copy.
     by_record = {_record_identity(h): h for h in native}
     for row in rows:
-        handle = SessionHandle(source=row["source"], uuid=row["session"],
-            project_cwd=row["cwd"], mtime=row["mtime"], title_hint=row["summary"]["title"],
-            unread_native=row["unread_native"], archive=row)
+        handle = _archive_handle(row)
         existing = by_record.get(_record_identity(handle))
         if not existing or existing.mtime < handle.mtime:
             by_record[_record_identity(handle)] = handle
@@ -2867,6 +2957,9 @@ def read(
 @click.option("--nth", default=1, help="Which thread to read, 1 = most recent (default).")
 @click.option("--match", default=0, help="Pick the Nth matching project (1-based).")
 @click.option("--limit", default=0, help="Only show the last N turns (0 = all).")
+@click.option("--around", help="Center on the turn nearest this ISO time, or the first turn containing this text (e.g. a live message id).")
+@click.option("--context", "context_turns", default=5, show_default=True, type=click.IntRange(min=0),
+              help="With --around: turns shown before and after it.")
 @click.option("--raw", is_flag=True, help="Include thinking blocks and tool calls/results.")
 @click.option("--include-subagents", is_flag=True, help="Include forked subagent turns (claude only).")
 @click.option("--no-mark-read", is_flag=True, help="Don't mark this thread as read.")
@@ -2883,6 +2976,8 @@ def thread(
     no_mark_read: bool,
     as_json: bool,
     direct_query: bool = False,
+    around: str | None = None,
+    context_turns: int = 5,
 ) -> None:
     """Read one thread in full, from the project matching QUERY — Slack's
     `thread <channel> <ts>`, with a UUID/--nth position standing in for
@@ -2894,9 +2989,22 @@ def thread(
     Defaults to the most recently active thread; pick another with --nth
     (2 = the one before, ...) or target an exact --session UUID. Marks it
     read (see `unread`) unless --no-mark-read is passed.
+
+    QUERY may instead be a live address, NODE/harness:id (harness claude,
+    codex, omp or cursor), as `one-conv live ls` and message envelopes show
+    it: read from this machine's history when NODE is this machine, and from
+    the live hub's archive otherwise. `--around` narrows the output to the
+    turns around a time or a message.
     """
     sources = selected_sources(source_filter, SOURCES)
-    if direct_query:
+    if around is not None and limit:
+        raise click.UsageError("--around picks its own window; drop --limit.")
+    address_match = None if direct_query else LIVE_ADDRESS.fullmatch(query)
+    if address_match and session_uuid:
+        raise click.UsageError("A live address names one conversation; drop --session.")
+    if address_match:
+        handle = _address_handle(query)
+    elif direct_query:
         sessions = _all_sessions_for(list(_iter_all_projects(sources)))
         # Displayed ID prefixes resolve before titles, independent of account groups.
         matches = [handle for handle in sessions if handle.uuid.startswith(query)]
@@ -2915,8 +3023,14 @@ def thread(
         sessions = _all_sessions_for(projects)
         handle = _pick_session_handle(sessions, session_uuid, nth)
     out = _handle_rendered_turns(handle, raw, include_subagents, limit)
+    anchor = None
+    if around is not None:
+        anchor = _around_index(out, around)
+        start = max(0, anchor - context_turns)
+        out, anchor = out[start:anchor + context_turns + 1], anchor - start
     title = _handle_title(handle)
     tokens = _handle_token_total(handle)
+    address = _handle_address(handle)
 
     if not no_mark_read:
         state = _load_read_state()
@@ -2924,14 +3038,19 @@ def thread(
         _save_read_state(state)
 
     if as_json:
-        click.echo(json.dumps(
-            {"source": handle.source, "session": handle.uuid, "cwd": handle.project_cwd, "title": title, "tokens": tokens, "turns": out},
-            ensure_ascii=False,
-        ))
+        document = {"source": handle.source, "session": handle.uuid, "cwd": handle.project_cwd, "title": title,
+                    "tokens": tokens, "turns": out}
+        if address:
+            document["address"] = address
+        if anchor is not None:
+            document["anchor"] = anchor  # Index in `turns` of the turn --around named.
+        click.echo(json.dumps(document, ensure_ascii=False))
         return
-    click.echo(f"# [{handle.source}] {handle.project_cwd} — thread {handle.uuid} — {title} — {len(out)} turns, {_format_tokens(tokens)} tok\n")
-    for m in out:
-        click.echo(f"{_local_ts(m['ts'])}  {m['role']}: {m['text']}\n")
+    label = f" — {address}" if address else ""
+    click.echo(f"# [{handle.source}] {handle.project_cwd} — thread {handle.uuid}{label} — {title} — {len(out)} turns, {_format_tokens(tokens)} tok\n")
+    for index, m in enumerate(out):
+        marker = ">> " if index == anchor else ""
+        click.echo(f"{marker}{_local_ts(m['ts'])}  {m['role']}: {m['text']}\n")
 
 
 # --- export: the conversation corpus ------------------------------------------
@@ -3133,16 +3252,12 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
                 idx = snippet.lower().find(needle)
                 start = max(0, idx - 80)
                 snippet = ("…" if start else "") + snippet[start : start + 200] + "…"
-            results.append(
-                {
-                    "ts": turn.ts,
-                    "source": h.source,
-                    "cwd": h.project_cwd,
-                    "session": h.uuid,
-                    "role": turn.role,
-                    "text": snippet,
-                }
-            )
+            row = {"ts": turn.ts, "source": h.source, "cwd": h.project_cwd, "session": h.uuid,
+                   "role": turn.role, "text": snippet}
+            address = _handle_address(h)
+            if address:
+                row["address"] = address
+            results.append(row)
             if len(results) >= limit:
                 break
         if len(results) >= limit:
@@ -3239,6 +3354,9 @@ def find(text: str, source_filter: str | None, limit: int, as_json: bool) -> Non
         summary = _handle_summary(h, state)
         if needle not in summary["title"].lower():
             continue
+        address = _handle_address(h)
+        if address:
+            summary = {**summary, "address": address}
         results.append(summary)
 
     results.sort(key=lambda s: s["end"] or s["start"], reverse=True)

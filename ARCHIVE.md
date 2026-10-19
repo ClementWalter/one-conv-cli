@@ -1,5 +1,41 @@
 # Optional conversation archive
 
+## The live controller's archive
+
+The cloud controller (`one-conv live control serve`) serves an archive at
+`/archive` on its public origin, authenticated with the node tokens its hub
+issues. Every node token reads every capture; a node uploads only captures whose
+origin is its own node name.
+
+A machine running `one-conv live serve` needs nothing else. The bridge runs
+`scripts/archive-sync.py` in the background for Claude Code, Codex, Oh My Pi and
+Cursor history, every 5 minutes (`ONE_CONV_ARCHIVE_SYNC_MINUTES`; `0` turns it
+off), with its hub URL and node token, and uploads under its node name. Its
+output goes to `archive-sync.log` in the bridge's state directory. Readers on
+that machine use the same settings, so `local chats`, `search`, `find`, `read`
+and `thread` include every node's sessions. `ONE_CONV_ARCHIVE_URL` set to
+another archive takes precedence; set to an empty value, it turns the archive
+off.
+
+A live address names a session on every machine:
+
+```sh
+one-conv local thread worker-1/codex:019a... --no-mark-read --json
+one-conv local thread macbook/claude:2d69d3d1-... --around 2026-10-19T14:05:00Z --context 3
+one-conv local thread macbook/claude:2d69d3d1-... --around MESSAGE_ID
+```
+
+`NODE` is this machine's node name: native history is read, and the archive
+copy is used when the native files are gone. Any other `NODE` is read from the
+archive. A bare `harness:id` names this machine. `search` and `find` JSON rows
+carry each agent session's `address`. The MCP `read_conversation` tool takes the
+address as `query`, with `around` and `context`.
+
+The controller needs `sqlalchemy` and `pydantic`, which its installer pins;
+without them it logs that the archive is disabled and serves the hub alone.
+
+## A standalone archive
+
 Copy captured history to your own service and use the existing `chats`, `find`,
 `search`, `read`, and `thread` commands. Provider filters and JSON shapes stay the
 same, and archived conversations render exactly as native ones, including `--raw`.

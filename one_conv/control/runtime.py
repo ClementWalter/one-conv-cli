@@ -159,11 +159,35 @@ class Workers:
             raise HubError(404, "No such tracked worker or pool") from None
 
 
+# Every node's bridge syncs its conversations here, under the same origin and node tokens as the hub.
+ARCHIVE_PATH = "/archive"
+
+
+def conversation_archive(directory, hub):
+    """The archive API, or None when its storage dependencies are not installed."""
+    try:
+        from archive.server import create_app
+        from archive.store import SQLiteStore
+    except ImportError as error:
+        log.warning("Conversation archive disabled: %s", error)
+        return None
+    root = Path(directory) / "archive"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    def node_for(request):
+        try:
+            return hub.authenticated_node(request)
+        except HubError:
+            return None
+
+    return create_app(SQLiteStore(f"sqlite:///{root / 'archive.db'}"), node_for=node_for)
+
+
 def application(directory, public_origin, *, worker_config=None, session_seconds=30 * 86400):
     """Keep browser cookies and agent bearer authorization on separate API routes."""
     from starlette.concurrency import run_in_threadpool
     from starlette.responses import JSONResponse
-    from starlette.routing import Route
+    from starlette.routing import Mount, Route
 
     from .server import application as cloud_application
     from .server import bounded_json
@@ -213,6 +237,9 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
             return JSONResponse({"error": "Worker operation is not confirmed; inspect its tracked status"}, status_code=503)
 
     app.router.routes.append(Route("/v1/workers", agent_workers, methods=["GET", "POST"]))
+    archive = conversation_archive(directory, app.state.hub)
+    if archive is not None:
+        app.router.routes.append(Mount(ARCHIVE_PATH, app=archive))
     original_lifespan = app.router.lifespan_context
 
     async def advance_workers():
@@ -238,5 +265,5 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
                         await task
 
     app.router.lifespan_context = lifespan
-    app.state.accounting, app.state.workers = accounting, workers
+    app.state.accounting, app.state.workers, app.state.archive = accounting, workers, archive
     return app

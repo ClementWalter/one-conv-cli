@@ -14,9 +14,12 @@ what the adapter did: `accepted` is not `read`.
 
 import json
 import logging
+import math
 import os
 import signal
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from contextlib import closing
@@ -34,6 +37,10 @@ except ImportError:  # Windows: no flock, so a second bridge is not detected.
 logger = logging.getLogger(__name__)
 
 PUBLISH_SECONDS = 15.0
+# Harness histories a node syncs to its hub's archive, so any session can read them by live address.
+ARCHIVE_SOURCES = ("claude", "codex", "omp", "cursor", "cursor-cli")
+ARCHIVE_SYNC_MINUTES = 5.0
+ARCHIVE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "archive-sync.py"
 # How long one inbox long-poll waits; also how long a stop request can take to be noticed.
 POLL_SECONDS = 5.0
 MAX_BACKOFF = 30.0
@@ -267,11 +274,70 @@ class Bridge:
             self.handle(item)
 
 
+def archive_sync_minutes() -> float:
+    """ONE_CONV_ARCHIVE_SYNC_MINUTES, shared with the CLI's own sync; 0 turns the bridge's sync off."""
+    try:
+        minutes = float(os.environ.get("ONE_CONV_ARCHIVE_SYNC_MINUTES", ARCHIVE_SYNC_MINUTES))
+    except ValueError:
+        return ARCHIVE_SYNC_MINUTES
+    return minutes if math.isfinite(minutes) else ARCHIVE_SYNC_MINUTES
+
+
+class ArchiveSync:
+    """Runs the archive sync for this node's histories in the background, one run at a time.
+
+    Captures go to the hub's own archive with the node token and are uploaded under the node's
+    name, so `NODE/harness:id` names them on every machine. The sync script skips unchanged
+    conversations, so frequent runs cost a listing and a stat per conversation.
+    """
+
+    def __init__(self, minutes: float | None = None, script: Path = ARCHIVE_SCRIPT):
+        self.seconds = (archive_sync_minutes() if minutes is None else minutes) * 60
+        self.script, self.process, self.started = script, None, None
+
+    def poll(self, url: str, token: str, node: str) -> bool:
+        """Start a sync when none runs and the last one started at least the interval ago."""
+        if self.seconds <= 0 or not self.script.is_file():
+            return False
+        if self.process is not None and self.process.poll() is None:
+            return False
+        if self.started is not None and time.monotonic() - self.started < self.seconds:
+            return False
+        from one_conv.archive import HUB_ARCHIVE_PATH
+        # The token travels in the environment, never in argv where other users could read it.
+        env = {**os.environ, "ONE_CONV_ARCHIVE_URL": url + HUB_ARCHIVE_PATH, "ONE_CONV_ARCHIVE_TOKEN": token,
+               "ONE_CONV_ARCHIVE_ORIGIN": node}
+        sources = [argument for source in ARCHIVE_SOURCES for argument in ("--source", source)]
+        log_path = bridge_dir() / "archive-sync.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        output = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            self.process = subprocess.Popen([sys.executable, str(self.script), *sources], env=env,
+                                            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+        except OSError as error:
+            logger.warning("archive sync could not start: %s", error)
+            return False
+        finally:
+            os.close(output)
+        self.started = time.monotonic()
+        return True
+
+    def stop(self) -> None:
+        """End a running sync; an interrupted upload is never acknowledged, so the next run redoes it."""
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
+
 def _report(**state) -> None:
     _write_private(bridge_dir() / "state.json", {**_read(bridge_dir() / "state.json"), **state, "pid": os.getpid()})
 
 
-def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None) -> int:
+def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
+          archive: ArchiveSync | None = None) -> int:
     """Run the bridge until SIGTERM/SIGINT or `stopping()`; returns the exit status."""
     lock_path = bridge_dir() / "serve.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -289,6 +355,7 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None) 
     stopping = stopping or (lambda: False)
     forward = tunnel.Tunnel(tunnel.destination(hub), hub_port) if hub.startswith("ssh://") else None
     ingress, backoff = Ingress(bridge_dir() / "ingress.db"), 1.0
+    archive = archive or ArchiveSync()
     _report(hub=hub, node=node, started=time.time(), last_error=None)
     try:
         while not (stop_requested or stopping()):
@@ -311,6 +378,7 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None) 
                     if forward and not forward.alive():
                         raise tunnel.TunnelError("the ssh forward closed")
                     bridge.step()
+                    archive.poll(url, token, node)
                     _report(last_ok=time.time(), published=len(bridge.directory), notes=bridge.notes)
             except (hubclient.HubUnavailable, tunnel.TunnelError) as error:
                 logger.warning("hub unreachable, retrying in %.0fs: %s", backoff, error)
@@ -331,5 +399,6 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None) 
             backoff = min(backoff * 2, MAX_BACKOFF)
         return 0
     finally:
+        archive.stop()
         _report(stopped=time.time())
         lock.close()

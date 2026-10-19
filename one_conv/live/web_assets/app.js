@@ -676,13 +676,25 @@ function taskLabel(task) {
   // Progress comes only from the task's own state, never from delivery receipts.
   const owner = task.owner ? person(task.owner).name : "";
   switch (task.state) {
-    case "unassigned": return "Unassigned";
+    case "unassigned": return staffingLabel(task.staffing) || "Unclaimed";
     case "assigned": return owner ? "Assigned to " + owner : "Assigned";
     case "working": return owner ? owner + " is working" : "Working";
     case "blocked": return owner ? "Blocked · " + owner : "Blocked";
     case "done": return owner ? "Done · " + owner : "Done";
     case "cancelled": return "Cancelled";
     default: return String(task.state || "Unknown");
+  }
+}
+function staffingLabel(staffing) {
+  // Who the hub is starting for a request no running session could take.
+  if (!staffing) return "";
+  const where = String(staffing.route || "").split("/")[0];
+  switch (staffing.state) {
+    case "node": return "Starting a session on " + where + "…";
+    case "cloud":
+    case "submitted": return "Starting a cloud session…";
+    case "unavailable": return "No session could start";
+    default: return "";
   }
 }
 function shortText(text, limit) {
@@ -720,6 +732,7 @@ function taskChip(task) {
   if (task.owner) state.title = task.owner;
   head.appendChild(state);
   if (validDate(task.updated)) head.appendChild(el("span", "updated " + freshness(task.updated), "task-updated"));
+  if (!task.owner && open && task.staffing && task.staffing.detail) state.title = task.staffing.detail;
   if (task.owner && open && task.owner_online === false) {
     const away = el("span", "Offline", "task-offline");
     away.title = "The owner is not connected. The request waits for it, or reassign it.";

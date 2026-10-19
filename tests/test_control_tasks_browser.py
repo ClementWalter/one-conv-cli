@@ -140,5 +140,5 @@ def test_a_stale_reassignment_shows_the_server_error(stale):
 
 
 def test_a_stale_reassignment_refreshes_the_chip(stale):
-    stale.locator(".task-chip .task-state").filter(has_text="Unassigned").wait_for(timeout=15000)
-    assert stale.locator(".task-chip .task-state").inner_text() == "Unassigned"
+    stale.locator(".task-chip .task-state").filter(has_text="Unclaimed").wait_for(timeout=15000)
+    assert stale.locator(".task-chip .task-state").inner_text() == "Unclaimed"

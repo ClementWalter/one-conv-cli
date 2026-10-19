@@ -72,3 +72,46 @@ def add_bridge_commands(live: click.Group) -> None:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
         click.echo(f"bridge for node {node} via {hub}; stop with Ctrl-C or `one-conv live serve --stop`", err=True)
         sys.exit(bridge.serve(hub, node, token, hub_port))
+
+    @live.command("spawner", context_settings=HELP,
+                  epilog="\b\nExamples:\n"
+                         "  one-conv live spawner --harness claude --cwd ~/work --yes\n"
+                         "  one-conv live spawner --harness claude --cwd ~/work --arg=--dangerously-skip-permissions --yes\n"
+                         "  one-conv live spawner            # show the current settings\n"
+                         "  one-conv live spawner --off --yes")
+    @click.option("--harness", type=click.Choice(["claude", "codex", "omp"]), help="The agent this machine starts.")
+    @click.option("--cwd", type=click.Path(exists=True, file_okay=False, resolve_path=True),
+                  help="The folder sessions start in.")
+    @click.option("--model", help="The model the started sessions use; the harness default otherwise.")
+    @click.option("--arg", "args", multiple=True, help="An extra argument for the harness command (repeatable).")
+    @click.option("--off", is_flag=True, help="Start no sessions for the hub any more.")
+    @click.option("--yes", is_flag=True, help="Save the change; without it, only show what would be saved.")
+    @click.option("--json", "as_json", is_flag=True, help="Emit the settings as JSON.")
+    def spawner_command(harness, cwd, model, args, off, yes, as_json):
+        """Let the hub start a session on this machine when a request finds none running.
+
+        The running bridge reads these settings at its next publication and offers to start
+        sessions; the hub prefers this machine and falls back to a cloud worker when it is
+        offline or the started session does not claim the request in time. Sessions start
+        detached in tmux, unattended: --arg is how they get their permission settings.
+        """
+        if off:
+            change = None
+        elif harness or cwd:
+            if not (harness and cwd):
+                raise click.UsageError("Give both --harness and --cwd, or --off.")
+            change = {"harness": harness, "cwd": cwd, "model": model, "args": list(args)}
+        else:
+            current = bridge.spawn_settings()
+            click.echo(json.dumps(current) if as_json else
+                       (f"starts {current['harness']} in {current['cwd']}"
+                        + (f" with {' '.join(current['args'])}" if current.get("args") else "")
+                        if current else "starts no sessions for the hub"))
+            return
+        if not yes:
+            click.echo(f"would save: {json.dumps(change)}; add --yes")
+            return
+        bridge.save_spawn_settings(change)
+        click.echo(json.dumps(change) if as_json else
+                   ("this machine starts no sessions for the hub" if change is None
+                    else f"this machine starts {harness} sessions in {cwd} when the hub asks"))

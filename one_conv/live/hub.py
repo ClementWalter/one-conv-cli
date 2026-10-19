@@ -21,7 +21,9 @@ A request from a trusted human (a node in `trusted_humans`, sending as "user") b
 in the same commit as its post (see `tasks`). A direct request is owned by its recipient. A
 channel request starts unowned and is offered to every running member: the first claim wins
 and the others then get it as context. A task whose owner stopped running is released and
-offered again. Ownership otherwise changes only through the owner itself (claim, delegate)
+offered again. A request that finds no running session is staffed at once: a spawn order to a
+connected bridge that offers to start sessions, or, when none takes it, a cloud worker that the
+control service starts (`staffing`). Ownership otherwise changes only through the owner itself (claim, delegate)
 or the human (assign), never through the node API on another agent's behalf.
 """
 
@@ -62,6 +64,11 @@ LEASE_SECONDS = 60.0
 MEMBER_GRACE_SECONDS = 600.0
 # A task whose owner session has not been published for this long is released for others to claim.
 OWNER_GRACE_SECONDS = 120.0
+# A spawn order nobody has turned into a claim by then goes to the cloud instead.
+SPAWN_FALLBACK_SECONDS = 90.0
+# Only requests created or released this recently are staffed, so old unowned ones never start sessions.
+STAFF_WINDOW_SECONDS = 3600.0
+SPAWN_HARNESSES = ("claude", "codex", "omp")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tokens (node TEXT PRIMARY KEY, hash TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS nodes (node TEXT PRIMARY KEY, seen REAL NOT NULL);
@@ -81,6 +88,10 @@ CREATE INDEX IF NOT EXISTS pending ON deliveries (to_node, outcome, post);
 CREATE TABLE IF NOT EXISTS welcomed (node TEXT NOT NULL, address TEXT NOT NULL, PRIMARY KEY (node, address));
 CREATE TABLE IF NOT EXISTS session_seen (node TEXT NOT NULL, address TEXT NOT NULL, seen REAL NOT NULL,
     PRIMARY KEY (node, address));
+CREATE TABLE IF NOT EXISTS spawners (node TEXT PRIMARY KEY, harness TEXT NOT NULL, updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS staffing (task TEXT NOT NULL, version INTEGER NOT NULL, route TEXT NOT NULL,
+    state TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created REAL NOT NULL, updated REAL NOT NULL,
+    PRIMARY KEY (task, version));
 """
 GENERAL = "general"
 
@@ -200,10 +211,16 @@ class Hub:
     def _seen(self, db, node: str) -> None:
         db.execute("INSERT OR REPLACE INTO nodes VALUES (?, ?)", (node, time.time()))
 
-    def publish(self, node: str, sessions) -> int:
-        """Replace this node's published sessions and renew its lease; a name already taken is refused."""
+    def publish(self, node: str, sessions, spawn: object = None) -> int:
+        """Replace this node's published sessions and renew its lease; a name already taken is refused.
+
+        `spawn` is the harness this node's bridge starts a session with when the hub asks it to,
+        or None when it starts none.
+        """
         if not isinstance(sessions, list):
             raise HubError(400, "sessions must be a list")
+        if spawn is not None and spawn not in SPAWN_HARNESSES:
+            raise HubError(400, f"spawn is one of {', '.join(SPAWN_HARNESSES)}, or absent")
         rows, names = [], set()
         for item in sessions:
             if not isinstance(item, dict) or not isinstance(item.get("address"), str) or "/" in item["address"]:
@@ -226,6 +243,10 @@ class Hub:
             now = time.time()
             db.executemany("INSERT OR REPLACE INTO session_seen VALUES (?, ?, ?)", [(node, r[1], now) for r in rows])
             db.executemany("UPDATE members SET seen = ? WHERE node = ? AND address = ?", [(now, node, r[1]) for r in rows])
+            if spawn is None:
+                db.execute("DELETE FROM spawners WHERE node = ?", (node,))
+            else:
+                db.execute("INSERT OR REPLACE INTO spawners VALUES (?, ?, ?)", (node, spawn, now))
             self._seen(db, node)
             self._sweep(db, now)
         return len(rows)
@@ -256,7 +277,115 @@ class Hub:
             self._retire(db, key)
             self._offer(db, task)
             released.append(task)
+        self._staff_waiting(db, now)
         return released
+
+    # ── staffing: from no running session to one ─────────────────────────────────────────────────
+
+    def _running(self, db, task: dict, now: float) -> bool:
+        """Whether a running session can take this unowned request: a live member of its channel."""
+        if not task["topic"]:
+            return False
+        return any(a != "user" and self._available(db, f"{n}/{a}", now)
+                   for n, a in self._recipients(db, f"#{task['topic']}", "", ""))
+
+    def _staff(self, db, task: dict, now: float) -> dict:
+        """Start a session for an unowned request: a spawn order to a connected spawner, else the cloud."""
+        row = db.execute("SELECT route, state FROM staffing WHERE task = ? AND version = ?",
+                         (task["key"], task["version"])).fetchone()
+        if row:
+            return {"route": row[0], "state": row[1]}
+        spawner = db.execute("SELECT s.node, s.harness FROM spawners s JOIN nodes n ON n.node = s.node"
+                             " WHERE n.seen >= ? ORDER BY n.seen DESC LIMIT 1", (now - LEASE_SECONDS,)).fetchone()
+        if spawner is None:
+            db.execute("INSERT INTO staffing VALUES (?, ?, 'cloud', 'cloud', '', ?, ?)",
+                       (task["key"], task["version"], now, now))
+            return {"route": "cloud", "state": "cloud"}
+        node, harness = spawner
+        route = f"{node}/spawn:{harness}"
+        msg_id = hashlib.sha256(f"{task['key']}@{task['version']}:spawn".encode()).hexdigest()[:32]
+        from_node, _, sender = task["created_by"].partition("/")
+        digest = hashlib.sha256(json.dumps(["spawn", task["key"], task["version"]]).encode()).hexdigest()
+        self._insert(db, from_node, msg_id, digest, route, sender, task["topic"], "expected", "push",
+                     self.spawn_prompt(db, task), [(node, f"spawn:{harness}", "candidate", "push", task["key"])],
+                     task=task["key"], kind="system")
+        db.execute("INSERT INTO staffing VALUES (?, ?, ?, 'node', '', ?, ?)",
+                   (task["key"], task["version"], route, now, now))
+        return {"route": route, "state": "node"}
+
+    def spawn_prompt(self, db, task: dict) -> str:
+        """The first prompt of a session started for a request: claim it, catch up, then answer."""
+        original = db.execute("SELECT text FROM posts WHERE seq = ?", (task["post"],)).fetchone()
+        where = f" in #{task['topic']}" if task["topic"] else " as a direct message"
+        steps = [(f"Claim it first: the task_claim tool with key=\"{task['key']}\" and version={task['version']}"
+                  f" (CLI: `one-conv live task claim {task['key']} --version {task['version']}`). If the claim is"
+                  " refused, another session has it: stop there and do nothing else.")]
+        if task["topic"]:
+            steps.append(f"Join #{task['topic']} with the join_topic tool to catch up on the channel. To dig into an"
+                         " earlier session, read it with read_conversation using a message's sender address.")
+        steps.append(f"Work the request, answer {task['created_by']} with send_message linked to the task"
+                     " (task and task_version as your claim returned them), then finish with task_update state done.")
+        return (f"A request from {task['created_by']}{where} found no running session, so this session was started"
+                f" for it (task {task['key']}, version {task['version']}).\n\nRequest:\n"
+                f"{original[0] if original else task['title']}\n\n"
+                + "\n".join(f"{i}. {step}" for i, step in enumerate(steps, 1)))
+
+    def _staff_waiting(self, db, now: float) -> None:
+        """Staff recent unowned requests nobody can take, move stalled spawn orders to the cloud, close the rest."""
+        open_states = ",".join("?" * len(tasks.FINISHED))
+        for values in db.execute(f"SELECT {tasks.COLUMNS} FROM tasks WHERE parent IS NULL AND owner IS NULL"
+                                 f" AND state NOT IN ({open_states}) AND updated >= ?",
+                                 (*tasks.FINISHED, now - STAFF_WINDOW_SECONDS)).fetchall():
+            task = tasks._row(values)
+            if not self._running(db, task, now):
+                self._staff(db, task, now)
+        for key, version, route, created in db.execute(
+                "SELECT task, version, route, created FROM staffing WHERE state IN ('node', 'cloud', 'submitted')"
+                ).fetchall():
+            task = tasks.get(db, key)
+            if task is None or task["owner"] is not None or task["state"] in tasks.FINISHED or task["version"] != version:
+                db.execute("UPDATE staffing SET state = 'done', updated = ? WHERE task = ? AND version = ?",
+                           (now, key, version))
+                continue
+            if route == "cloud":
+                continue
+            node, _, address = route.partition("/")
+            outcome = db.execute("SELECT d.outcome FROM deliveries d JOIN posts p ON p.seq = d.post WHERE d.task = ?"
+                                 " AND d.to_node = ? AND d.to_address = ? AND p.kind = 'system' ORDER BY d.rowid DESC"
+                                 " LIMIT 1", (key, node, address)).fetchone()
+            if (outcome and outcome[0] == "refused") or created < now - SPAWN_FALLBACK_SECONDS:
+                db.execute("UPDATE staffing SET route = 'cloud', state = 'cloud', detail = ?, updated = ?"
+                           " WHERE task = ? AND version = ?",
+                           (f"{route} {'refused the spawn' if outcome and outcome[0] == 'refused' else 'did not start a session in time'}",
+                            now, key, version))
+
+    def staffing_due(self) -> list[dict]:
+        """Requests waiting for a cloud worker, with the first prompt that worker gets."""
+        with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._sweep(db, time.time())
+            rows = db.execute("SELECT task, version FROM staffing WHERE state = 'cloud' ORDER BY created").fetchall()
+            due = []
+            for key, version in rows:
+                task = tasks.get(db, key)
+                due.append({"task": key, "version": version, "topic": task["topic"],
+                            "prompt": self.spawn_prompt(db, task)})
+            return due
+
+    def staffing_mark(self, key: str, version: int, state: str, detail: str = "") -> None:
+        """Record what the control service did about a cloud staffing request."""
+        if state not in ("submitted", "unavailable"):
+            raise HubError(400, "a staffing request is submitted or unavailable")
+        with self.lock, self._db() as db:
+            db.execute("UPDATE staffing SET state = ?, detail = ?, updated = ? WHERE task = ? AND version = ?"
+                       " AND state = 'cloud'", (state, detail[:500], time.time(), key, version))
+
+    def staffing(self, key: str) -> dict | None:
+        """The latest staffing of a task, for the human to see who is starting."""
+        with self._db() as db:
+            row = db.execute("SELECT route, state, detail, updated FROM staffing WHERE task = ? ORDER BY version DESC"
+                             " LIMIT 1", (key,)).fetchone()
+        return {"route": row[0], "state": row[1], "detail": row[2], "updated": row[3]} if row else None
 
     def _offer(self, db, task: dict) -> int:
         """Offer an unowned channel request to the channel's running members; how many were offered."""
@@ -470,8 +599,10 @@ class Hub:
                                    [(n, a, "owner", "push", key) if f"{n}/{a}" == owner else
                                     (n, a, "candidate", "push", key) if channel and a != "user" else
                                     (n, a, "observer", "fyi", key) for n, a in recipients])
-                tasks.create(db, key, post_seq=seq, topic=topic, owner=owner, created_by=f"{node}/{sender}",
-                             title=text)
+                task, _ = tasks.create(db, key, post_seq=seq, topic=topic, owner=owner,
+                                       created_by=f"{node}/{sender}", title=text)
+                if channel and not self._running(db, task, time.time()):
+                    self._staff(db, task, time.time())
             elif human:
                 # A human post that asks for nothing (an announcement) informs everyone and wakes nobody.
                 seq = self._insert(db, node, msg_id, digest, target, sender, topic, reply, mode, text,
@@ -857,7 +988,8 @@ def application(hub: Hub):
 
     async def sessions(request):
         if request.method == "PUT":
-            return await handle(request, lambda node, body, _: {"published": hub.publish(node, body.get("sessions"))})
+            return await handle(request, lambda node, body, _: {"published": hub.publish(node, body.get("sessions"),
+                                                                                          body.get("spawn"))})
         return await handle(request, lambda node, body, _: {"sessions": hub.directory()})
 
     async def messages(request):

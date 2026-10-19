@@ -261,9 +261,10 @@ class ControlStore:
             "bridge": {"node": NODE, "running": True, "mode": "cloud"}, "error": None}
 
     @staticmethod
-    def _task_view(task: dict, children: list[dict], online: set[str]) -> dict:
-        """What the human sees on a request: who owns it, its real progress, and who helps."""
+    def _task_view(task: dict, children: list[dict], online: set[str], staffing: dict | None = None) -> dict:
+        """What the human sees on a request: who owns it, its real progress, who helps, and who is starting."""
         return {"key": task["key"], "owner": display_address(task["owner"]) if task["owner"] else None,
+                "staffing": staffing,
                 "owner_online": task["owner"] in online if task["owner"] else False,
                 "state": task["state"], "note": task["note"], "version": task["version"], "updated": task["updated"],
                 "children": [{"key": child["key"], "kind": child["kind"], "owner": display_address(child["owner"]),
@@ -278,7 +279,11 @@ class ControlStore:
         online = {f"{node}/{address}" for node, address, seen, updated in db.execute(
             "SELECT s.node, s.address, n.seen, s.updated FROM sessions s JOIN nodes n ON n.node = s.node")
             if _online(seen, updated, now)}
-        return {seq: self._task_view(task, tasks.children(db, task["key"]), online) for seq, task in roots.items()}
+        staffing = {key: {"route": route, "state": state, "detail": detail} for key, route, state, detail in db.execute(
+            "SELECT task, route, state, detail FROM staffing s WHERE version = (SELECT MAX(version) FROM staffing"
+            " WHERE task = s.task)")}
+        return {seq: self._task_view(task, tasks.children(db, task["key"]), online, staffing.get(task["key"]))
+                for seq, task in roots.items()}
 
     def assign(self, payload):
         """The human gives a request to an agent (or unassigns it); the new owner is woken."""
@@ -367,7 +372,10 @@ class ControlStore:
                 "  FROM read_marks ORDER BY conversation)),"
                 # A claim, progress note, grant or reassignment changes what the human sees.
                 " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT key || '=' || state || ':' || version"
-                "  || ':' || IFNULL(owner, '') || ':' || updated AS row FROM tasks ORDER BY key))", (NODE,)).fetchone()
+                "  || ':' || IFNULL(owner, '') || ':' || updated AS row FROM tasks ORDER BY key)),"
+                # Staffing progress (a session starting on a machine or in the cloud) changes the request chip.
+                " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT task || '@' || version || '=' || state"
+                "  AS row FROM staffing ORDER BY task, version))", (NODE,)).fetchone()
         return hashlib.sha256(json.dumps(values).encode()).hexdigest()[:32]
 
     def topic(self, topic: str):

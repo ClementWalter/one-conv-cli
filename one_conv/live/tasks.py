@@ -1,14 +1,15 @@
 """Requests the human makes, each owned by one agent at a time.
 
 A task is the human's request as one shared piece of work. It is keyed by the post that made
-it ("node:message-id"), so a retried post finds the same task. One agent owns it; the others
-see the request as context and do not act on it. The owner works it, reports progress, can
-hand parts of it to collaborators as child tasks, and is the only one who answers it.
+it ("node:message-id"), so a retried post finds the same task. A channel request starts
+unowned and is offered to every running session in the channel: the first claim wins, the
+others then see it as context. The owner works it, reports progress, can hand parts of it to
+collaborators as child tasks, and is the only one who answers it.
 
 `version` is the ownership epoch: it changes only when the owner changes. Every owner action
-carries the version the agent was given, so an agent that lost the task (reassigned while it
-was away) is refused instead of acting on it. Nothing reopens or reassigns a task by itself:
-an absent owner is shown as such, and only the human reassigns.
+carries the version the agent was given, so an agent that lost the task (released or
+reassigned while it was away) is refused instead of acting on it. A task whose owner session
+has stopped running is released, so another session can claim it.
 
 The functions take an open SQLite connection inside the caller's transaction (BEGIN
 IMMEDIATE), so a task is created in the same commit as the post that made it, and two
@@ -31,8 +32,6 @@ CREATE INDEX IF NOT EXISTS tasks_by_post ON tasks (post_seq);
 CREATE TABLE IF NOT EXISTS task_events (key TEXT NOT NULL, version INTEGER NOT NULL, actor TEXT NOT NULL,
     action TEXT NOT NULL, state TEXT NOT NULL, owner TEXT, note TEXT NOT NULL DEFAULT '', at REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS task_events_by_key ON task_events (key, at);
-CREATE TABLE IF NOT EXISTS channel_leads (topic TEXT PRIMARY KEY, lead TEXT NOT NULL, set_by TEXT NOT NULL,
-    at REAL NOT NULL);
 """
 
 STATES = ("unassigned", "assigned", "working", "blocked", "done", "cancelled")
@@ -44,9 +43,8 @@ CHILD_KINDS = ("read", "implementation", "review")
 NOTE_LIMIT = 2000
 TITLE_LIMIT = 200
 KEY = re.compile(r"[a-z0-9][a-z0-9-]{0,31}:[0-9a-f]{32}(?:/[a-z]+-[0-9a-f]{8})*")
-# A lead is a published name or a full route; the route is resolved when a request arrives.
+# Whom a task goes to: a published name or a full route, resolved when it is given.
 LEAD = re.compile(r"@[a-z0-9][a-z0-9-]{0,31}|[a-z0-9][a-z0-9-]{0,31}/[a-z]+:[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
-DEFAULT_LEAD = "@coordinator"
 
 
 class TaskError(Exception):
@@ -198,7 +196,7 @@ def claim(db: sqlite3.Connection, key: str, actor: str, version: object = None) 
     if task["state"] in FINISHED:
         raise TaskError(409, f"{key} is already {task['state']}", task)
     if task["owner"] is not None:
-        raise TaskError(409, f"{key} is owned by {task['owner']}; ask the human to reassign it if needed", task)
+        raise TaskError(409, f"{key} is already claimed by {task['owner']}: do not work on it", task)
     if version is not None and version != task["version"]:
         raise TaskError(409, f"{key} is at version {task['version']}, not {version!r}", task)
     task.update(owner=actor, state="assigned", version=task["version"] + 1, updated=time.time())
@@ -280,22 +278,17 @@ def transfer(db: sqlite3.Connection, key: str, authority: str, to: str | None, v
     return task
 
 
+def release(db: sqlite3.Connection, key: str, actor: str) -> dict:
+    """Take a task away from an owner that stopped running, so another session can claim it."""
+    task = require(db, key)
+    if task["owner"] is None or task["state"] in FINISHED:
+        return task
+    task.update(owner=None, state="unassigned", version=task["version"] + 1, updated=time.time())
+    _event(db, _save(db, task), actor, "release")
+    return task
+
+
 def check_lead(lead: object) -> str:
     if not isinstance(lead, str) or not LEAD.fullmatch(lead):
-        raise TaskError(400, "a lead is @name or a full NODE/harness:id route")
+        raise TaskError(400, "give @name or a full NODE/harness:id route")
     return lead
-
-
-def set_lead(db: sqlite3.Connection, topic: str, lead: str | None, set_by: str) -> str | None:
-    """Who owns new human requests in this channel; None goes back to the default."""
-    if lead is None:
-        db.execute("DELETE FROM channel_leads WHERE topic = ?", (topic,))
-        return None
-    db.execute("INSERT OR REPLACE INTO channel_leads VALUES (?, ?, ?, ?)",
-               (topic, check_lead(lead), set_by, time.time()))
-    return lead
-
-
-def lead_for(db: sqlite3.Connection, topic: str) -> str:
-    row = db.execute("SELECT lead FROM channel_leads WHERE topic = ?", (topic,)).fetchone()
-    return row[0] if row else DEFAULT_LEAD

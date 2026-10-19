@@ -35,8 +35,8 @@ def test_new_channel_kickoff_reaches_the_chosen_agent(created):
 
 
 def test_new_channel_is_announced_in_general(created):
-    inbox = created[1]["worker"].get("/v1/inbox").json()["messages"]
-    assert any(row["topic"] == "general" and row["text"].startswith("You created #release") for row in inbox)
+    messages = created[1]["browser"].get("/api/topics/general").json()["messages"]
+    assert messages[-1]["text"].startswith("You created #release")
 
 
 def test_new_channel_opens_on_the_phone(created):

@@ -35,10 +35,8 @@ const model = {
   // Read marks the workspace accepted from this tab, per conversation, and the saves in flight.
   readMarks: new Map(),
   reading: new Set(),
-  // Task keys whose assignment this tab is saving, and the channel lead panel's rendered state.
+  // Task keys whose assignment this tab is saving.
   assigning: new Set(),
-  leadSignature: "",
-  leadSaving: false,
 };
 const harnesses = {
   claude: "Claude",
@@ -355,7 +353,7 @@ function rowButton(list, label, mark, active, action, count, unread = 0) {
     button.appendChild(badge);
   } else if (count !== undefined) {
     const amount = el("span", count, "row-count");
-    amount.title = count + " members";
+    amount.title = count + " running now";
     button.appendChild(amount);
   }
   button.addEventListener("click", action);
@@ -375,7 +373,7 @@ function sidebar() {
         model.view.kind === "topic" &&
         model.view.key === topic.topic,
       () => select("topic", topic.topic),
-      (topic.members || []).length,
+      topic.running ?? (topic.members || []).length,
       unreadOf("#" + topic.topic, topic.unread),
     );
   if (!topics.children.length)
@@ -414,13 +412,13 @@ function sidebar() {
   $("direct-count").textContent = model.threads.length || "";
   const people = $("people");
   people.replaceChildren();
-  const offlinePeople = $("offline-people");
-  offlinePeople.replaceChildren();
+  // Sessions come and go: only the running ones are listed; past ones live on in their channels.
   for (const session of model.state.sessions) {
     const p = person(session.address);
     const state = presenceOf(p);
+    if (state.state === "offline") continue;
     const button = rowButton(
-      state.state === "offline" ? offlinePeople : people,
+      people,
       p.name,
       avatar(session.address, "tiny-avatar"),
       false,
@@ -447,11 +445,9 @@ function sidebar() {
   }
   if (!people.children.length)
     people.appendChild(
-      el("li", "No current agent connections are reported.", "sidebar-empty"),
+      el("li", "No session is running right now.", "sidebar-empty"),
     );
   $("agent-count").textContent = model.state.sessions.filter((s) => presenceOf(person(s.address)).state !== "offline").length || "";
-  $("offline-count").textContent = offlinePeople.children.length || "";
-  $("offline-section").hidden = !offlinePeople.children.length;
   $("all-activity").classList.toggle(
     "active",
     model.view && model.view.kind === "activity",
@@ -552,9 +548,12 @@ function intro() {
   if (view.kind === "topic") {
     const chips = el("div", null, "intro-chips");
     const chip = el("span", null, "intro-chip");
+    const topic = currentTopic() || {};
     chip.append(
       icon("people"),
-      document.createTextNode(members().length + " members"),
+      document.createTextNode(
+        (topic.running ?? members().length) + " running · " + (topic.participants || []).length + " took part",
+      ),
     );
     const live = el("span", null, "intro-chip");
     live.append(icon("bolt"), document.createTextNode("Live conversation"));
@@ -1708,88 +1707,7 @@ function format(kind) {
     input.setSelectionRange(start + before.length, start + before.length);
   updateComposer();
 }
-const DEFAULT_LEAD = "@coordinator";
-function renderLead() {
-  // Its own box outside the member list, so the 4 s details refresh never closes an open picker.
-  let box = $("channel-lead");
-  if (!box) {
-    box = el("section", null, "channel-lead");
-    box.id = "channel-lead";
-    $("details-content").before(box);
-  }
-  const topic = model.view && model.view.kind === "topic" ? currentTopic() : null;
-  const info = topic && topic.lead && typeof topic.lead === "object" ? topic.lead : null;
-  if (!info || !model.capabilities.tasks) {
-    box.hidden = true;
-    box.replaceChildren();
-    model.leadSignature = "";
-    return;
-  }
-  box.hidden = false;
-  // Only a connected member of this channel can own its new requests.
-  const members = new Set(topic.members || []);
-  const agents = connectedAgents().filter((agent) => members.has(agent.address));
-  const signature = JSON.stringify([topic.topic, info, model.leadSaving,
-    agents.map((agent) => [agent.address, person(agent.address).name])]);
-  if (signature === model.leadSignature || box.contains(document.activeElement)) return;
-  model.leadSignature = signature;
-  box.replaceChildren(el("h3", "CHANNEL LEAD", "details-section-label"));
-  const row = el("div", null, "lead-row");
-  if (info.route) row.appendChild(avatar(info.route, "small-avatar"));
-  const text = el("div");
-  const name = info.route ? person(info.route).name : String(info.lead || DEFAULT_LEAD);
-  const outside = Boolean(info.route) && info.member === false;
-  const status = el("small", info.available ? "Owns new requests in this channel." :
-    outside ? "Not a member of #" + topic.topic + "; new requests stay unassigned until you assign them." :
-      "Not connected; new requests stay unassigned until you assign them.", outside ? "lead-warning" : "");
-  text.append(el("strong", name + (info.lead === DEFAULT_LEAD ? " · default" : ""), "lead-name"), status);
-  row.appendChild(text);
-  box.appendChild(row);
-  const picker = el("select", null, "lead-picker");
-  picker.setAttribute("aria-label", "Channel lead for #" + topic.topic);
-  const fallback = el("option", "Default (" + DEFAULT_LEAD + ")");
-  fallback.value = "__default";
-  picker.appendChild(fallback);
-  for (const agent of agents) {
-    const option = el("option", person(agent.address).name);
-    option.value = agent.address;
-    picker.appendChild(option);
-  }
-  // The default stays selected even when @coordinator is connected.
-  let current = "__default";
-  const isDefault = info.lead === DEFAULT_LEAD;
-  if (!isDefault && info.route && agents.some((agent) => agent.address === info.route)) current = info.route;
-  else if (!isDefault && info.lead) {
-    const option = el("option", name);
-    option.value = String(info.lead);
-    picker.appendChild(option);
-    current = option.value;
-  }
-  picker.value = current;
-  picker.disabled = model.leadSaving;
-  picker.addEventListener("change", () => setLead(topic.topic, picker.value === "__default" ? null : picker.value));
-  box.appendChild(picker);
-}
-async function setLead(topic, lead) {
-  if (model.leadSaving) return;
-  model.leadSaving = true;
-  if (document.activeElement) document.activeElement.blur();
-  renderLead();
-  try {
-    await post("/api/leads", { topic, lead });
-    toast(lead ? "New requests in #" + topic + " go to " + (lead.startsWith("@") ? lead : person(lead).name) : "#" + topic + " uses the default lead");
-  } catch (error) {
-    if (error instanceof StaleSession) return;
-    toast(error.message);
-  } finally {
-    model.leadSaving = false;
-    model.leadSignature = "";
-  }
-  await refreshState();
-  renderLead();
-}
 function renderDetails() {
-  renderLead();
   const content = $("details-content");
   content.replaceChildren();
   const summary = el("div", null, "details-summary");

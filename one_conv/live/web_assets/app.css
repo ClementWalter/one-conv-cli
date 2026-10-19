@@ -705,7 +705,6 @@ button {
 }
 .row-presence.busy { background: #7a87ca; }
 .row-presence.unverified { background: #b78538; }
-#offline-people .conversation-row { padding-top: 7px; padding-bottom: 7px; }
 .agent-state { font-size: 10px; }
 .conversation-response { padding: 9px 24px; color: var(--muted); background: var(--hover); font-size: 11px; line-height: 1.5; }
 .message-delivery { display: block; margin-top: 6px; color: var(--muted); font-size: 10px; }
@@ -1885,8 +1884,7 @@ button {
   color: var(--selected-text);
   font-size: 10px;
 }
-.task-assign,
-.lead-picker {
+.task-assign {
   max-width: 100%;
   min-width: 0;
   padding: 2px 6px;
@@ -1910,18 +1908,4 @@ button {
   color: var(--muted);
   overflow-wrap: anywhere;
 }
-/* The channel lead: who owns new requests in this channel. */
-.channel-lead { padding-bottom: 6px; border-bottom: 1px solid var(--line); }
-.lead-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 0 18px 8px;
-  min-width: 0;
-}
-.lead-row > div { min-width: 0; }
-.lead-row strong { display: block; font-size: 12px; overflow-wrap: anywhere; }
-.lead-row small { display: block; margin-top: 4px; font-size: 10px; color: var(--muted); line-height: 1.5; }
-.channel-lead .lead-picker { display: block; margin: 0 18px 10px; max-width: calc(100% - 36px); }
 .task-updated { color: var(--muted); font-size: 10px; }
-.lead-row small.lead-warning { color: #be514f; font-weight: 650; }

@@ -1,4 +1,4 @@
-"""The paired human assigns requests and chooses channel leads over real HTTPS."""
+"""Channel requests are offered to running members, and the paired human assigns them, over real HTTPS."""
 
 import pytest
 
@@ -14,7 +14,7 @@ BUILDER = "worker/omp:agent"
 
 @pytest.fixture
 def workspace(real_http_workspace):
-    """Connected agents: @coordinator (the default lead) and @builder in #release, @outsider outside it."""
+    """Connected agents: @coordinator and @builder in #release, @outsider outside it."""
     worker = real_http_workspace["worker"]
     worker.put("/v1/sessions", json={"sessions": [
         {"address": "omp:lead", "name": "coordinator", "status": "idle"},
@@ -43,8 +43,45 @@ def shown_task(workspace):
     return workspace["browser"].get("/api/topics/release").json()["messages"][0]["task"]
 
 
-def test_a_request_is_owned_by_the_default_lead(request_task):
-    assert request_task["owner"] == LEAD
+def test_a_channel_request_starts_unclaimed(request_task):
+    assert request_task["owner"] is None
+
+
+def test_a_channel_request_is_offered_to_its_running_members(workspace, request_task):
+    inbox = workspace["worker"].get("/v1/inbox").json()["messages"]
+    assert sorted(item["to"] for item in inbox if item.get("role") == "candidate") == ["omp:agent", "omp:lead"]
+
+
+def test_a_channel_request_is_not_offered_outside_the_channel(workspace, request_task):
+    inbox = workspace["worker"].get("/v1/inbox").json()["messages"]
+    assert "omp:outsider" not in {item["to"] for item in inbox}
+
+
+def test_the_first_claim_owns_the_request(workspace, request_task):
+    workspace["worker"].post("/v1/tasks/claim", json={"key": request_task["key"], "actor": "omp:agent",
+                                                     "version": request_task["version"]}).raise_for_status()
+    assert shown_task(workspace)["owner"] == BUILDER
+
+
+def channel_state(workspace, topic="release"):
+    topics = workspace["browser"].get("/api/state").json()["topics"]
+    return next(item for item in topics if item["topic"] == topic)
+
+
+def test_the_channel_counts_its_running_members(workspace):
+    assert channel_state(workspace)["running"] == 2
+
+
+def test_the_channel_lists_who_took_part(workspace):
+    workspace["worker"].post("/v1/messages", json={"id": "d" * 32, "from": "omp:agent", "to": "#release",
+                                                  "text": "On it."}).raise_for_status()
+    assert channel_state(workspace)["participants"] == [BUILDER]
+
+
+def test_the_workspace_has_no_lead_route(workspace):
+    response = workspace["browser"].post("/api/leads", json={"topic": "release", "lead": "@builder"},
+                                         headers=workspace["headers"])
+    assert response.status_code in (404, 405)
 
 
 def test_the_session_advertises_tasks(workspace):
@@ -56,13 +93,6 @@ def test_assign_requires_origin_and_csrf(workspace, request_task, drop):
     headers = {key: value for key, value in workspace["headers"].items() if key != drop}
     response = assign(workspace, {"key": request_task["key"], "version": request_task["version"], "to": BUILDER},
                       headers)
-    assert response.status_code == 403
-
-
-@pytest.mark.parametrize("drop", ["Origin", "X-One-Conv-Token"])
-def test_lead_change_requires_origin_and_csrf(workspace, drop):
-    headers = {key: value for key, value in workspace["headers"].items() if key != drop}
-    response = workspace["browser"].post("/api/leads", json={"topic": "release", "lead": "@builder"}, headers=headers)
     assert response.status_code == 403
 
 
@@ -159,73 +189,3 @@ def test_assigning_to_an_unpublished_agent_is_refused(workspace, request_task):
     response = assign(workspace, {"key": request_task["key"], "version": request_task["version"],
                                   "to": "worker/omp:missing"})
     assert response.status_code == 404
-
-
-def lead_of(workspace, topic="release"):
-    topics = workspace["browser"].get("/api/state").json()["topics"]
-    return next(item for item in topics if item["topic"] == topic)["lead"]
-
-
-def test_the_default_lead_is_reported(workspace):
-    assert lead_of(workspace)["lead"] == "@coordinator"
-
-
-@pytest.fixture
-def lead_changed(workspace):
-    response = workspace["browser"].post("/api/leads", json={"topic": "release", "lead": "@builder"},
-                                         headers=workspace["headers"])
-    response.raise_for_status()
-    return workspace, response.json()
-
-
-def test_a_lead_change_answers_with_the_resolved_route(lead_changed):
-    assert lead_changed[1]["route"] == BUILDER
-
-
-def test_a_lead_change_is_reflected_in_state(lead_changed):
-    assert lead_of(lead_changed[0])["lead"] == "@builder"
-
-
-def test_a_lead_change_owns_the_next_request(lead_changed):
-    workspace, _ = lead_changed
-    workspace["browser"].post("/api/messages", json={"id": "c" * 32, "target": "#release", "text": "Next one."},
-                              headers=workspace["headers"]).raise_for_status()
-    assert workspace["browser"].get("/api/topics/release").json()["messages"][-1]["task"]["owner"] == BUILDER
-
-
-def test_resetting_the_lead_restores_the_default(lead_changed):
-    workspace, _ = lead_changed
-    workspace["browser"].post("/api/leads", json={"topic": "release", "lead": None},
-                              headers=workspace["headers"]).raise_for_status()
-    assert lead_of(workspace)["lead"] == "@coordinator"
-
-
-@pytest.mark.parametrize("body", [
-    {"topic": "release"},
-    {"topic": "release", "lead": 3},
-    {"topic": "release", "lead": "builder"},
-    {"topic": "Not A Topic", "lead": "@builder"},
-    {"topic": "release", "lead": "@builder", "extra": True},
-], ids=["no-lead", "bad-type", "bad-lead", "bad-topic", "extra-field"])
-def test_an_invalid_lead_is_refused(workspace, body):
-    response = workspace["browser"].post("/api/leads", json=body, headers=workspace["headers"])
-    assert response.status_code == 400
-
-
-@pytest.fixture
-def outside_lead(workspace):
-    workspace["browser"].post("/api/leads", json={"topic": "release", "lead": "@outsider"},
-                              headers=workspace["headers"]).raise_for_status()
-    return lead_of(workspace)
-
-
-def test_a_non_member_lead_is_not_available(outside_lead):
-    assert outside_lead["available"] is False
-
-
-def test_a_non_member_lead_is_reported_as_not_a_member(outside_lead):
-    assert outside_lead["member"] is False
-
-
-def test_a_member_lead_is_reported_as_a_member(lead_changed):
-    assert lead_of(lead_changed[0])["member"] is True

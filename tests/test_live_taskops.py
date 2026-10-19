@@ -5,7 +5,7 @@ import json
 import pytest
 from click.testing import CliRunner
 
-from one_conv.live import hubclient, router, taskops, tasks, team
+from one_conv.live import hubclient, router, taskops, team
 from one_conv.live.cli import build_live_group
 from one_conv.live.model import LiveSession, envelope
 
@@ -17,6 +17,7 @@ TASK = {"key": KEY, "version": 2, "owner": "mac/claude:lead"}
     ("owner", "You own this request"),
     ("collaborator", "Work only this part"),
     ("observer", "Context only"),
+    ("candidate", "claim it before any work"),
 ])
 def test_the_envelope_tells_each_role_what_it_may_do(role, phrase):
     assert phrase in envelope("Book the train", None, "workspace/user", "expected", "m1", "general", None, TASK, role)
@@ -70,7 +71,7 @@ def test_a_lost_answer_makes_no_local_claim(lost, monkeypatch):
 
 @pytest.fixture
 def local(monkeypatch, tmp_path):
-    """Two live sessions on this machine, a lead named coordinator, and recorded deliveries."""
+    """Two live sessions on this machine in #release, and recorded deliveries."""
     monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path))
     monkeypatch.setattr(hubclient, "configured", lambda: None)
     sessions = {"claude": [LiveSession("claude", "lead", delivery="inbox")],
@@ -93,32 +94,48 @@ def local(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-def local_request(local):
+def offered(local):
     return router.send("#release", "Ship it", None, "user", message_id="b" * 32)
 
 
-def test_a_local_human_request_is_owned_by_the_lead(local_request):
-    assert local_request["task"]["owner"] == "claude:lead"
+@pytest.fixture
+def local_request(offered):
+    """The request once claude:lead claimed it."""
+    return {**offered, "task": taskops.claim(offered["task"]["key"], "claude:lead", offered["task"]["version"])}
 
 
-def test_a_local_human_request_wakes_only_the_lead(local, local_request):
+def test_a_local_human_request_starts_unclaimed(offered):
+    assert offered["task"]["owner"] is None
+
+
+def test_a_local_human_request_wakes_every_member(local, offered):
     pushed, _ = local
-    assert [address for address, _ in pushed] == ["claude:lead"]
+    assert sorted(address for address, _ in pushed) == ["claude:lead", "codex:peer"]
 
 
-def test_a_local_human_request_reaches_the_others_as_context(local, local_request):
-    _, filed = local
-    assert [target for target, _ in filed] == ["codex:peer"]
+def test_a_local_human_request_is_an_offer(local, offered):
+    pushed, _ = local
+    assert all('role="candidate"' in wrapped for _, wrapped in pushed)
+
+
+def test_a_local_claim_wakes_the_claimer(local, local_request):
+    pushed, _ = local
+    assert pushed[-1][0] == "claude:lead"
+
+
+def test_a_local_claim_gives_the_claimer_owner_instructions(local, local_request):
+    pushed, _ = local
+    assert "You own this request" in pushed[-1][1]
+
+
+def test_a_local_claim_is_refused_to_a_second_session(local, local_request):
+    with pytest.raises(taskops.TaskOpError):
+        taskops.claim(local_request["task"]["key"], "codex:peer", local_request["task"]["version"])
 
 
 def test_a_retried_local_request_finds_the_same_task(local, local_request):
     again = router.send("#release", "Ship it", None, "user", message_id="b" * 32)
     assert again["task"]["key"] == local_request["task"]["key"]
-
-
-def test_a_local_request_without_a_live_lead_is_unassigned(local):
-    taskops.local_call(lambda db: tasks.set_lead(db, "release", "local/claude:gone", "user"))
-    assert router.send("#release", "Ship it", None, "user", message_id="c" * 32)["task"]["owner"] is None
 
 
 def test_a_local_observer_cannot_answer_by_leaving_the_task_out(local, local_request):
@@ -232,7 +249,7 @@ def cli(local):
 
 @pytest.mark.parametrize("command", [["task", "--help"], ["task", "list", "--help"], ["task", "show", "--help"],
                                      ["task", "claim", "--help"], ["task", "update", "--help"],
-                                     ["task", "delegate", "--help"], ["lead", "--help"], ["lead", "set", "--help"]])
+                                     ["task", "delegate", "--help"]])
 def test_every_task_command_has_help_with_examples(cli, command):
     runner, group = cli
     assert "Examples:" in runner.invoke(group, command).output
@@ -249,11 +266,6 @@ def test_the_cli_refuses_an_update_from_a_non_owner(cli, local_request):
     result = runner.invoke(group, ["task", "update", local_request["task"]["key"], "--version",
                                    str(local_request["task"]["version"]), "--state", "done", "--as", "codex:peer"])
     assert result.exit_code != 0
-
-
-def test_the_cli_sets_a_local_lead(cli):
-    runner, group = cli
-    assert "#release: @peer" in runner.invoke(group, ["lead", "set", "#release", "@peer"]).output
 
 
 def test_send_requires_task_and_version_together(cli):

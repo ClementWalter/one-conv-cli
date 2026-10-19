@@ -78,7 +78,14 @@ def claim(key: str, address: str, version: int | None = None) -> dict:
     hub = _hub()
     if hub is not None:
         return _remote(lambda: hub.task_action("claim", {"key": key, "actor": address, "version": version}))
-    return local_call(lambda db: tasks.claim(db, key, address, version))
+    before = local_call(lambda db: tasks.require(db, tasks.check_key(key)))
+    task = local_call(lambda db: tasks.claim(db, key, address, version))
+    if task["version"] != before["version"]:
+        from . import router
+        # The claimer had the request as an offer; it now gets the owner's instructions.
+        router.deliver_task(address, f"You claimed task {task['key']} (version {task['version']}).\n{task['title']}",
+                            "user", task, "owner")
+    return task
 
 
 def update(key: str, address: str, version: int, state: str | None = None, note: str | None = None) -> dict:

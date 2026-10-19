@@ -50,12 +50,18 @@ def call(url, path, token, method="GET", body=None):
 
 @pytest.fixture
 def workspace(tmp_path):
-    """A workspace store with two agents on node mac, served over HTTP with mac's token."""
+    """A workspace store with two agents of #general on node mac, served over HTTP with mac's token.
+
+    The request is offered to both; claude:lead has claimed it.
+    """
     store = ControlStore(tmp_path / "store")
     token = store.add_node("mac")
     store.hub.publish("mac", [{"address": "claude:lead", "name": "coordinator"}, {"address": "codex:peer"}])
+    store.hub.join("mac", "general", "claude:lead")
+    store.hub.join("mac", "general", "codex:peer")
     url, stop = serve(application(store.hub))
     receipt = store.send({"id": "a" * 32, "target": "#general", "text": "Book the train"})
+    store.hub.claim("mac", {"key": store.hub.task_list()[0]["key"], "actor": "claude:lead", "version": 1})
     yield store, url, token, receipt["receipt"]
     stop()
 
@@ -75,14 +81,14 @@ def test_an_agent_reads_its_task_over_http(workspace, key):
 def test_the_owner_reports_progress_over_http(workspace, key):
     _, url, token, _ = workspace
     _status, body = call(url, "/v1/tasks/update", token, "POST",
-                        {"key": key, "actor": "claude:lead", "version": 1, "state": "working", "note": "on it"})
+                        {"key": key, "actor": "claude:lead", "version": 2, "state": "working", "note": "on it"})
     assert body["task"]["state"] == "working"
 
 
 def test_an_observer_update_over_http_is_refused_with_the_current_owner(workspace, key):
     _, url, token, _ = workspace
     status, body = call(url, "/v1/tasks/update", token, "POST",
-                        {"key": key, "actor": "codex:peer", "version": 1, "state": "done"})
+                        {"key": key, "actor": "codex:peer", "version": 2, "state": "done"})
     assert (status, body["task"]["owner"]) == (409, "mac/claude:lead")
 
 
@@ -126,8 +132,9 @@ def upgraded(tmp_path):
     """A hub with a human broadcast still queued from before tasks, then opened by the workspace."""
     directory = tmp_path / "store"
     directory.mkdir(mode=0o700)
-    old = Hub(str(directory / "hub.sqlite3"), general="general")
+    old = Hub(str(directory / "hub.sqlite3"))
     old.publish("mac", [{"address": "claude:lead", "name": "coordinator"}, {"address": "codex:peer"}])
+    old.join("mac", "general", "claude:lead")
     old.publish("workspace", [{"address": "user"}])
     old.send("workspace", {"id": "b" * 32, "from": "user", "to": "#general", "text": "Old request",
                            "reply": "expected", "mode": "push"}, join_sender=True)

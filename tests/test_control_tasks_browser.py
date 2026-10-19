@@ -1,4 +1,4 @@
-"""A human request's owner on the phone: who has it, reassigning it, and the channel lead, at 320 and 390 px."""
+"""A human request's owner on the phone: who claimed it and reassigning it, at 320 and 390 px."""
 
 import pytest
 
@@ -15,7 +15,7 @@ OVERFLOW = "() => document.documentElement.scrollWidth <= window.innerWidth"
 
 @pytest.fixture
 def workspace(real_http_workspace):
-    """#release has @coordinator (the default lead, with a long session title) and @builder; @outsider is not in it."""
+    """#release has @coordinator (with a long session title), who claimed the request, and @builder; @outsider is not in it."""
     worker = real_http_workspace["worker"]
     worker.put("/v1/sessions", json={"sessions": [
         {"address": "omp:lead", "name": "coordinator", "status": "idle", "title": "Coordinates every release " * 4},
@@ -26,6 +26,9 @@ def workspace(real_http_workspace):
     real_http_workspace["browser"].post(
         "/api/messages", json={"id": "a" * 32, "target": "#release", "text": "Ship the release notes today."},
         headers=real_http_workspace["headers"]).raise_for_status()
+    task = real_http_workspace["browser"].get("/api/topics/release").json()["messages"][0]["task"]
+    worker.post("/v1/tasks/claim", json={"key": task["key"], "actor": "omp:lead",
+                                         "version": task["version"]}).raise_for_status()
     return real_http_workspace
 
 
@@ -48,7 +51,7 @@ def phone(browser, workspace, request):
     context.close()
 
 
-def test_a_request_shows_the_lead_as_owner(phone):
+def test_a_claimed_request_shows_its_owner(phone):
     page, _ = phone
     assert page.locator(".task-chip .task-state").inner_text() == "Assigned to @coordinator"
 
@@ -139,67 +142,3 @@ def test_a_stale_reassignment_shows_the_server_error(stale):
 def test_a_stale_reassignment_refreshes_the_chip(stale):
     stale.locator(".task-chip .task-state").filter(has_text="Unassigned").wait_for(timeout=15000)
     assert stale.locator(".task-chip .task-state").inner_text() == "Unassigned"
-
-
-@pytest.fixture
-def details(phone):
-    page, workspace = phone
-    page.locator("#members-toggle").click()
-    page.locator("#channel-lead .lead-name").wait_for()
-    return page, workspace
-
-
-def test_the_details_show_the_channel_lead(details):
-    page, _ = details
-    assert page.locator("#channel-lead .lead-name").inner_text() == "@coordinator · default"
-
-
-def test_the_lead_picker_offers_only_channel_members(details):
-    page, _ = details
-    labels = page.locator("#channel-lead select option").all_inner_texts()
-    assert labels == ["Default (@coordinator)", "@builder", "@coordinator"]
-
-
-def test_the_lead_picker_starts_on_the_default(details):
-    page, _ = details
-    assert page.locator("#channel-lead select").input_value() == "__default"
-
-
-def test_the_channel_lead_panel_does_not_overflow(details):
-    page, _ = details
-    assert page.evaluate(OVERFLOW) is True
-
-
-@pytest.fixture
-def lead_changed(details):
-    page, workspace = details
-    page.locator("#channel-lead select").select_option(label="@builder")
-    page.locator("#channel-lead .lead-name").filter(has_text="@builder").wait_for(timeout=15000)
-    return page, workspace
-
-
-def test_changing_the_lead_updates_the_panel(lead_changed):
-    page, _ = lead_changed
-    assert page.locator("#channel-lead .lead-name").inner_text() == "@builder"
-
-
-def test_changing_the_lead_is_stored(lead_changed):
-    _, workspace = lead_changed
-    topics = workspace["browser"].get("/api/state").json()["topics"]
-    assert next(t for t in topics if t["topic"] == "release")["lead"]["lead"] == "worker/omp:agent"
-
-
-@pytest.fixture
-def outside_lead(phone):
-    """The lead is set elsewhere to a connected agent who is not in #release."""
-    page, workspace = phone
-    workspace["browser"].post("/api/leads", json={"topic": "release", "lead": "@outsider"},
-                              headers=workspace["headers"]).raise_for_status()
-    page.locator("#members-toggle").click()
-    warning = page.locator("#channel-lead .lead-warning")
-    warning.wait_for(timeout=15000)
-    return warning
-
-
-def test_a_non_member_lead_is_flagged(outside_lead):
-    assert outside_lead.inner_text().startswith("Not a member of #release")

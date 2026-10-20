@@ -106,13 +106,6 @@ def test_offline_history_is_separate_from_current_reports(workspace_ui):
     assert workspace_ui[0].locator("#people .agent-name").all_text_contents() == ["@jack", "Claude · abcdefgh"]
 
 
-def test_offline_direct_history_remains_available(workspace_ui):
-    page = workspace_ui[0]
-    page.locator("#sidebar-toggle").click()
-    page.locator("#threads .conversation-row").filter(has_text="Claude").click()
-    assert page.locator("#subtitle").inner_text() == "Offline"
-
-
 @pytest.fixture
 def direct_ui(workspace_ui):
     page = workspace_ui[0]

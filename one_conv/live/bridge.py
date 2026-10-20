@@ -45,6 +45,7 @@ PUBLISH_SECONDS = 15.0
 ARCHIVE_SOURCES = ("claude", "codex", "omp", "cursor", "cursor-cli")
 ARCHIVE_SYNC_MINUTES = 5.0
 ARCHIVE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "archive-sync.py"
+LAUNCHER = Path(__file__).resolve().parents[2] / "bin" / "one-conv"
 # How long one inbox long-poll waits; also how long a stop request can take to be noticed.
 POLL_SECONDS = 5.0
 MAX_BACKOFF = 30.0
@@ -394,8 +395,54 @@ def _report(**state) -> None:
     _write_private(bridge_dir() / "state.json", {**_read(bridge_dir() / "state.json"), **state, "pid": os.getpid()})
 
 
+class PromptSync:
+    """Runs `one-conv report-prompts` in the background every PROMPT_SYNC_SECONDS, one run at a time.
+
+    The launcher reads this machine's transcripts, so the prompts a human types into a running
+    session reach the hub as that human's messages (see `prompts`).
+    """
+
+    def __init__(self, seconds: float | None = None, launcher: Path = LAUNCHER):
+        from .prompts import PROMPT_SYNC_SECONDS
+        self.seconds = PROMPT_SYNC_SECONDS if seconds is None else seconds
+        self.launcher, self.process, self.started = launcher, None, None
+
+    def poll(self, url: str, token: str, node: str) -> bool:
+        """Start a run when none runs and the last one started at least the interval ago."""
+        if self.seconds <= 0 or not self.launcher.is_file():
+            return False
+        if self.process is not None and self.process.poll() is None:
+            return False
+        if self.started is not None and time.monotonic() - self.started < self.seconds:
+            return False
+        # The token travels in the environment, never in argv where other users could read it.
+        env = {**os.environ, "ONE_CONV_HUB_URL": url, "ONE_CONV_HUB_TOKEN": token, "ONE_CONV_HUB_NODE": node}
+        log_path = bridge_dir() / "prompts.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        output = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            self.process = subprocess.Popen([sys.executable, "-O", str(self.launcher), "report-prompts"], env=env,
+                                            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+        except OSError as error:
+            logger.warning("prompt sync could not start: %s", error)
+            return False
+        finally:
+            os.close(output)
+        self.started = time.monotonic()
+        return True
+
+    def stop(self) -> None:
+        """End a running sync; positions move only on the hub's answer, so the next run redoes it."""
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
+
 def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
-          archive: ArchiveSync | None = None) -> int:
+          archive: ArchiveSync | None = None, prompts: PromptSync | None = None) -> int:
     """Run the bridge until SIGTERM/SIGINT or `stopping()`; returns the exit status."""
     lock_path = bridge_dir() / "serve.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -413,7 +460,7 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
     stopping = stopping or (lambda: False)
     forward = tunnel.Tunnel(tunnel.destination(hub), hub_port) if hub.startswith("ssh://") else None
     ingress, backoff = Ingress(bridge_dir() / "ingress.db"), 1.0
-    archive = archive or ArchiveSync()
+    archive, prompts = archive or ArchiveSync(), prompts or PromptSync()
     _report(hub=hub, node=node, started=time.time(), last_error=None)
     try:
         while not (stop_requested or stopping()):
@@ -437,6 +484,7 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
                         raise tunnel.TunnelError("the ssh forward closed")
                     bridge.step()
                     archive.poll(url, token, node)
+                    prompts.poll(url, token, node)
                     _report(last_ok=time.time(), published=len(bridge.directory), notes=bridge.notes)
             except (hubclient.HubUnavailable, tunnel.TunnelError) as error:
                 logger.warning("hub unreachable, retrying in %.0fs: %s", backoff, error)
@@ -458,5 +506,6 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
         return 0
     finally:
         archive.stop()
+        prompts.stop()
         _report(stopped=time.time())
         lock.close()

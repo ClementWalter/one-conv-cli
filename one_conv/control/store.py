@@ -46,7 +46,8 @@ def private_database(path: Path):
 
 
 def display_address(address: str) -> str:
-    return "user" if address == HUMAN else address
+    """The workspace has one human: the paired mailbox and any machine's terminal are both You."""
+    return "user" if address == HUMAN or address.endswith("/user") else address
 
 
 def validate_message(payload: object) -> dict:
@@ -99,8 +100,13 @@ def validate_channel(payload: object) -> dict:
 
 
 def _provenance(row: dict) -> dict:
-    """Say where a reported row comes from: the sending machine's local message log."""
-    if row.get("reported"):
+    """Say where a reported row comes from: a prompt typed into the session's terminal, or the sending
+    machine's local message log."""
+    if row.get("reported") and row["from"] == "user":
+        row["terminal"] = True
+        row["delivery"] = {**row["delivery"], "label": "Typed in the terminal",
+                           "detail": "You typed this into the session's terminal; the session answered there."}
+    elif row.get("reported"):
         row["delivery"] = {**row["delivery"], "detail": row["delivery"]["detail"] + (
             " From the sending machine's local message log; nobody was notified again. Older local copies may"
             " be shortened to 20,000 characters.")}
@@ -294,10 +300,11 @@ class ControlStore:
                 "SELECT p.seq,p.id,p.from_node,p.sender,d.to_node || '/' || d.to_address,p.topic,p.reply,p.mode,"
                 "p.text,p.created,d.outcome,d.outcome_at,p.reported FROM posts p JOIN deliveries d ON d.post=p.seq "
                 # Directness comes from the original target, so a topic-tagged DM stays in its pair's thread.
-                # Only conversations with the human are shown; agents' messages to each other are theirs.
-                "WHERE p.target NOT LIKE '#%' AND p.kind IS NOT 'system' AND ((p.from_node = ? AND p.sender = 'user')"
+                # Only conversations with the human are shown; agents' messages to each other are theirs. The human
+                # writes from the paired workspace or from a machine's terminal, whose prompts its bridge reports.
+                "WHERE p.target NOT LIKE '#%' AND p.kind IS NOT 'system' AND (p.sender = 'user'"
                 " OR (d.to_node = ? AND d.to_address = 'user')) ORDER BY p.created DESC, p.seq DESC LIMIT ?",
-                (NODE, NODE, MESSAGES_SHOWN)).fetchall()
+                (NODE, MESSAGES_SHOWN)).fetchall()
             baseline, marks = unread.marks(db)
             shown = [values[0] for values in rows]
             acks = self.hub._acks(db, shown)

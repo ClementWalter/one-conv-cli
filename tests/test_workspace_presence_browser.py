@@ -147,7 +147,7 @@ def test_bubble_delivery_uses_only_reported_evidence(direct_ui, state, label):
 
 
 def test_unanswered_request_has_one_conversation_status(direct_ui):
-    assert direct_ui[0].locator("#conversation-response").inner_text() == "No later message from this agent yet."
+    assert direct_ui[0].locator("#conversation-response").inner_text().startswith("You wrote last and ")
 
 
 def test_unrelated_agent_message_does_not_count_as_a_return(direct_ui):
@@ -155,7 +155,7 @@ def test_unrelated_agent_message_does_not_count_as_a_return(direct_ui):
     threads[0]["messages"].append({"id": "b" * 32, "from": "laptop/claude:abcdefghij", "to": "user",
                                    "text": "An unrelated message.", "at": time.time()})
     page.reload(wait_until="networkidle")
-    assert page.locator("#conversation-response").inner_text() == "No later message from this agent yet."
+    assert page.locator("#conversation-response").inner_text().startswith("You wrote last and ")
 
 
 def test_later_return_is_activity_without_claiming_causal_reply(direct_ui):

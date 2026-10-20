@@ -849,8 +849,10 @@ function conversationResponse(rows) {
   const request = pairRows.filter((row) => row.from === "user").at(-1);
   if (!request) return;
   const later = pairRows.filter((row) => row.from === peer && Number(row.at) > Number(request.at)).at(-1);
+  // The nearest thing to a receipt: whether the agent has said anything since the human's last message.
   node.textContent = later ? "Latest message from " + person(peer).name + " · " + freshness(later.at) +
-    ". Messages have no read or reply-to receipts." : "No later message from this agent yet.";
+    ". Messages have no read or reply-to receipts." : "You wrote last and " + person(peer).name +
+    " has not answered since. Messages have no read receipts.";
   node.hidden = false;
 }
 async function refreshView(force = false) {

@@ -35,7 +35,7 @@ def workspace(tmp_path):
         if scope.get("path") == "/v1/accounting/events":
             sizes.append(size)
 
-    server = uvicorn.Server(uvicorn.Config(measured, log_level="error", access_log=False))
+    server = uvicorn.Server(uvicorn.Config(measured, log_level="error", access_log=False, timeout_graceful_shutdown=1))
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
     try:

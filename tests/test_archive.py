@@ -40,7 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def serve(app):
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
-    server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False))
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False, timeout_graceful_shutdown=1))
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
 
@@ -828,12 +828,14 @@ def test_unavailable_archive_warns_and_keeps_native_results(tmp_path):
     env = fixture_env(tmp_path)
     write_claude(env)
     with socket.socket() as reserved:
-        reserved.bind(("127.0.0.1", 0))  # Bound but not listening: connection must fail.
-        env.update(ONE_CONV_ARCHIVE_URL=f"http://127.0.0.1:{reserved.getsockname()[1]}", ONE_CONV_ARCHIVE_TOKEN="secret")
-        for args in (("search", "Quartz"), ("chats",), ("thread", "ancestry", "--no-mark-read")):
-            result = run(env, "bin/one-conv", "local", *args, "--source", "claude", "--json", success=False)
-            assert result.returncode == 0 and "unavailable" in result.stderr and "native history only" in result.stderr
-            assert json.loads(result.stdout)
+        reserved.bind(("127.0.0.1", 0))
+        port = reserved.getsockname()[1]
+    # Nothing listens there any more, so the connection is refused at once instead of timing out.
+    env.update(ONE_CONV_ARCHIVE_URL=f"http://127.0.0.1:{port}", ONE_CONV_ARCHIVE_TOKEN="secret")
+    for args in (("search", "Quartz"), ("chats",), ("thread", "ancestry", "--no-mark-read")):
+        result = run(env, "bin/one-conv", "local", *args, "--source", "claude", "--json", success=False)
+        assert result.returncode == 0 and "unavailable" in result.stderr and "native history only" in result.stderr
+        assert json.loads(result.stdout)
 
 
 def test_failed_capture_does_not_starve_older_history(tmp_path, archive):

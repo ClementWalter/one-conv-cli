@@ -1,4 +1,4 @@
-"""Prompts typed into a terminal session reach the workspace as the human's messages: filtered, dated, once, no wake."""
+"""A terminal session's conversation reaches the workspace: typed prompts and text replies, filtered, dated, once, no wake."""
 
 import json
 import os
@@ -68,7 +68,7 @@ class StubClient:
 
 
 def test_a_relayed_envelope_is_not_a_prompt():
-    assert prompts.prompts(thread([relayed()]), [relayed()], 0, False) == []
+    assert prompts.conversation(thread([relayed()]), [relayed()], 0, False) == []
 
 
 @pytest.mark.parametrize("text", [
@@ -79,53 +79,58 @@ def test_a_relayed_envelope_is_not_a_prompt():
 ])
 def test_slash_command_plumbing_is_not_a_prompt(text):
     turns = [StubTurn("user", text)]
-    assert prompts.prompts(thread(turns), turns, 0, False) == []
+    assert prompts.conversation(thread(turns), turns, 0, False) == []
 
 
 def test_a_bare_image_attachment_turn_is_not_a_prompt():
     turns = [StubTurn("user", "[Image: source: /tmp/images/1.png]")]
-    assert prompts.prompts(thread(turns), turns, 0, False) == []
+    assert prompts.conversation(thread(turns), turns, 0, False) == []
 
 
 def test_a_prompt_retyped_longer_before_any_answer_replaces_the_interrupted_one():
     turns = [typed("yes ok make sense", "2026-10-20T10:00:00Z"), typed("yes ok make sense, and deploy it", "2026-10-20T10:00:30Z")]
-    assert [row["text"] for row in prompts.prompts(thread(turns), turns, 0, False)] == ["yes ok make sense, and deploy it"]
+    assert [row["text"] for row in prompts.conversation(thread(turns), turns, 0, False)] == ["yes ok make sense, and deploy it"]
 
 
 def test_a_prompt_repeated_after_an_answer_is_a_new_prompt():
     turns = [typed("yes"), StubTurn("assistant", "Done."), typed("yes")]
-    assert len(prompts.prompts(thread(turns), turns, 0, False)) == 2
+    assert [row["text"] for row in prompts.conversation(thread(turns), turns, 0, False)] == ["yes", "Done.", "yes"]
 
 
 def test_a_tool_result_turn_is_not_a_prompt():
     turns = [tool_result()]
-    assert prompts.prompts(thread(turns), turns, 0, False) == []
+    assert prompts.conversation(thread(turns), turns, 0, False) == []
 
 
-def test_an_assistant_turn_is_not_a_prompt():
+def test_an_assistant_text_turn_is_a_reply():
     turns = [StubTurn("assistant", "Done.")]
-    assert prompts.prompts(thread(turns), turns, 0, False) == []
+    assert [row["role"] for row in prompts.conversation(thread(turns), turns, 0, False)] == ["assistant"]
+
+
+def test_an_assistant_turn_without_prose_is_left_out():
+    turns = [StubTurn("assistant", "", blocks=[{"type": "tool_use", "name": "Bash", "input": {}}])]
+    assert prompts.conversation(thread(turns), turns, 0, False) == []
 
 
 def test_a_typed_prompt_keeps_its_index_and_time():
     turns = [StubTurn("assistant", "Hello"), typed("fix the sidebar", "2026-10-20T10:05:00Z")]
-    assert prompts.prompts(thread(turns), turns, 0, False) == [
-        {"index": 1, "ts": "2026-10-20T10:05:00Z", "text": "fix the sidebar"}]
+    assert prompts.conversation(thread(turns), turns, 0, False)[1] == {
+        "index": 1, "ts": "2026-10-20T10:05:00Z", "role": "user", "text": "fix the sidebar"}
 
 
 def test_turns_before_the_position_are_left_out():
     turns = [typed("old"), StubTurn("assistant", "ok"), typed("new")]
-    assert [row["text"] for row in prompts.prompts(thread(turns), turns, 2, False)] == ["new"]
+    assert [row["text"] for row in prompts.conversation(thread(turns), turns, 2, False)] == ["new"]
 
 
 def test_first_sight_keeps_only_the_recent_prompts():
     turns = [typed(f"prompt {i}") for i in range(prompts.FIRST_SIGHT + 5)]
-    assert len(prompts.prompts(thread(turns), turns, None, False)) == prompts.FIRST_SIGHT
+    assert len(prompts.conversation(thread(turns), turns, None, False)) == prompts.FIRST_SIGHT
 
 
 def test_a_spawned_sessions_first_prompt_is_the_order_not_the_human():
     turns = [typed("review the migration"), StubTurn("assistant", "ok"), typed("thanks")]
-    assert [row["text"] for row in prompts.prompts(thread(turns), turns, 0, True)] == ["thanks"]
+    assert [row["text"] for row in prompts.conversation(thread(turns), turns, 0, True)] == ["ok", "thanks"]
 
 
 def test_prompt_id_is_stable():
@@ -137,21 +142,27 @@ def test_prompt_id_is_32_hex_characters():
 
 
 def test_item_carries_the_turns_own_time():
-    assert prompts.item(NODE, SESSION, {"index": 0, "ts": "2026-10-20T10:00:00Z", "text": "hi"})["at"] == 1_792_490_400.0
+    row = {"index": 0, "ts": "2026-10-20T10:00:00Z", "role": "user", "text": "hi"}
+    assert prompts.item(NODE, SESSION, row)["at"] == 1_792_490_400.0
 
 
-def test_item_is_from_the_human_to_the_session_and_expects_no_reply():
-    row = prompts.item(NODE, SESSION, {"index": 0, "ts": "2026-10-20T10:00:00Z", "text": "hi"})
+def test_a_prompt_is_from_the_human_to_the_session_and_expects_no_reply():
+    row = prompts.item(NODE, SESSION, {"index": 0, "ts": "2026-10-20T10:00:00Z", "role": "user", "text": "hi"})
     assert (row["from"], row["to"], row["reply"], row["outcome"]) == ("user", SESSION, "none", "accepted")
+
+
+def test_a_reply_is_from_the_session_to_the_human():
+    row = prompts.item(NODE, SESSION, {"index": 1, "ts": "2026-10-20T10:00:01Z", "role": "assistant", "text": "Done."})
+    assert (row["from"], row["to"]) == (SESSION, "user")
 
 
 # --- reporting ------------------------------------------------------------------------------------
 
 
-def test_report_sends_the_new_prompts(home):
+def test_report_sends_the_new_prompts_and_replies(home):
     client = StubClient()
-    prompts.report(client, NODE, {SESSION: thread([typed("first")])}, {})
-    assert [item["text"] for item in client.batches[0]] == ["first"]
+    prompts.report(client, NODE, {SESSION: thread([typed("first"), StubTurn("assistant", "Done.")])}, {})
+    assert [item["text"] for item in client.batches[0]] == ["first", "Done."]
 
 
 def test_report_moves_the_position_once_the_hub_answered(home):
@@ -199,15 +210,28 @@ def hub(tmp_path):
 
 @pytest.fixture
 def reported():
-    return prompts.item(NODE, SESSION, {"index": 0, "ts": "2026-10-20T10:00:00Z", "text": "fix the sidebar"})
+    return prompts.item(NODE, SESSION, {"index": 0, "ts": "2026-10-20T10:00:00Z", "role": "user", "text": "fix the sidebar"})
+
+
+@pytest.fixture
+def reply():
+    return prompts.item(NODE, SESSION, {"index": 1, "ts": "2026-10-20T10:00:05Z", "role": "assistant", "text": "Fixed."})
 
 
 def test_hub_records_a_terminal_prompt(hub, reported):
     assert hub.report(NODE, [reported])["results"][0]["status"] == "recorded"
 
 
-def test_hub_refuses_a_report_addressed_to_the_human(hub, reported):
+def test_hub_records_a_terminal_reply(hub, reply):
+    assert hub.report(NODE, [reply])["results"][0]["status"] == "recorded"
+
+
+def test_hub_refuses_a_report_from_the_human_to_the_human(hub, reported):
     assert hub.report(NODE, [{**reported, "to": "user"}])["results"][0]["status"] == "refused"
+
+
+def test_hub_refuses_a_report_to_the_workspace_human(hub, reply):
+    assert hub.report(NODE, [{**reply, "to": "workspace/user"}])["results"][0]["status"] == "refused"
 
 
 def test_a_terminal_prompt_wakes_nobody(hub, reported):
@@ -219,10 +243,10 @@ def test_a_terminal_prompt_wakes_nobody(hub, reported):
 
 
 @pytest.fixture
-def store(tmp_path, reported):
+def store(tmp_path, reported, reply):
     store = ControlStore(tmp_path / "workspace")
     store.hub.add_token(NODE)
-    store.hub.report(NODE, [reported])
+    store.hub.report(NODE, [reported, reply])
     return store
 
 
@@ -234,15 +258,19 @@ def test_workspace_shows_the_prompt_as_you(store):
     assert store.direct()["threads"][0]["messages"][0]["from"] == "user"
 
 
-def test_workspace_says_the_prompt_was_typed_in_the_terminal(store):
-    assert store.direct()["threads"][0]["messages"][0]["delivery"]["label"] == "Typed in the terminal"
+def test_workspace_shows_the_reply_from_the_session_in_the_same_thread(store):
+    assert store.direct()["threads"][0]["messages"][1]["from"] == f"{NODE}/{SESSION}"
 
 
-def test_workspace_marks_the_prompt_as_terminal(store):
-    assert store.direct()["threads"][0]["messages"][0]["terminal"] is True
+def test_workspace_marks_mirrored_turns(store):
+    assert [m["mirrored"] for m in store.direct()["threads"][0]["messages"]] == [True, True]
 
 
-def test_a_terminal_prompt_is_not_unread(store):
+def test_a_mirrored_turn_carries_no_terminal_label(store):
+    assert "terminal" not in json.dumps(store.direct()["threads"][0]["messages"]).lower()
+
+
+def test_an_old_terminal_reply_is_not_unread(store):
     assert store.direct()["threads"][0]["unread"] == 0
 
 
@@ -296,10 +324,10 @@ def served(tmp_path, home, monkeypatch):
 
 
 def test_report_prompts_command_reports_this_machines_sessions(served):
-    turns = [typed("fix the sidebar"), relayed()]
+    turns = [typed("fix the sidebar"), relayed(), StubTurn("assistant", "Fixed.")]
     command = prompts.build_prompts_command(lambda addresses: ({SESSION: thread(turns)}, []), lambda: [SESSION])
     result = CliRunner().invoke(command, ["--json"])
-    assert json.loads(result.output)["recorded"] == 1
+    assert json.loads(result.output)["recorded"] == 2
 
 
 def test_report_prompts_command_needs_a_hub(home, monkeypatch):

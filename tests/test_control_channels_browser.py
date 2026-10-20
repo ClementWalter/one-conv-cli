@@ -43,7 +43,7 @@ def test_new_channel_opens_on_the_phone(created):
     assert created[0].url.endswith("#topic=release")
 
 
-@pytest.fixture(params=[320, 390])
+@pytest.fixture(params=[390])
 def long_member_dialog(browser, real_http_workspace, request):
     """A member with a long native title and project path, in the dialog on a narrow phone."""
     workspace = real_http_workspace

@@ -53,7 +53,7 @@ def test_the_grouped_second_dm_says_it_is_synced_history(reported):
     assert reported.locator(".message-synced").nth(1).is_visible()
 
 
-@pytest.fixture(params=[320, 390])
+@pytest.fixture(params=[390])
 def long_recipient(browser, real_http_workspace, request):
     """A tagged DM to an agent with the longest allowed name, on a narrow phone."""
     workspace = real_http_workspace

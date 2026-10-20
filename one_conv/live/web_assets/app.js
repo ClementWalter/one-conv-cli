@@ -362,9 +362,12 @@ function rowButton(list, label, mark, active, action, count, unread = 0) {
 function sidebar() {
   const topics = $("topics");
   topics.replaceChildren();
+  const archived = $("archived-topics");
+  archived.replaceChildren();
+  // Archived channels stay reachable, folded away from the main list.
   for (const topic of model.state.topics)
     rowButton(
-      topics,
+      topic.archived ? archived : topics,
       topic.topic,
       el("span", "#", "hash"),
       model.view &&
@@ -382,7 +385,9 @@ function sidebar() {
         "sidebar-empty",
       ),
     );
-  $("topic-count").textContent = model.state.topics.length || "";
+  $("topic-count").textContent = model.state.topics.filter((topic) => !topic.archived).length || "";
+  $("archived-count").textContent = archived.children.length || "";
+  $("archived-section").hidden = !archived.children.length;
   const threads = $("threads");
   threads.replaceChildren();
   for (const thread of model.threads) {
@@ -555,7 +560,12 @@ function intro() {
     );
     const live = el("span", null, "intro-chip");
     live.append(icon("bolt"), document.createTextNode("Live conversation"));
-    chips.append(chip, live);
+    const archived = Boolean(topic.archived);
+    const archive = el("button", archived ? "Bring back" : "Archive", "intro-chip archive-channel");
+    archive.type = "button";
+    archive.title = archived ? "Show this channel in your list again" : "Hide this channel from your list; agents can still read it";
+    archive.addEventListener("click", () => archiveChannel(view.key, !archived));
+    chips.append(chip, live, archive);
     box.appendChild(chips);
   }
 }
@@ -1039,6 +1049,7 @@ async function session() {
     $("show-costs").hidden = !model.capabilities.accounting;
     $("logout-device").hidden = !data.authenticated;
     $("generate-invitation").hidden = !model.capabilities.pairing;
+    $("sign-out-others").hidden = !model.capabilities.sign_out_others;
     $("device-connect").hidden = !model.capabilities.pairing;
     updateComposer();
     return model.authenticated;
@@ -1133,6 +1144,21 @@ async function disconnectDevice() {
   } catch (error) { toast(error.message); }
 }
 
+async function signOutOthers() {
+  // Keeps only this device: every other browser and any unused invitation stops working.
+  $("sign-out-others").disabled = true;
+  $("sign-out-feedback").textContent = "Signing out other devices…";
+  try {
+    const result = await post("/api/devices/sign-out-others", {});
+    clearInvitation();
+    $("sign-out-feedback").textContent = result.signed_out === 1 ? "1 other device was signed out. Only this one stays connected."
+      : result.signed_out + " other devices were signed out. Only this one stays connected.";
+  } catch (error) {
+    $("sign-out-feedback").textContent = error.message;
+  } finally {
+    $("sign-out-others").disabled = false;
+  }
+}
 function clearInvitation() {
   invitationGeneration += 1;
   deviceInvitation = null;
@@ -1620,6 +1646,16 @@ function format(kind) {
     input.setSelectionRange(start + before.length, start + before.length);
   updateComposer();
 }
+async function archiveChannel(topic, archived) {
+  try {
+    await post("/api/channels/archive", { topic, archived });
+    toast(archived ? "#" + topic + " archived. Find it under Archived." : "#" + topic + " is back in your channels.");
+  } catch (error) {
+    toast(error.message);
+  }
+  model.signature = "";
+  await refreshState();
+}
 function renderDetails() {
   const content = $("details-content");
   content.replaceChildren();
@@ -1651,7 +1687,9 @@ function renderDetails() {
       el("strong", p.name),
       el(
         "small",
-        isHuman(address) ? "Human" : personContext(p),
+        isHuman(address) ? "Human"
+          : (model.view && model.view.kind === "topic" && !((currentTopic() || {}).working || []).includes(address)
+            ? "Watching · " : "Working here · ") + personContext(p),
       ),
     );
     if (!isHuman(address)) {
@@ -1871,6 +1909,7 @@ $("pair-device").addEventListener("click", connectDevice);
 $("logout-device").addEventListener("click", disconnectDevice);
 $("device-menu").addEventListener("click", () => $("device-dialog").showModal());
 $("generate-invitation").addEventListener("click", generateInvitation);
+$("sign-out-others").addEventListener("click", signOutOthers);
 $("copy-invitation").addEventListener("click", copyInvitation);
 $("share-invitation").addEventListener("click", shareInvitation);
 $("device-dialog").addEventListener("close", clearInvitation);

@@ -82,6 +82,16 @@ class AuthStore:
             return bool(db.execute("UPDATE browser_sessions SET revoked=? WHERE hash=? AND revoked IS NULL",
                                    (self.clock(), _hash(cookie))).rowcount)
 
+    def revoke_others(self, cookie: str) -> int:
+        """Disconnect every browser but this one and cancel unused pairing links; how many were disconnected."""
+        if not isinstance(cookie, str) or not TOKEN.fullmatch(cookie):
+            return 0
+        with private_database(self.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("DELETE FROM pairing WHERE consumed IS NULL")
+            return db.execute("UPDATE browser_sessions SET revoked=? WHERE revoked IS NULL AND hash != ?",
+                              (self.clock(), _hash(cookie))).rowcount
+
     def revoke_all_sessions(self) -> int:
         with private_database(self.path) as db:
             return db.execute("UPDATE browser_sessions SET revoked=? WHERE revoked IS NULL", (self.clock(),)).rowcount

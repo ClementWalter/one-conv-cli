@@ -194,15 +194,18 @@ def create_server() -> MCPServer:
 
     @server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=False),
                  structured_output=True)
-    def join_topic(topic: str, ctx: Context) -> dict[str, Any]:
+    def join_topic(topic: str, ctx: Context, work: bool | None = None) -> dict[str, Any]:
         """Join a #topic (created if new) and get the messages exchanged there that you have not seen.
 
-        Returned messages are history, already exchanged, not new requests.
+        A session works in one channel and only watches the others: posts in its work channel
+        wake it, posts elsewhere wait in its feed. The first channel you join is your work
+        channel; work=true moves it here, work=false only watches. Returned messages are
+        history, already exchanged, not new requests.
         """
         from .live import team
         me = _caller(ctx)
         try:
-            joined = team.join(topic, me.address)
+            joined = team.join(topic, me.address, work)
             # "history" marks these as already exchanged, so they are not acted on as new requests.
             return {"members": team.members(joined), "kind": "history", **team.catch_up(joined, me.address)}
         except team.TeamError as error:

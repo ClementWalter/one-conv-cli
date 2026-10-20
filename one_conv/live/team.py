@@ -169,11 +169,12 @@ def _remember_member(topic: str, address: str) -> None:
     _write(_topic_dir(topic) / "meta.json", meta)
 
 
-def join(topic: str, address: str) -> str:
+def join(topic: str, address: str, work: bool | None = None) -> str:
+    """Join TOPIC; through a hub, `work` makes it the session's work channel (True) or only watches it (False)."""
     topic = _check("topic", topic)
     hub = _hub()
     if hub is not None:
-        _hub_call(lambda: hub.join(topic, address))
+        _hub_call(lambda: hub.join(topic, address, work))
         with _locked():
             _remember_member(topic, address)
         return topic

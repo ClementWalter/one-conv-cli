@@ -301,14 +301,17 @@ def build_live_group(launcher: list[str]) -> click.Group:
     @live.command("join", context_settings=HELP, epilog=examples('one-conv live join release-4-2', 'one-conv live join release-4-2 --as codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03'))
     @click.argument("topic")
     @click.option("--as", "as_address", help="Session that joins; defaults to the calling agent.")
-    def join_command(topic, as_address):
+    @click.option("--work/--watch", "work", default=None,
+                  help="Make TOPIC this session's work channel, or only watch it. Default: work here if you work nowhere yet.")
+    def join_command(topic, as_address, work):
         """Join TOPIC (creating it if needed) and catch up on what was exchanged there.
 
-        Members receive every message sent to #TOPIC from then on.
+        A session works in one channel and watches the others: posts in its work channel
+        wake it, posts in watched channels wait in its feed.
         """
         try:
             me = _session(as_address)
-            joined = team.join(topic, me.address)
+            joined = team.join(topic, me.address, work)
             result = team.catch_up(joined, me.address)
         except (team.TeamError, router.LiveError) as error:
             raise click.ClickException(str(error)) from None

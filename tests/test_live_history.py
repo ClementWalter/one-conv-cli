@@ -238,16 +238,10 @@ def test_the_bridge_reports_a_local_dm(home, served, row):
     assert served[1].report_history()["recorded"] == 1
 
 
-def test_a_reported_dm_appears_in_the_workspace_thread(home, served, row):
+def test_a_reported_agent_dm_stays_out_of_the_human_direct_threads(home, served, row):
     _log(home, row)
     served[1].report_history()
-    assert served[0].direct()["threads"][0]["pair"] == "macbook/claude:c2 macbook/codex:c1"
-
-
-def test_a_reported_dm_shows_its_original_outcome(home, served, row):
-    _log(home, row)
-    served[1].report_history()
-    assert served[0].direct()["threads"][0]["messages"][0]["delivery"]["state"] == "accepted"
+    assert served[0].direct()["threads"] == []
 
 
 def test_reported_rows_are_not_sent_again(home, served, row):
@@ -375,11 +369,6 @@ def test_a_channel_post_is_not_marked_directed(tagged):
 
 def test_a_tagged_dm_keeps_its_recipient(tagged):
     assert tagged.topic("release")["messages"][0]["to"] == "macbook/claude:c2"
-
-
-def test_a_tagged_dm_stays_in_its_pairs_thread(tagged):
-    pairs = [thread["pair"] for thread in tagged.direct()["threads"]]
-    assert "macbook/claude:c2 macbook/codex:c1" in pairs
 
 
 def test_a_channel_post_stays_out_of_direct_threads(tagged):

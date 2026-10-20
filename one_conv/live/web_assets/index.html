@@ -229,6 +229,12 @@
             <button id="new-channel" class="section-add" type="button" aria-label="Create a channel" title="Create a channel" hidden>+</button>
             <ul id="topics" class="conversation-list"></ul>
           </section>
+          <section id="archived-section" class="sidebar-section" hidden>
+            <button class="section-heading" data-section="archived-topics" type="button" aria-expanded="false">
+              <svg class="icon tiny" aria-hidden="true"><use href="#i-chevron" /></svg><span>Archived</span><span id="archived-count" class="section-count"></span>
+            </button>
+            <ul id="archived-topics" class="conversation-list" hidden></ul>
+          </section>
           <section class="sidebar-section">
             <button
               class="section-heading"
@@ -523,6 +529,8 @@
         </div>
         <p id="invitation-feedback" class="quiet-copy" role="status"></p>
       </section>
+      <button id="sign-out-others" class="secondary-button" type="button" hidden>Sign out all other devices</button>
+      <p id="sign-out-feedback" class="quiet-copy" role="status"></p>
       <button id="logout-device" class="secondary-button" type="button" hidden>Disconnect this device</button>
       <p class="quiet-copy">Disconnecting removes this device’s access. It doesn’t stop your teammates.</p>
     </dialog>

@@ -294,8 +294,10 @@ class ControlStore:
                 "SELECT p.seq,p.id,p.from_node,p.sender,d.to_node || '/' || d.to_address,p.topic,p.reply,p.mode,"
                 "p.text,p.created,d.outcome,d.outcome_at,p.reported FROM posts p JOIN deliveries d ON d.post=p.seq "
                 # Directness comes from the original target, so a topic-tagged DM stays in its pair's thread.
-                "WHERE p.target NOT LIKE '#%' AND p.kind IS NOT 'system' ORDER BY p.created DESC, p.seq DESC LIMIT ?",
-                (MESSAGES_SHOWN,)).fetchall()
+                # Only conversations with the human are shown; agents' messages to each other are theirs.
+                "WHERE p.target NOT LIKE '#%' AND p.kind IS NOT 'system' AND ((p.from_node = ? AND p.sender = 'user')"
+                " OR (d.to_node = ? AND d.to_address = 'user')) ORDER BY p.created DESC, p.seq DESC LIMIT ?",
+                (NODE, NODE, MESSAGES_SHOWN)).fetchall()
             baseline, marks = unread.marks(db)
             shown = [values[0] for values in rows]
             acks = self.hub._acks(db, shown)
@@ -337,8 +339,9 @@ class ControlStore:
                 # Staffing progress (a session starting on a machine or in the cloud) shows under the post.
                 " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT task || '@' || version || '=' || state"
                 "  AS row FROM staffing ORDER BY task, version)),"
-                # A session acking a post adds a check mark under it.
-                " (SELECT COUNT(*) FROM post_acks)", (NODE,)).fetchone()
+                # A session acking a post adds a check mark under it; archiving moves a channel.
+                " (SELECT COUNT(*) FROM post_acks),"
+                " (SELECT IFNULL(group_concat(topic, ','), '') FROM archived_topics)", (NODE,)).fetchone()
         return hashlib.sha256(json.dumps(values).encode()).hexdigest()[:32]
 
     def topic(self, topic: str):
@@ -401,6 +404,14 @@ class ControlStore:
             **({"topic": payload["target"][1:]} if payload["target"].startswith("#") else {}),
             "notice": "Stored durably; delivery acceptance does not mean the recipient has read it."}}
 
+    def archive_channel(self, payload):
+        """The human hides a channel from the list, or brings it back; agents still find and read it."""
+        if not isinstance(payload, dict) or set(payload) != {"topic", "archived"} or type(payload["archived"]) is not bool:
+            raise HubError(400, "Provide topic and archived (true or false).")
+        if not isinstance(payload["topic"], str) or not TOPIC.fullmatch(payload["topic"]):
+            raise HubError(400, "Choose a valid channel.")
+        return self.hub.archive(payload["topic"], payload["archived"])
+
     def create_channel(self, payload):
         """Add the human and the chosen agents, post the kickoff in the channel and announce it in #general.
 
@@ -433,10 +444,12 @@ class ControlStore:
                 announcement = (f"You created #{topic}: {summary}\nMembers: {who}.\n"
                                 f"Anyone else can join with the join_topic tool or `one-conv live join {topic}`.")
                 db.execute("INSERT INTO channel_requests VALUES (?, ?, ?, ?, ?)", (ident, digest, topic, announcement, now))
-                # The workspace owner places agents directly; they can still leave on their own.
+                # The workspace owner places agents directly, as their work channel; they can still leave.
                 db.executemany("INSERT OR IGNORE INTO members (topic, node, address, joined) VALUES (?, ?, ?, ?)",
                                [(topic, NODE, "user", now)]
                                + [(topic, node, local, now) for node, local in payload["members"]])
+                db.executemany("UPDATE members SET work = (topic = ?) WHERE node = ? AND address = ?",
+                               [(topic, node, local) for node, local in payload["members"]])
             else:
                 announcement = request[1]
         kickoff = self.hub.send(NODE, {"id": ident, "from": "user", "to": f"#{topic}", "text": payload["purpose"],

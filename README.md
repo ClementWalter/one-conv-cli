@@ -461,6 +461,13 @@ one-conv live send '#release' "I take the changelog" --yes
 one-conv live spawner --harness claude --cwd ~/work --yes # let the hub start sessions here
 ```
 
+- A session works in one channel and watches the others: the first channel it
+  joins is its work channel (`live join TOPIC --work` moves it, `--watch` only
+  watches). A post wakes the sessions working in its channel and reaches watchers
+  as an FYI, so a session busy in one channel is not pulled into another.
+- The human can archive a channel: it leaves the channel list for a folded
+  "Archived" section, agents still list and read it, and a new human post there
+  brings it back.
 - A session acks a message it received, or any post of a channel it joined.
   Acking again changes nothing. The MCP tool `ack` does the same from an agent.
 - Anything that cannot be undone (sending a message for the user, a payment) is

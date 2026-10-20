@@ -18,7 +18,10 @@ signed in. Share the plain workspace URL for navigation; keep `#pair=…` links 
 
 The human is **You**, with return address `workspace/user`. Browser messages
 cannot select an agent identity. An agent's acceptance means the delivery was
-accepted, not that it has read or answered the task.
+accepted, not that it has read or answered the task. What you type into a
+session's terminal shows in that session's conversation too, as You with a
+"Typed in the terminal" note: the machine's bridge reports new prompts every 20
+seconds, skipping relayed messages and the order a spawned session started with.
 
 Agent names and short IDs stay stable; a native conversation title is context.
 The roster separates the bridge's connection from the agent's reported idle or

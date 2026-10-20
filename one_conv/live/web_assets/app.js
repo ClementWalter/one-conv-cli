@@ -775,7 +775,12 @@ function renderRows(rows, force = false) {
     }
     fill();
     content.appendChild(body);
-    if (row.reported === true) {
+    if (row.terminal === true) {
+      // Typed at a keyboard into the session, mirrored here by that machine's bridge.
+      const typed = el("span", "Typed in the terminal", "message-note message-synced");
+      typed.title = "You typed this into the session's terminal; the session answered there.";
+      content.appendChild(typed);
+    } else if (row.reported === true) {
       // Shown on every bubble, grouped or not: this copy is the sending machine's record.
       const synced = el("span", "Synced history", "message-note message-synced");
       synced.title = "From the sending machine's local message log; nobody was notified again.";

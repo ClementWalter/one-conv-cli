@@ -4096,6 +4096,10 @@ _feed_command = build_feed_command(_feed_find_threads, _feed_whoami, _feed_root,
 _feed_command.hidden = True
 cli.add_command(_feed_command)
 
+from one_conv.live.prompts import build_prompts_command  # noqa: E402
+
+cli.add_command(build_prompts_command(_feed_find_threads, _feed_live_addresses))
+
 install_namespaces(cli, lambda: _chatgpt_accounts(), lambda: _claude_accounts())
 
 

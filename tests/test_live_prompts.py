@@ -71,6 +71,32 @@ def test_a_relayed_envelope_is_not_a_prompt():
     assert prompts.prompts(thread([relayed()]), [relayed()], 0, False) == []
 
 
+@pytest.mark.parametrize("text", [
+    "<command-name>/model</command-name>\n<command-message>model</command-message>",
+    "<command-message>commit</command-message>\n<command-name>/commit</command-name>",
+    "<local-command-caveat>The command below was run directly in Claude Code.</local-command-caveat>",
+    "<local-command-stdout>Kept model as Mythos</local-command-stdout>",
+])
+def test_slash_command_plumbing_is_not_a_prompt(text):
+    turns = [StubTurn("user", text)]
+    assert prompts.prompts(thread(turns), turns, 0, False) == []
+
+
+def test_a_bare_image_attachment_turn_is_not_a_prompt():
+    turns = [StubTurn("user", "[Image: source: /tmp/images/1.png]")]
+    assert prompts.prompts(thread(turns), turns, 0, False) == []
+
+
+def test_a_prompt_retyped_longer_before_any_answer_replaces_the_interrupted_one():
+    turns = [typed("yes ok make sense", "2026-10-20T10:00:00Z"), typed("yes ok make sense, and deploy it", "2026-10-20T10:00:30Z")]
+    assert [row["text"] for row in prompts.prompts(thread(turns), turns, 0, False)] == ["yes ok make sense, and deploy it"]
+
+
+def test_a_prompt_repeated_after_an_answer_is_a_new_prompt():
+    turns = [typed("yes"), StubTurn("assistant", "Done."), typed("yes")]
+    assert len(prompts.prompts(thread(turns), turns, 0, False)) == 2
+
+
 def test_a_tool_result_turn_is_not_a_prompt():
     turns = [tool_result()]
     assert prompts.prompts(thread(turns), turns, 0, False) == []

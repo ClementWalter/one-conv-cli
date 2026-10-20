@@ -271,7 +271,10 @@ and progress updates.
 - An FYI receipt means the message was stored, not read. FYI messages older than
   7 days are pruned, read or not.
 
-A human post reaches every session running in its channel (or the one it was sent
+You work in one channel: the first one you join (or the one you join with
+`work=true`); the others you only watch, and their posts wait in your feed
+instead of waking you. Do not take up work posted in a channel you only watch.
+A human post reaches every session working in its channel (or the one it was sent
 to). Ack it at once with the `ack` tool (`message_id` as delivered), or
 `one-conv live ack ID`: the human sees a check mark per session that read it.
 Then sync in the channel before working: say what you take, leave what another

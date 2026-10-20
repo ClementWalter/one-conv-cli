@@ -172,7 +172,7 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
                              "human": {"address": "user", "route": HUMAN, "name": "You", "kind": "human"},
                              "capabilities": {"workers": "workers" in provider_map, "accounting": "accounting" in provider_map,
                                               "pairing": True, "channels": True, "changes": True,
-                                              "unread": True, "acks": True}})
+                                              "unread": True, "acks": True, "sign_out_others": True}})
 
     async def pair_device(request):
         """An authenticated owner can connect another device without exporting its session cookie."""
@@ -182,6 +182,13 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         token = await run_in_threadpool(auth.issue_pairing_token, PAIRING_SECONDS)
         return JSONResponse({"url": origin + "/#pair=" + token, "expires_at": expires,
                              "single_use": True, "access": "owner"})
+
+    async def sign_out_others(request):
+        """The owner disconnects every other browser and cancels unused pairing links, keeping this one."""
+        if await bounded_json(request):
+            raise HubError(400, "Signing out other devices accepts an empty JSON object.")
+        cookie, _ = session_for(request)
+        return JSONResponse({"signed_out": await run_in_threadpool(auth.revoke_others, cookie)})
 
     async def login(request):
         check_origin(request)
@@ -247,6 +254,10 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         payload = await bounded_json(request)
         return JSONResponse(await run_in_threadpool(store.create_channel, payload))
 
+    async def archive(request):
+        payload = await bounded_json(request)
+        return JSONResponse(await run_in_threadpool(store.archive_channel, payload))
+
     async def provider(request):
         callback = provider_map.get(request.path_params["name"])
         if callback is None:
@@ -285,10 +296,12 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         Route("/api/session", endpoint(session, public=True)),
         Route("/api/login", endpoint(login, public=True), methods=["POST"]),
         Route("/api/devices/pair", endpoint(pair_device, write=True), methods=["POST"]),
+        Route("/api/devices/sign-out-others", endpoint(sign_out_others, write=True), methods=["POST"]),
         Route("/api/logout", endpoint(logout, write=True), methods=["POST"]),
         Route("/api/state", endpoint(state)), Route("/api/changes", endpoint(changes)), Route("/api/topics/{topic}", endpoint(topic)),
         Route("/api/direct", endpoint(direct)), Route("/api/messages", endpoint(message, write=True), methods=["POST"]),
         Route("/api/channels", endpoint(channel, write=True), methods=["POST"]),
+        Route("/api/channels/archive", endpoint(archive, write=True), methods=["POST"]),
         Route("/api/read", endpoint(read, write=True), methods=["POST"]),
         Route("/api/providers/{name}", endpoint(provider), methods=["GET", "POST"]),
         *hub_application(store.hub).routes,

@@ -96,8 +96,9 @@ class HubClient:
 
     # Topics ---------------------------------------------------------------------------------
 
-    def join(self, topic: str, address: str) -> dict:
-        return self.request("PUT", f"/v1/topics/{quote(topic)}/members/{quote(address, safe=':')}")
+    def join(self, topic: str, address: str, work: bool | None = None) -> dict:
+        query = "" if work is None else f"?work={int(work)}"
+        return self.request("PUT", f"/v1/topics/{quote(topic)}/members/{quote(address, safe=':')}{query}")
 
     def leave(self, topic: str, address: str) -> dict:
         return self.request("DELETE", f"/v1/topics/{quote(topic)}/members/{quote(address, safe=':')}")

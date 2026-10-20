@@ -15,7 +15,11 @@ ingress log is what keeps a retried delivery from prompting an agent twice.
 
 A topic is a channel of work, not a team roster. Its members are the sessions running now that
 joined it: membership ends shortly after a session stops being published, while the channel's
-posts, and the session that wrote each one, stay for whoever joins later.
+posts, and the session that wrote each one, stay for whoever joins later. A session works in one
+channel (its first join, or the one it chooses with `work`) and only watches the others: a post
+wakes the channel's working members, and reaches watchers as an fyi, so a session busy with one
+channel is never pulled into another. Archived channels are hidden from the human's list and
+stay readable by everyone.
 
 A post from a trusted human (a node in `trusted_humans`, sending as "user") wakes every running
 member of its channel. Each session acks it (`acknowledge`), so the human sees who read it, and
@@ -79,6 +83,7 @@ CREATE TABLE IF NOT EXISTS welcomed (node TEXT NOT NULL, address TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS session_seen (node TEXT NOT NULL, address TEXT NOT NULL, seen REAL NOT NULL,
     PRIMARY KEY (node, address));
 CREATE TABLE IF NOT EXISTS spawners (node TEXT PRIMARY KEY, harness TEXT NOT NULL, updated REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS archived_topics (topic TEXT PRIMARY KEY, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS post_acks (post INTEGER NOT NULL, node TEXT NOT NULL, address TEXT NOT NULL, at REAL NOT NULL,
     PRIMARY KEY (post, node, address));
 CREATE TABLE IF NOT EXISTS staffing (task TEXT NOT NULL, version INTEGER NOT NULL, route TEXT NOT NULL,
@@ -133,6 +138,9 @@ class Hub:
             # When the member's session was last published; membership ends a grace period after it.
             if "seen" not in members:
                 db.execute("ALTER TABLE members ADD COLUMN seen REAL")
+            # 1 for the channel the session works in; memberships from before only watch.
+            if "work" not in members:
+                db.execute("ALTER TABLE members ADD COLUMN work INTEGER NOT NULL DEFAULT 0")
             deliveries = {row[1] for row in db.execute("PRAGMA table_info(deliveries)")}
             # A delivery can wake its recipient while the same post only informs the others.
             for column in ("mode",):
@@ -253,8 +261,8 @@ class Hub:
         """Whether a session is running in this channel to read a human post."""
         if not topic:
             return False
-        return any(a != "user" and self._available(db, f"{n}/{a}", now)
-                   for n, a in self._recipients(db, f"#{topic}", "", ""))
+        return any(a != "user" and work and self._available(db, f"{n}/{a}", now)
+                   for n, a, work in self._members(db, topic))
 
     def _human_post(self, db, seq: int) -> dict | None:
         row = db.execute("SELECT from_node, id, sender, topic, text, created FROM posts WHERE seq = ?",
@@ -291,7 +299,8 @@ class Hub:
         ident = post["key"].partition(":")[2]
         return (f"{post['created_by']} posted in #{post['topic']} and no session was running there, so this session"
                 f" was started for it.\n\nMessage:\n{post['text']}\n\n"
-                f"1. Join #{post['topic']} with the join_topic tool to catch up on the channel.\n"
+                f"1. Join #{post['topic']} with the join_topic tool (work=true): it is your work channel, and"
+                " only its posts wake you.\n"
                 f"2. Ack the message with the ack tool (message_id=\"{ident}\").\n"
                 f"3. Work it and answer in #{post['topic']}. Other sessions may join: before starting a piece of work,"
                 " say in the channel what you take, and leave anything already taken to whoever took it. To dig into"
@@ -405,11 +414,7 @@ class Hub:
     def _recipients(self, db, target: str, from_node: str, sender: str) -> list[tuple[str, str]]:
         """Where a message goes: one session, a named one, or every member of a topic but the sender."""
         if target.startswith("#"):
-            # A channel reaches its members whose session is still published; it may have none right now.
-            members = db.execute("SELECT m.node, m.address FROM members m WHERE m.topic = ? AND (m.address = 'user'"
-                                 " OR EXISTS (SELECT 1 FROM sessions s WHERE s.node = m.node AND s.address = m.address))"
-                                 " ORDER BY m.joined", (target[1:],)).fetchall()
-            return [(n, a) for n, a in members if (n, a) != (from_node, sender)]
+            return [(n, a) for n, a, _ in self._members(db, target[1:]) if (n, a) != (from_node, sender)]
         if target.startswith("@"):
             row = db.execute("SELECT node, address FROM sessions WHERE name = ?", (target[1:],)).fetchone()
             if row is None:
@@ -419,6 +424,23 @@ class Hub:
         if not self._published(db, node, address):
             raise HubError(404, f"{target} is not a published session")
         return [(node, address)]
+
+    def _members(self, db, topic: str) -> list[tuple[str, str, bool]]:
+        """A channel's members whose session is still published, with whether each works there.
+
+        The human's mailbox always counts as working: it receives every post.
+        """
+        rows = db.execute("SELECT m.node, m.address, m.work FROM members m WHERE m.topic = ? AND (m.address = 'user'"
+                          " OR EXISTS (SELECT 1 FROM sessions s WHERE s.node = m.node AND s.address = m.address))"
+                          " ORDER BY m.joined", (topic,)).fetchall()
+        return [(n, a, bool(w) or a == "user") for n, a, w in rows]
+
+    def _modes(self, db, target: str, recipients: list[tuple[str, str]], mode: str | None) -> list[tuple]:
+        """Deliveries for a post: a channel wakes its working members and only informs its watchers."""
+        if not target.startswith("#") or mode == "fyi":
+            return [(n, a, mode) for n, a in recipients]
+        working = {(n, a) for n, a, w in self._members(db, target[1:]) if w}
+        return [(n, a, mode if (n, a) in working else "fyi") for n, a in recipients]
 
     def _receipt(self, db, seq: int, msg_id: str, duplicate: bool) -> dict:
         rows = db.execute("SELECT delivery, to_node, to_address, outcome FROM deliveries WHERE post = ? "
@@ -502,7 +524,10 @@ class Hub:
             if human and reply == "expected" and mode == "push":
                 # Every running member reads a human post; they ack it and agree in the channel who does what.
                 seq = self._insert(db, node, msg_id, digest, target, sender, topic, reply, mode, text,
-                                   [(n, a, None) for n, a in recipients])
+                                   self._modes(db, target, recipients, None))
+                # A human post brings an archived channel back to the human's list.
+                if target.startswith("#"):
+                    db.execute("DELETE FROM archived_topics WHERE topic = ?", (topic,))
                 if target.startswith("#") and not self._running(db, topic, time.time()):
                     self._staff(db, self._human_post(db, seq), time.time())
             elif human:
@@ -511,7 +536,7 @@ class Hub:
                                    [(n, a, "fyi") for n, a in recipients])
             else:
                 seq = self._insert(db, node, msg_id, digest, target, sender, topic, reply, mode, text,
-                                   [(n, a, None) for n, a in recipients])
+                                   self._modes(db, target, recipients, None))
             return self._receipt(db, seq, msg_id, False)
 
     @staticmethod
@@ -630,15 +655,41 @@ class Hub:
         return {"id": msg_id, "recipients": [{"to": f"{n}/{a}", "delivery": d, "outcome": o or "stored",
                                               "outcome_at": at} for d, n, a, o, at in rows]}
 
-    def join(self, node: str, topic: str, address: str) -> dict:
-        """Add one of this node's sessions to a topic; only that node can add its own sessions."""
+    def join(self, node: str, topic: str, address: str, work: bool | None = None) -> dict:
+        """Add one of this node's sessions to a topic; only that node can add its own sessions.
+
+        `work=True` makes it the session's work channel (its previous one is watched from then on),
+        `work=False` only watches, and None works there when the session works nowhere yet.
+        """
         if not TOPIC.fullmatch(topic):
             raise HubError(400, "a topic is lowercase letters, digits and dashes")
         with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
             if not self._published(db, node, address):
                 raise HubError(403, "only a session this node published can join")
-            db.execute("INSERT OR IGNORE INTO members (topic, node, address, joined) VALUES (?, ?, ?, ?)", (topic, node, address, time.time()))
-        return {"topic": topic, "member": f"{node}/{address}"}
+            db.execute("INSERT OR IGNORE INTO members (topic, node, address, joined) VALUES (?, ?, ?, ?)",
+                       (topic, node, address, time.time()))
+            elsewhere = db.execute("SELECT topic FROM members WHERE node = ? AND address = ? AND work = 1"
+                                   " AND topic != ?", (node, address, topic)).fetchone()
+            if work or (work is None and elsewhere is None):
+                db.execute("UPDATE members SET work = (topic = ?) WHERE node = ? AND address = ?", (topic, node, address))
+            elif work is False:
+                db.execute("UPDATE members SET work = 0 WHERE topic = ? AND node = ? AND address = ?",
+                           (topic, node, address))
+            working = db.execute("SELECT work FROM members WHERE topic = ? AND node = ? AND address = ?",
+                                 (topic, node, address)).fetchone()[0]
+        return {"topic": topic, "member": f"{node}/{address}", "work": bool(working)}
+
+    def archive(self, topic: str, archived: bool) -> dict:
+        """Hide a channel from the human's list, or bring it back; agents still list and read it."""
+        if not TOPIC.fullmatch(topic):
+            raise HubError(400, "a topic is lowercase letters, digits and dashes")
+        with self.lock, self._db() as db:
+            if archived:
+                db.execute("INSERT OR REPLACE INTO archived_topics VALUES (?, ?)", (topic, time.time()))
+            else:
+                db.execute("DELETE FROM archived_topics WHERE topic = ?", (topic,))
+        return {"topic": topic, "archived": archived}
 
     def leave(self, node: str, topic: str, address: str) -> dict:
         with self.lock, self._db() as db:
@@ -650,24 +701,29 @@ class Hub:
         """Each channel: its current members, how many run now, and every session that posted in it."""
         now = time.time()
         with self._db() as db:
-            members = db.execute("SELECT m.topic, m.node, m.address FROM members m WHERE m.address = 'user' OR EXISTS"
-                                 " (SELECT 1 FROM sessions s WHERE s.node = m.node AND s.address = m.address)"
+            members = db.execute("SELECT m.topic, m.node, m.address, m.work FROM members m WHERE m.address = 'user' OR"
+                                 " EXISTS (SELECT 1 FROM sessions s WHERE s.node = m.node AND s.address = m.address)"
                                  " ORDER BY m.topic, m.joined").fetchall()
+            archived = {topic for (topic,) in db.execute("SELECT topic FROM archived_topics")}
             last = dict(db.execute("SELECT topic, MAX(created) FROM posts WHERE topic IS NOT NULL GROUP BY topic"))
             authors = db.execute("SELECT topic, from_node || '/' || sender, MAX(created) FROM posts WHERE topic IS NOT NULL"
                                  " AND sender != 'user' AND IFNULL(kind, '') != 'system' GROUP BY topic, from_node, sender"
                                  " ORDER BY topic, MAX(created) DESC").fetchall()
-            running = {route for route in {f"{n}/{a}" for _, n, a in members if a != "user"}
+            running = {route for route in {f"{n}/{a}" for _, n, a, _ in members if a != "user"}
                        if self._available(db, route, now)}
         listing: dict[str, dict] = {}
 
         def entry(topic):
-            return listing.setdefault(topic, {"topic": topic, "members": [], "running": 0, "participants": [],
-                                              "last": last.get(topic)})
-        for topic, node, address in members:
+            return listing.setdefault(topic, {"topic": topic, "members": [], "working": [], "running": 0,
+                                              "participants": [], "last": last.get(topic),
+                                              "archived": topic in archived})
+        for topic, node, address, work in members:
             route = f"{node}/{address}"
             entry(topic)["members"].append(route)
-            entry(topic)["running"] += route in running
+            if work and address != "user":
+                entry(topic)["working"].append(route)
+                # Running counts the sessions that work here; watchers are not woken by its posts.
+                entry(topic)["running"] += route in running
         for topic, route, _ in authors:
             entry(topic)["participants"].append(route)
         # A topic whose members all left, or that only reported history names, is still readable.
@@ -771,7 +827,10 @@ def application(hub: Hub):
     async def membership(request):
         def work(node, body, req):
             topic, address = req.path_params["topic"], req.path_params["address"]
-            return hub.join(node, topic, address) if req.method == "PUT" else hub.leave(node, topic, address)
+            if req.method == "DELETE":
+                return hub.leave(node, topic, address)
+            work = req.query_params.get("work")
+            return hub.join(node, topic, address, None if work is None else work == "1")
         return await handle(request, work)
 
     async def history(request):

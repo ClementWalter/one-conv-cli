@@ -1859,3 +1859,9 @@ button {
 }
 .message-ack { color: #2f8f5b; font-weight: 600; overflow-wrap: anywhere; }
 .message-acks.starting { font-style: italic; }
+/* Archive or bring back the open channel; agents still read archived channels. */
+.archive-channel {
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+}

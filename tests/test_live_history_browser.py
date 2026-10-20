@@ -45,9 +45,9 @@ def test_the_marker_says_only_the_recipient_was_notified(reported):
     assert reported.locator(".message-directed").nth(1).inner_text().endswith("only")
 
 
-def test_the_reported_dm_appears_under_direct_messages(reported):
+def test_agent_dms_are_not_listed_under_direct_messages(reported):
     reported.get_by_role("button", name="Open workspace sidebar").click()
-    assert reported.locator("#threads li").count() == 2
+    assert reported.locator("#threads button").count() == 0
 
 
 def test_the_grouped_second_dm_says_it_is_synced_history(reported):

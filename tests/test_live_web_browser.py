@@ -126,11 +126,6 @@ def test_channel_composer_reaches_its_member(page, workspace):
     assert response.value.json()["receipt"]["topic"] == "design-review"
 
 
-def test_agent_conversation_does_not_offer_an_impersonating_composer(page):
-    page.locator("#threads .conversation-row").first.click()
-    assert page.locator("#composer").is_hidden()
-
-
 def test_search_finds_real_message_content(page):
     page.locator("#search").fill("ready for your review")
     page.locator("#search").press("Enter")

@@ -388,31 +388,7 @@ function sidebar() {
   $("topic-count").textContent = model.state.topics.filter((topic) => !topic.archived).length || "";
   $("archived-count").textContent = archived.children.length || "";
   $("archived-section").hidden = !archived.children.length;
-  const threads = $("threads");
-  threads.replaceChildren();
-  for (const thread of model.threads) {
-    const pair = thread.pair.split(" ");
-    const other = pair.find((address) => address !== "user") || pair[0];
-    const label = pair.includes("user")
-      ? person(other).name
-      : pairName(thread.pair);
-    rowButton(
-      threads,
-      label,
-      avatar(other, "tiny-avatar"),
-      model.view &&
-        model.view.kind === "direct" &&
-        model.view.key === thread.pair,
-      () => select("direct", thread.pair),
-      undefined,
-      unreadOf(thread.pair, thread.unread),
-    );
-  }
-  if (!threads.children.length)
-    threads.appendChild(
-      el("li", "A direct line to your agents.", "sidebar-empty"),
-    );
-  $("direct-count").textContent = model.threads.length || "";
+  // A conversation with a session opens from its row among the running sessions, with its unread count.
   const people = $("people");
   people.replaceChildren();
   // Sessions come and go: only the running ones are listed; past ones live on in their channels.
@@ -946,9 +922,7 @@ function select(kind, key = "", updateHash = true) {
   $(
     kind === "activity"
       ? "nav-activity"
-      : kind === "direct"
-        ? "nav-direct"
-        : "nav-home",
+      : "nav-home",
   ).classList.add("selected");
   if (kind === "activity") activity();
   else if (kind === "home") renderRows([]);
@@ -1970,12 +1944,6 @@ $("nav-home").addEventListener("click", () => {
 $("workspace-home").addEventListener("click", (event) => {
   event.preventDefault();
   $("nav-home").click();
-});
-$("nav-direct").addEventListener("click", () => {
-  const previous = savedRoute("direct");
-  if (previous) select(previous.kind, previous.key);
-  else if (model.threads.length) select("direct", model.threads[0].pair);
-  else newMessage();
 });
 $("nav-activity").addEventListener("click", () => select("activity"));
 $("all-activity").addEventListener("click", () => select("activity"));

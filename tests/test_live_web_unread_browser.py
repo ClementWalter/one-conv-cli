@@ -75,7 +75,7 @@ def channel_news(page):
 @pytest.fixture
 def direct_news(page):
     router.send("user", "A question for you.", LiveSession("omp", "browser-builder"))
-    row = page.locator("#threads .conversation-row.unread").filter(has_text="builder")
+    row = page.locator("#people .conversation-row.unread").filter(has_text="builder")
     row.wait_for(state="attached", timeout=15000)
     open_sidebar(page)
     return row
@@ -121,7 +121,7 @@ def test_unread_direct_message_shows_its_count(direct_news):
 def test_opening_a_direct_message_clears_it(page, direct_news):
     direct_news.click()
     page.locator(".message-body").filter(has_text="A question for you.").wait_for()
-    page.locator("#threads .conversation-row.unread").wait_for(state="detached")
+    page.locator("#people .conversation-row.unread").wait_for(state="detached")
     assert page.locator(".conversation-row.unread").count() == 0
 
 

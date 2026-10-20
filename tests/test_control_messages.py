@@ -321,7 +321,7 @@ def real_http_workspace(tmp_path, tls_certificate):
     app = application(tmp_path, origin)
     worker_token = app.state.hub.add_token("worker")
     certificate, key = tls_certificate
-    server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False,
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False, timeout_graceful_shutdown=1,
                                           ssl_certfile=str(certificate), ssl_keyfile=str(key)))
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()

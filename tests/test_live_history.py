@@ -115,7 +115,7 @@ def test_a_conflict_keeps_the_first_text(hub, item):
 
 
 @pytest.mark.parametrize("change", [
-    {"from": "box/user"}, {"to": "user"}, {"to": "workspace/user"}, {"from": "box/codex:c9"}, {"to": "#release"},
+    {"from": "box/user"}, {"from": "user", "to": "user"}, {"to": "workspace/user"}, {"from": "box/codex:c9"}, {"to": "#release"},
     {"id": "not-hex"}, {"topic": "Bad Topic"}, {"text": ""}, {"outcome": "read"}, {"mode": "loud"}, {"at": "yesterday"},
 ])
 def test_an_invalid_item_is_refused(hub, item, change):
@@ -128,7 +128,7 @@ def test_invalid_unicode_is_refused_without_blocking_the_rest(hub, item):
 
 
 def test_an_invalid_item_does_not_block_the_rest(hub, item):
-    results = hub.report("mac", [{**item, "to": "user"}, {**item, "id": "b" * 32}])["results"]
+    results = hub.report("mac", [{**item, "to": "workspace/user"}, {**item, "id": "b" * 32}])["results"]
     assert [row["status"] for row in results] == ["refused", "recorded"]
 
 

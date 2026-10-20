@@ -100,12 +100,10 @@ def validate_channel(payload: object) -> dict:
 
 
 def _provenance(row: dict) -> dict:
-    """Say where a reported row comes from: a prompt typed into the session's terminal, or the sending
-    machine's local message log."""
-    if row.get("reported") and row["from"] == "user":
-        row["terminal"] = True
-        row["delivery"] = {**row["delivery"], "label": "Typed in the terminal",
-                           "detail": "You typed this into the session's terminal; the session answered there."}
+    """Say where a reported row comes from: the session's own terminal, or the sending machine's message log."""
+    if row.get("reported") and "user" in (row["from"], row["to"]):
+        # A turn of the conversation held in the terminal: there was no delivery to report on.
+        row["mirrored"] = True
     elif row.get("reported"):
         row["delivery"] = {**row["delivery"], "detail": row["delivery"]["detail"] + (
             " From the sending machine's local message log; nobody was notified again. Older local copies may"
@@ -301,10 +299,9 @@ class ControlStore:
                 "p.text,p.created,d.outcome,d.outcome_at,p.reported FROM posts p JOIN deliveries d ON d.post=p.seq "
                 # Directness comes from the original target, so a topic-tagged DM stays in its pair's thread.
                 # Only conversations with the human are shown; agents' messages to each other are theirs. The human
-                # writes from the paired workspace or from a machine's terminal, whose prompts its bridge reports.
-                "WHERE p.target NOT LIKE '#%' AND p.kind IS NOT 'system' AND (p.sender = 'user'"
-                " OR (d.to_node = ? AND d.to_address = 'user')) ORDER BY p.created DESC, p.seq DESC LIMIT ?",
-                (NODE, MESSAGES_SHOWN)).fetchall()
+                # writes from the paired workspace or from a machine's terminal, whose bridge reports the exchange.
+                "WHERE p.target NOT LIKE '#%' AND p.kind IS NOT 'system' AND (p.sender = 'user' OR d.to_address = 'user')"
+                " ORDER BY p.created DESC, p.seq DESC LIMIT ?", (MESSAGES_SHOWN,)).fetchall()
             baseline, marks = unread.marks(db)
             shown = [values[0] for values in rows]
             acks = self.hub._acks(db, shown)

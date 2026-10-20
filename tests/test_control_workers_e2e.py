@@ -97,7 +97,7 @@ def loopback_hub(tmp_path):
     state = Hub(str(tmp_path / "hub.db"))
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
-    server = uvicorn.Server(uvicorn.Config(application(state), log_level="error", access_log=False))
+    server = uvicorn.Server(uvicorn.Config(application(state), log_level="error", access_log=False, timeout_graceful_shutdown=1))
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
     while not server.started:

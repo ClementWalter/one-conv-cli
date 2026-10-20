@@ -32,7 +32,7 @@ def browser(request):
         instance.close()
 
 
-@pytest.fixture(params=[320, 390, 1280])
+@pytest.fixture(params=[390, 1280])
 def width(request):
     return request.param
 

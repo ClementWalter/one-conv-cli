@@ -775,12 +775,8 @@ function renderRows(rows, force = false) {
     }
     fill();
     content.appendChild(body);
-    if (row.terminal === true) {
-      // Typed at a keyboard into the session, mirrored here by that machine's bridge.
-      const typed = el("span", "Typed in the terminal", "message-note message-synced");
-      typed.title = "You typed this into the session's terminal; the session answered there.";
-      content.appendChild(typed);
-    } else if (row.reported === true) {
+    // A turn mirrored from the session's terminal is the conversation itself, not a synced copy.
+    if (row.reported === true && row.mirrored !== true) {
       // Shown on every bubble, grouped or not: this copy is the sending machine's record.
       const synced = el("span", "Synced history", "message-note message-synced");
       synced.title = "From the sending machine's local message log; nobody was notified again.";
@@ -804,7 +800,7 @@ function renderRows(rows, force = false) {
       const source = el("div", row.source, "message-source");
       content.appendChild(source);
     }
-    if (isHuman(row.from)) {
+    if (isHuman(row.from) && row.mirrored !== true) {
       const delivery = row.delivery && typeof row.delivery === "object" ? row.delivery : null;
       // Channel rollups carry their own counted label; direct messages keep the short forms.
       const label = delivery && (Array.isArray(delivery.recipients) ? delivery.label :

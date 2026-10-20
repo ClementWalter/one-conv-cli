@@ -559,11 +559,12 @@ class Hub:
         reply, mode = item.get("reply", "expected"), item.get("mode", "push")
         if not isinstance(msg_id, str) or not MESSAGE_ID.fullmatch(msg_id):
             raise HubError(400, "id must be 32 lowercase hex characters")
-        # The human at the node's terminal may be the sender: a prompt typed into one of its sessions.
-        if not (isinstance(target, str) and LOCAL_AGENT.fullmatch(target)
-                and isinstance(sender, str) and (sender == "user" or LOCAL_AGENT.fullmatch(sender))):
+        # The human at the node's terminal may be either end: a prompt typed into one of its sessions, or
+        # the reply that session gave there.
+        agent = {end: isinstance(end, str) and LOCAL_AGENT.fullmatch(end) is not None for end in (sender, target)}
+        if not (agent[target] and (sender == "user" or agent[sender])) and not (agent[sender] and target == "user"):
             raise HubError(403, "a node reports only messages between its own agents (harness:id), "
-                                "or from the human at its terminal to one of them")
+                                "or between the human at its terminal and one of them")
         if topic is not None and (not isinstance(topic, str) or not TOPIC.fullmatch(topic)):
             raise HubError(400, "a topic is lowercase letters, digits and dashes")
         if not isinstance(text, str) or not text or len(text) > MAX_TEXT:

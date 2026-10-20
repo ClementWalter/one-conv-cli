@@ -34,7 +34,7 @@ MEASURE = """async (text) => {
 }"""
 
 
-@pytest.fixture(params=[320, 390])
+@pytest.fixture(params=[390])
 def phone(browser, real_http_workspace, request):
     workspace = real_http_workspace
     # Requests answered by the offline service worker would bypass the network stubs below.

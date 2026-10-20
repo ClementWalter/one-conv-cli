@@ -24,7 +24,7 @@ def workspace(tmp_path, monkeypatch):
     origin = f"http://127.0.0.1:{sock.getsockname()[1]}"
     app = application(tmp_path, origin, worker_config={})
     token = app.state.hub.add_token("cfo")
-    server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False))
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False, timeout_graceful_shutdown=1))
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
     try:

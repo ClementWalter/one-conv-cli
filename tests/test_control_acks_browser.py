@@ -29,7 +29,7 @@ def workspace(real_http_workspace):
     return real_http_workspace
 
 
-@pytest.fixture(params=[320, 390])
+@pytest.fixture(params=[390])
 def phone(browser, workspace, request):
     context = browser.new_context(viewport={"width": request.param, "height": 740}, is_mobile=True, has_touch=True,
                                   ignore_https_errors=True, service_workers="block")

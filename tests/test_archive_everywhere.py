@@ -65,7 +65,7 @@ def controller(tmp_path):
     sock.bind(("127.0.0.1", 0))
     origin = f"http://127.0.0.1:{sock.getsockname()[1]}"
     app = application(tmp_path / "control", origin)
-    server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False))
+    server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False, timeout_graceful_shutdown=1))
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
     while not server.started:
@@ -346,9 +346,11 @@ class StubSync:
 @pytest.fixture
 def served(controller, monkeypatch):
     monkeypatch.setattr(router, "list_all", lambda harness=None: [])
+    # One short inbox poll is enough to reach the sync; the prompt mirror is another test's subject.
+    monkeypatch.setattr(bridge, "POLL_SECONDS", 0.2)
     stub = StubSync()
     bridge.serve(controller["origin"], "laptop", controller["laptop"], stopping=lambda: bool(stub.polls),
-                 archive=stub)
+                 archive=stub, prompts=StubSync())
     return controller, stub
 
 

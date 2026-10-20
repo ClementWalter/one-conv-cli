@@ -400,7 +400,9 @@ function sidebar() {
       people,
       p.name,
       avatar(session.address, "tiny-avatar"),
-      false,
+      model.view &&
+        model.view.kind === "direct" &&
+        model.view.key === pairOf(session.address),
       () => select("direct", pairOf(session.address)),
       undefined,
       threadUnread(pairOf(session.address)),

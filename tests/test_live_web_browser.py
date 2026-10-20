@@ -147,6 +147,18 @@ def test_channel_draft_is_preserved_when_opening_a_direct_message(page):
     assert page.locator("#message-input").input_value() == "A draft for the channel, not a DM."
 
 
+def test_open_session_row_stays_marked_in_the_sidebar(page):
+    page.locator("#people .conversation-row").filter(has_text="builder").click()
+    page.mouse.move(900, 450)  # Off the sidebar: the mark must not depend on the pointer resting on the row.
+    assert page.locator("#people .conversation-row").filter(has_text="builder").get_attribute("aria-current") == "page"
+
+
+def test_opening_a_channel_unmarks_the_session_row(page):
+    page.locator("#people .conversation-row").filter(has_text="builder").click()
+    page.locator("#topics .conversation-row").first.click()
+    assert page.locator("#people .conversation-row").filter(has_text="builder").get_attribute("aria-current") is None
+
+
 def test_lost_response_retry_keeps_its_id_after_sending_another_conversation(page, workspace):
     """A response lost after acceptance must not turn an explicit retry into another wake."""
     attempts = []

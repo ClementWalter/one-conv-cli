@@ -39,6 +39,8 @@ import threading
 import time
 from contextlib import contextmanager
 
+from . import summary
+
 NODE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 TOPIC = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 MESSAGE_ID = re.compile(r"[0-9a-f]{32}")
@@ -89,6 +91,8 @@ CREATE TABLE IF NOT EXISTS post_acks (post INTEGER NOT NULL, node TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS staffing (task TEXT NOT NULL, version INTEGER NOT NULL, route TEXT NOT NULL,
     state TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created REAL NOT NULL, updated REAL NOT NULL,
     PRIMARY KEY (task, version));
+CREATE TABLE IF NOT EXISTS topic_summaries (topic TEXT NOT NULL, lo INTEGER NOT NULL, hi INTEGER NOT NULL,
+    text TEXT NOT NULL, author TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY (topic, lo, hi));
 """
 GENERAL = "general"
 
@@ -537,7 +541,13 @@ class Hub:
             else:
                 seq = self._insert(db, node, msg_id, digest, target, sender, topic, reply, mode, text,
                                    self._modes(db, target, recipients, None))
-            return self._receipt(db, seq, msg_id, False)
+            receipt = self._receipt(db, seq, msg_id, False)
+            if topic is not None:
+                # The sender whose post completes a block writes its summary.
+                request = self._pending(db, topic)
+                if request:
+                    receipt["summarize"] = request
+            return receipt
 
     @staticmethod
     def _reported(item) -> tuple:
@@ -741,24 +751,99 @@ class Hub:
         """Trust this node's "user" as the human whose posts wake every running session and get acked."""
         self.trusted_humans.add(node)
 
-    def history(self, topic: str, after: int = 0, limit: int = 100) -> list[dict]:
-        """A topic's posts, oldest first, after the row whose `cursor` is `after`.
+    # A topic's posts in order, numbered from 0; the hub's own instructions reach their recipient
+    # through its inbox only and nobody wrote them, so they are not part of the history.
+    NUMBERED = ("(SELECT p.*, ROW_NUMBER() OVER (ORDER BY p.seq) - 1 AS pos FROM posts p"
+                " WHERE p.topic = ? AND p.kind IS NOT 'system')")
+
+    def history(self, topic: str, after: int = 0, limit: int = 100, pos: int = 0) -> list[dict]:
+        """A topic's posts, oldest first, after the row whose `cursor` is `after` and from position `pos`.
 
         The cursor is the hub's own post sequence: client ids are unique only per sending node.
+        A position is the post's number in the topic, the one block summaries are built on.
         """
         with self._db() as db:
-            rows = db.execute("SELECT p.seq, p.id, p.from_node, p.sender, p.target, p.reply, p.mode, p.text, p.created,"
-                              " p.reported FROM posts p"
-                              # The hub's own instructions reach their recipient through its inbox only;
-                              # nobody wrote them, so a topic's history never shows them.
-                              " WHERE p.topic = ? AND p.seq > ? AND p.kind IS NOT 'system' ORDER BY p.seq LIMIT ?",
-                              (topic, after, max(1, min(limit, 500)))).fetchall()
+            rows = db.execute(f"SELECT seq, id, from_node, sender, target, reply, mode, text, created, reported, pos"
+                              f" FROM {self.NUMBERED} WHERE seq > ? AND pos >= ? ORDER BY seq LIMIT ?",
+                              (topic, after, pos, max(1, min(limit, 500)))).fetchall()
             acks = self._acks(db, [row[0] for row in rows])
         # `to` is the original target: "#topic" for a post to everyone, a route for a tagged direct message.
         # `acks` lists who read it. Replaying history wakes nobody.
         return [{"cursor": str(q), "id": i, "from": f"{fn}/{s}", "to": t, "reply": r, "mode": m, "text": x,
-                 "created": c, "reported": bool(rep), **({"acks": acks[q]} if q in acks else {})}
-                for q, i, fn, s, t, r, m, x, c, rep in rows]
+                 "created": c, "reported": bool(rep), "pos": n, **({"acks": acks[q]} if q in acks else {})}
+                for q, i, fn, s, t, r, m, x, c, rep, n in rows]
+
+    # Block summaries ------------------------------------------------------------------------
+
+    def _count(self, db, topic: str) -> int:
+        return db.execute("SELECT COUNT(*) FROM posts WHERE topic = ? AND kind IS NOT 'system'", (topic,)).fetchone()[0]
+
+    def _posts_at(self, db, topic: str, lo: int, hi: int) -> list[dict]:
+        rows = db.execute(f"SELECT id, from_node, sender, text, created, pos FROM {self.NUMBERED}"
+                          " WHERE pos >= ? AND pos < ? ORDER BY seq", (topic, lo, hi)).fetchall()
+        return [{"pos": n, "id": i, "from": f"{fn}/{s}", "at": c, "text": x} for i, fn, s, x, c, n in rows]
+
+    def _settled(self, db, topic: str) -> dict[tuple[int, int], dict]:
+        return {(lo, hi): {"block": summary.label(lo, hi), "text": text, "by": author, "at": at}
+                for lo, hi, text, author, at in db.execute(
+                    "SELECT lo, hi, text, author, at FROM topic_summaries WHERE topic = ? ORDER BY lo, hi", (topic,))}
+
+    def _pending(self, db, topic: str) -> dict | None:
+        settled = self._settled(db, topic)
+        todo = summary.pending(self._count(db, topic), settled)
+        if not todo:
+            return None
+        lo, hi = todo[0]
+        return summary.request(topic, lo, hi, {b: r["text"] for b, r in settled.items()},
+                               lambda a, b: self._posts_at(db, topic, a, b), len(todo) - 1)
+
+    def summaries(self, topic: str) -> dict:
+        """A topic's post count, its settled block summaries and the block it waits for next."""
+        if not TOPIC.fullmatch(topic):
+            raise HubError(400, "a topic is lowercase letters, digits and dashes")
+        with self._db() as db:
+            return {"topic": topic, "count": self._count(db, topic), "summaries": list(self._settled(db, topic).values()),
+                    "pending": self._pending(db, topic)}
+
+    def summarize(self, node: str, topic: str, block: str, body: dict) -> dict:
+        """Settle one block's summary, written by a session this node published; the first line recorded stays."""
+        if not TOPIC.fullmatch(topic):
+            raise HubError(400, "a topic is lowercase letters, digits and dashes")
+        try:
+            lo, hi = summary.parse_block(block)
+            text = summary.check(str(body.get("text") or ""))
+        except summary.SummaryError as error:
+            raise HubError(400, str(error)) from None
+        with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            author = self._actor(db, node, body.get("by"))
+            settled, result = self._settled(db, topic), {"topic": topic, "block": summary.label(lo, hi)}
+            if (lo, hi) in settled:
+                result.update(settled=False, existing=settled[(lo, hi)]["text"])
+            else:
+                total = self._count(db, topic)
+                if hi > total:
+                    raise HubError(409, f"#{topic} holds {total} post(s); block {block} is not complete yet")
+                if hi - lo > summary.LEAF and not all(half in settled for half in summary.halves(lo, hi)):
+                    raise HubError(409, f"block {block} waits for its halves; summarize them first")
+                db.execute("INSERT INTO topic_summaries VALUES (?, ?, ?, ?, ?, ?)", (topic, lo, hi, text, author, time.time()))
+                result["settled"] = True
+            result["pending"] = self._pending(db, topic)
+        return result
+
+    def open_block(self, topic: str, block: str) -> dict:
+        """One block a level down: its halves' summaries, or its posts for a block of the smallest size."""
+        if not TOPIC.fullmatch(topic):
+            raise HubError(400, "a topic is lowercase letters, digits and dashes")
+        try:
+            lo, hi = summary.parse_block(block)
+        except summary.SummaryError as error:
+            raise HubError(400, str(error)) from None
+        with self._db() as db:
+            if lo >= self._count(db, topic):
+                raise HubError(404, f"#{topic} has no post #{lo} yet")
+            settled = {b: r["text"] for b, r in self._settled(db, topic).items()}
+            return {"topic": topic, **summary.opened(lo, hi, settled, lambda a, b: self._posts_at(db, topic, a, b))}
 
 
 def application(hub: Hub):
@@ -839,11 +924,23 @@ def application(hub: Hub):
                 limit = int(req.query_params.get("limit", "100"))
             except ValueError:
                 limit = 100
-            after = req.query_params.get("after", "0")
-            if not after.isdigit():
-                raise HubError(400, "after is the cursor of a history row")
+            after, pos = req.query_params.get("after", "0"), req.query_params.get("pos", "0")
+            if not after.isdigit() or not pos.isdigit():
+                raise HubError(400, "after is the cursor of a history row, pos a post's position in the topic")
             # SQLite integers stop at 2**63 - 1; a cursor past every post simply has nothing after it.
-            return {"messages": hub.history(req.path_params["topic"], min(int(after), 2**63 - 1), limit)}
+            return {"messages": hub.history(req.path_params["topic"], min(int(after), 2**63 - 1), limit,
+                                            min(int(pos), 2**63 - 1))}
+        return await handle(request, work)
+
+    async def summaries(request):
+        return await handle(request, lambda node, body, req: hub.summaries(req.path_params["topic"]))
+
+    async def block(request):
+        def work(node, body, req):
+            topic, block = req.path_params["topic"], req.path_params["block"]
+            if req.method == "PUT":
+                return hub.summarize(node, topic, block, body)
+            return hub.open_block(topic, block)
         return await handle(request, work)
 
     async def report(request):
@@ -867,4 +964,6 @@ def application(hub: Hub):
         Route("/v1/topics", topics, methods=["GET"]),
         Route("/v1/topics/{topic}/members/{address:path}", membership, methods=["PUT", "DELETE"]),
         Route("/v1/topics/{topic}/messages", history, methods=["GET"]),
+        Route("/v1/topics/{topic}/summaries", summaries, methods=["GET"]),
+        Route("/v1/topics/{topic}/summaries/{block}", block, methods=["GET", "PUT"]),
     ])

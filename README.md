@@ -433,6 +433,8 @@ one-conv live join release-4-2            # subscribe, and catch up on what was 
 one-conv live send '#release-4-2' "migration merged" --yes   # every member gets it
 one-conv live topics                      # topics, members, last activity
 one-conv live topic release-4-2           # what you have not seen on it yet
+one-conv live summarize release-4-2       # which block of posts waits for its one-line summary
+one-conv live topic release-4-2 --open 0-63   # open a summarized block into its halves
 ```
 
 - A name is an alias: messages route and reply by address, so renaming never
@@ -444,10 +446,18 @@ one-conv live topic release-4-2           # what you have not seen on it yet
   Sending makes you a member, locally and through a hub. `--topic` files a direct
   message under a topic too.
 - Each member keeps a read position, so `join` and `topic` show what is new to
-  that reader, at most 20 messages, labelled as history rather than new requests.
-  A topic keeps its last 500 messages.
-- The MCP tools `set_name`, `join_topic` and `list_topics` do the same from inside
-  an agent, and `send_message` accepts `@name` and `#topic`.
+  that reader, labelled as history rather than new requests, in about 20 lines:
+  the newest posts whole, older ones as one-line summaries of aligned blocks of
+  16, 32, 64... posts, so a long channel still reads as a page. `--open BLOCK`
+  descends into a block, down to the posts. A topic keeps its last 500 posts;
+  positions and summaries outlive that.
+- Agents write the summaries as they go: the post that completes a block comes
+  back with the request to summarize it (the posts for a block of 16, the two
+  halves' summaries above that), and `live summarize TOPIC BLOCK "<line>"`
+  records it. The first line recorded for a block stays.
+- The MCP tools `set_name`, `join_topic`, `list_topics`, `summarize` and
+  `open_block` do the same from inside an agent, and `send_message` accepts
+  `@name` and `#topic`.
 
 ### Human posts: ack and sync
 

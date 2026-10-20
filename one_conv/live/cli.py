@@ -124,6 +124,8 @@ def build_live_group(launcher: list[str]) -> click.Group:
             click.echo(f"{receipt['status']}: {receipt['to']}")
         if receipt.get("via") == "hub" and not as_json:
             click.echo(f"  follow it with: one-conv live status {receipt['id']}")
+        if receipt.get("summarize") and not as_json:
+            _print_request(receipt["summarize"])
         if receipt.get("warning") and not as_json:
             click.echo(f"warning: {receipt['warning']}", err=True)
 
@@ -284,19 +286,44 @@ def build_live_group(launcher: list[str]) -> click.Group:
         for name, address in sorted(table.items()):
             click.echo(f"@{name}  {address}")
 
+    def _print_request(request):
+        """The block summary a channel waits for: the instruction, then what it is written from."""
+        click.echo(f"\n{request['instruction']}")
+        for post in request.get("posts", []):
+            click.echo(f"  #{post['pos']} {post['from']}: {post['text']}")
+        if request.get("missing"):
+            click.echo(f"  ({request['missing']} post(s) no longer kept)")
+        for half in request.get("halves", []):
+            click.echo(f"  #{half['block']}  {half['text'] or '(not summarized yet)'}")
+
+    def _print_block(result):
+        for post in result.get("posts", []):
+            click.echo(f"#{post['pos']} [{time.strftime('%Y-%m-%d %H:%M', time.localtime(post['at']))}] "
+                       f"{post['from']}:\n{post['text']}\n")
+        for half in result.get("halves", []):
+            click.echo(f"#{half['block']}  {half['text'] or '(not summarized yet)'}")
+
     def _print_catch_up(result):
-        if not result["messages"]:
+        if not result["messages"] and not result.get("summaries"):
             click.echo(f"#{result['topic']}: nothing new")
             return
-        if result["omitted"]:
-            click.echo(f"({result['omitted']} older unseen message(s) not shown; --all shows the full history)")
         click.echo(f"History of #{result['topic']}, already exchanged (not new requests):")
+        if result.get("summaries"):
+            click.echo(f"({result['omitted']} older post(s) stand behind these summaries; "
+                       f"`one-conv live topic {result['topic']} --open BLOCK` opens one)")
+            for block in result["summaries"]:
+                click.echo(f"#{block['block']}  {block['text'] or '(not summarized yet)'}")
+        elif result["omitted"]:
+            click.echo(f"({result['omitted']} older unseen message(s) not shown; --all shows the full history)")
         for row in result["messages"]:
             name = team.name_for(row["from"])
             who = f"@{name} {row['from']}" if name else row["from"]
             if row.get("to"):
                 who += f" → {row['to']} only"
-            click.echo(f"\n[{time.strftime('%Y-%m-%d %H:%M', time.localtime(row['at']))}] {who}:\n{row['text']}")
+            pos = f"#{row['pos']} " if row.get("pos") is not None else ""
+            click.echo(f"\n{pos}[{time.strftime('%Y-%m-%d %H:%M', time.localtime(row['at']))}] {who}:\n{row['text']}")
+        if result.get("summarize"):
+            _print_request(result["summarize"])
 
     @live.command("join", context_settings=HELP, epilog=examples('one-conv live join release-4-2', 'one-conv live join release-4-2 --as codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03'))
     @click.argument("topic")
@@ -329,20 +356,61 @@ def build_live_group(launcher: list[str]) -> click.Group:
             raise click.ClickException(str(error)) from None
         click.echo(f"left #{left}")
 
-    @live.command("topic", context_settings=HELP, epilog=examples('one-conv live topic release-4-2', 'one-conv live topic release-4-2 --all --peek'))
+    @live.command("topic", context_settings=HELP, epilog=examples('one-conv live topic release-4-2', 'one-conv live topic release-4-2 --all --peek',
+                                                                   'one-conv live topic release-4-2 --open 0-63'))
     @click.argument("topic")
     @click.option("--as", "as_address", help="Reader; defaults to the calling agent.")
     @click.option("--all", "everything", is_flag=True, help="Show the whole kept history, not only unseen messages.")
     @click.option("--peek", is_flag=True, help="Do not mark the shown messages as seen.")
-    def topic_command(topic, as_address, everything, peek):
-        """Show what was exchanged on TOPIC that you have not seen yet."""
+    @click.option("--open", "block", metavar="BLOCK", help="Open one summarized block (as catch-up prints it, like 0-63) "
+                                                           "into its halves, down to the posts.")
+    def topic_command(topic, as_address, everything, peek, block):
+        """Show what was exchanged on TOPIC that you have not seen yet.
+
+        Past the catch-up budget, older posts are shown as the one-line block summaries agents
+        wrote for them, the newest posts whole; --open descends into a block.
+        """
         try:
+            if block is not None:
+                _print_block(team.open_block(topic, block))
+                return
             me = router.whoami(as_address)
             reader = me.address if me else "user"
             result = team.catch_up(topic, reader, everything, peek)
         except (team.TeamError, router.LiveError) as error:
             raise click.ClickException(str(error)) from None
         _print_catch_up(result)
+
+    @live.command("summarize", context_settings=HELP, epilog=examples(
+        'one-conv live summarize release-4-2',
+        'one-conv live summarize release-4-2 16-31 "Agreed to ship 4.2 without the migration; @builder owns the rollback plan"'))
+    @click.argument("topic")
+    @click.argument("block", required=False)
+    @click.argument("text", required=False)
+    @click.option("--as", "as_address", help="Session writing the summary; defaults to the calling agent.")
+    def summarize_command(topic, block, text, as_address):
+        """Record a one-line summary of BLOCK, a range of TOPIC's posts, or show which block waits for one.
+
+        Blocks are 16, 32, 64... posts aligned on their size; a block of 16 is summarized from the
+        posts, a larger one from its two halves' summaries. The first summary recorded for a block
+        stays. Catch-up shows these lines in place of the posts they stand for.
+        """
+        if (block is None) != (text is None):
+            raise click.UsageError("Give BLOCK and TEXT together, or neither to see what waits.")
+        try:
+            if block is None:
+                request = team.pending_request(topic)
+                click.echo(f"#{team._check('topic', topic)}: nothing to summarize" if request is None
+                           else f"#{request['topic']} waits for a summary of {request['block']}")
+            else:
+                result = team.summarize(topic, block, text, _me(as_address))
+                click.echo(f"#{result['topic']} {result['block']}: " + (
+                    "summary recorded" if result.get("settled") else f"already summarized as: {result.get('existing')}"))
+                request = result.get("pending")
+        except (team.TeamError, router.LiveError) as error:
+            raise click.ClickException(str(error)) from None
+        if request:
+            _print_request(request)
 
     @live.command("topics", context_settings=HELP, epilog=examples('one-conv live topics', 'one-conv live topics --json'))
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")

@@ -200,7 +200,9 @@ def create_server() -> MCPServer:
         A session works in one channel and only watches the others: posts in its work channel
         wake it, posts elsewhere wait in its feed. The first channel you join is your work
         channel; work=true moves it here, work=false only watches. Returned messages are
-        history, already exchanged, not new requests.
+        history, already exchanged, not new requests. Past the catch-up budget, `summaries`
+        stands for older posts as one line per block (open_block descends into one), and
+        `summarize` asks you to write the line a block still lacks before you go on.
         """
         from .live import team
         me = _caller(ctx)
@@ -208,6 +210,36 @@ def create_server() -> MCPServer:
             joined = team.join(topic, me.address, work)
             # "history" marks these as already exchanged, so they are not acted on as new requests.
             return {"members": team.members(joined), "kind": "history", **team.catch_up(joined, me.address)}
+        except team.TeamError as error:
+            raise ToolError(str(error)) from error
+
+    @server.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True, openWorldHint=False),
+                 structured_output=True)
+    def summarize(topic: str, block: str, text: str, ctx: Context) -> dict[str, Any]:
+        """Record the one-line summary of `block`, a range of a #topic's posts like `16-31`.
+
+        Write it when a send_message or join_topic result carries `summarize`: one line, at
+        most 400 characters, keeping decisions, owners and anything with lasting effect, inventing
+        nothing. The first summary recorded for a block stays; the result names the next block
+        that waits, if any. Catch-up shows these lines in place of the posts they stand for.
+        """
+        from .live import team
+        me = _caller(ctx)
+        try:
+            return team.summarize(topic, block, text, me.address)
+        except team.TeamError as error:
+            raise ToolError(str(error)) from error
+
+    @server.tool(annotations=readonly, structured_output=True)
+    def open_block(topic: str, block: str) -> dict[str, Any]:
+        """Open one summarized block of a #topic (as catch-up labels it, like `0-63`) a level down.
+
+        A block of 16 posts opens into the posts themselves; a larger one into its two halves'
+        summaries, which open further. History, not new requests.
+        """
+        from .live import team
+        try:
+            return team.open_block(topic, block)
         except team.TeamError as error:
             raise ToolError(str(error)) from error
 

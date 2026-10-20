@@ -4,8 +4,10 @@ A name is an alias for a session address; messages still route and reply by addr
 renaming never breaks a reply. A topic has members and a bounded message history; sending
 to a topic delivers to every member. Files are keyed by a hash of the topic, never by the
 raw text, and each member keeps a read position so catching up shows only what is new.
-When a hub is configured it holds topic membership and history for every machine; this
-machine then keeps only each reader's position.
+Posts are numbered in order; catch-up beyond its budget shows the newest whole and older ones
+as the one-line block summaries agents write (see `summary`). When a hub is configured it holds
+topic membership, history and summaries for every machine; this machine then keeps only each
+reader's position.
 """
 
 import hashlib
@@ -16,7 +18,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import hubclient
+from . import hubclient, summary
 from .model import live_home
 
 try:
@@ -130,8 +132,50 @@ def _messages(topic: str) -> list[dict]:
         except ValueError:
             continue  # A corrupt line must not hide the rest of the history.
         if isinstance(row, dict) and isinstance(row.get("id"), str):
+            # A post recorded before numbering is numbered by its place in the kept history.
+            row.setdefault("seq", len(rows))
             rows.append(row)
     return rows
+
+
+def _summaries(topic: str) -> dict[tuple[int, int], dict]:
+    """(lo, hi) -> the settled summary row of that block."""
+    out = {}
+    try:
+        lines = (_topic_dir(topic) / "summaries.jsonl").read_text().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue  # A corrupt line must not hide the rest.
+        if isinstance(row, dict) and isinstance(row.get("lo"), int) and isinstance(row.get("hi"), int):
+            out.setdefault((row["lo"], row["hi"]), row)
+    return out
+
+
+def _texts(settled: dict) -> dict[tuple[int, int], str]:
+    return {block: row["text"] for block, row in settled.items()}
+
+
+def _post(row: dict) -> dict:
+    return {"pos": row["seq"], "id": row["id"], "from": row["from"], "at": row["at"], "text": row["text"]}
+
+
+def _posts(rows: list[dict]):
+    """The kept posts in a block, as `summary` reads them."""
+    return lambda lo, hi: [_post(r) for r in rows if lo <= r["seq"] < hi]
+
+
+def _pending(topic: str, rows: list[dict], settled: dict) -> dict | None:
+    """The summary this topic asks for next, or None when the tree is complete."""
+    total = rows[-1]["seq"] + 1 if rows else 0
+    todo = summary.pending(total, settled)
+    if not todo:
+        return None
+    lo, hi = todo[0]
+    return summary.request(topic, lo, hi, _texts(settled), _posts(rows), len(todo) - 1)
 
 
 def _hub():
@@ -204,13 +248,18 @@ def leave(topic: str, address: str) -> str:
     return topic
 
 
-def record(topic: str, message_id: str, sender: str, text: str) -> None:
-    """Append one exchanged message and keep the most recent TOPIC_HISTORY."""
+def record(topic: str, message_id: str, sender: str, text: str) -> dict | None:
+    """Append one exchanged message and keep the most recent TOPIC_HISTORY.
+
+    Returns the summary request this post completes, if any, so the sender writes it.
+    """
     topic = _check("topic", topic)
     with _locked():
         _topic_dir(topic).mkdir(parents=True, exist_ok=True)
         rows = _messages(topic)
-        rows.append({"id": message_id, "at": time.time(), "from": sender, "text": text})
+        # Numbering continues past the kept history, so a position names one post forever.
+        rows.append({"id": message_id, "seq": rows[-1]["seq"] + 1 if rows else 0, "at": time.time(),
+                     "from": sender, "text": text})
         path = _topic_dir(topic) / "messages.jsonl"
         partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         partial.write_text("".join(json.dumps(r) + "\n" for r in rows[-TOPIC_HISTORY:]))
@@ -221,6 +270,7 @@ def record(topic: str, message_id: str, sender: str, text: str) -> None:
         # The sender has seen their own message.
         meta["members"][sender]["seen"] = message_id
         _write(_topic_dir(topic) / "meta.json", meta)
+        return _pending(topic, rows, _summaries(topic))
 
 
 def _hub_catch_up(hub, topic: str, address: str, everything: bool, peek: bool, limit: int = CATCH_UP) -> dict:
@@ -235,22 +285,39 @@ def _hub_catch_up(hub, topic: str, address: str, everything: bool, peek: bool, l
         cursor = None if everything else (meta.get("members", {}).get(address) or {}).get("hub_cursor")
     if not (isinstance(cursor, str) and cursor.isdigit()):
         cursor = None
-    rows = [{"id": r["id"], "cursor": r.get("cursor"), "at": r.get("created") or 0, "from": r["from"],
-             "text": r["text"], "mode": r.get("mode", "push"),
-             # A tagged direct message keeps its one recipient, so it is not read as a broadcast.
-             **({"to": r["to"]} if isinstance(r.get("to"), str) and not r["to"].startswith("#") else {}),
-             **({"reported": True} if r.get("reported") is True else {})}
-            for r in _hub_call(lambda: hub.history(topic, cursor, limit=TOPIC_HISTORY))]
-    shown = rows[-limit:]
+    rows = [_hub_row(r) for r in _hub_call(lambda: hub.history(topic, cursor, limit=TOPIC_HISTORY))]
+    shown, blocks, omitted, request = rows, [], 0, None
+    # A hub from before numbering gives no positions; it is read as before, newest posts only.
+    if len(rows) > limit and rows[0].get("pos") is not None:
+        info = _hub_call(lambda: hub.summaries(topic))
+        settled = {summary.parse_block(s["block"]): s["text"] for s in info["summaries"]}
+        blocks, singles = summary.layout(info["count"], rows[0]["pos"], limit, settled)
+        shown = [r for r in rows if r["pos"] in set(singles)]
+        if singles and len(shown) < len(singles):
+            # More unseen posts than one history page holds: read the ones to show by position.
+            shown = [_hub_row(r) for r in _hub_call(lambda: hub.history(topic, None, len(singles), singles[0]))]
+        omitted, request = info["count"] - rows[0]["pos"] - len(shown), info.get("pending")
+    elif len(rows) > limit:
+        shown, omitted = rows[-limit:], len(rows) - limit
     current = members(topic)
     is_member = address in current or any(m.endswith("/" + address) for m in current)
-    if rows and not peek and is_member and rows[-1].get("cursor"):
+    newest = max((int(r["cursor"]) for r in rows + shown if r.get("cursor")), default=None)
+    if newest is not None and not peek and is_member:
         with _locked():
             _remember_member(topic, address)
             meta = _meta(topic)
-            meta["members"][address]["hub_cursor"] = rows[-1]["cursor"]
+            meta["members"][address]["hub_cursor"] = str(newest)
             _write(_topic_dir(topic) / "meta.json", meta)
-    return {"topic": topic, "messages": shown, "omitted": len(rows) - len(shown), "member": is_member}
+    return {"topic": topic, "messages": shown, "summaries": blocks, "omitted": omitted, "member": is_member,
+            **({"summarize": request} if request else {})}
+
+
+def _hub_row(r: dict) -> dict:
+    return {"id": r["id"], "cursor": r.get("cursor"), "pos": r.get("pos"), "at": r.get("created") or 0,
+            "from": r["from"], "text": r["text"], "mode": r.get("mode", "push"),
+            # A tagged direct message keeps its one recipient, so it is not read as a broadcast.
+            **({"to": r["to"]} if isinstance(r.get("to"), str) and not r["to"].startswith("#") else {}),
+            **({"reported": True} if r.get("reported") is True else {})}
 
 
 def catch_up(topic: str, address: str, everything: bool = False, peek: bool = False,
@@ -268,17 +335,91 @@ def catch_up(topic: str, address: str, everything: bool = False, peek: bool = Fa
         meta = _meta(topic)
         if not meta:
             raise TeamError(f"#{topic} does not exist; `one-conv live join {topic}` creates it")
-        rows = _messages(topic)
+        rows, settled = _messages(topic), _summaries(topic)
         seen = (meta.get("members", {}).get(address) or {}).get("seen")
         ids = [r["id"] for r in rows]
-        start = 0 if everything or seen not in ids else ids.index(seen) + 1
-        unseen = rows[start:]
-        shown = unseen[-limit:]
+        start = 0 if everything or seen not in ids else rows[ids.index(seen)]["seq"] + 1
+        unseen = [r for r in rows if r["seq"] >= start]
+        shown, blocks = unseen, []
+        if len(unseen) > limit:
+            total = rows[-1]["seq"] + 1
+            blocks, singles = summary.layout(total, start, limit, _texts(settled))
+            shown = [r for r in rows if r["seq"] in set(singles)]
         if not peek and address in meta.get("members", {}) and rows:
             meta["members"][address]["seen"] = rows[-1]["id"]
             _write(_topic_dir(topic) / "meta.json", meta)
-    return {"topic": topic, "messages": shown, "omitted": len(unseen) - len(shown),
-            "member": address in meta.get("members", {})}
+        request = _pending(topic, rows, settled) if blocks else None
+    return {"topic": topic, "messages": [{"pos": r["seq"], **r} for r in shown], "summaries": blocks,
+            "omitted": len(unseen) - len(shown), "member": address in meta.get("members", {}),
+            **({"summarize": request} if request else {})}
+
+
+def pending_request(topic: str) -> dict | None:
+    """The block summary this topic waits for, with its material, or None when none is due."""
+    topic = _check("topic", topic)
+    hub = _hub()
+    if hub is not None:
+        return _hub_call(lambda: hub.summaries(topic)).get("pending")
+    with _locked():
+        if not _meta(topic):
+            raise TeamError(f"#{topic} does not exist; `one-conv live join {topic}` creates it")
+        return _pending(topic, _messages(topic), _summaries(topic))
+
+
+def summarize(topic: str, block: str, text: str, address: str) -> dict:
+    """Settle one block's summary, written by `address`; the first line recorded for a block stays.
+
+    A block is accepted once every post in it was exchanged and, above the smallest size, once
+    both halves are settled, so summaries are only ever written from settled text.
+    """
+    topic = _check("topic", topic)
+    try:
+        lo, hi = summary.parse_block(block)
+        text = summary.check(text)
+    except summary.SummaryError as error:
+        raise TeamError(str(error)) from None
+    hub = _hub()
+    if hub is not None:
+        return _hub_call(lambda: hub.summarize(topic, summary.label(lo, hi), text, address))
+    with _locked():
+        if not _meta(topic):
+            raise TeamError(f"#{topic} does not exist; `one-conv live join {topic}` creates it")
+        rows, settled = _messages(topic), _summaries(topic)
+        total = rows[-1]["seq"] + 1 if rows else 0
+        result = {"topic": topic, "block": summary.label(lo, hi)}
+        if (lo, hi) in settled:
+            result.update(settled=False, existing=settled[(lo, hi)]["text"])
+        else:
+            if hi > total:
+                raise TeamError(f"#{topic} holds {total} post(s); block {block} is not complete yet")
+            if hi - lo > summary.LEAF and not all(half in settled for half in summary.halves(lo, hi)):
+                raise TeamError(f"block {block} waits for its halves; summarize them first")
+            row = {"lo": lo, "hi": hi, "text": text, "by": address, "at": time.time()}
+            with (_topic_dir(topic) / "summaries.jsonl").open("a") as handle:
+                handle.write(json.dumps(row) + "\n")
+            settled[(lo, hi)] = row
+            result["settled"] = True
+        result["pending"] = _pending(topic, rows, settled)
+    return result
+
+
+def open_block(topic: str, block: str) -> dict:
+    """One block a level down: its halves' summaries, or its posts for a block of the smallest size."""
+    topic = _check("topic", topic)
+    try:
+        lo, hi = summary.parse_block(block)
+    except summary.SummaryError as error:
+        raise TeamError(str(error)) from None
+    hub = _hub()
+    if hub is not None:
+        return _hub_call(lambda: hub.open_block(topic, summary.label(lo, hi)))
+    with _locked():
+        if not _meta(topic):
+            raise TeamError(f"#{topic} does not exist; `one-conv live join {topic}` creates it")
+        rows, settled = _messages(topic), _summaries(topic)
+    if lo >= (rows[-1]["seq"] + 1 if rows else 0):
+        raise TeamError(f"#{topic} has no post #{lo} yet")
+    return {"topic": topic, **summary.opened(lo, hi, _texts(settled), _posts(rows))}
 
 
 def topics() -> list[dict]:

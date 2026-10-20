@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from ..live import web
-from ..live.hub import Hub, HubError
+from ..live.hub import ATTACHMENT_LIMIT, ATTACHMENT_TYPES, Hub, HubError
 from ..live.hub import application as hub_application
 from .auth import COOKIE, AuthStore
 from .store import HUMAN, ControlStore
@@ -246,6 +246,27 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         payload = await bounded_json(request)
         return JSONResponse(await run_in_threadpool(store.send, payload))
 
+    async def upload(request):
+        """One image, sent as its own bytes; the answer's id goes into the message that carries it."""
+        media_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+        if media_type not in ATTACHMENT_TYPES or request.headers.get("content-encoding", "identity").lower() != "identity":
+            raise HubError(415, "Attach a PNG, JPEG, GIF or WebP image, uncompressed.")
+        declared = request.headers.getlist("content-length")
+        if declared and (len(declared) != 1 or not re.fullmatch(r"[0-9]{1,12}", declared[0])):
+            raise HubError(400, "Content-Length must be a nonnegative byte count.")
+        if declared and int(declared[0]) > ATTACHMENT_LIMIT:
+            raise HubError(413, "The image is too large.")
+        body = bytearray()
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > ATTACHMENT_LIMIT:
+                raise HubError(413, "The image is too large.")
+            body.extend(chunk)
+        return JSONResponse(await run_in_threadpool(store.store_attachment, media_type, bytes(body)))
+
+    async def attachment(request):
+        media_type, body = await run_in_threadpool(store.attachment, request.path_params["ident"])
+        return Response(body, media_type=media_type)
+
     async def read(request):
         payload = await bounded_json(request)
         return JSONResponse(await run_in_threadpool(store.mark_read, payload))
@@ -300,6 +321,8 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         Route("/api/logout", endpoint(logout, write=True), methods=["POST"]),
         Route("/api/state", endpoint(state)), Route("/api/changes", endpoint(changes)), Route("/api/topics/{topic}", endpoint(topic)),
         Route("/api/direct", endpoint(direct)), Route("/api/messages", endpoint(message, write=True), methods=["POST"]),
+        Route("/api/attachments", endpoint(upload, write=True), methods=["POST"]),
+        Route("/api/attachments/{ident}", endpoint(attachment)),
         Route("/api/channels", endpoint(channel, write=True), methods=["POST"]),
         Route("/api/channels/archive", endpoint(archive, write=True), methods=["POST"]),
         Route("/api/read", endpoint(read, write=True), methods=["POST"]),

@@ -24,6 +24,12 @@ bridge reports new prompts and text replies every 20 seconds, as `one-conv local
 thread` renders them, skipping relayed messages, command output and the order a
 spawned session started with.
 
+A message can carry up to four images (PNG, JPEG, GIF or WebP, 10 MB each):
+paste one into the composer, drop it, or pick it with the paperclip. The image
+is uploaded at once and travels with the message; the receiving machine's
+bridge saves it under its live directory and tells the session where, so the
+agent reads the file to see it.
+
 Agent names and short IDs stay stable; a native conversation title is context.
 The roster separates the bridge's connection from the agent's reported idle or
 busy status. A loaded native thread with no activity report is **Unverified**,

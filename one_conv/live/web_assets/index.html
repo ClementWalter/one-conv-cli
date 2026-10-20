@@ -367,6 +367,8 @@
               placeholder="Message your team"
               aria-label="Message text"
             ></textarea>
+            <div id="attachments" class="attachment-strip" aria-label="Attached images" hidden></div>
+            <input id="attach-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
             <div class="composer-bottom">
               <div class="composer-identity">
                 <button
@@ -378,6 +380,16 @@
                 >
                   <svg class="icon" aria-hidden="true">
                     <use href="#i-smile" />
+                  </svg></button
+                ><button
+                  id="attach-toggle"
+                  class="format-button"
+                  type="button"
+                  aria-label="Attach an image"
+                  title="Attach an image (or paste one)"
+                >
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M21 11.5l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8l9-9a3.5 3.5 0 0 1 5 5l-9 9a1.5 1.5 0 0 1-2.1-2.1l8.3-8.3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
                   </svg></button
                 ><span class="composer-divider"></span
                 ><span class="mini-human">Y</span

@@ -51,6 +51,11 @@ REPORT_BATCH = 100
 # the adapter refused it, or the bridge cannot tell (it crashed between claiming and reporting).
 OUTCOMES = ("accepted", "refused", "unconfirmed")
 MODES = ("push", "fyi")
+# Images a human attaches to a message: stored on the hub, fetched by the receiving bridge and the workspace.
+ATTACHMENT_TYPES = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}
+ATTACHMENT_LIMIT = 10_000_000
+ATTACHMENTS_PER_MESSAGE = 4
+ATTACHMENT_ID = re.compile(r"[0-9a-f]{32}")
 MAX_TEXT = 200_000
 # A JSON-escaped text can take up to six bytes per character, plus the envelope fields.
 MAX_BODY = MAX_TEXT * 6 + 4096
@@ -93,6 +98,8 @@ CREATE TABLE IF NOT EXISTS staffing (task TEXT NOT NULL, version INTEGER NOT NUL
     PRIMARY KEY (task, version));
 CREATE TABLE IF NOT EXISTS topic_summaries (topic TEXT NOT NULL, lo INTEGER NOT NULL, hi INTEGER NOT NULL,
     text TEXT NOT NULL, author TEXT NOT NULL, at REAL NOT NULL, PRIMARY KEY (topic, lo, hi));
+CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, node TEXT NOT NULL, media_type TEXT NOT NULL,
+    size INTEGER NOT NULL, body BLOB NOT NULL, created REAL NOT NULL);
 """
 GENERAL = "general"
 
@@ -138,6 +145,9 @@ class Hub:
             # "system" for an instruction the hub issued itself, which no human or agent wrote.
             if "kind" not in posts:
                 db.execute("ALTER TABLE posts ADD COLUMN kind TEXT")
+            # JSON list of the images attached to the post: id, media_type and size of each.
+            if "attachments" not in posts:
+                db.execute("ALTER TABLE posts ADD COLUMN attachments TEXT")
             members = {row[1] for row in db.execute("PRAGMA table_info(members)")}
             # When the member's session was last published; membership ends a grace period after it.
             if "seen" not in members:
@@ -467,15 +477,17 @@ class Hub:
         return who if self._published(db, node, address) else None
 
     def _insert(self, db, node: str, msg_id: str, digest: str, target: str, sender: str, topic: str | None,
-                reply: str, mode: str, text: str, deliveries, kind: str | None = None) -> int:
+                reply: str, mode: str, text: str, deliveries, kind: str | None = None,
+                attachments: list[dict] | None = None) -> int:
         """One post and its deliveries; `deliveries` is (node, address, mode) per recipient, mode None for the post's.
 
         `kind="system"` marks an instruction the hub itself issued (a spawn order): it is delivered
         like any post but is never shown as something the human or an agent wrote.
         """
         seq = db.execute("INSERT INTO posts (from_node, id, digest, target, sender, topic, reply, mode, text, created,"
-                         " kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                         (node, msg_id, digest, target, sender, topic, reply, mode, text, time.time(), kind)).lastrowid
+                         " kind, attachments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (node, msg_id, digest, target, sender, topic, reply, mode, text, time.time(), kind,
+                          json.dumps(attachments) if attachments else None)).lastrowid
         db.executemany("INSERT INTO deliveries (delivery, post, to_node, to_address, mode) VALUES (?, ?, ?, ?, ?)",
                        [(secrets.token_hex(16), seq, n, a, m) for n, a, m in deliveries])
         return seq
@@ -485,8 +497,12 @@ class Hub:
         msg_id, sender, text = message.get("id"), message.get("from"), message.get("text")
         if not isinstance(msg_id, str) or not MESSAGE_ID.fullmatch(msg_id):
             raise HubError(400, "id must be 32 lowercase hex characters, chosen by the sender")
-        if not isinstance(text, str) or not text or len(text) > MAX_TEXT:
-            raise HubError(400, f"text must be a non-empty string of at most {MAX_TEXT} characters")
+        attached = message.get("attachments") or []
+        if (not isinstance(attached, list) or len(attached) > ATTACHMENTS_PER_MESSAGE
+                or not all(isinstance(a, str) and ATTACHMENT_ID.fullmatch(a) for a in attached)):
+            raise HubError(400, f"attachments is a list of at most {ATTACHMENTS_PER_MESSAGE} attachment ids")
+        if not isinstance(text, str) or (not text and not attached) or len(text) > MAX_TEXT:
+            raise HubError(400, f"text must be a string of at most {MAX_TEXT} characters, non-empty unless an image is attached")
         reply = message.get("reply", "expected")
         if reply not in ("expected", "none", "inline"):
             raise HubError(400, "reply must be expected, none or inline")
@@ -500,7 +516,7 @@ class Hub:
         topic = target[1:] if target.startswith("#") else message.get("topic")
         if topic is not None and (not isinstance(topic, str) or not TOPIC.fullmatch(topic)):
             raise HubError(400, "a topic is lowercase letters, digits and dashes")
-        digest = hashlib.sha256(json.dumps([target, sender, topic, reply, mode, text]).encode()).hexdigest()
+        digest = hashlib.sha256(json.dumps([target, sender, topic, reply, mode, text, *attached]).encode()).hexdigest()
         with self.lock, self._db() as db:
             # The lease check and durable claim share one snapshot across server instances.
             db.execute("BEGIN IMMEDIATE")
@@ -510,6 +526,7 @@ class Hub:
                 if existing[1] != digest:
                     raise HubError(409, "this id was already used for a different message; send it under a new id")
                 return self._receipt(db, existing[0], msg_id, True)
+            attachments = self._attachments(db, attached)
             # A sender is this node's own session or the person at its terminal, never another node's agent.
             if not isinstance(sender, str) or (not self._published(db, node, sender) and sender not in ("user", "unknown")):
                 raise HubError(403, "from must be a session this node published, or user/unknown")
@@ -528,7 +545,7 @@ class Hub:
             if human and reply == "expected" and mode == "push":
                 # Every running member reads a human post; they ack it and agree in the channel who does what.
                 seq = self._insert(db, node, msg_id, digest, target, sender, topic, reply, mode, text,
-                                   self._modes(db, target, recipients, None))
+                                   self._modes(db, target, recipients, None), attachments=attachments)
                 # A human post brings an archived channel back to the human's list.
                 if target.startswith("#"):
                     db.execute("DELETE FROM archived_topics WHERE topic = ?", (topic,))
@@ -537,10 +554,10 @@ class Hub:
             elif human:
                 # A human post that asks for nothing (an announcement) informs everyone and wakes nobody.
                 seq = self._insert(db, node, msg_id, digest, target, sender, topic, reply, mode, text,
-                                   [(n, a, "fyi") for n, a in recipients])
+                                   [(n, a, "fyi") for n, a in recipients], attachments=attachments)
             else:
                 seq = self._insert(db, node, msg_id, digest, target, sender, topic, reply, mode, text,
-                                   self._modes(db, target, recipients, None))
+                                   self._modes(db, target, recipients, None), attachments=attachments)
             receipt = self._receipt(db, seq, msg_id, False)
             if topic is not None:
                 # The sender whose post completes a block writes its summary.
@@ -548,6 +565,48 @@ class Hub:
                 if request:
                     receipt["summarize"] = request
             return receipt
+
+    def _attachments(self, db, ids: list[str]) -> list[dict] | None:
+        """The metadata of the attached images, in the order given; an unknown id refuses the message."""
+        if not ids:
+            return None
+        out = []
+        for ident in ids:
+            row = db.execute("SELECT media_type, size FROM attachments WHERE id = ?", (ident,)).fetchone()
+            if row is None:
+                raise HubError(400, f"attachment {ident} was not uploaded")
+            out.append({"id": ident, "media_type": row[0], "size": row[1]})
+        return out
+
+    def store_attachment(self, node: str, media_type: str, body: bytes) -> dict:
+        """Keep one uploaded image; its id goes into the message that carries it."""
+        if media_type not in ATTACHMENT_TYPES:
+            raise HubError(415, "attach a PNG, JPEG, GIF or WebP image")
+        if not body or len(body) > ATTACHMENT_LIMIT:
+            raise HubError(413, f"an image is at most {ATTACHMENT_LIMIT // 1_000_000} MB")
+        ident = secrets.token_hex(16)
+        with self.lock, self._db() as db:
+            db.execute("INSERT INTO attachments VALUES (?, ?, ?, ?, ?, ?)",
+                       (ident, node, media_type, len(body), body, time.time()))
+        return {"id": ident, "media_type": media_type, "size": len(body)}
+
+    def attachment(self, ident: str) -> tuple[str, bytes]:
+        """(media_type, body) of an uploaded image; any authenticated node may fetch what was sent to it."""
+        if not ATTACHMENT_ID.fullmatch(ident):
+            raise HubError(400, "an attachment id is 32 lowercase hex characters")
+        with self._db() as db:
+            row = db.execute("SELECT media_type, body FROM attachments WHERE id = ?", (ident,)).fetchone()
+        if row is None:
+            raise HubError(404, "no such attachment")
+        return row[0], bytes(row[1])
+
+    @staticmethod
+    def _parsed(attachments) -> list[dict]:
+        try:
+            rows = json.loads(attachments) if attachments else []
+        except ValueError:
+            return []
+        return rows if isinstance(rows, list) else []
 
     @staticmethod
     def _reported(item) -> tuple:
@@ -628,7 +687,7 @@ class Hub:
                 self._seen(db, node)
                 rows = db.execute(
                     "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.topic, p.reply,"
-                    " COALESCE(d.mode, p.mode), p.text, p.created, p.kind"
+                    " COALESCE(d.mode, p.mode), p.text, p.created, p.kind, p.attachments"
                     " FROM deliveries d JOIN posts p ON p.seq = d.post"
                     " WHERE d.to_node = ? AND d.outcome IS NULL ORDER BY d.post LIMIT 50", (node,)).fetchall()
                 if rows:
@@ -638,12 +697,13 @@ class Hub:
                 return [self._handed(row) for row in rows]
             time.sleep(0.25)
 
-    @staticmethod
-    def _handed(row) -> dict:
+    @classmethod
+    def _handed(cls, row) -> dict:
         """One inbox item; an instruction the hub issued is labelled as such, never as the human's or an agent's."""
-        d, i, a, fn, s, t, r, m, x, c, post_kind = row
+        d, i, a, fn, s, t, r, m, x, c, post_kind, attachments = row
         return {"delivery": d, "id": i, "to": a, "from": f"{fn}/{s}", "topic": t, "reply": r, "mode": m,
-                "text": x, "created": c, **({"system": True} if post_kind == "system" else {})}
+                "text": x, "created": c, **({"system": True} if post_kind == "system" else {}),
+                **({"attachments": cls._parsed(attachments)} if attachments else {})}
 
     def ack(self, node: str, delivery: str, outcome: str) -> dict:
         """Record the outcome of one of this node's deliveries; the first outcome reported stands."""
@@ -767,15 +827,16 @@ class Hub:
         A position is the post's number in the topic, the one block summaries are built on.
         """
         with self._db() as db:
-            rows = db.execute(f"SELECT seq, id, from_node, sender, target, reply, mode, text, created, reported, pos"
-                              f" FROM {self.NUMBERED} WHERE seq > ? AND pos >= ? ORDER BY seq LIMIT ?",
+            rows = db.execute(f"SELECT seq, id, from_node, sender, target, reply, mode, text, created, reported, pos,"
+                              f" attachments FROM {self.NUMBERED} WHERE seq > ? AND pos >= ? ORDER BY seq LIMIT ?",
                               (topic, after, pos, max(1, min(limit, 500)))).fetchall()
             acks = self._acks(db, [row[0] for row in rows])
         # `to` is the original target: "#topic" for a post to everyone, a route for a tagged direct message.
         # `acks` lists who read it. Replaying history wakes nobody.
         return [{"cursor": str(q), "id": i, "from": f"{fn}/{s}", "to": t, "reply": r, "mode": m, "text": x,
-                 "created": c, "reported": bool(rep), "pos": n, **({"acks": acks[q]} if q in acks else {})}
-                for q, i, fn, s, t, r, m, x, c, rep, n in rows]
+                 "created": c, "reported": bool(rep), "pos": n, **({"acks": acks[q]} if q in acks else {}),
+                 **({"attachments": self._parsed(att)} if att else {})}
+                for q, i, fn, s, t, r, m, x, c, rep, n, att in rows]
 
     # Block summaries ------------------------------------------------------------------------
 
@@ -939,6 +1000,15 @@ def application(hub: Hub):
     async def summaries(request):
         return await handle(request, lambda node, body, req: hub.summaries(req.path_params["topic"]))
 
+    async def attachment(request):
+        from starlette.responses import Response
+        try:
+            await run_in_threadpool(hub.authenticated_node, request)
+            media_type, body = await run_in_threadpool(hub.attachment, request.path_params["ident"])
+        except HubError as error:
+            return JSONResponse({"error": str(error)}, status_code=error.status)
+        return Response(body, media_type=media_type)
+
     async def block(request):
         def work(node, body, req):
             topic, block = req.path_params["topic"], req.path_params["block"]
@@ -970,4 +1040,5 @@ def application(hub: Hub):
         Route("/v1/topics/{topic}/messages", history, methods=["GET"]),
         Route("/v1/topics/{topic}/summaries", summaries, methods=["GET"]),
         Route("/v1/topics/{topic}/summaries/{block}", block, methods=["GET", "PUT"]),
+        Route("/v1/attachments/{ident}", attachment, methods=["GET"]),
     ])

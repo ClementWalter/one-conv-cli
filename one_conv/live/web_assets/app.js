@@ -548,17 +548,23 @@ function intro() {
   }
 }
 function inline(parent, text) {
-  const pattern = /(`[^`\n]+`|\*\*[^*]+\*\*|\*[^*\n]+\*|https?:\/\/[^\s<>]+)/g;
+  // Inline markdown as agents write it: code, links, bold, strikethrough, emphasis and bare URLs.
+  const pattern = /(`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\)|\*\*[^*\n]+\*\*|__[^_\n]+__|~~[^~\n]+~~|\*[^*\n]+\*|(?<![A-Za-z0-9])_[^_\n]+_(?![A-Za-z0-9])|https?:\/\/[^\s<>]+)/g;
   let start = 0;
   for (const match of text.matchAll(pattern)) {
     parent.appendChild(document.createTextNode(text.slice(start, match.index)));
     const value = match[0];
-    if (value.startsWith("`"))
-      parent.appendChild(el("code", value.slice(1, -1)));
-    else if (value.startsWith("**"))
-      parent.appendChild(el("strong", value.slice(2, -2)));
-    else if (value.startsWith("*"))
-      parent.appendChild(el("em", value.slice(1, -1)));
+    if (value.startsWith("`")) parent.appendChild(el("code", value.slice(1, -1)));
+    else if (value.startsWith("[")) {
+      const close = value.indexOf("](");
+      const link = el("a", value.slice(1, close));
+      link.href = value.slice(close + 2, -1);
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      parent.appendChild(link);
+    } else if (value.startsWith("**") || value.startsWith("__")) inline(parent.appendChild(el("strong")), value.slice(2, -2));
+    else if (value.startsWith("~~")) inline(parent.appendChild(el("s")), value.slice(2, -2));
+    else if (value.startsWith("*") || value.startsWith("_")) inline(parent.appendChild(el("em")), value.slice(1, -1));
     else {
       const link = el("a", value);
       link.href = value;
@@ -570,52 +576,92 @@ function inline(parent, text) {
   }
   parent.appendChild(document.createTextNode(text.slice(start)));
 }
+const TABLE_RULE = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+function tableCells(line) {
+  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  return trimmed.split("|").map((cell) => cell.trim());
+}
 function messageText(container, text) {
+  // Block markdown as agents write it: paragraphs, headings, bulleted and numbered lists (one level of
+  // nesting), quotes, rules, tables and fenced code. Anything else stays as written.
   container.replaceChildren();
-  let paragraph = [],
-    bullets = [],
-    code = null;
+  const lines = String(text).split("\n");
+  let paragraph = [], quote = [], list = null, code = null;
   function flush() {
     if (paragraph.length) {
-      const p = el("p");
-      inline(p, paragraph.join("\n"));
-      container.appendChild(p);
+      inline(container.appendChild(el("p")), paragraph.join("\n"));
       paragraph = [];
     }
-    if (bullets.length) {
-      const ul = el("ul");
-      for (const value of bullets) {
-        const li = el("li");
-        inline(li, value);
-        ul.appendChild(li);
-      }
-      container.appendChild(ul);
-      bullets = [];
+    if (quote.length) {
+      inline(container.appendChild(el("blockquote")).appendChild(el("p")), quote.join("\n"));
+      quote = [];
     }
+    list = null;
   }
-  for (const line of String(text).split("\n")) {
+  function item(ordered, indent, value) {
+    if (list && indent > list.indent && list.last) {
+      // One nested level under the previous item, whichever kind of list either one is.
+      if (!list.sub) list.sub = list.last.appendChild(el(ordered ? "ol" : "ul"));
+      inline(list.sub.appendChild(el("li")), value);
+      return;
+    }
+    if (!list || list.ordered !== ordered || indent < list.indent) {
+      flush();
+      list = { ordered, indent, node: container.appendChild(el(ordered ? "ol" : "ul")), last: null, sub: null };
+    }
+    list.last = list.node.appendChild(el("li"));
+    list.sub = null;
+    inline(list.last, value);
+  }
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
     if (line.trim().startsWith("```")) {
       if (code !== null) {
-        container
-          .appendChild(el("pre"))
-          .appendChild(el("code", code.join("\n")));
+        container.appendChild(el("pre")).appendChild(el("code", code.join("\n")));
         code = null;
       } else {
         flush();
         code = [];
       }
-    } else if (code !== null) code.push(line);
-    else if (!line.trim()) flush();
-    else if (/^\s*[-*] /.test(line)) {
-      if (paragraph.length) flush();
-      bullets.push(line.replace(/^\s*[-*] /, ""));
+      continue;
+    }
+    if (code !== null) { code.push(line); continue; }
+    if (!line.trim()) { flush(); continue; }
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    const bullet = /^(\s*)[-*+]\s+(.*)$/.exec(line);
+    const numbered = /^(\s*)\d+[.)]\s+(.*)$/.exec(line);
+    if (heading) {
+      flush();
+      // Messages are small: every heading level is a bold line, stepping down from h3.
+      inline(container.appendChild(el("h" + Math.min(6, heading[1].length + 2))), heading[2].trim());
+    } else if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+      flush();
+      container.appendChild(el("hr"));
+    } else if (/^\s*>/.test(line)) {
+      if (paragraph.length || list) flush();
+      quote.push(line.replace(/^\s*>\s?/, ""));
+    } else if (bullet || numbered) {
+      if (paragraph.length || quote.length) flush();
+      const match = bullet || numbered;
+      item(Boolean(numbered), match[1].length, match[2]);
+    } else if (/\|/.test(line) && index + 1 < lines.length && TABLE_RULE.test(lines[index + 1])) {
+      flush();
+      const table = container.appendChild(el("table"));
+      const head = table.appendChild(el("thead")).appendChild(el("tr"));
+      for (const cell of tableCells(line)) inline(head.appendChild(el("th")), cell);
+      const body = table.appendChild(el("tbody"));
+      index += 1;
+      while (index + 1 < lines.length && /\|/.test(lines[index + 1]) && lines[index + 1].trim()) {
+        index += 1;
+        const row = body.appendChild(el("tr"));
+        for (const cell of tableCells(lines[index])) inline(row.appendChild(el("td")), cell);
+      }
     } else {
-      if (bullets.length) flush();
+      if (list || quote.length) flush();
       paragraph.push(line);
     }
   }
-  if (code !== null)
-    container.appendChild(el("pre")).appendChild(el("code", code.join("\n")));
+  if (code !== null) container.appendChild(el("pre")).appendChild(el("code", code.join("\n")));
   flush();
 }
 const LOCAL_DELIVERY = {
@@ -630,6 +676,7 @@ function localRow(entry) {
   const [label, detail] = LOCAL_DELIVERY[entry.state];
   return {
     id: entry.id, from: "user", to: entry.target, text: entry.text, at: entry.at, local: entry,
+    attachments: entry.attachments || [],
     delivery: { state: entry.state, label: entry.state === "refused" && entry.error ? "Refused · " + entry.error : label, detail },
   };
 }
@@ -774,6 +821,23 @@ function renderRows(rows, force = false) {
       }
     }
     fill();
+    if (Array.isArray(row.attachments) && row.attachments.length) {
+      const images = el("div", null, "message-images");
+      for (const attachment of row.attachments) {
+        if (!attachment || typeof attachment.id !== "string" || !/^[0-9a-f]{32}$/.test(attachment.id)) continue;
+        const link = el("a", null, "message-image-link");
+        link.href = "/api/attachments/" + attachment.id;
+        link.target = "_blank";
+        link.rel = "noopener";
+        const image = el("img", null, "message-image");
+        image.src = link.href;
+        image.alt = "Attached image";
+        image.loading = "lazy";
+        link.appendChild(image);
+        images.appendChild(link);
+      }
+      body.appendChild(images);
+    }
     content.appendChild(body);
     // A turn mirrored from the session's terminal is the conversation itself, not a synced copy.
     if (row.reported === true && row.mirrored !== true) {
@@ -1004,7 +1068,7 @@ function updateComposer() {
     !model.token ||
     unavailable ||
     model.sending ||
-    !$("message-input").value.trim();
+    (!$("message-input").value.trim() && !model.attachments.some((a) => a.id));
   $("send-message").title = unavailable ? "This agent is offline. Your draft stays here until it reconnects." : "Send message as a human";
 }
 const DEFAULT_FEEDBACK =
@@ -1508,8 +1572,9 @@ async function showCosts() {
 async function send(event) {
   event.preventDefault();
   const destination = target(),
-    text = $("message-input").value.trim();
-  if (!destination || !text || !model.token) return;
+    text = $("message-input").value.trim(),
+    attachments = model.attachments.filter((a) => a.id);
+  if (!destination || (!text && !attachments.length) || !model.token) return;
   if (!destination.startsWith("#") && !presenceOf(person(destination)).can_message) {
     feedback("This agent is offline. Your draft stays here until it reconnects.", "error");
     return;
@@ -1519,15 +1584,18 @@ async function send(event) {
     feedback("Offline — not sent. Your draft is kept.", "error");
     return;
   }
-  const draftKey = JSON.stringify([destination, text]);
+  const ids = attachments.map((a) => a.id);
+  const draftKey = JSON.stringify([destination, text, ids]);
   if (!model.pending.has(draftKey))
     model.pending.set(draftKey, { id: crypto.randomUUID().replaceAll("-", ""), target: destination, text });
   const { id } = model.pending.get(draftKey);
-  const entry = model.outbox.get(id) || { id, target: destination, text, draftKey, at: Date.now() / 1000 };
+  const entry = model.outbox.get(id) || { id, target: destination, text, draftKey, at: Date.now() / 1000,
+    attachments: attachments.map((a) => ({ id: a.id, media_type: a.media_type, size: a.size })) };
   entry.state = "sending";
   model.outbox.set(id, entry);
   model.drafts.delete(destination);
   $("message-input").value = "";
+  clearAttachments();
   $("message-input").style.height = "auto";
   model.first = true;
   renderRows(model.serverRows || [], true);
@@ -1557,7 +1625,8 @@ async function transmit(entry) {
     response = await fetch("/api/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-One-Conv-Token": model.token || "" },
-      body: JSON.stringify({ id: entry.id, target: entry.target, text: entry.text }),
+      body: JSON.stringify({ id: entry.id, target: entry.target, text: entry.text,
+        ...(entry.attachments && entry.attachments.length ? { attachments: entry.attachments.map((a) => a.id) } : {}) }),
     });
     data = await response.json().catch(() => ({}));
   } catch (_) {
@@ -1853,6 +1922,104 @@ function theme(value) {
 }
 
 $("composer").addEventListener("submit", send);
+
+// --- images attached to a message ---------------------------------------------------------
+// An image is uploaded as soon as it is pasted, dropped or picked, so sending only names its id.
+model.attachments = [];
+function renderAttachments() {
+  const strip = $("attachments");
+  strip.replaceChildren();
+  strip.hidden = !model.attachments.length;
+  for (const attachment of model.attachments) {
+    const chip = el("div", null, "attachment-chip" + (attachment.id ? "" : attachment.error ? " failed" : " uploading"));
+    const image = el("img", null, "attachment-thumb");
+    image.src = attachment.url;
+    image.alt = attachment.name || "Attached image";
+    chip.appendChild(image);
+    chip.appendChild(el("span", attachment.error || (attachment.id ? "" : "Uploading…"), "attachment-state"));
+    const remove = el("button", null, "attachment-remove");
+    remove.type = "button";
+    remove.setAttribute("aria-label", "Remove " + (attachment.name || "image"));
+    remove.appendChild(icon("close"));
+    remove.addEventListener("click", () => {
+      model.attachments = model.attachments.filter((a) => a !== attachment);
+      URL.revokeObjectURL(attachment.url);
+      renderAttachments();
+      updateComposer();
+    });
+    chip.appendChild(remove);
+    strip.appendChild(chip);
+  }
+}
+function clearAttachments() {
+  for (const attachment of model.attachments) URL.revokeObjectURL(attachment.url);
+  model.attachments = [];
+  renderAttachments();
+}
+async function attach(file) {
+  if (!file || !/^image\/(png|jpeg|gif|webp)$/.test(file.type)) {
+    feedback("Only PNG, JPEG, GIF and WebP images can be attached.", "error");
+    return;
+  }
+  if (model.attachments.length >= 4) {
+    feedback("A message carries at most four images.", "error");
+    return;
+  }
+  const attachment = { url: URL.createObjectURL(file), name: file.name, media_type: file.type, size: file.size, id: null, error: "" };
+  model.attachments.push(attachment);
+  renderAttachments();
+  try {
+    const response = await fetch("/api/attachments", {
+      method: "POST", headers: { "Content-Type": file.type, "X-One-Conv-Token": model.token || "" }, body: file,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || typeof data.id !== "string") throw new Error(data.error || "The image was not stored.");
+    attachment.id = data.id;
+  } catch (error) {
+    attachment.error = error.message || "Upload failed";
+  }
+  renderAttachments();
+  updateComposer();
+}
+function attachFiles(files) {
+  for (const file of files || []) attach(file);
+}
+$("attach-toggle").addEventListener("click", () => $("attach-input").click());
+$("attach-input").addEventListener("change", (event) => {
+  attachFiles(event.target.files);
+  event.target.value = "";
+});
+$("message-input").addEventListener("paste", (event) => {
+  const files = [...(event.clipboardData ? event.clipboardData.items : [])]
+    .filter((item) => item.kind === "file" && item.type.startsWith("image/")).map((item) => item.getAsFile());
+  if (!files.length) return;
+  event.preventDefault();
+  attachFiles(files);
+});
+for (const type of ["dragover", "drop"]) {
+  $("composer").addEventListener(type, (event) => {
+    if (!event.dataTransfer || ![...event.dataTransfer.types].includes("Files")) return;
+    event.preventDefault();
+    if (type === "drop") attachFiles(event.dataTransfer.files);
+  });
+}
+
+// --- the phone's viewport ------------------------------------------------------------------
+// iOS scrolls the page to bring a focused composer above its keyboard and may leave it shifted, with
+// the top bar cut off and the frame showing under the composer. The app follows the visual viewport
+// instead and never lets the page itself scroll.
+function fitViewport() {
+  const viewport = window.visualViewport;
+  if (!viewport) return;
+  document.documentElement.style.setProperty("--viewport-height", Math.round(viewport.height) + "px");
+  if (window.scrollY || window.scrollX || viewport.offsetTop) window.scrollTo(0, 0);
+}
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", fitViewport);
+  window.visualViewport.addEventListener("scroll", fitViewport);
+  window.addEventListener("focusout", () => setTimeout(fitViewport, 50));
+  fitViewport();
+}
 $("message-input").addEventListener("input", () => {
   // Editing a conversation's composer makes its draft the person's own, for that conversation only.
   const destination = target();

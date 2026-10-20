@@ -12,7 +12,17 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ..live import unread
-from ..live.hub import GENERAL, MESSAGE_ID, TOPIC, Hub, HubError, _online, split_address
+from ..live.hub import (
+    ATTACHMENT_ID,
+    ATTACHMENTS_PER_MESSAGE,
+    GENERAL,
+    MESSAGE_ID,
+    TOPIC,
+    Hub,
+    HubError,
+    _online,
+    split_address,
+)
 from ..live.hub import NODE as PEER_NODE
 from .presence import (
     channel_delivery,
@@ -51,14 +61,18 @@ def display_address(address: str) -> str:
 
 
 def validate_message(payload: object) -> dict:
-    """The browser supplies content and a stable retry ID, never a sender identity."""
-    if not isinstance(payload, dict) or set(payload) != {"id", "target", "text"}:
-        raise HubError(400, "Provide only id, target and text; the sender is always You.")
+    """The browser supplies content, a stable retry ID and the images it uploaded, never a sender identity."""
+    if not isinstance(payload, dict) or not {"id", "target", "text"} <= set(payload) <= {"id", "target", "text", "attachments"}:
+        raise HubError(400, "Provide only id, target, text and attachments; the sender is always You.")
     ident, target, text = (payload[key] for key in ("id", "target", "text"))
+    attachments = payload.get("attachments") or []
+    if (not isinstance(attachments, list) or len(attachments) > ATTACHMENTS_PER_MESSAGE
+            or not all(isinstance(a, str) and ATTACHMENT_ID.fullmatch(a) for a in attachments)):
+        raise HubError(400, f"attachments lists at most {ATTACHMENTS_PER_MESSAGE} uploaded image ids.")
     if not isinstance(ident, str) or not MESSAGE_ID.fullmatch(ident):
         raise HubError(400, "id must be 32 lowercase hexadecimal characters, unchanged on retry")
-    if not isinstance(text, str) or not text.strip():
-        raise HubError(400, "Write a nonempty message.")
+    if not isinstance(text, str) or (not text.strip() and not attachments):
+        raise HubError(400, "Write a nonempty message or attach an image.")
     if len(text) > TEXT_LIMIT:
         raise HubError(413, "Message text is too large.")
     if not isinstance(target, str) or not target or len(target) > 512:
@@ -75,7 +89,7 @@ def validate_message(payload: object) -> dict:
         split_address(target)
         if re.search(r"\s", target):
             raise HubError(400, "An agent route cannot contain whitespace.")
-    return {"id": ident, "target": target, "text": text}
+    return {"attachments": attachments, "id": ident, "target": target, "text": text}
 
 
 def validate_channel(payload: object) -> dict:
@@ -282,21 +296,30 @@ class ControlStore:
                 for node, local, ident, sender_node, sender, target, topic, text, created in rows}
 
     @staticmethod
-    def _row(seq, ident, node, sender, target, topic, reply, mode, text, created, outcome, outcome_at=None, reported=0):
+    def _row(seq, ident, node, sender, target, topic, reply, mode, text, created, outcome, outcome_at=None, reported=0,
+             attachments=None):
         row = {"cursor": str(seq), "id": ident, "from": display_address(f"{node}/{sender}"),
                "to": display_address(target), "topic": topic, "reply": reply, "mode": mode,
                "text": text, "at": created, "status": outcome or "stored",
                "delivery": message_delivery(outcome, outcome_at, human_inbox=target == HUMAN)}
         if reported:
             row["reported"] = True
+        if attachments:
+            row["attachments"] = Hub._parsed(attachments)
         return row
+
+    def store_attachment(self, media_type: str, body: bytes) -> dict:
+        return self.hub.store_attachment(NODE, media_type, body)
+
+    def attachment(self, ident: str) -> tuple[str, bytes]:
+        return self.hub.attachment(ident)
 
     def direct(self):
         self.drain_human()
         with self.hub._db() as db:
             rows = db.execute(
                 "SELECT p.seq,p.id,p.from_node,p.sender,d.to_node || '/' || d.to_address,p.topic,p.reply,p.mode,"
-                "p.text,p.created,d.outcome,d.outcome_at,p.reported FROM posts p JOIN deliveries d ON d.post=p.seq "
+                "p.text,p.created,d.outcome,d.outcome_at,p.reported,p.attachments FROM posts p JOIN deliveries d ON d.post=p.seq "
                 # Directness comes from the original target, so a topic-tagged DM stays in its pair's thread.
                 # Only conversations with the human are shown; agents' messages to each other are theirs. The human
                 # writes from the paired workspace or from a machine's terminal, whose bridge reports the exchange.
@@ -356,7 +379,7 @@ class ControlStore:
             total = db.execute("SELECT COUNT(*) FROM posts WHERE topic=? AND kind IS NOT 'system'",
                                (topic,)).fetchone()[0]
             rows = db.execute(
-                "SELECT seq,id,from_node,sender,target,topic,reply,mode,text,created,NULL,NULL,reported "
+                "SELECT seq,id,from_node,sender,target,topic,reply,mode,text,created,NULL,NULL,reported,attachments "
                 # Reported history keeps its original send time, so time orders the channel.
                 "FROM posts WHERE topic=? AND kind IS NOT 'system' ORDER BY created DESC, seq DESC LIMIT ?",
                 (topic, MESSAGES_SHOWN)).fetchall()
@@ -395,7 +418,8 @@ class ControlStore:
         """Retrying after any crash reuses the hub's atomic (node, ID, payload) claim."""
         payload = validate_message(payload)
         receipt = self.hub.send(NODE, {"id": payload["id"], "from": "user", "to": payload["target"],
-                                       "text": payload["text"], "reply": "expected", "mode": "push"},
+                                       "text": payload["text"], "reply": "expected", "mode": "push",
+                                       "attachments": payload["attachments"]},
                                 join_sender=payload["target"].startswith("#"),
                                 require_online=not payload["target"].startswith("#"))
         recipients = receipt["recipients"]

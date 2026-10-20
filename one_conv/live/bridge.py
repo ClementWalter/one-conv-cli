@@ -212,12 +212,40 @@ class _AdapterFailed(Exception):
     pass
 
 
-def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, on_started=None) -> tuple[str, str]:
+def attachments_dir() -> Path:
+    return live_home() / "attachments"
+
+
+def with_attachments(text: str, attachments, fetch) -> str:
+    """The message text followed by where each attached image was saved, so the session can read it.
+
+    `fetch(attachment)` returns the saved file's path; an image the hub would not hand over is
+    named as missing rather than dropped, so the receiver knows the message had one.
+    """
+    if not isinstance(attachments, list) or not attachments or fetch is None:
+        return text
+    lines = []
+    for number, attachment in enumerate(attachments, 1):
+        if not isinstance(attachment, dict) or not isinstance(attachment.get("id"), str):
+            continue
+        try:
+            path = fetch(attachment)
+        except (hubclient.HubRefused, hubclient.HubUnavailable, OSError, ValueError) as error:
+            # A missing image must not lose the words it came with.
+            lines.append(f"[Attached image {number} could not be fetched from the hub: {type(error).__name__}: {error}]")
+            continue
+        lines.append(f"[Attached image {number}: {path} ({attachment.get('media_type', 'image')}, "
+                     f"{attachment.get('size', '?')} bytes). Read this file to view it.]")
+    return text + ("\n\n" + "\n".join(lines) if lines else "")
+
+
+def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, on_started=None,
+                    fetch=None) -> tuple[str, str]:
     """Hand one hub delivery to the session here it is addressed to; returns (outcome, detail).
 
     Only a session listed live on this machine receives it: a stored-only Codex thread or a
     stopped one is refused rather than queued for nobody. An fyi is filed for `local feed`
-    and never wakes the session.
+    and never wakes the session. `fetch` saves an attached image locally and returns its path.
     """
     target, sender_route = str(item.get("to", "")), str(item.get("from", ""))
     if target.startswith("spawn:"):
@@ -236,15 +264,16 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, on_sta
         # The hub's own instruction (an assignment, a release): nobody wrote it, so it has no sender.
         sender, sender_route = None, "system"
     mode, reply, topic = item.get("mode", "push"), item.get("reply", "expected"), item.get("topic")
+    text = with_attachments(item["text"], item.get("attachments"), fetch)
     if mode == "fyi":
         if harness == "boat":
             return "refused", "an fyi cannot reach a Boat conversation: a sandbox has no feed on this machine"
-        wrapped = envelope(item["text"], sender, sender_route, "none", item.get("id"), topic, remote.get("name"))
+        wrapped = envelope(text, sender, sender_route, "none", item.get("id"), topic, remote.get("name"))
         router._append_fyi(target, sender_route, wrapped)
         return "accepted", "stored FYI"
     if harness == "boat" and reply == "expected":
         reply = "inline"
-    wrapped = envelope(item["text"], sender, sender_route, reply, item.get("id"), topic, remote.get("name"))
+    wrapped = envelope(text, sender, sender_route, reply, item.get("id"), topic, remote.get("name"))
     try:
         with router._rate_slot(sender_route, target):
             try:
@@ -309,11 +338,26 @@ class Bridge:
             logger.warning("local message history was not reported: %s", error)
             return None
 
+    def fetch_attachment(self, attachment: dict) -> Path:
+        """Save an attached image under this machine's live directory, once, and return its path."""
+        from .hub import ATTACHMENT_ID, ATTACHMENT_TYPES
+        ident = attachment["id"]
+        if not ATTACHMENT_ID.fullmatch(ident):
+            raise ValueError(f"{ident!r} is not an attachment id")
+        suffix = ATTACHMENT_TYPES.get(str(attachment.get("media_type")), "bin")
+        path = attachments_dir() / f"{ident}.{suffix}"
+        if not path.exists():
+            _, body = self.client.download(f"/v1/attachments/{ident}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as handle:
+                handle.write(body)
+        return path
+
     def handle(self, item: dict) -> str:
         """Deliver one inbox item at most once, then ack its outcome."""
         fresh, recorded = self.ingress.claim(item)
         if fresh:
-            outcome, detail = deliver_inbound(item, self.directory, self.publish)
+            outcome, detail = deliver_inbound(item, self.directory, self.publish, fetch=self.fetch_attachment)
             self.ingress.finish(item["delivery"], outcome, detail)
         elif recorded is None:
             outcome = "unconfirmed"

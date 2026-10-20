@@ -186,9 +186,67 @@ body {
 .cost-empty { line-height: 1.6; padding: 20px; background: var(--soft); border-radius: 12px; }
 .device-dialog .secondary-button { margin-top: 18px; }
 @media (display-mode: standalone) {
+  /* The page never scrolls: the keyboard shrinks the visual viewport, which the layout follows. */
+  html, body { height: 100%; overscroll-behavior: none; }
+  body { position: fixed; inset: 0; width: 100%; }
   .topbar { padding-top: env(safe-area-inset-top); height: calc(46px + env(safe-area-inset-top)); }
-  .workspace { height: calc(100dvh - 46px - env(safe-area-inset-top)); padding-bottom: max(5px, env(safe-area-inset-bottom)); }
+  .workspace {
+    height: calc(var(--viewport-height, 100dvh) - 46px - env(safe-area-inset-top));
+    padding-bottom: max(5px, env(safe-area-inset-bottom));
+  }
 }
+.message-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+.message-image {
+  display: block;
+  max-width: min(100%, 360px);
+  max-height: 320px;
+  border-radius: 8px;
+  border: 1px solid var(--line, #e6dde9);
+}
+.attachment-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 10px 0;
+}
+.attachment-chip {
+  position: relative;
+  display: grid;
+  gap: 2px;
+  width: 72px;
+  font-size: 9px;
+  color: var(--muted);
+}
+.attachment-chip.uploading .attachment-thumb { opacity: 0.5; }
+.attachment-chip.failed .attachment-state { color: #b3261e; }
+.attachment-thumb {
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--line, #e6dde9);
+}
+.attachment-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--text);
+  color: var(--surface);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  padding: 0;
+}
+.attachment-remove .icon { width: 10px; height: 10px; }
 @media (max-width: 760px) {
   .topbar-end { gap: 6px !important; }
   .topbar-end .top-avatar { display: none; }
@@ -1071,6 +1129,59 @@ button {
 .message-body li {
   padding-left: 3px;
 }
+.message-body ol {
+  margin: 4px 0 7px;
+  padding-left: 22px;
+}
+.message-body ul ul,
+.message-body ol ol,
+.message-body ul ol,
+.message-body ol ul {
+  margin: 2px 0 2px;
+}
+.message-body h3,
+.message-body h4,
+.message-body h5,
+.message-body h6 {
+  margin: 10px 0 4px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+.message-body h3 { font-size: 16px; }
+.message-body h4 { font-size: 15px; }
+.message-body h5,
+.message-body h6 { font-size: 14px; }
+.message-body blockquote {
+  margin: 4px 0 7px;
+  padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--selected);
+  color: var(--muted);
+}
+.message-body hr {
+  border: 0;
+  border-top: 1px solid var(--line, #e6dde9);
+  margin: 10px 0;
+}
+.message-body table {
+  border-collapse: collapse;
+  margin: 6px 0 8px;
+  font-size: 13px;
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.message-body th,
+.message-body td {
+  border: 1px solid var(--line, #e6dde9);
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+.message-body th {
+  background: var(--hover);
+  font-weight: 650;
+}
+.message-body s { opacity: 0.7; }
 .message-body code {
   font:
     11px/1.5 ui-monospace,
@@ -1772,6 +1883,9 @@ button {
   .composer-area {
     padding: 8px 12px 10px;
   }
+  .workspace {
+    height: calc(var(--viewport-height, 100dvh) - 46px);
+  }
   /* iPhone keeps the page scale when focusing controls with readable native-sized text. */
   input,
   textarea,
@@ -1830,10 +1944,6 @@ button {
 .device-dialog .dialog-heading h2 { padding-right: 32px; }
 .job-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .pool-job { padding-top: 16px; border-top: 1px solid var(--border); }
-@media (display-mode: standalone) {
-  .topbar { padding-top: env(safe-area-inset-top); height: calc(46px + env(safe-area-inset-top)); }
-  .workspace { height: calc(100dvh - 46px - env(safe-area-inset-top)); padding-bottom: max(5px, env(safe-area-inset-bottom)); }
-}
 /* A send this tab started: honest states until the workspace's own copy replaces it. */
 .message-delivery.local-sending { color: var(--muted); font-style: italic; }
 .message-delivery.local-uncertain,

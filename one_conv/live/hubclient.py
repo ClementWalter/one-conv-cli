@@ -94,6 +94,23 @@ class HubClient:
         except (urllib.error.URLError, OSError, ValueError) as error:
             raise HubUnavailable(f"hub at {self.url} is unreachable: {error}") from None
 
+    def download(self, path: str) -> tuple[str, bytes]:
+        """(media_type, body) of a binary resource, such as an attachment a message carries."""
+        if self.listener_pid is not None and not tunnel.listening(self.listener_pid, urlsplit(self.url).port or 0):
+            raise HubUnavailable("the bridge's ssh forward is not running")
+        request = urllib.request.Request(self.url + path, headers={"Authorization": f"Bearer {self.token}"})
+        try:
+            with self._opener.open(request, timeout=self.timeout) as response:
+                return response.headers.get("Content-Type", "application/octet-stream").partition(";")[0], response.read()
+        except urllib.error.HTTPError as error:
+            try:
+                message = json.loads(error.read()).get("error", "")
+            except ValueError:
+                message = error.reason
+            raise HubRefused(error.code, message) from None
+        except (urllib.error.URLError, OSError) as error:
+            raise HubUnavailable(f"hub at {self.url} is unreachable: {error}") from None
+
     # Topics ---------------------------------------------------------------------------------
 
     def join(self, topic: str, address: str, work: bool | None = None) -> dict:

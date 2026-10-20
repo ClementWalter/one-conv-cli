@@ -138,3 +138,19 @@ def test_the_layout_follows_the_visual_viewport(phone):
     phone.evaluate("() => window.visualViewport.dispatchEvent(new Event('resize'))")
     assert phone.evaluate("() => document.documentElement.style.getPropertyValue('--viewport-height')") == \
         phone.evaluate("() => Math.round(window.visualViewport.height) + 'px'")
+
+
+def test_a_closed_keyboard_takes_no_height(phone):
+    phone.evaluate("() => window.visualViewport.dispatchEvent(new Event('resize'))")
+    assert phone.evaluate("() => document.documentElement.style.getPropertyValue('--keyboard-height')") == "0px"
+
+
+def test_the_installed_layout_rules_come_after_the_phone_rules():
+    from one_conv.live import web
+    assert web.STYLE.rindex("@media (display-mode: standalone)") > web.STYLE.rindex("@media (max-width: 760px)")
+
+
+def test_the_installed_top_bar_keeps_its_controls_below_the_status_bar():
+    from one_conv.live import web
+    installed = web.STYLE[web.STYLE.rindex("@media (display-mode: standalone)"):]
+    assert "padding-top: env(safe-area-inset-top)" in installed

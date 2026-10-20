@@ -2011,7 +2011,11 @@ for (const type of ["dragover", "drop"]) {
 function fitViewport() {
   const viewport = window.visualViewport;
   if (!viewport) return;
-  document.documentElement.style.setProperty("--viewport-height", Math.round(viewport.height) + "px");
+  const root = document.documentElement.style;
+  root.setProperty("--viewport-height", Math.round(viewport.height) + "px");
+  // What the keyboard takes: the layout viewport and the visual one are measured alike, so their
+  // difference is the keyboard and nothing else (the status bar is in both or in neither).
+  root.setProperty("--keyboard-height", Math.max(0, Math.round(window.innerHeight - viewport.height - viewport.offsetTop)) + "px");
   if (window.scrollY || window.scrollX || viewport.offsetTop) window.scrollTo(0, 0);
 }
 if (window.visualViewport) {

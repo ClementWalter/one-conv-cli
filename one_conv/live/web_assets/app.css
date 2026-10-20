@@ -185,16 +185,6 @@ body {
 .usage-row small { color: var(--muted); }
 .cost-empty { line-height: 1.6; padding: 20px; background: var(--soft); border-radius: 12px; }
 .device-dialog .secondary-button { margin-top: 18px; }
-@media (display-mode: standalone) {
-  /* The page never scrolls: the keyboard shrinks the visual viewport, which the layout follows. */
-  html, body { height: 100%; overscroll-behavior: none; }
-  body { position: fixed; inset: 0; width: 100%; }
-  .topbar { padding-top: env(safe-area-inset-top); height: calc(46px + env(safe-area-inset-top)); }
-  .workspace {
-    height: calc(var(--viewport-height, 100dvh) - 46px - env(safe-area-inset-top));
-    padding-bottom: max(5px, env(safe-area-inset-bottom));
-  }
-}
 .message-images {
   display: flex;
   flex-wrap: wrap;
@@ -1974,4 +1964,37 @@ button {
   border: 0;
   cursor: pointer;
   font: inherit;
+}
+/* Installed on a phone's home screen. Last in the sheet, so it wins over the phone rules above: the
+   page is a fixed column that never scrolls; the top bar extends under the status bar and keeps
+   its controls below it; the workspace fills what remains and stops above the home indicator; the
+   keyboard, measured from the visual viewport, raises the bottom edge rather than pushing the page. */
+@media (display-mode: standalone) {
+  html, body { height: 100%; overscroll-behavior: none; }
+  body {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: var(--keyboard-height, 0px);
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+  }
+  .topbar {
+    flex: none;
+    padding-top: env(safe-area-inset-top);
+    height: calc(46px + env(safe-area-inset-top));
+  }
+  .workspace {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: auto;
+    padding-bottom: max(5px, env(safe-area-inset-bottom));
+  }
+  .sidebar,
+  .sidebar-open .sidebar-overlay,
+  .details {
+    top: calc(46px + env(safe-area-inset-top));
+  }
 }

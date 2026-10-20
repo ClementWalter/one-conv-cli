@@ -3,8 +3,8 @@
 The workspace shows one-conv messages, so words sent from the phone reach it while the same words typed
 at the laptop's keyboard never did. The bridge runs `one-conv report-prompts` every PROMPT_SYNC_SECONDS:
 for each running session on this machine it reads the transcript's new user turns, keeps those a human
-typed (a relayed one-conv envelope is already a message; tool results, command wrappers and the prompt a
-spawned session was started with are not the human) and reports them to the hub as history from `user`
+typed (a relayed one-conv envelope is already a message; tool results, slash-command wrappers, echoed
+command output and the prompt a spawned session was started with are not the human) and reports them to the hub as history from `user`
 to the session, at the turn's own time, so the workspace lists them under You in that session's
 conversation and wakes nobody. Positions are kept per session as the feed keeps its own, so a rewritten
 transcript is noticed instead of replayed.
@@ -28,7 +28,10 @@ logger = logging.getLogger(__name__)
 PROMPT_SYNC_SECONDS = 20.0
 # Prompts reported when a session is first seen: its recent past, not its whole life.
 FIRST_SIGHT = 20
-ENVELOPE = re.compile(r"<\s*one-conv-message\b", re.IGNORECASE)
+# A user turn carrying one of these was not typed as a sentence: a relayed one-conv message (already on the
+# hub) or Claude Code's slash-command plumbing and the local command output it echoes back.
+NOT_TYPED = re.compile(r"<\s*(one-conv-message|command-name|command-message|local-command-caveat|local-command-stdout)\b"
+                       r"|\A\s*\[Image: source: [^\]]*\]\s*\Z", re.IGNORECASE)
 
 
 def cursor_path() -> Path:
@@ -62,9 +65,9 @@ def spawned_addresses() -> set[str]:
         if isinstance(rows, dict) else set()
 
 
-def is_relayed(turn) -> bool:
-    """A user turn carrying a one-conv envelope is a message that already reached the hub."""
-    return any(isinstance(block, dict) and block.get("type") == "text" and ENVELOPE.search(block.get("text") or "")
+def not_typed(turn) -> bool:
+    """A user turn that is a relayed message or command plumbing rather than something the human typed."""
+    return any(isinstance(block, dict) and block.get("type") == "text" and NOT_TYPED.search(block.get("text") or "")
                for block in turn.blocks)
 
 
@@ -88,16 +91,22 @@ def prompts(thread: feed.Thread, turns: list, start: int | None, skip_first: boo
     """
     raw_index = {id(turn): index for index, turn in enumerate(turns)}
     first = next((raw_index[id(t)] for t in turns if t.role == "user"), None)
-    rows = []
+    rows, answered = [], True
     for turn in thread.visible(turns):
         index = raw_index.get(id(turn), -1)
-        if turn.role != "user" or (start is not None and index < start) or (skip_first and index == first):
+        if turn.role != "user":
+            answered = True
             continue
-        if is_relayed(turn):
+        if (start is not None and index < start) or (skip_first and index == first) or not_typed(turn):
             continue
         text = thread.render(turn)
-        if text:
-            rows.append({"index": index, "ts": turn.ts, "text": text})
+        if not text:
+            continue
+        # A prompt sent again, longer, before any answer replaces the interrupted one it extends.
+        if rows and not answered and text.startswith(rows[-1]["text"]):
+            rows.pop()
+        rows.append({"index": index, "ts": turn.ts, "text": text})
+        answered = False
     return rows if start is not None else rows[-FIRST_SIGHT:]
 
 

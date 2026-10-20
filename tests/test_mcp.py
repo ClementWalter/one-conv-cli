@@ -107,7 +107,7 @@ def test_stdio_discovers_tools(saved_history):
     assert {tool.name for tool in result.tools} == {
         "list_chats", "read_conversation", "search_conversations", "find_conversations", "list_accounts",
         "list_live_sessions", "send_message", "set_name", "join_topic", "list_topics",
-        "task_show", "task_claim", "task_update", "task_delegate",
+        "ack",
     }
 
 
@@ -135,7 +135,7 @@ def test_generated_config_starts_server():
         async with Client(StdioServerParameters(**config)) as client:
             return await client.list_tools()
 
-    assert len(asyncio.run(discover()).tools) == 14
+    assert len(asyncio.run(discover()).tools) == 11
 
 
 def test_stdio_send_message_names_codex_caller_from_tool_meta(tmp_path):
@@ -183,6 +183,6 @@ def call_in_process(tool, arguments):
     return asyncio.run(call())
 
 
-def test_a_refused_task_action_tells_the_agent_why():
-    _, text = call_in_process("task_show", {"key": "not a key"})
-    assert "a task key is NODE:message-id" in text
+def test_a_refused_tool_call_tells_the_agent_why():
+    _, text = call_in_process("ack", {"message_id": "a" * 32})
+    assert text.startswith("Error executing tool ack: ")

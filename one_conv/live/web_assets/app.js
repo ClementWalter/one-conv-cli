@@ -35,8 +35,6 @@ const model = {
   // Read marks the workspace accepted from this tab, per conversation, and the saves in flight.
   readMarks: new Map(),
   reading: new Set(),
-  // Task keys whose assignment this tab is saving.
-  assigning: new Set(),
 };
 const harnesses = {
   claude: "Claude",
@@ -668,25 +666,8 @@ function withOutbox(rows) {
   const local = [...model.outbox.values()].filter((entry) => entry.target === destination).map(localRow);
   return local.length ? [...rows, ...local] : rows;
 }
-const TASK_FINISHED = ["done", "cancelled"];
-function connectedAgents() {
-  return model.state.sessions.filter((s) => !s.history_only && presenceOf(person(s.address)).state !== "offline");
-}
-function taskLabel(task) {
-  // Progress comes only from the task's own state, never from delivery receipts.
-  const owner = task.owner ? person(task.owner).name : "";
-  switch (task.state) {
-    case "unassigned": return staffingLabel(task.staffing) || "Unclaimed";
-    case "assigned": return owner ? "Assigned to " + owner : "Assigned";
-    case "working": return owner ? owner + " is working" : "Working";
-    case "blocked": return owner ? "Blocked · " + owner : "Blocked";
-    case "done": return owner ? "Done · " + owner : "Done";
-    case "cancelled": return "Cancelled";
-    default: return String(task.state || "Unknown");
-  }
-}
 function staffingLabel(staffing) {
-  // Who the hub is starting for a request no running session could take.
+  // Who the hub is starting for a post no running session could read.
   if (!staffing) return "";
   const where = String(staffing.route || "").split("/")[0];
   switch (staffing.state) {
@@ -697,91 +678,20 @@ function staffingLabel(staffing) {
     default: return "";
   }
 }
-function shortText(text, limit) {
-  text = String(text || "").replace(/\s+/g, " ").trim();
-  return text.length > limit ? text.slice(0, limit - 1).trimEnd() + "…" : text;
-}
-async function assignTask(task, to) {
-  // One assignment per task at a time; the chip says so until the workspace answers.
-  if (model.assigning.has(task.key)) return;
-  model.assigning.add(task.key);
-  // The choice is made: release the picker so the list can show "Assigning…" right away.
-  const focused = document.activeElement;
-  if (focused && focused.classList && focused.classList.contains("task-assign")) focused.blur();
-  renderRows(model.serverRows || [], true);
-  try {
-    await post("/api/tasks/assign", { key: task.key, version: task.version, to });
-    toast(to ? "Assigned to " + person(to).name : "Request unassigned");
-  } catch (error) {
-    if (error instanceof StaleSession) return;
-    // A stale version means someone changed it first: say so, then show the current owner.
-    toast(error.message);
-  } finally {
-    model.assigning.delete(task.key);
+function ackLine(row) {
+  // Who read the post: one check mark per session that acked it.
+  const acks = Array.isArray(row.acks) ? row.acks : [];
+  if (!acks.length) {
+    const starting = staffingLabel(row.staffing);
+    if (!starting) return null;
+    const line = el("small", starting, "message-acks starting");
+    if (row.staffing && row.staffing.detail) line.title = row.staffing.detail;
+    return line;
   }
-  model.signature = "";
-  await refreshState();
-}
-function taskChip(task) {
-  const chip = el("div", null, "task-chip task-" + String(task.state || "unknown"));
-  const open = !TASK_FINISHED.includes(task.state);
-  const head = el("div", null, "task-head");
-  if (task.owner) head.appendChild(avatar(task.owner, "tiny-avatar"));
-  const busy = model.assigning.has(task.key);
-  const state = el("span", busy ? "Assigning…" : taskLabel(task), "task-state");
-  if (task.owner) state.title = task.owner;
-  head.appendChild(state);
-  if (validDate(task.updated)) head.appendChild(el("span", "updated " + freshness(task.updated), "task-updated"));
-  if (!task.owner && open && task.staffing && task.staffing.detail) state.title = task.staffing.detail;
-  if (task.owner && open && task.owner_online === false) {
-    const away = el("span", "Offline", "task-offline");
-    away.title = "The owner is not connected. The request waits for it, or reassign it.";
-    head.appendChild(away);
-  }
-  if (model.capabilities.tasks && open) {
-    const picker = el("select", null, "task-assign");
-    picker.setAttribute("aria-label", (task.owner ? "Reassign" : "Assign") + " this request");
-    const prompt = el("option", task.owner ? "Reassign…" : "Assign…");
-    prompt.value = "";
-    prompt.disabled = true;
-    prompt.selected = true;
-    picker.appendChild(prompt);
-    for (const agent of connectedAgents()) {
-      if (agent.address === task.owner) continue;
-      const option = el("option", person(agent.address).name);
-      option.value = agent.address;
-      picker.appendChild(option);
-    }
-    if (task.owner) {
-      const none = el("option", "Unassign");
-      none.value = "__unassign";
-      picker.appendChild(none);
-    }
-    picker.disabled = busy || picker.options.length < 2;
-    picker.addEventListener("change", () => {
-      const choice = picker.value;
-      if (choice) assignTask(task, choice === "__unassign" ? null : choice);
-    });
-    head.appendChild(picker);
-  }
-  chip.appendChild(head);
-  if (task.note) {
-    const note = el("p", shortText(task.note, 140), "task-note");
-    note.title = task.note;
-    chip.appendChild(note);
-  }
-  const children = Array.isArray(task.children) ? task.children : [];
-  if (children.length) {
-    const list = el("ul", null, "task-children");
-    for (const child of children) {
-      const line = el("li", String(child.kind || "part") + ": " + (child.owner ? person(child.owner).name : "nobody") +
-        " " + String(child.state || ""));
-      if (child.note) line.title = child.note;
-      list.appendChild(line);
-    }
-    chip.appendChild(list);
-  }
-  return chip;
+  const line = el("small", null, "message-acks");
+  line.title = "Read by " + acks.map((who) => person(who).name).join(", ");
+  for (const who of acks) line.appendChild(el("span", "✓ " + person(who).name, "message-ack"));
+  return line;
 }
 function renderRows(rows, force = false) {
   model.serverRows = rows;
@@ -789,17 +699,6 @@ function renderRows(rows, force = false) {
   conversationResponse(rows);
   const signature = JSON.stringify([model.view, rows, model.state.names, model.state.sessions.map((s) => [s.address, s.name])]);
   if (!force && signature === model.signature) return;
-  const picking = document.activeElement;
-  if (picking && picking.classList && picking.classList.contains("task-assign") && $("messages").contains(picking)) {
-    // Rebuilding now would detach the picker the human is using. The newest snapshot is kept in
-    // model.serverRows and drawn once the picker loses focus; a choice made from an older version
-    // is refused by the workspace and the view refreshes.
-    if (!picking.dataset.deferred) {
-      picking.dataset.deferred = "1";
-      picking.addEventListener("blur", () => renderRows(model.serverRows || [], true), { once: true });
-    }
-    return;
-  }
   const scroll = $("message-scroll");
   const follow =
     model.first ||
@@ -927,7 +826,8 @@ function renderRows(rows, force = false) {
         status.append(" ", retry);
       }
       content.appendChild(status);
-      if (row.task && typeof row.task === "object") content.appendChild(taskChip(row.task));
+      const acks = ackLine(row);
+      if (acks) content.appendChild(acks);
     }
     item.appendChild(content);
     list.appendChild(item);

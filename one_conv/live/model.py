@@ -72,34 +72,8 @@ def _attr(value: str) -> str:
     return html.escape(value, quote=True)
 
 
-def _task_footer(task: dict, role: str | None) -> str:
-    """What an agent may do about the request it received: own it, work a part, or only know of it."""
-    key, version = _attr(str(task.get("key"))), task.get("version")
-    if role == "owner":
-        return (f"\nYou own this request (task {key}, version {version}): you alone work it and answer it."
-                f"\nReport progress: `one-conv live task update {key} --version {version} --state working"
-                " --note \"...\"` (or the task_update tool); finish with --state done."
-                f"\nGive a part to a teammate: `one-conv live task delegate {key} --version {version} --to @name"
-                " --kind review`."
-                f"\nLink your answer to it: send_message with task=\"{key}\" and task_version={version}"
-                f" (CLI: --task {key} --task-version {version}).")
-    if role == "collaborator":
-        return (f"\nYou were granted child task {key} (version {version}) of a request owned by another agent."
-                " Work only this part, and report to its owner with "
-                f"`one-conv live task update {key} --version {version} --state done --note \"...\"`.")
-    if role == "candidate":
-        return (f"\nUnclaimed request (task {key}, version {version}), offered to every session in this channel."
-                f" To take it, claim it before any work: `one-conv live task claim {key} --version {version}`"
-                " (or the task_claim tool). Only the session whose claim succeeds works and answers it;"
-                " if your claim is refused, another session has it: do not work on it.")
-    owner = _attr(str(task.get("owner") or "nobody yet"))
-    return (f"\nContext only: this request is task {key}, owned by {owner}. Do not act on it or answer the human"
-            " about it unless its owner grants you a part or the human asks you.")
-
-
 def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", reply: str = "expected",
-             message_id: str | None = None, topic: str | None = None, handle: str | None = None,
-             task: dict | None = None, role: str | None = None) -> str:
+             message_id: str | None = None, topic: str | None = None, handle: str | None = None) -> str:
     """Wrap a message so the receiver knows who sent it, on which topic, and whether to answer.
 
     An agent sender is a teammate working for the same user: the message is a request to
@@ -120,7 +94,7 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
     if human:
         attrs += ' kind="human"'
     elif address == "system":
-        # The hub's own instruction about a task: not the human, not an agent.
+        # The hub's own instruction (a spawn order): not the human, not an agent.
         attrs += ' kind="system"'
     elif sender is not None:
         if handle:
@@ -153,10 +127,11 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
     elif sender is not None and not sender.id.startswith("?"):
         footer = f'\nTo reply, call the one-conv send_message tool with to="{_attr(sender.address)}"'
         footer += f', or to="#{_attr(topic)}" to answer everyone on the topic.' if topic else "."
-    if task:
-        attrs += f' task="{_attr(str(task.get("key")))}" task-version="{_attr(str(task.get("version")))}"'
-        if role:
-            attrs += f' role="{_attr(role)}"'
-        # An observer gets context and a candidate must claim first: neither is told how to answer yet.
-        footer = _task_footer(task, role) if role in ("observer", "candidate") else _task_footer(task, role) + footer
+    if human and reply == "expected" and message_id:
+        # The human sees who read the post; several sessions read it, so they divide the work first.
+        footer = (f'\nAck it now with the one-conv ack tool (message_id="{_attr(message_id)}"), or'
+                  f" `one-conv live ack {_attr(message_id)}`."
+                  + (f" Other sessions in #{_attr(topic)} read it too: before working, say in the channel what you"
+                     " take and leave what another session already took; anything that cannot be undone is done"
+                     " by one session, named in the channel." if topic else "") + footer)
     return f"<one-conv-message {attrs}>\n{text}\n</one-conv-message>{footer}"

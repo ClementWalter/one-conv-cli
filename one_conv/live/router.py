@@ -1,6 +1,5 @@
 """List live sessions across harnesses, identify the sender, resolve a target and deliver."""
 
-import hashlib
 import json
 import logging
 import math
@@ -296,22 +295,32 @@ def _logged(receipt: dict, text: str, topic: str | None, fyi: bool, reply: str) 
     return receipt
 
 
+def ack(message_id: str, address: str) -> dict:
+    """Record on the hub that this session read a message delivered to it; the human sees the check mark."""
+    try:
+        hub = hubclient.configured()
+    except hubclient.HubRefused as error:
+        raise LiveError(str(error)) from error
+    if hub is None:
+        raise LiveError("acks are kept by a live hub, and this machine has none; just reply instead")
+    try:
+        return hub.request("POST", "/v1/acknowledgments", {"actor": address, "id": message_id})
+    except (hubclient.HubRefused, hubclient.HubUnavailable) as error:
+        raise LiveError(str(error)) from error
+
+
 def send(target: str, text: str, sender: LiveSession | None, origin: str = "unknown",
          fyi: bool = False, reply: str = "expected", topic: str | None = None,
-         message_id: str | None = None, task: dict | None = None, about: str | None = None) -> dict:
+         message_id: str | None = None) -> dict:
     """Deliver to one session, or to every member of a topic for a `#topic` target.
 
     `message_id` is chosen once and reused on retry, so a receiver can drop a duplicate.
-    `task` ({key, version}) links the post to a task the sender holds, and the hub checks it;
-    `about="other"` says the post answers no open request. Through a hub, a post to the human
-    or into a channel with an open request someone else owns needs one of the two.
     """
     message_id = message_id or uuid.uuid4().hex
-    extra = {**({"task": task} if task else {}), **({"about": about} if about else {})}
     named = topic_of(target)
     try:
         if named is not None:
-            return _logged(_send_topic(named, text, sender, origin, fyi, reply, message_id, extra), text, None,
+            return _logged(_send_topic(named, text, sender, origin, fyi, reply, message_id), text, None,
                            fyi, reply)
         if topic is not None:
             topic = team._check("topic", topic)
@@ -323,30 +332,12 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
         if hub is None:
             raise LiveError(f"{target} is on machine {node}; reaching it needs this machine's bridge "
                             "(`one-conv live serve --hub ...`).")
-        # A post linked to a task goes through the hub that holds the task, even to a session here.
-        if node != hub.node or extra.get("task"):
+        if node != hub.node:
             receipt = _post_remote(hub, target, text, sender.address if sender else origin, fyi, reply, topic,
-                                   message_id, extra)
+                                   message_id)
             return _logged(receipt, text, topic, fyi, reply)
         target = local  # This machine's own NODE/ prefix: deliver here.
-    task = None
-    try:
-        hub_here = hubclient.configured()
-    except hubclient.HubRefused as error:
-        raise LiveError(str(error)) from error
-    if hub_here is not None and extra.get("task"):
-        raise LiveError("a post linked to a task goes through the hub: address the task owner as NODE/harness:id")
-    if hub_here is None and sender is None and origin == "user" and not fyi and reply == "expected" \
-            and target != "user":
-        # A direct request from the person at this machine: its recipient owns it.
-        task = _local_request(message_id, text, topic, resolve(target).address)
-    elif hub_here is None and sender is not None:
-        # Without a hub this machine's task store is the authority; with one, the hub is.
-        _local_policy(sender.address, target, topic, extra)
-    receipt = _send_one(target, text, sender, origin, fyi, reply, topic, message_id, task,
-                        "owner" if task else None)
-    if task is not None:
-        receipt["task"] = task
+    receipt = _send_one(target, text, sender, origin, fyi, reply, topic, message_id)
     if topic is not None:
         team.record(topic, message_id, receipt["from"], text)
     return _logged(receipt, text, topic, fyi, reply)
@@ -365,15 +356,14 @@ def remote_address(target: str) -> tuple[str | None, str]:
 
 
 def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str, topic: str | None,
-                 message_id: str, extra: dict | None = None) -> dict:
+                 message_id: str) -> dict:
     """Post a direct message to a session on another machine; the hub hands it to that machine's bridge.
 
     The message sits in the bridge's outbox from before the request until the hub answers,
     so a crash or an unreachable hub leaves it for the bridge to repost under the same id.
     """
     message = {"id": message_id, "to": target, "from": sender, "reply": "none" if fyi else reply,
-               "mode": "fyi" if fyi else "push", "text": text, **({"topic": topic} if topic else {}),
-               **(extra or {})}
+               "mode": "fyi" if fyi else "push", "text": text, **({"topic": topic} if topic else {})}
     try:
         receipt = hubclient.submit(hub, message)
     except (hubclient.HubRefused, hubclient.PendingConflict) as error:
@@ -387,7 +377,7 @@ def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str
 
 
 def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
-                reply: str, message_id: str, extra: dict | None = None) -> dict:
+                reply: str, message_id: str) -> dict:
     """Record the message on the topic, then deliver it to each member but the sender."""
     topic = team._check("topic", topic)
     sender_label = sender.address if sender else origin
@@ -397,85 +387,28 @@ def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, 
         raise LiveError(str(error)) from error
     if hub is not None:
         return _post_topic(hub, topic, text, sender_label, "none" if fyi else reply, message_id,
-                           "fyi" if fyi else "push", extra)
+                           "fyi" if fyi else "push")
     members = team.members(topic)
-    task = None
-    if sender is None and origin == "user" and not fyi and reply == "expected":
-        # A request from the person at this machine is offered to every member; the first claim owns it.
-        task = _local_request(message_id, text, topic, None)
-    elif sender is not None:
-        _local_policy(sender.address, f"#{topic}", topic, extra or {})
     team.record(topic, message_id, sender_label, text)
     deliveries = []
     for member in members:
         if member == sender_label:
             continue
         try:
-            deliveries.append(_send_one(member, text, sender, origin, fyi, reply, topic, message_id, task,
-                                        None if task is None else "candidate"))
+            deliveries.append(_send_one(member, text, sender, origin, fyi, reply, topic, message_id))
         except (LiveError, RuntimeError, OSError, ValueError) as error:
             # A member that cannot be reached now still finds the message when it catches up.
             deliveries.append({"to": member, "status": f"not delivered: {error}"})
     receipt = {"topic": topic, "id": message_id, "from": sender_label, "deliveries": deliveries}
-    if task is not None:
-        receipt["task"] = task
     return receipt
-
-
-def _local_request(message_id: str, text: str, topic: str | None, owner: str | None) -> dict:
-    """The task a request from the person at this machine makes, in this machine's task store."""
-    from . import taskops, tasks
-    return taskops.local_call(lambda db: tasks.create(db, tasks.key_for("local", message_id), post_seq=None,
-                                                      topic=topic, owner=owner, created_by="user", title=text)[0])
-
-
-def _local_policy(sender: str, target: str, topic: str | None, extra: dict) -> None:
-    """Without a hub, the same publisher rules as the hub's, checked against this machine's tasks."""
-    from . import taskops, tasks
-    link = extra.get("task")
-
-    def check(db):
-        if link is not None:
-            task = tasks.require(db, link.get("key"))
-            tasks._fence(task, sender, link.get("version"))
-            if task["state"] in tasks.FINISHED:
-                raise tasks.TaskError(409, f"{task['key']} is already {task['state']}: post the answer before "
-                                           "marking it done, or send without --task if it is about something else")
-            if task["parent"] and target != (tasks.get(db, task["parent"]) or {}).get("owner"):
-                raise tasks.TaskError(403, f"{task['key']} is a part of {task['parent']}: report it to that request's "
-                                           "owner, who answers the human")
-            return
-        if extra.get("about") == "other" or not (target == "user" or target.startswith("#")):
-            return
-        mine = set(team_topics_of(sender))
-        for task in tasks.listing(db, open_only=True):
-            if task["parent"] or task["owner"] == sender or task["created_by"] != "user":
-                continue
-            if (target == "user" and task["topic"] in mine) or (target.startswith("#") and task["topic"] == topic):
-                raise tasks.TaskError(409, f"{target} has an open request owned by {task['owner'] or 'nobody yet'}"
-                                           f" (task {task['key']}). Only its owner answers it. Link a task you hold"
-                                           " with --task KEY --task-version N, or send with --not-task if this is"
-                                           " about something else.")
-    try:
-        taskops.local_call(check)
-    except taskops.TaskOpError as error:
-        raise LiveError(str(error)) from error
 
 
 def team_topics_of(address: str) -> list[str]:
     return [row["topic"] for row in team.topics() if address in row.get("members", [])]
 
 
-def deliver_task(route: str, text: str, giver: str, task: dict, role: str) -> dict:
-    """Wake an agent on this machine with a task it now holds, under a stable id per grant."""
-    sender = next((s for s in list_all(giver.partition(":")[0]) if s.address == giver), None) if ":" in giver else None
-    message_id = hashlib.sha256(f"{task['key']}@{task['version']}:{role}".encode()).hexdigest()[:32]
-    return _send_one(route, text, sender, "user" if sender is None else "unknown", False, "expected",
-                     task.get("topic"), message_id, task, role)
-
-
 def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id: str,
-                mode: str = "push", extra: dict | None = None) -> dict:
+                mode: str = "push") -> dict:
     """Post once; the hub records the message and fans it out to every member on every machine.
 
     The message sits in the bridge's outbox from before the request until the hub answers,
@@ -485,7 +418,7 @@ def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id:
     """
     # mode is the delivery mode (wake the receiver or not), kept apart from the reply policy.
     message = {"id": message_id, "to": f"#{topic}", "from": sender, "topic": topic,
-               "mode": mode, "reply": reply, "text": text, **(extra or {})}
+               "mode": mode, "reply": reply, "text": text}
     if ":" in sender:
         message["join_topic"] = True
     try:
@@ -501,8 +434,7 @@ def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id:
 
 
 def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
-              reply: str, topic: str | None, message_id: str, task: dict | None = None,
-              role: str | None = None) -> dict:
+              reply: str, topic: str | None, message_id: str) -> dict:
     if target == "user":
         # The human workspace reads the shared log and has no harness to wake.
         return {"to": "user", "title": "You", "cwd": "", "delivery": "human workspace",
@@ -517,7 +449,7 @@ def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, f
     if session.harness == "boat" and reply == "expected":
         reply = "inline"
     handle = team.name_for(sender.address) if sender is not None else None
-    wrapped = envelope(text, sender, origin, "none" if fyi else reply, message_id, topic, handle, task, role)
+    wrapped = envelope(text, sender, origin, "none" if fyi else reply, message_id, topic, handle)
     with _rate_slot(sender_label, session.address):
         if fyi:
             _append_fyi(session.address, sender_label, wrapped)

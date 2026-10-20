@@ -108,9 +108,9 @@ def deliver_spawn(item: dict, on_started=None) -> tuple[str, str]:
     config = spawn_settings()
     if config is None or config["harness"] != harness:
         return "refused", f"this machine does not start {harness} sessions"
-    if item.get("role") != "candidate":
-        # Someone claimed the request before this order was handed out.
-        return "accepted", "not started: the request already has an owner"
+    if item.get("mode") == "fyi":
+        # A session acked the post before this order was handed out.
+        return "accepted", "not started: a session already read the post"
     try:
         spawn.preflight(harness)
     except spawn.SpawnError as error:
@@ -235,19 +235,15 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, on_sta
         # The hub's own instruction (an assignment, a release): nobody wrote it, so it has no sender.
         sender, sender_route = None, "system"
     mode, reply, topic = item.get("mode", "push"), item.get("reply", "expected"), item.get("topic")
-    # A task delivery says whether this session owns the request, works a part of it, or only observes.
-    task, role = item.get("task"), item.get("role")
     if mode == "fyi":
         if harness == "boat":
             return "refused", "an fyi cannot reach a Boat conversation: a sandbox has no feed on this machine"
-        wrapped = envelope(item["text"], sender, sender_route, "none", item.get("id"), topic, remote.get("name"),
-                           task, role)
+        wrapped = envelope(item["text"], sender, sender_route, "none", item.get("id"), topic, remote.get("name"))
         router._append_fyi(target, sender_route, wrapped)
         return "accepted", "stored FYI"
     if harness == "boat" and reply == "expected":
         reply = "inline"
-    wrapped = envelope(item["text"], sender, sender_route, reply, item.get("id"), topic, remote.get("name"),
-                       task, role)
+    wrapped = envelope(item["text"], sender, sender_route, reply, item.get("id"), topic, remote.get("name"))
     try:
         with router._rate_slot(sender_route, target):
             try:

@@ -172,7 +172,7 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
                              "human": {"address": "user", "route": HUMAN, "name": "You", "kind": "human"},
                              "capabilities": {"workers": "workers" in provider_map, "accounting": "accounting" in provider_map,
                                               "pairing": True, "channels": True, "changes": True,
-                                              "unread": True, "tasks": True}})
+                                              "unread": True, "acks": True}})
 
     async def pair_device(request):
         """An authenticated owner can connect another device without exporting its session cookie."""
@@ -247,10 +247,6 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         payload = await bounded_json(request)
         return JSONResponse(await run_in_threadpool(store.create_channel, payload))
 
-    async def assign(request):
-        payload = await bounded_json(request)
-        return JSONResponse(await run_in_threadpool(store.assign, payload))
-
     async def provider(request):
         callback = provider_map.get(request.path_params["name"])
         if callback is None:
@@ -294,8 +290,6 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         Route("/api/direct", endpoint(direct)), Route("/api/messages", endpoint(message, write=True), methods=["POST"]),
         Route("/api/channels", endpoint(channel, write=True), methods=["POST"]),
         Route("/api/read", endpoint(read, write=True), methods=["POST"]),
-        # Only the paired human assigns requests.
-        Route("/api/tasks/assign", endpoint(assign, write=True), methods=["POST"]),
         Route("/api/providers/{name}", endpoint(provider), methods=["GET", "POST"]),
         *hub_application(store.hub).routes,
     ])

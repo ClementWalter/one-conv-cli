@@ -11,7 +11,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 
-from ..live import tasks, unread
+from ..live import unread
 from ..live.hub import GENERAL, MESSAGE_ID, TOPIC, Hub, HubError, _online, split_address
 from ..live.hub import NODE as PEER_NODE
 from .presence import (
@@ -125,7 +125,7 @@ class ControlStore:
             with private_database(path):
                 pass
         self.hub = hub
-        # The paired human is the only authority whose requests become tasks, and who assigns them.
+        # The paired human is the trusted human: its posts wake every running session and are acked.
         hub.adopt_trusted_human(NODE)
         with self.hub._db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS staffing_grants "
@@ -261,42 +261,6 @@ class ControlStore:
             "bridge": {"node": NODE, "running": True, "mode": "cloud"}, "error": None}
 
     @staticmethod
-    def _task_view(task: dict, children: list[dict], online: set[str], staffing: dict | None = None) -> dict:
-        """What the human sees on a request: who owns it, its real progress, who helps, and who is starting."""
-        return {"key": task["key"], "owner": display_address(task["owner"]) if task["owner"] else None,
-                "staffing": staffing,
-                "owner_online": task["owner"] in online if task["owner"] else False,
-                "state": task["state"], "note": task["note"], "version": task["version"], "updated": task["updated"],
-                "children": [{"key": child["key"], "kind": child["kind"], "owner": display_address(child["owner"]),
-                              "state": child["state"], "note": child["note"]} for child in children]}
-
-    def _tasks_for(self, db, seqs: list[int]) -> dict[int, dict]:
-        """The task view for each post that made one, by post sequence."""
-        roots = tasks.for_posts(db, seqs)
-        if not roots:
-            return {}
-        now = time.time()
-        online = {f"{node}/{address}" for node, address, seen, updated in db.execute(
-            "SELECT s.node, s.address, n.seen, s.updated FROM sessions s JOIN nodes n ON n.node = s.node")
-            if _online(seen, updated, now)}
-        staffing = {key: {"route": route, "state": state, "detail": detail} for key, route, state, detail in db.execute(
-            "SELECT task, route, state, detail FROM staffing s WHERE version = (SELECT MAX(version) FROM staffing"
-            " WHERE task = s.task)")}
-        return {seq: self._task_view(task, tasks.children(db, task["key"]), online, staffing.get(task["key"]))
-                for seq, task in roots.items()}
-
-    def assign(self, payload):
-        """The human gives a request to an agent (or unassigns it); the new owner is woken."""
-        if (not isinstance(payload, dict) or set(payload) - {"key", "to", "version", "note"}
-                or not {"key", "version"} <= set(payload)):
-            raise HubError(400, "Provide key, version (as shown), and to (an agent route, @name, or null to unassign).")
-        to = payload.get("to")
-        if to is not None and not isinstance(to, str):
-            raise HubError(400, "to is an agent route, @name, or null to unassign.")
-        task = self.hub.assign(payload["key"], to, HUMAN, payload["version"], payload.get("note"))
-        return {"task": {**task, "owner": display_address(task["owner"]) if task["owner"] else None}}
-
-    @staticmethod
     def _activity(db):
         """Use the last persisted interaction per route without interpreting message contents as a task."""
         rows = db.execute(
@@ -334,11 +298,11 @@ class ControlStore:
                 (MESSAGES_SHOWN,)).fetchall()
             baseline, marks = unread.marks(db)
             shown = [values[0] for values in rows]
-            task_views, links = self._tasks_for(db, shown), self._links(db, shown)
+            acks = self.hub._acks(db, shown)
         threads = defaultdict(list)
         for values in reversed(rows):
             row = _provenance(self._row(*values))
-            self._attach(row, values[0], task_views, links)
+            self._attach(row, values[0], acks)
             pair = " ".join(sorted((row["from"], row["to"])))
             threads[pair].append(row)
         return {"threads": [{"pair": pair, "messages": rows, "last": rows[-1]["at"],
@@ -370,19 +334,18 @@ class ControlStore:
                 "  WHERE node != ? ORDER BY node, address)),"
                 " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT conversation || '=' || at AS row"
                 "  FROM read_marks ORDER BY conversation)),"
-                # A claim, progress note, grant or reassignment changes what the human sees.
-                " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT key || '=' || state || ':' || version"
-                "  || ':' || IFNULL(owner, '') || ':' || updated AS row FROM tasks ORDER BY key)),"
-                # Staffing progress (a session starting on a machine or in the cloud) changes the request chip.
+                # Staffing progress (a session starting on a machine or in the cloud) shows under the post.
                 " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT task || '@' || version || '=' || state"
-                "  AS row FROM staffing ORDER BY task, version))", (NODE,)).fetchone()
+                "  AS row FROM staffing ORDER BY task, version)),"
+                # A session acking a post adds a check mark under it.
+                " (SELECT COUNT(*) FROM post_acks)", (NODE,)).fetchone()
         return hashlib.sha256(json.dumps(values).encode()).hexdigest()[:32]
 
     def topic(self, topic: str):
         if not TOPIC.fullmatch(topic):
             raise HubError(400, "Choose a valid topic.")
         with self.hub._db() as db:
-            # The hub's own assignment notices are shown through the request's task, not as messages.
+            # The hub's own instructions (spawn orders, task notices) are never shown as messages.
             total = db.execute("SELECT COUNT(*) FROM posts WHERE topic=? AND kind IS NOT 'system'",
                                (topic,)).fetchone()[0]
             rows = db.execute(
@@ -392,7 +355,10 @@ class ControlStore:
                 (topic, MESSAGES_SHOWN)).fetchall()
             recipients = defaultdict(list)
             shown = [row[0] for row in rows]
-            task_views, links = self._tasks_for(db, shown), self._links(db, shown)
+            acks = self.hub._acks(db, shown)
+            # A session being started for a post nobody was running to read.
+            starting = {key: {"route": route, "state": state, "detail": detail} for key, route, state, detail in
+                        db.execute("SELECT task, route, state, detail FROM staffing WHERE state != 'done'")}
             if rows:
                 for post, route, outcome, outcome_at in db.execute(
                         "SELECT post, to_node || '/' || to_address, outcome, outcome_at FROM deliveries "
@@ -406,24 +372,17 @@ class ControlStore:
             message["status"] = message["delivery"]["state"]
             # A topic-tagged direct message is listed here for context; only its target received it.
             message["directed"] = not row[4].startswith("#")
-            self._attach(message, row[0], task_views, links)
+            self._attach(message, row[0], acks)
+            if f"{row[2]}:{row[1]}" in starting:
+                message["staffing"] = starting[f"{row[2]}:{row[1]}"]
             messages.append(_provenance(message))
         return {"topic": topic, "messages": messages, "omitted": max(0, total - len(rows))}
 
     @staticmethod
-    def _links(db, seqs: list[int]) -> dict[int, str]:
-        """The task each of these posts answers or reports on, when its sender linked one."""
-        if not seqs:
-            return {}
-        return dict(db.execute(f"SELECT seq, task FROM posts WHERE task IS NOT NULL AND seq IN "
-                               f"({','.join('?' * len(seqs))})", seqs))
-
-    @staticmethod
-    def _attach(message: dict, seq: int, task_views: dict, links: dict) -> None:
-        if seq in task_views:
-            message["task"] = task_views[seq]
-        elif seq in links:
-            message["answers"] = links[seq]
+    def _attach(message: dict, seq: int, acks: dict) -> None:
+        """Who read the message, as the sessions that acked it."""
+        if seq in acks:
+            message["acks"] = [display_address(route) for route in acks[seq]]
 
     def send(self, payload):
         """Retrying after any crash reuses the hub's atomic (node, ID, payload) claim."""

@@ -1873,6 +1873,17 @@ button {
   .composer-area {
     padding: 8px 12px 10px;
   }
+  /* At rest the composer is one input line; its toolbar and controls appear while it is in use. */
+  .composer.compact .formatting-toolbar,
+  .composer.compact .composer-bottom,
+  .composer.compact #attachments {
+    display: none;
+  }
+  .composer.compact textarea {
+    min-height: 40px;
+    height: 40px !important;
+    padding: 10px 14px;
+  }
   .workspace {
     height: calc(var(--viewport-height, 100dvh) - 46px);
   }

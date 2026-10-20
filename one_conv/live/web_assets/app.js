@@ -1923,10 +1923,26 @@ function theme(value) {
 
 $("composer").addEventListener("submit", send);
 
+// --- the compact composer -----------------------------------------------------------------------
+// On a phone the composer rests as one input line and shows its toolbar and controls while it is
+// being used: focused, holding text, or carrying an image.
+function fitComposer() {
+  const composer = $("composer");
+  const busy = composer.contains(document.activeElement) || Boolean($("message-input").value)
+    || (model.attachments || []).length > 0;
+  composer.classList.toggle("compact", !busy);
+}
+$("composer").addEventListener("focusin", fitComposer);
+// On blur the next focused element is not known yet; a toolbar tap must keep the composer open.
+$("composer").addEventListener("focusout", () => setTimeout(fitComposer, 0));
+$("message-input").addEventListener("input", fitComposer);
+fitComposer();
+
 // --- images attached to a message ---------------------------------------------------------
 // An image is uploaded as soon as it is pasted, dropped or picked, so sending only names its id.
 model.attachments = [];
 function renderAttachments() {
+  if (typeof fitComposer === "function") setTimeout(fitComposer, 0);
   const strip = $("attachments");
   strip.replaceChildren();
   strip.hidden = !model.attachments.length;

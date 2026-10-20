@@ -80,6 +80,9 @@ def phone_screen(long_workspace, request):
         page.locator(".sidebar").evaluate("node => Promise.all(node.getAnimations().map(animation => animation.finished))")
     if request.param in ("topic", "direct"):
         page.locator(".show-more").click()
+        # The resting composer is one input line; its send button is the primary control once in use.
+        page.locator("#message-input").focus()
+        page.locator("#send-message").wait_for(state="visible")
         selectors += [".conversation", ".conversation-header", ".conversation-intro", ".message-scroll", ".composer-area"]
     elif request.param == "people":
         page.locator("#members-toggle").click()

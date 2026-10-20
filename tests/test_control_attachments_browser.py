@@ -122,6 +122,7 @@ def test_a_removed_image_is_not_sent(pasted):
 
 
 def test_the_attach_button_opens_the_file_picker(phone):
+    phone.locator("#message-input").focus()  # The resting composer shows the paperclip once in use.
     with phone.expect_file_chooser() as chooser:
         phone.get_by_role("button", name="Attach an image").click()
     assert chooser.value.is_multiple
@@ -154,3 +155,38 @@ def test_the_installed_top_bar_keeps_its_controls_below_the_status_bar():
     from one_conv.live import web
     installed = web.STYLE[web.STYLE.rindex("@media (display-mode: standalone)"):]
     assert "padding-top: env(safe-area-inset-top)" in installed
+
+
+# --- the compact composer -------------------------------------------------------------------------
+
+
+def test_the_phone_composer_rests_as_one_input_line(phone):
+    phone.locator("#message-input").evaluate("node => node.blur()")
+    assert phone.locator("#composer .formatting-toolbar").is_hidden()
+
+
+def test_the_phone_composer_opens_its_toolbar_when_focused(phone):
+    phone.locator("#message-input").focus()
+    phone.locator("#composer .formatting-toolbar").wait_for(state="visible")
+    assert phone.locator("#composer .send-button").is_visible()
+
+
+def test_the_phone_composer_closes_again_when_left_empty(phone):
+    phone.locator("#message-input").focus()
+    phone.locator("#composer .formatting-toolbar").wait_for(state="visible")
+    phone.locator("#title").click()
+    phone.locator("#composer .formatting-toolbar").wait_for(state="hidden")
+    assert phone.locator("#composer").evaluate("node => node.classList.contains('compact')")
+
+
+def test_the_phone_composer_stays_open_while_it_holds_text(phone):
+    phone.locator("#message-input").fill("a draft")
+    phone.locator("#title").click()
+    assert phone.locator("#composer .formatting-toolbar").is_visible()
+
+
+def test_a_toolbar_tap_keeps_the_phone_composer_open(phone):
+    phone.locator("#message-input").focus()
+    phone.locator("#composer .formatting-toolbar").wait_for(state="visible")
+    phone.get_by_role("button", name="Bold").click()
+    assert phone.locator("#composer .formatting-toolbar").is_visible()

@@ -186,11 +186,18 @@ def test_catch_up_excludes_other_topics(homes):
     assert [row["text"] for row in team.catch_up("release", "omp:o1")["messages"]] == ["relevant"]
 
 
-def test_catch_up_is_capped(homes):
+def test_catch_up_past_its_budget_folds_the_oldest_block(homes):
     team.join("release", "omp:o1")
     for index in range(team.CATCH_UP + 5):
         team.record("release", f"m{index}", "claude:c1", f"message {index}")
-    assert team.catch_up("release", "omp:o1")["omitted"] == 5
+    assert team.catch_up("release", "omp:o1")["omitted"] == 16
+
+
+def test_catch_up_past_its_budget_shows_the_newest_posts_whole(homes):
+    team.join("release", "omp:o1")
+    for index in range(team.CATCH_UP + 5):
+        team.record("release", f"m{index}", "claude:c1", f"message {index}")
+    assert [m["pos"] for m in team.catch_up("release", "omp:o1")["messages"]] == list(range(16, 25))
 
 
 def test_history_keeps_the_most_recent_messages(homes, monkeypatch):

@@ -339,7 +339,9 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
         target = local  # This machine's own NODE/ prefix: deliver here.
     receipt = _send_one(target, text, sender, origin, fyi, reply, topic, message_id)
     if topic is not None:
-        team.record(topic, message_id, receipt["from"], text)
+        request = team.record(topic, message_id, receipt["from"], text)
+        if request:
+            receipt["summarize"] = request
     return _logged(receipt, text, topic, fyi, reply)
 
 
@@ -373,7 +375,8 @@ def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str
                 "status": "queued for the hub: no receipt yet, the bridge will resend it under the same id"}
     row = (receipt.get("recipients") or [{}])[0]
     return {"to": row.get("to", target), "id": message_id, "from": sender, "via": "hub", "delivery": "hub",
-            "status": "stored on the hub" if row.get("status") == "stored" else row.get("status", "stored")}
+            "status": "stored on the hub" if row.get("status") == "stored" else row.get("status", "stored"),
+            **({"summarize": receipt["summarize"]} if receipt.get("summarize") else {})}
 
 
 def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
@@ -389,7 +392,7 @@ def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, 
         return _post_topic(hub, topic, text, sender_label, "none" if fyi else reply, message_id,
                            "fyi" if fyi else "push")
     members = team.members(topic)
-    team.record(topic, message_id, sender_label, text)
+    request = team.record(topic, message_id, sender_label, text)
     deliveries = []
     for member in members:
         if member == sender_label:
@@ -400,6 +403,8 @@ def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, 
             # A member that cannot be reached now still finds the message when it catches up.
             deliveries.append({"to": member, "status": f"not delivered: {error}"})
     receipt = {"topic": topic, "id": message_id, "from": sender_label, "deliveries": deliveries}
+    if request:
+        receipt["summarize"] = request
     return receipt
 
 
@@ -430,7 +435,8 @@ def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id:
                 "deliveries": [{"to": f"#{topic}", "status": "queued for the hub: no receipt yet, the bridge "
                                                              "will resend it under the same id"}]}
     return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
-            "deliveries": [{"to": row["to"], "status": row["status"]} for row in receipt.get("recipients", [])]}
+            "deliveries": [{"to": row["to"], "status": row["status"]} for row in receipt.get("recipients", [])],
+            **({"summarize": receipt["summarize"]} if receipt.get("summarize") else {})}
 
 
 def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,

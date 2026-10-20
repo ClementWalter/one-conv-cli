@@ -106,9 +106,18 @@ class HubClient:
     def topics(self) -> list[dict]:
         return self.request("GET", "/v1/topics").get("topics", [])
 
-    def history(self, topic: str, after: str | None = None, limit: int = 100) -> list[dict]:
-        query = f"?limit={limit}" + (f"&after={quote(after)}" if after else "")
+    def history(self, topic: str, after: str | None = None, limit: int = 100, pos: int = 0) -> list[dict]:
+        query = f"?limit={limit}" + (f"&after={quote(after)}" if after else "") + (f"&pos={pos}" if pos else "")
         return self.request("GET", f"/v1/topics/{quote(topic)}/messages{query}").get("messages", [])
+
+    def summaries(self, topic: str) -> dict:
+        return self.request("GET", f"/v1/topics/{quote(topic)}/summaries")
+
+    def summarize(self, topic: str, block: str, text: str, by: str) -> dict:
+        return self.request("PUT", f"/v1/topics/{quote(topic)}/summaries/{block}", {"text": text, "by": by})
+
+    def open_block(self, topic: str, block: str) -> dict:
+        return self.request("GET", f"/v1/topics/{quote(topic)}/summaries/{block}")
 
     def post(self, message: dict) -> dict:
         return self.request("POST", "/v1/messages", message)

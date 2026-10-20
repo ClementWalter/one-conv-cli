@@ -449,41 +449,28 @@ one-conv live topic release-4-2           # what you have not seen on it yet
 - The MCP tools `set_name`, `join_topic` and `list_topics` do the same from inside
   an agent, and `send_message` accepts `@name` and `#topic`.
 
-### Human requests: one owner each
+### Human posts: ack and sync
 
-A request from the human is a task with one owner, so a message to a channel is
-one piece of shared work rather than an instruction to every member.
+A human post wakes every session running in its channel. Each session acks it,
+and the workspace shows a check mark per session that read it. The sessions then
+agree in the channel who does what.
 
 ```bash
-one-conv live task list --mine --open                    # what I own and have not finished
-one-conv live task update KEY --version N --state working --note "reading the logs"
-one-conv live task delegate KEY --version N --to @reviewer --kind review
-one-conv live send workspace/user "done: PR #42" --task KEY --task-version N --yes
-one-conv live task update KEY --version N --state done
-one-conv live lead set '#release' @builder               # no hub: who owns new requests here
+one-conv live ack 0c43b732d61146d1a376ea74a702ce99      # the id the message arrived with
+one-conv live send '#release' "I take the changelog" --yes
+one-conv live spawner --harness claude --cwd ~/work --yes # let the hub start sessions here
 ```
 
-- The channel's lead (default `@coordinator`) owns a human message in a channel
-  and is woken; a human direct message is owned by its recipient. Everyone else
-  receives the request as context, as an FYI that never wakes them. With no
-  connected lead the request stays visibly unassigned and wakes nobody.
-- The owner reports progress (`working`, `blocked`, `done`, `cancelled`) and
-  grants parts as child tasks (`read`, `implementation`, `review`). A
-  collaborator works only its part and reports to the owner, who alone answers
-  the human. The workspace shows the owner, state and last note on each request.
-- Ownership is fenced by a version that changes only when the owner does. When
-  the human reassigns a request, the new owner is woken with it, and the former
-  owner's updates and linked answers are refused. Nothing reassigns a request on
-  its own: an absent owner is shown as such, and the human decides.
-- Beside an open request someone else owns, a message to the human or into its
-  channel must be linked to a task the sender holds (`--task`), or say it is
-  about something else (`--not-task`); the hub refuses it otherwise. The same
-  rules hold locally without a hub, where the person at the machine is the human.
+- A session acks a message it received, or any post of a channel it joined.
+  Acking again changes nothing. The MCP tool `ack` does the same from an agent.
+- Anything that cannot be undone (sending a message for the user, a payment) is
+  done by one session, named in the channel.
+- A human post in a channel with nobody running starts a session at once: on a
+  machine whose bridge offers to (`live spawner`), else on a cloud worker when no
+  such machine is connected, refuses, or no session acks within 90 s. The post
+  shows "Starting a session…" until a session acks it.
 - Limits: the hub authenticates machines, not each process, so a session on a
-  machine is trusted as that machine's agent; only the paired workspace human
-  creates tasks through a hub, and a human posting from a machine's own browser
-  viewer does not. A message sent with another tool than one-conv is outside
-  these rules.
+  machine is trusted as that machine's agent.
 
 ### Work with agents in a browser
 

@@ -180,7 +180,7 @@ def test_cloud_list_counts_visible_turns(app, cloud_tool_history):
 
 def test_short_help_survives_legacy_help_cache(app):
     CliRunner().invoke(cloud_cli.cloud_group, ["--help"])
-    namespaces.install(app.cli, lambda: iter(()), lambda: iter(()))
+    namespaces.install(app.cli, lambda: iter(()), lambda: iter(()), app.LOGIN_PROFILES_DIR)
     assert CliRunner().invoke(app.cli, ["cloud", "-h"]).exit_code == 0
 
 
@@ -281,13 +281,71 @@ def test_global_refresh_with_no_accounts_fails(app, saved_conversations, monkeyp
     assert result.exit_code == 1
 
 
-def test_login_opens_selected_browser_without_keychain(app, monkeypatch):
+@pytest.fixture
+def opened(monkeypatch):
     calls = []
     monkeypatch.setattr(sys, "platform", "darwin")
     monkeypatch.setattr(subprocess, "run", lambda command, **kwargs: calls.append(command))
+    return calls
+
+
+def test_login_never_prompts_for_keychain(app, opened, monkeypatch):
     monkeypatch.setattr(native_auth, "read_secret", lambda *args, **kwargs: pytest.fail("Login cannot prompt for Keychain"))
+    result = CliRunner().invoke(app.cli, ["cloud", "claude", "connect", "--login"])
+    assert result.exit_code == 0
+
+
+def test_login_opens_a_profile_only_one_conv_uses(app, opened):
     CliRunner().invoke(app.cli, ["cloud", "claude", "connect", "--login", "--browser", "chrome"])
-    assert calls == [["open", "-a", "Google Chrome", "https://claude.ai/login"]]
+    assert opened == [["open", "-na", "Google Chrome", "--args",
+                       f"--user-data-dir={app.LOGIN_PROFILES_DIR / 'chrome' / 'claude-1'}",
+                       "--no-first-run", "--no-default-browser-check", "https://claude.ai/login"]]
+
+
+def test_login_profile_is_private(app, opened):
+    CliRunner().invoke(app.cli, ["cloud", "claude", "connect", "--login"])
+    assert (app.LOGIN_PROFILES_DIR / "chrome" / "claude-1").stat().st_mode & 0o777 == 0o700
+
+
+def test_another_login_gets_its_own_profile(app, opened):
+    (app.LOGIN_PROFILES_DIR / "chrome" / "claude-1").mkdir(parents=True)
+    CliRunner().invoke(app.cli, ["cloud", "claude", "connect", "--login"])
+    assert f"--user-data-dir={app.LOGIN_PROFILES_DIR / 'chrome' / 'claude-2'}" in opened[0]
+
+
+@pytest.mark.parametrize(("product", "login", "url"), [
+    ("claude", "claude-1", "https://claude.ai/login"),
+    ("cowork", "claude-1", "https://claude.ai/login"),
+    ("chatgpt", "chatgpt-1", "https://chatgpt.com/auth/login"),
+    ("codex", "chatgpt-1", "https://chatgpt.com/auth/login"),
+])
+def test_login_profile_follows_provider_site(app, opened, product, login, url):
+    CliRunner().invoke(app.cli, ["cloud", product, "connect", "--login"])
+    assert opened[0][4:] == [f"--user-data-dir={app.LOGIN_PROFILES_DIR / 'chrome' / login}",
+                             "--no-first-run", "--no-default-browser-check", url]
+
+
+def test_login_reopens_named_profile(app, opened):
+    (app.LOGIN_PROFILES_DIR / "chrome" / "claude-1").mkdir(parents=True)
+    (app.LOGIN_PROFILES_DIR / "chrome" / "claude-2").mkdir()
+    CliRunner().invoke(app.cli, ["cloud", "claude", "connect", "--login", "--profile", "claude-1"])
+    assert f"--user-data-dir={app.LOGIN_PROFILES_DIR / 'chrome' / 'claude-1'}" in opened[0]
+
+
+def test_login_rejects_unknown_profile(app, opened):
+    result = CliRunner().invoke(app.cli, ["cloud", "claude", "connect", "--login", "--profile", "claude-9"])
+    assert "No one-conv login named claude-9" in result.output
+
+
+def test_profile_requires_login(app, monkeypatch):
+    monkeypatch.setattr(native_auth, "read_secret", lambda *args, **kwargs: pytest.fail("A usage error cannot prompt"))
+    result = CliRunner().invoke(app.cli, ["cloud", "claude", "connect", "--profile", "claude-1"])
+    assert result.exit_code == 2
+
+
+def test_login_refuses_browser_without_separate_profiles(app, opened):
+    result = CliRunner().invoke(app.cli, ["cloud", "claude", "connect", "--login", "--browser", "arc"])
+    assert "use --browser chrome" in result.output
 
 
 def test_local_rejects_cloud_source(app):
@@ -372,6 +430,19 @@ def test_browser_discovery_keeps_provider_cookies_separate(app, monkeypatch, tmp
     monkeypatch.setattr(app, "_chatgpt_keychain_key", lambda service: b"synthetic-key")
     monkeypatch.setattr(app, "_chatgpt_decrypt_cookie", lambda encrypted, key: encrypted.decode())
     assert list(app._chatgpt_cookie_jars(domain, cookie))[0][1] == {cookie: value}
+
+
+def test_browser_discovery_reads_one_conv_login_profiles(app, monkeypatch):
+    store = app.LOGIN_PROFILES_DIR / "synthetic" / "claude-1" / "Default" / "Cookies"
+    store.parent.mkdir(parents=True)
+    with sqlite3.connect(store) as connection:
+        connection.execute("CREATE TABLE cookies(host_key TEXT, name TEXT, encrypted_value BLOB)")
+        connection.execute("INSERT INTO cookies VALUES(?, ?, ?)", (".claude.ai", "sessionKey", b"login-session"))
+    monkeypatch.setattr(app, "CHATGPT_COOKIE_SOURCES", [("synthetic", str(store.parent / "absent"), "synthetic-service")])
+    monkeypatch.setattr(app, "_chatgpt_keychain_key", lambda service: b"synthetic-key")
+    monkeypatch.setattr(app, "_chatgpt_decrypt_cookie", lambda encrypted, key: encrypted.decode())
+    assert list(app._chatgpt_cookie_jars("claude.ai", "sessionKey")) == [
+        ("synthetic/one-conv/claude-1", {"sessionKey": "login-session"})]
 
 
 def test_connect_authorizes_only_selected_browser(app, monkeypatch):

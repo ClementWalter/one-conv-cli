@@ -1284,6 +1284,9 @@ CHATGPT_COOKIE_SOURCES = [
     ("edge", "~/Library/Application Support/Microsoft Edge/*/Cookies", "Microsoft Edge Safe Storage"),
     ("chromium", "~/Library/Application Support/Chromium/*/Cookies", "Chromium Safe Storage"),
 ]
+# Profiles `connect --login` opens, as <root>/<browser label>/<login name>/. Each holds a
+# login of its own, so signing out in an everyday profile never revokes it.
+LOGIN_PROFILES_DIR = Path(os.environ.get("ONE_CONV_LOGIN_PROFILES", str(STATE_DIR / "browser-profiles")))
 
 # ChatGPT wraps inline render directives in private-use codepoints:
 # <kind><json>. They carry no prose, so they're stripped.
@@ -1399,7 +1402,11 @@ def _chatgpt_cookie_jars(domain="chatgpt.com", required_cookie="__Secure-next-au
         browser_filter = (context.obj or {}).get("browser_filter") if context else None
         if browser_filter and label != browser_filter:
             continue
-        for store in sorted(glob.glob(str(Path(pattern).expanduser()))):
+        stores = [(store, f"{label}/{Path(store).parent.name}")
+                  for store in sorted(glob.glob(str(Path(pattern).expanduser())))]
+        stores += [(str(store), f"{label}/one-conv/{store.parents[1].name}")
+                   for store in sorted(LOGIN_PROFILES_DIR.glob(f"{label}/*/Default/Cookies"))]
+        for store, profile in stores:
             if service not in keys:
                 keys[service] = _chatgpt_keychain_key(service)
             key = keys[service]
@@ -1430,7 +1437,7 @@ def _chatgpt_cookie_jars(domain="chatgpt.com", required_cookie="__Secure-next-au
                 for k in chunks:
                     jar.pop(k)
             if jar.get(required_cookie):
-                yield f"{label}/{Path(store).parent.name}", jar
+                yield profile, jar
 
 
 def _session_vault():
@@ -1458,7 +1465,11 @@ def _claude_accounts():
     def expired(profile, cookies):
         entry = saved.get(cookies.get("sessionKey"))
         if entry is None:
-            log.warning("The Claude login in %s is signed out; sign in again on claude.ai", profile)
+            if "/one-conv/" in profile:
+                log.warning("The one-conv Claude login %s is signed out; sign in again with: "
+                            "one-conv cloud claude connect --login --profile %s", profile, profile.rsplit("/", 1)[1])
+            else:
+                log.warning("The Claude login in %s is signed out; sign in again on claude.ai", profile)
             return
         # Signing out on claude.ai revokes the session server-side, so the saved copy is dead too.
         vault.remove("claude", entry.identity)
@@ -4100,7 +4111,7 @@ from one_conv.live.prompts import build_prompts_command  # noqa: E402
 
 cli.add_command(build_prompts_command(_feed_find_threads, _feed_live_addresses))
 
-install_namespaces(cli, lambda: _chatgpt_accounts(), lambda: _claude_accounts())
+install_namespaces(cli, lambda: _chatgpt_accounts(), lambda: _claude_accounts(), LOGIN_PROFILES_DIR)
 
 
 def _tune_snapshot(out_root: Path) -> tuple[int, int]:

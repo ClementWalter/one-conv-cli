@@ -122,10 +122,11 @@ sources explicitly and attempts all accounts before returning any refresh
 errors. `--source` restricts both refresh and listing. JSON stays on stdout;
 progress, skips, and sync reports go to stderr.
 
-`cloud claude connect --login --browser chrome` opens Claude sign-in. If Chrome
-already has another Claude account, switch accounts there or use a separate
-browser profile to keep both live. Verify with `cloud claude accounts` after
-sign-in. Opening a login page does not verify a connection. Plain `connect`
+`cloud claude connect --login` adds an account: it opens Claude sign-in in a
+browser profile only one-conv uses (`claude-1`, `claude-2`, ...), so each added
+account keeps a login of its own and the user can sign in and out freely in
+their everyday browser. Renew an expired one with `--login --profile claude-1`.
+Verify with `cloud claude accounts` after sign-in. Opening a login page does not verify a connection. Plain `connect`
 authorizes Keychain access; it does not sign in to the provider.
 
 ```bash

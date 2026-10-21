@@ -139,7 +139,7 @@ def _scope_callback(sources, accounts=None):
     return configure
 
 
-def install(root, browser_accounts, claude_accounts):
+def install(root, browser_accounts, claude_accounts, login_profiles):
     """Mount product readers and pulls while leaving old invocations intact."""
     from .cloud_cli import cloud_group, sync
 
@@ -156,6 +156,7 @@ def install(root, browser_accounts, claude_accounts):
     cloud = click.Group("cloud", commands=dict(cloud_group.commands), context_settings=HELP_SETTINGS)
     cloud.callback = _scope_callback(cloud_sources, {
         "browser_accounts": browser_accounts, "claude_accounts": claude_accounts,
+        "login_profiles": login_profiles,
     })
     cloud.help = "Read cloud conversation history by product. Pull first, then read saved history."
     cloud.epilog = "\b\nExamples:\n  one-conv cloud claude --help\n  one-conv cloud chatgpt --help\n  one-conv cloud search QUERY"
@@ -271,6 +272,51 @@ def _accounts(name):
                          context_settings=HELP_SETTINGS)
 
 
+LOGIN_APPS = {"chrome": "Google Chrome", "brave": "Brave Browser",
+              "edge": "Microsoft Edge", "chromium": "Chromium"}
+
+
+def _open_login_window(name, browser, profile, root):
+    """Open provider sign-in in a browser profile only one-conv uses.
+
+    Signing out on claude.ai or chatgpt.com revokes that browser's session
+    server-side. A login made in its own profile is a separate session, so
+    the user can sign in and out freely in their everyday browser.
+    """
+    import itertools
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    site = "claude" if name in ("claude", "cowork") else "chatgpt"
+    url = "https://claude.ai/login" if site == "claude" else "https://chatgpt.com/auth/login"
+    if sys.platform != "darwin":
+        raise click.ClickException("Opening a sign-in window currently supports macOS only.")
+    if browser not in LOGIN_APPS:
+        raise click.ClickException(f"{browser} cannot open a separate sign-in profile; use --browser chrome.")
+    parent = Path(root) / browser
+    if profile:
+        directory = parent / profile
+        if not directory.is_dir():
+            raise click.ClickException(f"No one-conv login named {profile}; omit --profile to start a new one.")
+    else:
+        taken = {path.name for path in parent.glob(f"{site}-*")}
+        directory = parent / next(f"{site}-{n}" for n in itertools.count(1) if f"{site}-{n}" not in taken)
+    # Cookies of every login live here, so each level is private to the user.
+    for level in (Path(root), parent, directory):
+        level.mkdir(exist_ok=True, mode=0o700)
+    try:
+        subprocess.run(["open", "-na", LOGIN_APPS[browser], "--args", f"--user-data-dir={directory}",
+                        "--no-first-run", "--no-default-browser-check", url],
+                       check=True, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        raise click.ClickException("Could not open the selected browser for login.") from None
+    click.echo(f"Sign in in the window that opened (one-conv login {directory.name}), then run "
+               f"one-conv cloud {name} accounts to verify it. This login is separate from your everyday "
+               "browser: signing out there leaves it connected. Opening this page does not mean the "
+               "account is connected.", err=True)
+
+
 def _connect(name):
     """Request one browser's Keychain authorization only during explicit setup."""
     services = {"chrome": "Chrome Safe Storage", "arc": "Arc Safe Storage",
@@ -278,23 +324,13 @@ def _connect(name):
                 "chromium": "Chromium Safe Storage"}
 
     @click.pass_context
-    def invoke(context, browser, login):
+    def invoke(context, browser, login, profile):
         from .native_auth import read_secret
         if login:
-            url = "https://claude.ai/login" if name in ("claude", "cowork") else "https://chatgpt.com/auth/login"
-            import subprocess
-            import sys
-            apps = {"chrome": "Google Chrome", "arc": "Arc", "brave": "Brave Browser",
-                    "edge": "Microsoft Edge", "chromium": "Chromium"}
-            if sys.platform != "darwin":
-                raise click.ClickException("Opening a selected browser currently supports macOS only.")
-            try:
-                subprocess.run(["open", "-a", apps[browser], url], check=True, capture_output=True, timeout=10)
-            except (OSError, subprocess.SubprocessError):
-                raise click.ClickException("Could not open the selected browser for login.") from None
-            click.echo(f"Finish provider sign-in in {browser}, then run one-conv cloud {name} accounts to verify it. "
-                       "Opening this page does not mean the account is connected.", err=True)
+            _open_login_window(name, browser, profile, context.obj["login_profiles"])
             return
+        if profile:
+            raise click.UsageError("--profile names a one-conv login window; use it with --login.")
         click.echo(f"Authorizing {browser} access. Choose Always Allow in the macOS dialog to reuse this authorization.", err=True)
         try:
             secret = read_secret(services[browser], authorize=True)
@@ -307,10 +343,14 @@ def _connect(name):
         context.invoke(_accounts(name), as_json=False)
 
     return click.Command("connect", callback=invoke,
-                         params=[click.Option(["--login"], is_flag=True, help="Open provider sign-in instead of requesting Keychain authorization."),
+                         params=[click.Option(["--login"], is_flag=True,
+                                              help="Sign in to another account in a browser window only one-conv uses."),
+                                 click.Option(["--profile"], metavar="LOGIN",
+                                              help="Reopen this one-conv login (e.g. claude-1) to renew it."),
                                  click.Option(["--browser"], type=click.Choice(tuple(services)),
                                               default="chrome", show_default=True,
                                               help="Authorize this browser only.")],
                          help="Authorize a stable native helper once; normal pulls never prompt.",
-                         epilog=f"\b\nExamples:\n  one-conv cloud {name} connect --browser chrome",
+                         epilog=(f"\b\nExamples:\n  one-conv cloud {name} connect --browser chrome\n"
+                                 f"  one-conv cloud {name} connect --login"),
                          context_settings=HELP_SETTINGS)

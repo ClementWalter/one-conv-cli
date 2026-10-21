@@ -2029,10 +2029,19 @@ function fitViewport() {
   if (!viewport) return;
   const root = document.documentElement.style;
   root.setProperty("--viewport-height", Math.round(viewport.height) + "px");
-  // What the keyboard takes: the layout viewport and the visual one are measured alike, so their
-  // difference is the keyboard and nothing else (the status bar is in both or in neither).
-  root.setProperty("--keyboard-height", Math.max(0, Math.round(window.innerHeight - viewport.height - viewport.offsetTop)) + "px");
+  // What the keyboard takes is the layout viewport less the visual one. A keyboard is never under
+  // 120px; a smaller difference is a bar the two viewports disagree about, and takes nothing.
+  const taken = Math.round(window.innerHeight - viewport.height - viewport.offsetTop);
+  root.setProperty("--keyboard-height", (taken >= 120 ? taken : 0) + "px");
   if (window.scrollY || window.scrollX || viewport.offsetTop) window.scrollTo(0, 0);
+  const report = document.getElementById("layout-report");
+  if (report) {
+    const inset = (side) => getComputedStyle(document.documentElement).getPropertyValue("--inset-" + side).trim() || "?";
+    report.textContent = "Layout: screen " + screen.width + "×" + screen.height + " · window " + window.innerWidth + "×"
+      + window.innerHeight + " · viewport " + Math.round(viewport.width) + "×" + Math.round(viewport.height)
+      + (viewport.offsetTop ? " at " + Math.round(viewport.offsetTop) : "") + " · insets " + inset("top") + "/" + inset("bottom")
+      + " · " + (matchMedia("(display-mode: standalone)").matches ? "installed" : "in the browser");
+  }
 }
 if (window.visualViewport) {
   window.visualViewport.addEventListener("resize", fitViewport);

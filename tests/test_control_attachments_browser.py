@@ -185,6 +185,17 @@ def test_the_phone_composer_stays_open_while_it_holds_text(phone):
     assert phone.locator("#composer .formatting-toolbar").is_visible()
 
 
+def test_the_resting_phone_composer_hides_its_helper_text(phone):
+    phone.locator("#message-input").evaluate("node => node.blur()")
+    assert phone.locator("#composer-feedback").is_hidden()
+
+
+def test_the_device_dialog_reports_the_layout(phone):
+    phone.locator("#device-menu").click()
+    phone.locator("#layout-report").wait_for()
+    assert "viewport" in phone.locator("#layout-report").inner_text()
+
+
 def test_a_toolbar_tap_keeps_the_phone_composer_open(phone):
     phone.locator("#message-input").focus()
     phone.locator("#composer .formatting-toolbar").wait_for(state="visible")

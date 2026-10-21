@@ -78,6 +78,11 @@ def deliver(session: LiveSession, text: str) -> str:
         if result.returncode:
             raise RuntimeError(result.stderr.strip() or f"cursor desktop send exited {result.returncode}")
         return result.stdout.strip() or "delivered"
+    from . import spawn  # spawn imports this module
+    # An idle CLI chat runs no hook, so the inbox would wait; a spawned one's pane takes the text now.
+    if pane := spawn.pane_for(session.address):
+        spawn.type_into(pane, text)
+        return f"typed into tmux session {pane}"
     target = inbox(session.id)
     target.mkdir(parents=True, exist_ok=True)
     name = f"{time.time_ns()}-{uuid.uuid4().hex}.json"

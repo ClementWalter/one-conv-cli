@@ -27,6 +27,7 @@ def homes(tmp_path, monkeypatch):
     ("claude", ["claude", "--dangerously-skip-permissions", "--model", "sonnet", "do it"]),
     ("codex", ["codex", "--dangerously-skip-permissions", "--model", "sonnet", "do it"]),
     ("omp", ["omp", "--dangerously-skip-permissions", "--model=sonnet", "do it"]),
+    ("cursor", ["agent", "--dangerously-skip-permissions", "--model", "sonnet", "do it"]),
 ])
 def test_command_puts_extra_flags_before_the_prompt(harness, expected):
     assert spawn.command(harness, "do it", "sonnet", ("--dangerously-skip-permissions",)) == expected
@@ -44,7 +45,30 @@ def test_command_refuses_an_empty_prompt():
 
 def test_command_refuses_an_unknown_harness():
     with pytest.raises(spawn.SpawnError, match="cannot spawn"):
-        spawn.command("cursor", "do it", None, ())
+        spawn.command("aider", "do it", None, ())
+
+
+def test_command_trusts_the_folder_for_cursor_by_flag():
+    assert spawn.command("cursor", "do it", None, ("--force",), trust_folder=True) == ["agent", "--trust", "--force", "do it"]
+
+
+def test_command_leaves_claude_trust_to_the_pane():
+    assert spawn.command("claude", "do it", None, (), trust_folder=True) == ["claude", "do it"]
+
+
+def test_preflight_looks_for_cursors_agent_command(monkeypatch):
+    monkeypatch.setattr(spawn.shutil, "which", lambda name: None if name == "agent" else f"/bin/{name}")
+    with pytest.raises(spawn.SpawnError, match="agent is not on PATH"):
+        spawn.preflight("cursor")
+
+
+def test_wait_returns_the_chat_the_cursor_pane_holds_open(monkeypatch, tmp_path):
+    stub_tmux(monkeypatch)
+    monkeypatch.setattr(spawn, "_pane_pid", lambda name: 100)
+    monkeypatch.setattr(spawn, "_process_tree", lambda root: {100, 101})
+    monkeypatch.setattr(spawn.cursor, "chat_for_pid", lambda pid: THREAD if pid == 101 else None)
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
+    assert spawn.wait_for_session("cursor", tmp_path, set(), "t", 5) == f"cursor:{THREAD}"
 
 
 def test_preflight_needs_tmux(monkeypatch):

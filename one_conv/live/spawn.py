@@ -14,15 +14,18 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import codex, omp, router
+from . import codex, cursor, omp, router
 from .model import LiveSession, live_home
 
-HARNESSES = ("claude", "codex", "omp")
+HARNESSES = ("claude", "codex", "omp", "cursor")
+# Cursor's terminal agent is the `agent` command; every other harness runs under its own name.
+BINARIES = {"cursor": "agent"}
 # Each harness's interactive command with a first prompt; the prompt is one argv element.
 COMMANDS = {
     "claude": lambda prompt, model: ["claude", *(["--model", model] if model else []), prompt],
     "codex": lambda prompt, model: ["codex", *(["--model", model] if model else []), prompt],
     "omp": lambda prompt, model: ["omp", *([f"--model={model}"] if model else []), prompt],
+    "cursor": lambda prompt, model: ["agent", *(["--model", model] if model else []), prompt],
 }
 SESSION_PREFIX = "oneconv-"
 
@@ -63,22 +66,26 @@ def _save(rows: dict) -> None:
     os.replace(partial, path)
 
 
-def command(harness: str, prompt: str, model: str | None, extra: tuple[str, ...]) -> list[str]:
+def command(harness: str, prompt: str, model: str | None, extra: tuple[str, ...],
+            trust_folder: bool = False) -> list[str]:
     """The argv tmux runs directly, without a shell, so the prompt stays literal."""
     if harness not in COMMANDS:
         raise SpawnError(f"cannot spawn {harness!r}; choose one of {', '.join(HARNESSES)}")
     if not prompt.strip():
         raise SpawnError("a spawned agent needs a first prompt")
     argv = COMMANDS[harness](prompt, model)
-    return [argv[0], *extra, *argv[1:]]
+    # Cursor takes trust as a flag; Claude Code's trust question is answered in the pane.
+    trust = ("--trust",) if harness == "cursor" and trust_folder else ()
+    return [argv[0], *trust, *extra, *argv[1:]]
 
 
 def preflight(harness: str) -> None:
     """Refuse a spawn that could not end up reachable, before anything starts."""
     if shutil.which("tmux") is None:
         raise SpawnError("live spawn needs tmux on PATH")
-    if shutil.which(harness) is None:
-        raise SpawnError(f"{harness} is not on PATH")
+    binary = BINARIES.get(harness, harness)
+    if shutil.which(binary) is None:
+        raise SpawnError(f"{binary} is not on PATH")
     if harness == "omp" and not omp.extension_path().exists():
         # Without the extension an omp session never registers, so nothing could message it.
         raise SpawnError("omp sessions register only with the live extension; run `one-conv live install --yes` first")
@@ -88,15 +95,15 @@ def start(harness: str, prompt: str, cwd: Path, model: str | None = None, extra:
           wait_seconds: float = 60.0, trust_folder: bool = False) -> Spawned:
     """Start the agent detached in tmux, then wait until it is listed as a live session.
 
-    `trust_folder` answers Claude Code's first-visit folder-trust question with yes; without
-    it, a spawn into a folder Claude has not been trusted in stops and says so.
+    `trust_folder` answers Claude Code's first-visit folder-trust question with yes, and passes
+    `--trust` to Cursor; without it, a spawn into an untrusted folder stops at that question.
     """
     preflight(harness)
     name = f"{SESSION_PREFIX}{harness}-{uuid.uuid4().hex[:8]}"
     if harness == "codex":
         # Codex threads carry no pid, so the spawn name in the first prompt is what identifies this one.
         prompt = f"{prompt}\n\n(one-conv spawn {name})"
-    argv = command(harness, prompt, model, extra)
+    argv = command(harness, prompt, model, extra, trust_folder)
     before = {s.address for s in router.list_all(harness)}
     result = subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", str(cwd), "-x", "200", "-y", "50",
                              "--", *argv], capture_output=True, text=True, check=False)
@@ -111,6 +118,22 @@ def start(harness: str, prompt: str, cwd: Path, model: str | None = None, extra:
     rows[name] = spawned.to_json()
     _save(rows)
     return spawned
+
+
+def pane_for(address: str) -> str | None:
+    """The tmux session of the spawned agent at `address`, while it still runs."""
+    return next((name for name, row in _load().items() if row.get("address") == address and _alive(name)), None)
+
+
+def type_into(tmux_name: str, text: str) -> None:
+    """Submit `text` in the pane as one bracketed paste, so its newlines do not submit it early."""
+    buffer = f"{tmux_name}-{uuid.uuid4().hex[:8]}"
+    for argv, stdin in ((["tmux", "load-buffer", "-b", buffer, "-"], text),
+                        (["tmux", "paste-buffer", "-p", "-d", "-b", buffer, "-t", tmux_name], None),
+                        (["tmux", "send-keys", "-t", tmux_name, "Enter"], None)):
+        result = subprocess.run(argv, input=stdin, capture_output=True, text=True, check=False)
+        if result.returncode:
+            raise SpawnError(f"could not type into tmux session {tmux_name}: {result.stderr.strip() or result.returncode}")
 
 
 # What tmux says when the session, or its whole server, is gone; any other failure proves nothing.
@@ -176,6 +199,13 @@ def owned_by_spawn(session: LiveSession, tmux_name: str) -> bool:
     return bool(session.pid and root and session.pid in _process_tree(root))
 
 
+def _cursor_chat(tmux_name: str) -> str | None:
+    """The chat the pane's `agent` process holds open; it exists from the first prompt, before any hook runs."""
+    root = _pane_pid(tmux_name)
+    return next((chat for pid in sorted(_process_tree(root)) if (chat := cursor.chat_for_pid(pid))), None) \
+        if root else None
+
+
 def _pane(tmux_name: str) -> str:
     return subprocess.run(["tmux", "capture-pane", "-p", "-t", tmux_name], capture_output=True, text=True,
                           check=False).stdout
@@ -199,6 +229,12 @@ def wait_for_session(harness: str, cwd: Path, before: set[str], tmux_name: str, 
             time.sleep(0.5)
             subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"], check=False)
             answered = True
+        if harness == "cursor":
+            # A Cursor chat registers only when its first turn ends; `live send` already reaches it by id.
+            if chat := _cursor_chat(tmux_name):
+                return f"cursor:{chat}"
+            time.sleep(1)
+            continue
         fresh = [s for s in router.list_all(harness) if s.address not in before and _same_dir(s, resolved)
                  and owned_by_spawn(s, tmux_name)]
         if len(fresh) == 1:

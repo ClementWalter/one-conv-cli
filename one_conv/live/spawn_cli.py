@@ -28,8 +28,9 @@ def add_spawn_commands(live: click.Group) -> None:
                   epilog="\b\nExamples:\n  one-conv live spawn codex 'review the diff on this branch' --yes\n"
                          "  one-conv live spawn claude 'write the tests' --model sonnet --cwd ../repo --yes\n"
                          "  one-conv live spawn omp --stdin --yes < brief.md\n"
+                         "  one-conv live spawn cursor 'review the diff' --trust-folder --arg=--force --arg=--approve-mcps --yes\n"
                          "  one-conv live spawn codex 'review the release' --cloud --name jack --topic release --yes")
-    @click.argument("harness", type=click.Choice(spawn.HARNESSES))
+    @click.argument("harness", type=click.Choice((*spawn.HARNESSES, "agent")))
     @click.argument("prompt", required=False)
     @click.option("--stdin", "from_stdin", is_flag=True, help="Read the first prompt from stdin.")
     @click.option("--model", help="Model for the new agent, in that harness's own naming.")
@@ -44,14 +45,16 @@ def add_spawn_commands(live: click.Group) -> None:
                   help="Extra argument for the harness command, repeatable (e.g. --arg=--dangerously-skip-permissions).")
     @click.option("--no-intro", is_flag=True, help="Send the prompt as is, without saying who started the agent.")
     @click.option("--trust-folder", is_flag=True,
-                  help="Answer yes to Claude Code's first-visit question about trusting --cwd.")
+                  help="Trust --cwd: answer Claude Code's first-visit question, or pass Cursor's --trust.")
     @click.option("--wait", "wait_seconds", default=60.0, show_default=True,
                   help="Seconds to wait for the agent to register as a live session.")
     @click.option("--yes", is_flag=True, help="Actually start it. Without it, prints what would run.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the spawned agent as JSON.")
     def spawn_command(harness, prompt, from_stdin, model, cloud, name, topic, profile, request_id, cwd, extra,
                       no_intro, trust_folder, wait_seconds, yes, as_json):
-        """Start a resident Claude Code, Codex or Oh My Pi teammate, locally or in the cloud.
+        """Start a resident Claude Code, Codex, Oh My Pi or Cursor teammate, locally or in the cloud.
+
+        `cursor` and `agent` both start Cursor's terminal agent, the `agent` command.
 
         With --cloud, the configured workspace prepares repositories, tools and provider
         access in a shared worker box. --name and --topic are required. The receipt gives
@@ -62,6 +65,7 @@ def add_spawn_commands(live: click.Group) -> None:
         end it with `live stop`. It inherits your usual permission settings for that harness,
         so an unattended agent may wait on a prompt: pass the harness's own flags with --arg.
         """
+        harness = "cursor" if harness == "agent" else harness
         if from_stdin:
             prompt = sys.stdin.read()
         if not prompt:
@@ -93,7 +97,7 @@ def add_spawn_commands(live: click.Group) -> None:
             raise click.UsageError(f"--cwd {cwd} is not a directory.")
         text = prompt if no_intro else introduction(prompt, router.whoami())
         try:
-            argv = spawn.command(harness, text, model, tuple(extra))
+            argv = spawn.command(harness, text, model, tuple(extra), trust_folder)
             if not yes:
                 click.echo("DRY-RUN (nothing started). Re-run with --yes to start.")
                 click.echo(f"  in tmux: {' '.join(argv[:-1])} <prompt, {len(text)} chars>")

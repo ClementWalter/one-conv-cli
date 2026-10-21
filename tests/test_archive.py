@@ -773,6 +773,28 @@ def test_sync_recaptures_a_cursor_ide_row_change_under_an_unchanged_header(tmp_p
     assert run(env, "scripts/archive-sync.py", "--source", "cursor") == {"uploaded": 1, "unchanged": 0}
 
 
+def write_unused_cursor_chat(env):
+    """A chat Cursor lists in its headers but never wrote records for."""
+    path = Path(env["CURSOR_USER_DIR"]) / "globalStorage" / "state.vscdb"
+    workspace = Path(env["CURSOR_USER_DIR"]) / "workspaceStorage" / "workspace" / "workspace.json"
+    path.parent.mkdir(parents=True)
+    workspace.parent.mkdir(parents=True)
+    workspace.write_text(json.dumps({"folder": "file:///example/cursor-fixture"}))
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE composerHeaders (composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, value)")
+        conn.execute("INSERT INTO composerHeaders VALUES (?, ?, ?, ?, ?, ?)",
+            ("cursor-unused", "workspace", 1, None, 0, json.dumps({"type": "head"})))
+        conn.execute("CREATE TABLE cursorDiskKV (key, value)")
+
+
+def test_sync_counts_an_unused_cursor_chat_as_empty(tmp_path, archive):
+    _, _client, url = archive
+    env = fixture_env(tmp_path)
+    write_unused_cursor_chat(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    assert run(env, "scripts/archive-sync.py", "--source", "cursor") == {"uploaded": 0, "unchanged": 0, "empty": 1}
+
+
 def test_sync_reconciles_an_archive_rolled_back_to_an_older_revision(tmp_path, archive):
     _, client, url = archive
     env = fixture_env(tmp_path)

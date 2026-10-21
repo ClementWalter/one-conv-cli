@@ -305,6 +305,10 @@ def captured_copy(reader, handle, paths, originals):
         yield rebuilt_handle(reader, handle, root / handle.path.relative_to(base))
 
 
+class EmptyConversation(ArchiveError):
+    """A conversation that holds nothing yet, such as a Cursor chat opened and never used."""
+
+
 def original_records(reader, handle, paths):
     if handle.source == "cursor":
         conn = reader._cursor_connect()
@@ -313,10 +317,13 @@ def original_records(reader, handle, paths):
         try:
             rows = conn.execute("SELECT key, value FROM cursorDiskKV WHERE key = ? OR key LIKE ?",
                 (f"composerData:{handle.composer_id}", f"bubbleId:{handle.composer_id}:%")).fetchall()
-            if not rows:
-                raise ArchiveError("Cursor conversation records are unavailable")
             header = conn.execute("SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, value "
                                   "FROM composerHeaders WHERE composerId = ?", (handle.composer_id,)).fetchone()
+            if not rows:
+                # Cursor lists a chat as soon as it is opened but writes its records only on first use.
+                if header is not None:
+                    raise EmptyConversation("Cursor conversation has no messages yet")
+                raise ArchiveError("Cursor conversation records are unavailable")
             # One record keeps a conversation's many small rows in a few chunks.
             return {"cursorDiskKV": encode({key: base64.b64encode(value if isinstance(value, bytes) else value.encode()).decode()
                                             for key, value in sorted(rows, key=lambda row: row[0])}),
@@ -657,6 +664,8 @@ def sync(reader, client, origin, args, lock):
             existing[key] = {"key": key, "revision": head, "mtime": handle.mtime}
             stamps[key] = {"stamp": stamp, "revision": head}
             result["uploaded"] += 1
+        except EmptyConversation:
+            result["empty"] = result.get("empty", 0) + 1  # Nothing to archive until it is used.
         # One unreadable or malformed conversation must not stop the others.
         except SYNC_ERRORS + (reader.click.ClickException,) as error:
             failures.append(f"{handle.source}/{handle.uuid}: {type(error).__name__}: {error}")

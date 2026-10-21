@@ -77,6 +77,7 @@ one-conv live control serve --origin https://team.example --config control.json
 one-conv live control pair --origin https://team.example --output phone.link
 one-conv live control node add laptop --output laptop.token
 one-conv live serve --hub https://team.example --node laptop --token-stdin < laptop.token
+one-conv live serve --install --yes   # on a Mac: keep the bridge running across restarts
 ```
 
 The operator CLI writes pairing links and node credentials into new private

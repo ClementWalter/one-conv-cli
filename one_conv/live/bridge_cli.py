@@ -7,7 +7,7 @@ import sys
 
 import click
 
-from . import bridge, hubclient, tunnel
+from . import bridge, hubclient, service, tunnel
 
 HELP = {"help_option_names": ["-h", "--help"]}
 
@@ -26,22 +26,41 @@ def add_bridge_commands(live: click.Group) -> None:
                          "  one-conv live serve --hub https://hub.example.com --node ci-runner --token-stdin < ci-runner.token\n"
                          "  one-conv live serve            # again, with the last settings\n"
                          "  one-conv live serve --status\n"
-                         "  one-conv live serve --stop")
+                         "  one-conv live serve --stop\n"
+                         "  one-conv live serve --install --yes   # start at login, restart after a crash")
     @click.option("--hub", help="https://HOST, http://127.0.0.1:PORT (loopback only), or ssh://[user@]HOST to tunnel to it.")
     @click.option("--node", help="This machine's name on the hub, as its token was issued (a-z, 0-9, -).")
     @click.option("--hub-port", type=int, help="The hub's port on an ssh host.  [default: 8789]")
     @click.option("--token-stdin", is_flag=True, help="Read this node's token from stdin and remember it (mode 600).")
     @click.option("--status", "show_status", is_flag=True, help="Show whether the bridge runs, and its last state.")
     @click.option("--stop", "stop_it", is_flag=True, help="Stop the running bridge.")
+    @click.option("--install", "install_it", is_flag=True,
+                  help="Run the bridge as a macOS login service: it starts at login and restarts after a crash.")
+    @click.option("--uninstall", "uninstall_it", is_flag=True, help="Remove the login service.")
+    @click.option("--yes", is_flag=True, help="Apply --install or --uninstall; without it, only show what would change.")
     @click.option("--json", "as_json", is_flag=True, help="Emit --status as JSON.")
-    def serve_command(hub, node, hub_port, token_stdin, show_status, stop_it, as_json):
+    def serve_command(hub, node, hub_port, token_stdin, show_status, stop_it, install_it, uninstall_it, yes, as_json):
         """Connect this machine to a live hub, so its agents and agents elsewhere reach each other.
 
         The bridge publishes the sessions running here, delivers messages the hub holds for
         them through their usual adapters, and posts what `live send` queued while the hub
         was unreachable. No inbound network access is required. Run one per machine, in
-        the foreground or under tmux; its token comes from `live-hub.py token add`.
+        the foreground, under tmux, or as a login service (--install); its token comes
+        from `live-hub.py token add`.
         """
+        if install_it or uninstall_it:
+            if not yes:
+                click.echo(f"would {'install' if install_it else 'remove'} the login service {service.plist_path()}"
+                           + (" and stop a bridge running outside it" if install_it and not service.installed()
+                              and bridge.status()["running"] else "") + "; add --yes")
+                return
+            try:
+                notes = service.install() if install_it else service.uninstall()
+            except RuntimeError as error:
+                raise click.ClickException(str(error)) from None
+            for note in notes:
+                click.echo(note)
+            return
         if show_status:
             state = bridge.status()
             if as_json:
@@ -52,6 +71,7 @@ def add_bridge_commands(live: click.Group) -> None:
             if state.get("last_error"):
                 click.echo(f"  last error: {state['last_error']}")
             click.echo(f"  queued for the hub: {state['outbox']}")
+            click.echo(f"  starts at login: {'yes' if service.installed() else 'no (one-conv live serve --install --yes)'}")
             for note in state.get("notes") or []:
                 click.echo(f"  {note}")
             return

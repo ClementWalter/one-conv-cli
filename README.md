@@ -588,9 +588,13 @@ On each machine, with the token issued to it:
 one-conv live serve --hub ssh://me@hub-box --node laptop --token-stdin < laptop.token
 one-conv live serve --hub https://hub.example.com --node ci-runner --token-stdin < ci-runner.token
 one-conv live serve --status
+one-conv live serve --install --yes   # macOS: start at login, restart after a crash
 one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes
 ```
 
+- On a Mac, `--install --yes` hands the bridge to launchd once its settings are
+  saved: it starts at every login and restarts after a crash, while a clean stop
+  (`--stop`) keeps it stopped until the next login. `--uninstall --yes` removes it.
 - `ssh://` opens `ssh -N -L` to the hub's port, non-interactively and only to a
   host whose key is already known; `https://` verifies the certificate; plain
   `http://` is accepted only to a loopback address (127.0.0.1, ::1). The token travels only in a request

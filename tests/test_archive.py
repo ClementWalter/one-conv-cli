@@ -787,6 +787,28 @@ def write_unused_cursor_chat(env):
         conn.execute("CREATE TABLE cursorDiskKV (key, value)")
 
 
+def test_sync_uploads_a_cursor_chat_with_a_null_bubble_row(tmp_path, archive):
+    _, _client, url = archive
+    env = fixture_env(tmp_path)
+    write_cursor_ide(env, "IDE question")
+    with sqlite3.connect(Path(env["CURSOR_USER_DIR"]) / "globalStorage" / "state.vscdb") as conn:
+        conn.execute("INSERT INTO cursorDiskKV VALUES (?, NULL)", ("bubbleId:cursor-fixture:orphan",))
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    assert run(env, "scripts/archive-sync.py", "--source", "cursor") == {"uploaded": 1, "unchanged": 0}
+
+
+def test_cursor_thread_skips_a_referenced_null_bubble(tmp_path):
+    env = fixture_env(tmp_path)
+    write_cursor_ide(env, "IDE question")
+    with sqlite3.connect(Path(env["CURSOR_USER_DIR"]) / "globalStorage" / "state.vscdb") as conn:
+        conn.execute("INSERT INTO cursorDiskKV VALUES (?, NULL)", ("bubbleId:cursor-fixture:orphan",))
+        conn.execute("UPDATE cursorDiskKV SET value = ? WHERE key = ?", (json.dumps(
+            {"fullConversationHeadersOnly": [{"bubbleId": "orphan"}, {"bubbleId": "one"}]}), "composerData:cursor-fixture"))
+    thread = run(env, "bin/one-conv", "local", "thread", "/example/cursor-fixture", "--source", "cursor",
+                 "--no-mark-read", "--json")
+    assert [turn["text"] for turn in thread["turns"]] == ["IDE question"]
+
+
 def test_sync_counts_an_unused_cursor_chat_as_empty(tmp_path, archive):
     _, _client, url = archive
     env = fixture_env(tmp_path)

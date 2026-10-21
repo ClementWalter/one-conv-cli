@@ -325,7 +325,9 @@ def original_records(reader, handle, paths):
                     raise EmptyConversation("Cursor conversation has no messages yet")
                 raise ArchiveError("Cursor conversation records are unavailable")
             # One record keeps a conversation's many small rows in a few chunks.
-            return {"cursorDiskKV": encode({key: base64.b64encode(value if isinstance(value, bytes) else value.encode()).decode()
+            # Cursor leaves some unreferenced bubble rows NULL; they stay null so the copy is exact.
+            return {"cursorDiskKV": encode({key: None if value is None else
+                                            base64.b64encode(value if isinstance(value, bytes) else value.encode()).decode()
                                             for key, value in sorted(rows, key=lambda row: row[0])}),
                     "composerHeaders": encode(list(header) if header else None)}
         finally:

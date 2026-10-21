@@ -465,3 +465,16 @@ def test_denied_connect_does_not_discover_accounts(app, monkeypatch):
     monkeypatch.setattr(app, "_claude_accounts", lambda: pytest.fail("Denied connect cannot discover sessions"))
     result = CliRunner().invoke(app.cli, ["cloud", "claude", "connect"])
     assert "Browser credential access was not authorized" in result.output
+
+
+def test_bridge_sync_failure_names_the_bridge_log(app, caplog):
+    from one_conv.archive import sync_record
+    app._archive_sync_health(sync_record({"failed": 1, "failures": ["cursor/x: ArchiveError: boom"], "finished": 1}), 5)
+    assert str(Path(os.environ["ONE_CONV_LIVE_DIR"]) / "bridge" / "archive-sync.log") in caplog.text
+
+
+def test_command_sync_failure_names_the_state_log(app, caplog, monkeypatch):
+    from one_conv.archive import sync_record
+    monkeypatch.setenv("ONE_CONV_ARCHIVE_URL", "https://archive.example.test")
+    app._archive_sync_health(sync_record({"failed": 1, "failures": ["cursor/x: ArchiveError: boom"], "finished": 1}), 5)
+    assert str(app.STATE_DIR / "archive-sync.log") in caplog.text

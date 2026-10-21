@@ -826,7 +826,7 @@ def _cursor_iter_turns(composer_id: str) -> list[Turn]:
             return []
         try:
             data = json.loads(row[0])
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):  # TypeError: a NULL row
             return []
         turns = []
         for bh in data.get("fullConversationHeadersOnly") or []:
@@ -841,7 +841,7 @@ def _cursor_iter_turns(composer_id: str) -> list[Turn]:
                 continue
             try:
                 bubble = json.loads(brow[0])
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):  # TypeError: a NULL bubble row
                 continue
             role = {1: "user", 2: "assistant"}.get(bubble.get("type"))
             if role is None:
@@ -878,7 +878,7 @@ def _cursor_session_tokens(composer_id: str) -> int | None:
             return None
         try:
             data = json.loads(row[0])
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):  # TypeError: a NULL row
             return None
         total = 0
         found = False
@@ -894,7 +894,7 @@ def _cursor_session_tokens(composer_id: str) -> int | None:
                 continue
             try:
                 bubble = json.loads(brow[0])
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):  # TypeError: a NULL bubble row
                 continue
             token_count = bubble.get("tokenCount")
             if not token_count:
@@ -2221,14 +2221,17 @@ def _archive_sync_health(state, minutes):
     instead of stopping the user's command.
     """
     from one_conv.archive import SYNC_LOG
+    from one_conv.live.model import live_home
+    # An explicit ONE_CONV_ARCHIVE_URL syncs from commands; otherwise the live bridge runs it and logs there.
+    log_path = STATE_DIR / SYNC_LOG if os.environ.get("ONE_CONV_ARCHIVE_URL") else live_home() / "bridge" / SYNC_LOG
     if state["error"] or state["failed"]:
         detail = state["error"] or "; ".join(state["failures"]) or "no details recorded"
         finished = (datetime.fromtimestamp(state["finished"]).strftime("%Y-%m-%d %H:%M")
                     if state["finished"] is not None else "an unknown time")
-        log.warning("Archive sync at %s failed: %s (log: %s)", finished, detail, STATE_DIR / SYNC_LOG)
+        log.warning("Archive sync at %s failed: %s (log: %s)", finished, detail, log_path)
     elif minutes > 0 and (state["succeeded"] or state["requested"]) is not None \
             and time.time() - (state["succeeded"] or state["requested"]) > 86400:
-        log.warning("Archive sync has not completed in the last day (log: %s)", STATE_DIR / SYNC_LOG)
+        log.warning("Archive sync has not completed in the last day (log: %s)", log_path)
 
 
 def _archive_sync_in_background():

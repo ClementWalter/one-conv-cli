@@ -1,5 +1,7 @@
 /* A conversation-first workspace with persistent navigation and a human composer. */
 :root {
+  --inset-top: env(safe-area-inset-top, 0px);
+  --inset-bottom: env(safe-area-inset-bottom, 0px);
   color-scheme: light;
   --frame: #3a103e;
   --rail: #441448;
@@ -1884,8 +1886,8 @@ button {
     height: 40px !important;
     padding: 10px 14px;
   }
-  .workspace {
-    height: calc(var(--viewport-height, 100dvh) - 46px);
+  .composer.compact + .composer-feedback {
+    display: none;
   }
   /* iPhone keeps the page scale when focusing controls with readable native-sized text. */
   input,

@@ -766,6 +766,35 @@ class Hub:
                 db.execute("DELETE FROM archived_topics WHERE topic = ?", (topic,))
         return {"topic": topic, "archived": archived}
 
+    def stop(self, from_node: str, route: str) -> dict:
+        """Order the bridge of `route`'s machine to end that session; returns the order's id.
+
+        The order is a system post addressed to `stop:<address>` on that machine, so only its
+        bridge acts on it and it never shows as a message anyone wrote.
+        """
+        node, address = split_address(route)
+        if address == "user":
+            raise HubError(400, "only an agent session can be stopped")
+        msg_id = secrets.token_hex(16)
+        target = f"{node}/stop:{address}"
+        with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not self._available(db, route, time.time()):
+                raise HubError(409, "This agent is offline; its machine cannot receive a stop order.")
+            digest = hashlib.sha256(json.dumps(["stop", target, msg_id]).encode()).hexdigest()
+            self._insert(db, from_node, msg_id, digest, target, "user", None, "none", "push",
+                         f"Stop {address}", [(node, f"stop:{address}", None)], kind="system")
+        return {"id": msg_id, "to": route}
+
+    def stop_outcome(self, from_node: str, msg_id: str) -> str | None:
+        """The bridge's outcome for a stop order, or None while it has not reported one."""
+        with self._db() as db:
+            row = db.execute("SELECT d.outcome FROM deliveries d JOIN posts p ON p.seq = d.post WHERE p.from_node = ?"
+                             " AND p.id = ? AND p.kind = 'system'", (from_node, msg_id)).fetchone()
+        if row is None:
+            raise HubError(404, "no such stop order")
+        return row[0]
+
     def leave(self, node: str, topic: str, address: str) -> dict:
         with self.lock, self._db() as db:
             removed = db.execute("DELETE FROM members WHERE topic = ? AND node = ? AND address = ?",

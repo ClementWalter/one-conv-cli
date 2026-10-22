@@ -1547,6 +1547,14 @@ button {
 .member-row .row-presence {
   margin-left: auto;
 }
+/* Sits under its member row, aligned with the text past the avatar. */
+.stop-agent {
+  margin: 0 18px 12px 52px;
+  padding: 7px 12px;
+  font-size: 12px;
+}
+.stop-agent.armed { background: #b3261e; color: white; }
+.stop-agent:disabled { opacity: 0.6; }
 .message-dialog {
   width: min(480px, calc(100vw - 32px));
   padding: 0;

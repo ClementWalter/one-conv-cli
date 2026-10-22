@@ -170,7 +170,7 @@ def test_pairing_tokens_are_not_logged(client, app, caplog):
 
 def test_provider_capabilities_reflect_configured_callbacks(paired):
     client, _ = paired
-    assert client.get("/api/session").json()["capabilities"] == {"workers": True, "accounting": False, "pairing": True, "channels": True, "changes": True, "unread": True, "acks": True, "sign_out_others": True}
+    assert client.get("/api/session").json()["capabilities"] == {"workers": True, "accounting": False, "pairing": True, "channels": True, "changes": True, "unread": True, "acks": True, "sign_out_others": True, "stop": True}
 
 
 def test_anonymous_browser_cannot_create_a_device_invite(client):

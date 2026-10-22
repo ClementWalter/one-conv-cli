@@ -36,6 +36,8 @@ HUMAN = "workspace/user"
 TEXT_LIMIT = 32_000
 MESSAGES_SHOWN = 300
 MEMBERS_LIMIT = 50
+# How long a stop request waits for the agent's bridge to report; its inbox long-poll picks orders up within a second.
+STOP_WAIT = 10.0
 
 
 @contextmanager
@@ -253,9 +255,11 @@ class ControlStore:
                 "WHERE r.conversation = '#' || p.topic), ?) GROUP BY p.topic", (baseline,)))
             contacts = db.execute(
                 "SELECT p.from_node,p.sender FROM posts p JOIN deliveries d ON d.post=p.seq "
-                "WHERE p.topic IS NULL AND d.to_node=? AND d.to_address='user' "
+                "WHERE p.topic IS NULL AND p.kind IS NOT 'system' AND d.to_node=? AND d.to_address='user' "
                 "UNION SELECT d.to_node,d.to_address FROM posts p JOIN deliveries d ON d.post=p.seq "
-                "WHERE p.topic IS NULL AND p.from_node=? AND p.sender='user'", (NODE, NODE)).fetchall()
+                # A stop order is the hub's instruction, not a conversation with the stopped agent.
+                "WHERE p.topic IS NULL AND p.kind IS NOT 'system' AND p.from_node=? AND p.sender='user'",
+                (NODE, NODE)).fetchall()
         published = {row["address"] for row in directory}
         # Conversation identities survive disappearing publications without inventing an alias or live process.
         for node, local in contacts:
@@ -431,6 +435,19 @@ class ControlStore:
                            for row in recipients],
             **({"topic": payload["target"][1:]} if payload["target"].startswith("#") else {}),
             "notice": "Stored durably; delivery acceptance does not mean the recipient has read it."}}
+
+    def stop_session(self, payload, wait: float | None = None):
+        """The human ends an agent the spawner started; answers stopped, refused or pending."""
+        if not isinstance(payload, dict) or set(payload) != {"address"} or not isinstance(payload["address"], str):
+            raise HubError(400, "Provide the address of the agent to stop.")
+        order = self.hub.stop(NODE, payload["address"])
+        deadline = time.monotonic() + (STOP_WAIT if wait is None else wait)
+        outcome = self.hub.stop_outcome(NODE, order["id"])
+        while outcome is None and time.monotonic() < deadline:
+            time.sleep(0.25)
+            outcome = self.hub.stop_outcome(NODE, order["id"])
+        status = {"accepted": "stopped", "refused": "refused", "unconfirmed": "unconfirmed"}.get(outcome, "pending")
+        return {"address": display_address(payload["address"]), "status": status, "id": order["id"]}
 
     def archive_channel(self, payload):
         """The human hides a channel from the list, or brings it back; agents still find and read it."""

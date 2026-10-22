@@ -35,6 +35,9 @@ const model = {
   // Read marks the workspace accepted from this tab, per conversation, and the saves in flight.
   readMarks: new Map(),
   reading: new Set(),
+  // The agent whose Stop button was tapped once and waits for a confirming second tap, and stops in flight.
+  stopArmed: null,
+  stopping: new Set(),
 };
 const harnesses = {
   claude: "Claude",
@@ -1766,11 +1769,56 @@ function renderDetails() {
         toggleDetails(false);
       });
     content.appendChild(button);
+    if (!isHuman(address) && model.capabilities.stop && presenceOf(p).can_message) content.appendChild(stopButton(address, p));
   }
   if (!addresses.length)
     content.appendChild(
       el("p", "Agents will appear here when they join.", "sidebar-empty"),
     );
+}
+function stopButton(address, p) {
+  const armed = model.stopArmed && model.stopArmed.address === address && model.stopArmed.until > Date.now();
+  const busy = model.stopping.has(address);
+  const button = el("button", busy ? "Stopping…" : armed ? "Tap again to stop " + p.name : "Stop agent",
+    "secondary-button stop-agent" + (armed ? " armed" : ""));
+  button.type = "button";
+  button.disabled = busy;
+  button.addEventListener("click", () => {
+    // A second tap within a few seconds confirms; a browser confirm dialog would block the page.
+    if (!armed) {
+      model.stopArmed = { address, until: Date.now() + 5000 };
+      renderDetails();
+      setTimeout(() => {
+        if (model.stopArmed && model.stopArmed.address === address && model.stopArmed.until <= Date.now()) {
+          model.stopArmed = null;
+          if (model.details) renderDetails();
+        }
+      }, 5100);
+      return;
+    }
+    model.stopArmed = null;
+    stopAgent(address, p.name);
+  });
+  return button;
+}
+async function stopAgent(address, name) {
+  model.stopping.add(address);
+  if (model.details) renderDetails();
+  try {
+    const result = await post("/api/sessions/stop", { address });
+    toast({
+      stopped: name + " stopped.",
+      refused: name + " was not stopped: only agents the Mac's spawner started can be stopped here. Close it in its terminal.",
+      unconfirmed: name + "'s machine could not confirm the stop. Check again in a moment.",
+    }[result.status] || "Stop sent; " + name + "'s machine has not answered yet.");
+  } catch (error) {
+    if (!(error instanceof StaleSession)) toast(error.message);
+  } finally {
+    model.stopping.delete(address);
+  }
+  model.signature = "";
+  await refreshState();
+  if (model.details) renderDetails();
 }
 function toggleDetails(open = !model.details) {
   model.details = open;

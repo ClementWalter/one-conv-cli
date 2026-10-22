@@ -121,6 +121,27 @@ def deliver_spawn(item: dict, on_started=None) -> tuple[str, str]:
     return "accepted", f"starting a {harness} session in {config['cwd']}"
 
 
+def deliver_stop(item: dict, on_stopped=None) -> tuple[str, str]:
+    """End a session the spawner started here, on the hub's order; any other session is refused."""
+    address = str(item.get("to", "")).partition(":")[2]
+    if not item.get("system"):
+        # Only the hub issues stop orders; a message addressed here by anyone else ends nothing.
+        return "refused", "a stop order must come from the hub"
+    if parse_address(address)[0] is None:
+        return "refused", f"{address!r} is not a session address"
+    try:
+        row = spawn.stop(address)
+    except spawn.SpawnError as error:
+        return "refused", str(error)
+    if on_stopped is not None:
+        try:
+            # Republish at once so the stopped session leaves the directory before the next lease renewal.
+            on_stopped()
+        except (hubclient.HubRefused, hubclient.HubUnavailable) as error:
+            logger.warning("stopped %s but could not republish: %s", address, error)
+    return "accepted", f"stopped tmux session {row['tmux']}"
+
+
 def settings() -> dict:
     """What `live serve` was last started with: hub, node, hub_port and token."""
     return _read(bridge_dir() / "serve.json")
@@ -250,6 +271,8 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, on_sta
     target, sender_route = str(item.get("to", "")), str(item.get("from", ""))
     if target.startswith("spawn:"):
         return deliver_spawn(item, on_started)
+    if target.startswith("stop:"):
+        return deliver_stop(item, on_started)
     harness, _ = parse_address(target)
     if harness is None:
         return "refused", f"{target!r} is not a session address"

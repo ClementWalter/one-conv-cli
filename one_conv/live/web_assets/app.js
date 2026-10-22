@@ -2035,8 +2035,12 @@ function fitViewport() {
   const taken = Math.round(window.innerHeight - viewport.height - viewport.offsetTop);
   root.setProperty("--keyboard-height", (taken >= 120 ? taken : 0) + "px");
   // iOS may pan the visual viewport over the page instead of shrinking it, so an open keyboard pins
-  // the app to the visible area wherever that is (see .keyboard-open in the phone rules).
-  document.documentElement.classList.toggle("keyboard-open", window.innerHeight - viewport.height >= 120);
+  // the app to the visible area wherever that is (see .keyboard-open in the phone rules). The installed
+  // app can shrink the window with the keyboard, hiding the difference, so a text field focused on a
+  // touch screen counts as an open keyboard too.
+  const editing = matchMedia("(pointer: coarse)").matches && document.activeElement
+    && document.activeElement.matches("input:not([type=file]):not([type=checkbox]), textarea, [contenteditable]");
+  document.documentElement.classList.toggle("keyboard-open", window.innerHeight - viewport.height >= 120 || Boolean(editing));
   if (window.scrollY || window.scrollX || viewport.offsetTop) window.scrollTo(0, 0);
   const report = document.getElementById("layout-report");
   if (report) {
@@ -2051,6 +2055,7 @@ if (window.visualViewport) {
   window.visualViewport.addEventListener("resize", fitViewport);
   window.visualViewport.addEventListener("scroll", fitViewport);
   window.addEventListener("focusout", () => setTimeout(fitViewport, 50));
+  window.addEventListener("focusin", fitViewport);
   fitViewport();
 }
 $("message-input").addEventListener("input", () => {

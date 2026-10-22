@@ -50,7 +50,7 @@ def test_the_question_lists_each_option_with_its_description():
 
 def test_the_question_ends_with_the_marker_for_the_buttons():
     assert json.loads(ask.question_text([FRAMEWORK]).splitlines()[-1][len(ask.MARKER):-4])["questions"][0]["options"] == [
-        "React", "Vue"]
+        {"label": "React", "description": "Most used"}, {"label": "Vue", "description": ""}]
 
 
 # --- reading the reply ---------------------------------------------------------------------------

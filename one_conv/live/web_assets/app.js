@@ -596,48 +596,94 @@ function askOf(text) {
   if (!match) return [text, null];
   try {
     const ask = JSON.parse(match[1]);
-    return Array.isArray(ask.questions) ? [text.slice(0, match.index), ask.questions] : [text, null];
+    // The form shows the questions and options, so only the message's opening line stays as text.
+    return Array.isArray(ask.questions) ? [text.slice(0, match.index).split("\n\n")[0], ask.questions] : [text, null];
   } catch {
     return [text, null];
   }
 }
-function askOptions(questions, agent) {
-  // Each option is a button; the answer is sent to the asking agent as an ordinary reply, which its
-  // hook reads as `Header: choice` lines (or the bare choice for a single question).
-  const box = el("div", null, "ask-options");
-  const chosen = questions.map(() => new Set());
-  const reply = () => questions.length === 1 ? [...chosen[0]].join(", ")
-    : questions.map((q, i) => (q.header || q.question) + ": " + [...chosen[i]].join(", ")).join("\n");
+// Choices survive the thread being drawn again while the person is still filling the form.
+const askState = new Map();
+function askOptions(questions, agent, key) {
+  // One fieldset per question, as in the terminal: its options as radio buttons (checkboxes when
+  // several answers are allowed), each with its description, plus "Other" for a typed answer. The
+  // answer goes to the asking agent as an ordinary reply, which its hook reads as `Header: answer`
+  // lines (or the bare answer for a single question).
+  const form = el("form", null, "ask-options");
+  const state = askState.get(key) || { checked: {}, typed: {}, sent: false };
+  askState.set(key, state);
+  const name = "ask-" + key;
   const submit = el("button", "Send answer", "primary-button ask-send");
-  submit.type = "button";
-  submit.disabled = true;
-  submit.addEventListener("click", () => answerAsk(agent, reply()));
-  questions.forEach((question, index) => {
-    const group = el("div", null, "ask-question");
-    group.appendChild(el("span", question.header || question.question, "ask-header"));
-    for (const label of question.options || []) {
-      const option = el("button", label, "intro-chip ask-option");
-      option.type = "button";
-      option.addEventListener("click", () => {
-        if (questions.length === 1 && !question.multiSelect) return answerAsk(agent, label);
-        if (!question.multiSelect) chosen[index].clear();
-        if (chosen[index].has(label)) chosen[index].delete(label);
-        else chosen[index].add(label);
-        for (const node of group.querySelectorAll(".ask-option")) node.classList.toggle("chosen", chosen[index].has(node.textContent));
-        submit.disabled = chosen.some((set) => !set.size);
-      });
-      group.appendChild(option);
+  submit.type = "submit";
+  const groups = questions.map((question, index) => {
+    const group = form.appendChild(el("fieldset", null, "ask-question"));
+    group.appendChild(el("legend", question.header || "Question", "ask-header"));
+    group.appendChild(el("p", question.question || "", "ask-text"));
+    const type = question.multiSelect ? "checkbox" : "radio";
+    const choice = (label, description) => {
+      const row = group.appendChild(el("label", null, "ask-option"));
+      const input = row.appendChild(el("input"));
+      input.type = type;
+      input.name = name + "-" + index;
+      input.value = label;
+      const words = row.appendChild(el("span", null, "ask-choice"));
+      words.appendChild(el("strong", label));
+      if (description) words.appendChild(el("span", description, "ask-description"));
+      return input;
+    };
+    for (const option of question.options || []) {
+      const label = typeof option === "string" ? option : option.label;
+      choice(label, typeof option === "string" ? "" : option.description);
     }
-    box.appendChild(group);
+    const other = choice("Other", "");
+    const typed = other.closest("label").appendChild(el("input", null, "ask-other"));
+    typed.type = "text";
+    typed.value = state.typed[index] || "";
+    for (const input of group.querySelectorAll("input[type=radio], input[type=checkbox]"))
+      input.checked = (state.checked[index] || []).includes(input.value);
+    typed.placeholder = "Your own answer";
+    typed.setAttribute("aria-label", "Your own answer to " + (question.header || "this question"));
+    typed.addEventListener("input", () => { other.checked = Boolean(typed.value.trim()) || other.checked; ready(); });
+    return { question, group, typed };
   });
-  if (questions.length > 1 || questions.some((q) => q.multiSelect)) box.appendChild(submit);
-  return box;
+  const answerOf = ({ group, typed }) => [...group.querySelectorAll("input:checked")]
+    .map((input) => input.value === "Other" ? typed.value.trim() : input.value).filter(Boolean).join(", ");
+  function ready() {
+    groups.forEach(({ group, typed }, index) => {
+      state.checked[index] = [...group.querySelectorAll("input:checked")].map((input) => input.value);
+      state.typed[index] = typed.value;
+    });
+    submit.disabled = state.sent || groups.some((entry) => !answerOf(entry));
+  }
+  form.addEventListener("change", ready);
+  form.appendChild(submit);
+  ready();
+  if (state.sent) for (const control of form.elements) control.disabled = true;
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const answers = groups.map(answerOf);
+    if (answers.some((answer) => !answer)) return;
+    const text = groups.length === 1 ? answers[0]
+      : groups.map((entry, index) => (entry.question.header || entry.question.question) + ": " + answers[index]).join("\n");
+    // Sending draws the thread again at once, so the form is marked sent before it goes.
+    state.sent = true;
+    if (answerAsk(agent, text) === false) {
+      state.sent = false;
+      return;
+    }
+    for (const control of form.elements) control.disabled = true;
+  });
+  return form;
 }
 function answerAsk(agent, text) {
   // The reply goes through the composer, so it is queued, retried and shown like any message.
-  if (target() !== agent) return feedback("Open the conversation with this agent to answer.", "error");
+  if (target() !== agent) {
+    feedback("Open the conversation with this agent to answer.", "error");
+    return false;
+  }
   $("message-input").value = text;
   $("composer").requestSubmit();
+  return true;
 }
 function messageText(container, text) {
   // Block markdown as agents write it: paragraphs, headings, bulleted and numbered lists (one level of
@@ -877,7 +923,7 @@ function renderRows(rows, force = false) {
         });
         body.appendChild(more);
       }
-      if (ask && row.from !== "user") body.appendChild(askOptions(ask, row.from));
+      if (ask && row.from !== "user") body.appendChild(askOptions(ask, row.from, key));
     }
     fill();
     if (Array.isArray(row.attachments) && row.attachments.length) {

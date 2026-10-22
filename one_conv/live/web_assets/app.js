@@ -2029,10 +2029,14 @@ function fitViewport() {
   if (!viewport) return;
   const root = document.documentElement.style;
   root.setProperty("--viewport-height", Math.round(viewport.height) + "px");
+  root.setProperty("--viewport-top", Math.round(viewport.offsetTop) + "px");
   // What the keyboard takes is the layout viewport less the visual one. A keyboard is never under
   // 120px; a smaller difference is a bar the two viewports disagree about, and takes nothing.
   const taken = Math.round(window.innerHeight - viewport.height - viewport.offsetTop);
   root.setProperty("--keyboard-height", (taken >= 120 ? taken : 0) + "px");
+  // iOS may pan the visual viewport over the page instead of shrinking it, so an open keyboard pins
+  // the app to the visible area wherever that is (see .keyboard-open in the phone rules).
+  document.documentElement.classList.toggle("keyboard-open", window.innerHeight - viewport.height >= 120);
   if (window.scrollY || window.scrollX || viewport.offsetTop) window.scrollTo(0, 0);
   const report = document.getElementById("layout-report");
   if (report) {

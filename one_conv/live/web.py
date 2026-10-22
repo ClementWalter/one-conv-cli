@@ -6,6 +6,7 @@ position. Writes require a per-instance token and the same loopback origin; all 
 require a localhost Host header. The page renders messages as text, never as markup.
 """
 
+import hashlib
 import hmac
 import json
 import logging
@@ -265,3 +266,5 @@ def application(port: int):
 PAGE = Path(__file__).with_name("web_assets").joinpath("index.html").read_text(encoding="utf-8")
 STYLE = Path(__file__).with_name("web_assets").joinpath("app.css").read_text(encoding="utf-8")
 SCRIPT = Path(__file__).with_name("web_assets").joinpath("app.js").read_text(encoding="utf-8")
+# Changes whenever a deploy changes the page; an open app reloads itself when it sees a new one.
+VERSION = hashlib.sha256((PAGE + STYLE + SCRIPT).encode()).hexdigest()[:16]

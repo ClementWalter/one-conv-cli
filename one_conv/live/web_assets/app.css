@@ -1924,6 +1924,27 @@ button {
   .notice {
     padding: 9px 16px;
   }
+  /* With the keyboard open the app fills exactly the visible area, in the browser and installed alike,
+     so the composer sits right above the keyboard. Its specificity beats the installed rules below. */
+  html.keyboard-open body {
+    position: fixed;
+    top: var(--viewport-top, 0px);
+    bottom: auto;
+    left: 0;
+    right: 0;
+    height: var(--viewport-height, 100dvh);
+    display: flex;
+    flex-direction: column;
+  }
+  html.keyboard-open .topbar {
+    flex: none;
+  }
+  html.keyboard-open .workspace {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: auto;
+    padding-bottom: 5px;
+  }
 }
 @media (prefers-reduced-motion: reduce) {
   *,

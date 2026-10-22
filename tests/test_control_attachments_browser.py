@@ -146,6 +146,26 @@ def test_a_closed_keyboard_takes_no_height(phone):
     assert phone.evaluate("() => document.documentElement.style.getPropertyValue('--keyboard-height')") == "0px"
 
 
+KEYBOARD = """() => {
+  // iOS with the keyboard open: a 400px visual viewport panned 200px down the 740px page.
+  Object.defineProperty(window.visualViewport, "height", { get: () => 400 });
+  Object.defineProperty(window.visualViewport, "offsetTop", { get: () => 200 });
+  window.visualViewport.dispatchEvent(new Event("resize"));
+}"""
+
+
+def test_an_open_keyboard_keeps_the_composer_above_it(phone):
+    phone.locator("#message-input").focus()
+    phone.evaluate(KEYBOARD)
+    assert phone.locator("#composer").bounding_box()["y"] + phone.locator("#composer").bounding_box()["height"] <= 600
+
+
+def test_an_open_keyboard_keeps_the_top_bar_in_view(phone):
+    phone.locator("#message-input").focus()
+    phone.evaluate(KEYBOARD)
+    assert phone.locator(".topbar").bounding_box()["y"] >= 200
+
+
 def test_the_installed_layout_rules_come_after_the_phone_rules():
     from one_conv.live import web
     assert web.STYLE.rindex("@media (display-mode: standalone)") > web.STYLE.rindex("@media (max-width: 760px)")

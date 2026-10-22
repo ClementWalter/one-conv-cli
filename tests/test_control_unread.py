@@ -1,5 +1,7 @@
 """Cloud workspace unread counts: one server-side read mark per conversation, shared by every device."""
 
+import time
+
 import pytest
 
 from one_conv.control.store import ControlStore
@@ -75,6 +77,21 @@ def test_topic_tagged_direct_message_is_not_a_channel_unread(store):
 
 
 def test_agent_direct_message_is_unread(store):
+    post(store, "a", to="workspace/user")
+    assert thread_unread(store) == 1
+
+
+def test_a_terminal_exchange_mirrored_to_the_workspace_is_not_unread(store):
+    store.hub.report("worker", [{"id": "e" * 32, "from": "omp:agent", "to": "user", "topic": None, "mode": "push",
+                                 "reply": "none", "text": "Done at the terminal.", "at": time.time() + 60,
+                                 "outcome": "accepted"}])
+    assert thread_unread(store) == 0
+
+
+def test_a_direct_message_beside_a_terminal_exchange_is_still_unread(store):
+    store.hub.report("worker", [{"id": "e" * 32, "from": "omp:agent", "to": "user", "topic": None, "mode": "push",
+                                 "reply": "none", "text": "Done at the terminal.", "at": time.time() + 60,
+                                 "outcome": "accepted"}])
     post(store, "a", to="workspace/user")
     assert thread_unread(store) == 1
 

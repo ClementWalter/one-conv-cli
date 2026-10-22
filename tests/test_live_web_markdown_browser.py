@@ -26,7 +26,9 @@ MARKDOWN = """## Release check
 
 ---
 
-See [the plan](https://example.invalid/plan), __also bold__, _quietly_ and ~~not this~~."""
+See [the plan](https://example.invalid/plan), __also bold__, _quietly_ and ~~not this~~.
+
+Merged https://example.invalid/pull/64, see https://example.invalid/wiki/Run_(tests) and https://example.invalid/end."""
 
 
 @pytest.fixture
@@ -72,6 +74,22 @@ def test_a_rule_renders_as_a_divider(page):
 def test_a_markdown_link_renders_with_its_text_and_target(page):
     link = page.locator(".message-body a", has_text="the plan")
     assert link.get_attribute("href") == "https://example.invalid/plan"
+
+
+def test_a_bare_url_leaves_a_following_comma_out_of_the_link(page):
+    assert page.locator(".message-body a", has_text="pull/64").get_attribute("href") == "https://example.invalid/pull/64"
+
+
+def test_a_bare_url_leaves_a_sentence_end_out_of_the_link(page):
+    assert page.locator(".message-body a", has_text="/end").get_attribute("href") == "https://example.invalid/end"
+
+
+def test_a_bare_url_keeps_a_closing_parenthesis_it_opened(page):
+    assert page.locator(".message-body a", has_text="wiki").get_attribute("href") == "https://example.invalid/wiki/Run_(tests)"
+
+
+def test_the_punctuation_after_a_bare_url_stays_in_the_text(page):
+    assert "pull/64, see" in page.locator(".message-body p", has_text="Merged").inner_text()
 
 
 def test_underscore_bold_renders_as_strong(page):

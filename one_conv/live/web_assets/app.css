@@ -2005,6 +2005,38 @@ button {
 }
 .message-ack { color: #2f8f5b; font-weight: 600; overflow-wrap: anywhere; }
 .message-acks.starting { font-style: italic; }
+/* A forwarded Claude Code question: one button per option, sent back to the asking agent. */
+.ask-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+.ask-question {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.ask-header {
+  width: 100%;
+  font-size: 11px;
+  font-weight: 700;
+}
+.ask-option {
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--input);
+}
+.ask-option.chosen {
+  border-color: #aa87b8;
+  background: #f1e7f4;
+}
+.ask-send {
+  align-self: flex-start;
+}
 /* Archive or bring back the open channel; agents still read archived channels. */
 .archive-channel {
   border: 0;

@@ -76,6 +76,22 @@ def plan(launcher: list[str]) -> list[Step]:
         data["crossSessionInbound"] = "accept"
         _write_json(settings, data)
 
+    ask_command = shlex.join([*launcher, "live", "ask-hook"])
+    # The hook waits up to 30 min for the workspace; Claude Code stops waiting a minute later.
+    ask_entry = {"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": ask_command, "timeout": 1860}]}
+
+    def ask_hook_done():
+        return ask_entry in _json_file(settings).get("hooks", {}).get("PreToolUse", [])
+
+    def ask_hook_apply():
+        data = _json_file(settings)
+        entries = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
+        # A reinstall from another checkout path replaces the old hook instead of adding a second.
+        entries[:] = [entry for entry in entries
+                      if not any("live ask-hook" in hook.get("command", "") for hook in entry.get("hooks", []))]
+        entries.append(ask_entry)
+        _write_json(settings, data)
+
     def extension_done():
         path = omp.extension_path()
         return path.exists() and path.read_text() == extension
@@ -115,6 +131,8 @@ def plan(launcher: list[str]) -> list[Step]:
         Step("claude", f'set "crossSessionInbound": "accept" in {settings}; any local process running as '
              "you can then inject user turns into every Claude Code session, including bypass ones",
              inbound_done, inbound_apply),
+        Step("claude", f"add the AskUserQuestion hook to {settings}, so a question can be answered from the "
+             "workspace (the terminal asks after 30 min without an answer)", ask_hook_done, ask_hook_apply),
         Step("codex", "register the one-conv MCP server",
              lambda: _registered(["codex", "mcp", "get", "one-conv"], mcp),
              lambda: _replace(["codex", "mcp", "remove", "one-conv"],

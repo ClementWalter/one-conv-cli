@@ -589,6 +589,56 @@ function tableCells(line) {
   const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
   return trimmed.split("|").map((cell) => cell.trim());
 }
+// A Claude Code question forwarded by the AskUserQuestion hook ends with one marker line naming its options.
+const ASK_MARKER = /\n?<!-- one-conv-ask (\{.*\}) -->\s*$/;
+function askOf(text) {
+  const match = text.match(ASK_MARKER);
+  if (!match) return [text, null];
+  try {
+    const ask = JSON.parse(match[1]);
+    return Array.isArray(ask.questions) ? [text.slice(0, match.index), ask.questions] : [text, null];
+  } catch {
+    return [text, null];
+  }
+}
+function askOptions(questions, agent) {
+  // Each option is a button; the answer is sent to the asking agent as an ordinary reply, which its
+  // hook reads as `Header: choice` lines (or the bare choice for a single question).
+  const box = el("div", null, "ask-options");
+  const chosen = questions.map(() => new Set());
+  const reply = () => questions.length === 1 ? [...chosen[0]].join(", ")
+    : questions.map((q, i) => (q.header || q.question) + ": " + [...chosen[i]].join(", ")).join("\n");
+  const submit = el("button", "Send answer", "primary-button ask-send");
+  submit.type = "button";
+  submit.disabled = true;
+  submit.addEventListener("click", () => answerAsk(agent, reply()));
+  questions.forEach((question, index) => {
+    const group = el("div", null, "ask-question");
+    group.appendChild(el("span", question.header || question.question, "ask-header"));
+    for (const label of question.options || []) {
+      const option = el("button", label, "intro-chip ask-option");
+      option.type = "button";
+      option.addEventListener("click", () => {
+        if (questions.length === 1 && !question.multiSelect) return answerAsk(agent, label);
+        if (!question.multiSelect) chosen[index].clear();
+        if (chosen[index].has(label)) chosen[index].delete(label);
+        else chosen[index].add(label);
+        for (const node of group.querySelectorAll(".ask-option")) node.classList.toggle("chosen", chosen[index].has(node.textContent));
+        submit.disabled = chosen.some((set) => !set.size);
+      });
+      group.appendChild(option);
+    }
+    box.appendChild(group);
+  });
+  if (questions.length > 1 || questions.some((q) => q.multiSelect)) box.appendChild(submit);
+  return box;
+}
+function answerAsk(agent, text) {
+  // The reply goes through the composer, so it is queued, retried and shown like any message.
+  if (target() !== agent) return feedback("Open the conversation with this agent to answer.", "error");
+  $("message-input").value = text;
+  $("composer").requestSubmit();
+}
 function messageText(container, text) {
   // Block markdown as agents write it: paragraphs, headings, bulleted and numbered lists (one level of
   // nesting), quotes, rules, tables and fenced code. Anything else stays as written.
@@ -803,7 +853,7 @@ function renderRows(rows, force = false) {
       content.appendChild(meta);
     }
     const body = el("div", null, "message-body");
-    const text = String(row.text || "");
+    const [text, ask] = askOf(String(row.text || ""));
     const key = row.id || [row.from, row.at, text.slice(0, 20)].join(":");
     const long = text.length > 800;
     function fill() {
@@ -827,6 +877,7 @@ function renderRows(rows, force = false) {
         });
         body.appendChild(more);
       }
+      if (ask && row.from !== "user") body.appendChild(askOptions(ask, row.from));
     }
     fill();
     if (Array.isArray(row.attachments) && row.attachments.length) {

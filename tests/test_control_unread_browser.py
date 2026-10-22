@@ -1,5 +1,7 @@
 """Cloud unread marks over real HTTPS: a channel read on one paired device clears on the other."""
 
+import re
+
 import pytest
 
 from one_conv.control.auth import AuthStore
@@ -103,3 +105,34 @@ def repaired(browser, real_http_workspace, width):
 
 def test_an_old_read_mark_rejection_does_not_sign_out_a_new_pairing(repaired):
     assert repaired.evaluate("model.authenticated") is True
+
+
+# --- a forwarded Claude Code question ----------------------------------------------------------------
+
+ASK = ("**A question for you** (tap an option, or reply with your own answer)\n\n**Framework**: Which framework?\n"
+       "- React\n- Vue\n\n" '<!-- one-conv-ask {"questions": [{"question": "Which framework?", "header": "Framework", '
+       '"options": ["React", "Vue"], "multiSelect": false}]} -->')
+
+
+@pytest.fixture
+def question(browser, real_http_workspace):
+    real_http_workspace["worker"].post("/v1/messages", json={"id": "f" * 32, "from": "omp:agent", "to": "workspace/user",
+                                                             "text": ASK}).raise_for_status()
+    context, page = paired(browser, real_http_workspace, "direct=user%20worker%2Fomp%3Aagent", 1280)
+    page.locator(".ask-option").first.wait_for()
+    yield page
+    context.close()
+
+
+def test_a_forwarded_question_offers_its_options_as_buttons(question):
+    assert question.locator(".ask-option").all_inner_texts() == ["React", "Vue"]
+
+
+def test_a_forwarded_question_hides_its_marker(question):
+    assert "one-conv-ask" not in question.locator(".message-body").first.inner_text()
+
+
+def test_tapping_an_option_sends_it_to_the_agent(question):
+    question.locator(".ask-option", has_text="Vue").click()
+    question.locator(".message-body p").filter(has_text=re.compile(r"^Vue$")).wait_for()
+    assert question.locator(".message-body p").filter(has_text=re.compile(r"^Vue$")).count() == 1

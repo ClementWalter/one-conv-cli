@@ -30,7 +30,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import history, hubclient, router, spawn, team, tunnel
+from . import ask, history, hubclient, router, spawn, team, tunnel
 from .model import envelope, live_home, parse_address
 
 try:
@@ -294,6 +294,9 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, on_sta
         wrapped = envelope(text, sender, sender_route, "none", item.get("id"), topic, remote.get("name"))
         router._append_fyi(target, sender_route, wrapped)
         return "accepted", "stored FYI"
+    # A Claude Code session waiting on a question takes the human's message as its answer.
+    if harness == "claude" and ask.file_answer(session.id, sender_route, item["text"]):
+        return "accepted", "answered the session's pending question"
     if harness == "boat" and reply == "expected":
         reply = "inline"
     wrapped = envelope(text, sender, sender_route, reply, item.get("id"), topic, remote.get("name"))

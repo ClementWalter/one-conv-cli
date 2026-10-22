@@ -453,6 +453,16 @@ def build_live_group(launcher: list[str]) -> click.Group:
             payload = {}
         click.echo(json.dumps(cursor.run_stop_hook(payload)))
 
+    @live.command("ask-hook", hidden=True)
+    def ask_hook_command():
+        """Claude Code PreToolUse hook for AskUserQuestion: reads the hook payload on stdin."""
+        from . import ask
+        try:
+            payload = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            payload = {}
+        click.echo(json.dumps(ask.run_hook(payload)))
+
     from ..control.cli import build_control_group
     from .bridge_cli import add_bridge_commands
     from .spawn_cli import add_spawn_commands

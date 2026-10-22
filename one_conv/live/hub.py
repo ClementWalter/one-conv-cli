@@ -250,7 +250,8 @@ class Hub:
             else:
                 db.execute("INSERT OR REPLACE INTO spawners VALUES (?, ?, ?)", (node, spawn, now))
             self._seen(db, node)
-            self._sweep(db, now)
+            # A clock read before _seen would put this node's lease in the future and count its sessions offline.
+            self._sweep(db, time.time())
         return len(rows)
 
     def sweep(self) -> list[dict]:

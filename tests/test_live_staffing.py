@@ -102,6 +102,17 @@ def test_a_post_with_a_running_member_is_not_staffed(hub):
     assert staffing(hub, post(hub)) is None
 
 
+def test_a_running_member_republishing_does_not_staff_the_post(hub, monkeypatch):
+    hub.publish("mac", [{"address": "claude:one"}], spawn="claude")
+    hub.join("mac", "work", "claude:one")
+    key = post(hub)
+    # Every clock read is later than the previous one, as on a real machine.
+    start, ticks = time.time(), iter(range(10**9))
+    monkeypatch.setattr(hub_module.time, "time", lambda: start + next(ticks) * 0.001)
+    hub.publish("mac", [{"address": "claude:one"}], spawn="claude")
+    assert staffing(hub, key) is None
+
+
 def test_an_offline_spawner_is_skipped(spawner):
     with sqlite3.connect(spawner.path) as db:
         db.execute("UPDATE nodes SET seen = ? WHERE node = 'mac'", (time.time() - hub_module.LEASE_SECONDS - 1,))

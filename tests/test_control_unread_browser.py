@@ -1,5 +1,6 @@
 """Cloud unread marks over real HTTPS: a channel read on one paired device clears on the other."""
 
+import json
 import re
 
 import pytest
@@ -109,30 +110,91 @@ def test_an_old_read_mark_rejection_does_not_sign_out_a_new_pairing(repaired):
 
 # --- a forwarded Claude Code question ----------------------------------------------------------------
 
-ASK = ("**A question for you** (tap an option, or reply with your own answer)\n\n**Framework**: Which framework?\n"
-       "- React\n- Vue\n\n" '<!-- one-conv-ask {"questions": [{"question": "Which framework?", "header": "Framework", '
-       '"options": ["React", "Vue"], "multiSelect": false}]} -->')
+def ask_text(*questions):
+    marker = json.dumps({"questions": list(questions)})
+    return f"**A question for you** (tap an option, or reply with your own answer)\n\n**Details** here\n\n<!-- one-conv-ask {marker} -->"
+
+
+FRAMEWORK = {"question": "Which framework?", "header": "Framework", "multiSelect": False,
+             "options": [{"label": "React", "description": "Most used"}, {"label": "Vue", "description": ""}]}
+EXTRAS = {"question": "Which extras?", "header": "Extras", "multiSelect": True,
+          "options": [{"label": "Router", "description": ""}, {"label": "Store", "description": ""}]}
+
+
+def asked(browser, workspace, *questions):
+    workspace["worker"].post("/v1/messages", json={"id": "f" * 32, "from": "omp:agent", "to": "workspace/user",
+                                                   "text": ask_text(*questions)}).raise_for_status()
+    context, page = paired(browser, workspace, "direct=user%20worker%2Fomp%3Aagent", 1280)
+    page.locator(".ask-option").first.wait_for()
+    return context, page
 
 
 @pytest.fixture
 def question(browser, real_http_workspace):
-    real_http_workspace["worker"].post("/v1/messages", json={"id": "f" * 32, "from": "omp:agent", "to": "workspace/user",
-                                                             "text": ASK}).raise_for_status()
-    context, page = paired(browser, real_http_workspace, "direct=user%20worker%2Fomp%3Aagent", 1280)
-    page.locator(".ask-option").first.wait_for()
+    context, page = asked(browser, real_http_workspace, FRAMEWORK)
     yield page
     context.close()
 
 
-def test_a_forwarded_question_offers_its_options_as_buttons(question):
-    assert question.locator(".ask-option").all_inner_texts() == ["React", "Vue"]
+@pytest.fixture
+def two_questions(browser, real_http_workspace):
+    context, page = asked(browser, real_http_workspace, FRAMEWORK, EXTRAS)
+    yield page
+    context.close()
+
+
+def sent(page, text):
+    page.locator(".message-body p").filter(has_text=re.compile("^" + re.escape(text) + "$")).wait_for()
+    return page.locator(".message-body p").filter(has_text=re.compile("^" + re.escape(text) + "$")).count()
+
+
+def test_a_forwarded_question_offers_its_options_and_other(question):
+    assert question.locator(".ask-option strong").all_inner_texts() == ["React", "Vue", "Other"]
+
+
+def test_a_single_answer_question_offers_radio_buttons(question):
+    assert question.locator(".ask-option input[type=radio]").count() == 3
+
+
+def test_a_multi_answer_question_offers_checkboxes(two_questions):
+    assert two_questions.locator(".ask-question").nth(1).locator("input[type=checkbox]").count() == 3
+
+
+def test_an_option_shows_its_description(question):
+    assert question.locator(".ask-description").first.inner_text() == "Most used"
 
 
 def test_a_forwarded_question_hides_its_marker(question):
     assert "one-conv-ask" not in question.locator(".message-body").first.inner_text()
 
 
-def test_tapping_an_option_sends_it_to_the_agent(question):
+def test_nothing_can_be_sent_before_choosing(question):
+    assert question.locator(".ask-send").is_disabled()
+
+
+def test_a_chosen_option_is_sent_to_the_agent(question):
     question.locator(".ask-option", has_text="Vue").click()
-    question.locator(".message-body p").filter(has_text=re.compile(r"^Vue$")).wait_for()
-    assert question.locator(".message-body p").filter(has_text=re.compile(r"^Vue$")).count() == 1
+    question.locator(".ask-send").click()
+    assert sent(question, "Vue") == 1
+
+
+def test_a_typed_answer_is_sent_to_the_agent(question):
+    question.locator(".ask-other").fill("Svelte")
+    question.locator(".ask-send").click()
+    assert sent(question, "Svelte") == 1
+
+
+def test_a_sent_form_cannot_be_sent_again(question):
+    question.locator(".ask-option", has_text="React").click()
+    question.locator(".ask-send").click()
+    sent(question, "React")
+    assert question.locator(".ask-send").is_disabled()
+
+
+def test_several_questions_are_answered_by_header(two_questions):
+    two_questions.locator(".ask-option", has_text="Vue").click()
+    two_questions.locator(".ask-option", has_text="Router").click()
+    two_questions.locator(".ask-option", has_text="Store").click()
+    two_questions.locator(".ask-send").click()
+    two_questions.locator(".message-body p", has_text="Extras: Router, Store").wait_for()
+    assert "Framework: Vue" in two_questions.locator(".message-body p", has_text="Extras: Router, Store").inner_text()

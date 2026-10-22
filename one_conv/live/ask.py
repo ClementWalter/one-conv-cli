@@ -50,7 +50,8 @@ def question_text(questions: list[dict]) -> str:
         if item.get("multiSelect"):
             lines.append("_Several answers allowed._")
     marker = [{"question": item.get("question", ""), "header": item.get("header") or "",
-               "options": [option.get("label", "") for option in item.get("options") or []],
+               "options": [{"label": option.get("label", ""), "description": option.get("description") or ""}
+                           for option in item.get("options") or []],
                "multiSelect": bool(item.get("multiSelect"))} for item in questions]
     lines.append("")
     lines.append(MARKER + json.dumps({"questions": marker}) + " -->")

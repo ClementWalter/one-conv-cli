@@ -2005,34 +2005,68 @@ button {
 }
 .message-ack { color: #2f8f5b; font-weight: 600; overflow-wrap: anywhere; }
 .message-acks.starting { font-style: italic; }
-/* A forwarded Claude Code question: one button per option, sent back to the asking agent. */
+/* A forwarded Claude Code question: per question, its options as radio buttons or checkboxes and
+   "Other" for a typed answer, sent back to the asking agent. */
 .ask-options {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   margin-top: 8px;
 }
 .ask-question {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 6px;
-  align-items: center;
-}
-.ask-header {
-  width: 100%;
-  font-size: 11px;
-  font-weight: 700;
-}
-.ask-option {
-  cursor: pointer;
-  font: inherit;
-  font-size: 13px;
-  color: var(--text);
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
   background: var(--input);
 }
-.ask-option.chosen {
-  border-color: #aa87b8;
+.ask-header {
+  padding: 0 4px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+}
+.ask-text {
+  margin: 0 0 2px;
+  font-weight: 600;
+}
+.ask-option {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  align-items: flex-start;
+  padding: 6px 4px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.ask-option:has(input:checked) {
   background: #f1e7f4;
+}
+.ask-option input[type="radio"],
+.ask-option input[type="checkbox"] {
+  margin: 3px 0 0;
+  flex: none;
+}
+.ask-choice {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-width: 0;
+}
+.ask-description {
+  color: var(--muted);
+  font-size: 12px;
+}
+.ask-other {
+  flex: 1 1 100%;
+  margin-left: 22px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
 }
 .ask-send {
   align-self: flex-start;

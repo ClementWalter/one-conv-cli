@@ -160,6 +160,13 @@ def test_an_open_keyboard_keeps_the_composer_above_it(phone):
     assert phone.locator("#composer").bounding_box()["y"] + phone.locator("#composer").bounding_box()["height"] <= 600
 
 
+def test_a_keyboard_that_shrinks_the_window_too_keeps_the_composer_above_it(phone):
+    phone.locator("#message-input").focus()
+    phone.evaluate("() => Object.defineProperty(window, 'innerHeight', { get: () => 400 })")
+    phone.evaluate(KEYBOARD)
+    assert phone.locator("#composer").bounding_box()["y"] + phone.locator("#composer").bounding_box()["height"] <= 600
+
+
 def test_an_open_keyboard_keeps_the_top_bar_in_view(phone):
     phone.locator("#message-input").focus()
     phone.evaluate(KEYBOARD)

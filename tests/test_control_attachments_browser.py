@@ -200,6 +200,12 @@ def test_the_installed_workspace_leaves_no_band_under_the_conversation():
     assert "env(safe-area-inset-bottom)" not in installed[:installed.index(".composer-area")]
 
 
+def test_the_installed_app_fills_the_whole_screen_height():
+    from one_conv.live import web
+    installed = web.STYLE[web.STYLE.rindex("@media (display-mode: standalone)"):]
+    assert "height: calc(100lvh - var(--keyboard-height, 0px))" in installed
+
+
 def test_the_installed_top_bar_keeps_its_controls_below_the_status_bar():
     from one_conv.live import web
     installed = web.STYLE[web.STYLE.rindex("@media (display-mode: standalone)"):]

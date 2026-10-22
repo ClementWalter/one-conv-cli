@@ -167,6 +167,16 @@ def test_a_keyboard_that_shrinks_the_window_too_keeps_the_composer_above_it(phon
     assert phone.locator("#composer").bounding_box()["y"] + phone.locator("#composer").bounding_box()["height"] <= 600
 
 
+def test_a_focused_composer_without_a_keyboard_keeps_the_full_height(phone):
+    phone.locator("#message-input").focus()
+    # A 60px bar the window and the visual viewport disagree about is not a keyboard.
+    phone.evaluate("""() => {
+      Object.defineProperty(window.visualViewport, "height", { get: () => 680 });
+      window.visualViewport.dispatchEvent(new Event("resize"));
+    }""")
+    assert not phone.evaluate("() => document.documentElement.classList.contains('keyboard-open')")
+
+
 def test_an_open_keyboard_keeps_the_top_bar_in_view(phone):
     phone.locator("#message-input").focus()
     phone.evaluate(KEYBOARD)

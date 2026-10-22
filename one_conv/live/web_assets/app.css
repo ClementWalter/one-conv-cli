@@ -181,7 +181,8 @@ body {
 .device-dialog .secondary-button { margin-top: 18px; }
 @media (display-mode: standalone) {
   .topbar { padding-top: env(safe-area-inset-top); height: calc(46px + env(safe-area-inset-top)); }
-  .workspace { height: calc(100dvh - 46px - env(safe-area-inset-top)); padding-bottom: max(5px, env(safe-area-inset-bottom)); }
+  .workspace { height: calc(100dvh - 46px - env(safe-area-inset-top)); padding-bottom: 0; }
+  .composer-area { padding-bottom: calc(11px + env(safe-area-inset-bottom)); }
 }
 @media (max-width: 760px) {
   .topbar-end { gap: 6px !important; }
@@ -1731,5 +1732,6 @@ button {
 .pool-job { padding-top: 16px; border-top: 1px solid var(--border); }
 @media (display-mode: standalone) {
   .topbar { padding-top: env(safe-area-inset-top); height: calc(46px + env(safe-area-inset-top)); }
-  .workspace { height: calc(100dvh - 46px - env(safe-area-inset-top)); padding-bottom: max(5px, env(safe-area-inset-bottom)); }
+  .workspace { height: calc(100dvh - 46px - env(safe-area-inset-top)); padding-bottom: 0; }
+  .composer-area { padding-bottom: calc(11px + env(safe-area-inset-bottom)); }
 }

@@ -339,7 +339,9 @@ class ControlStore:
             pair = " ".join(sorted((row["from"], row["to"])))
             threads[pair].append(row)
         return {"threads": [{"pair": pair, "messages": rows, "last": rows[-1]["at"],
-                             "unread": unread.count(rows, marks.get(pair, baseline))}
+                             # An exchange a terminal reported was read at that terminal.
+                             "unread": unread.count([row for row in rows if not (row.get("reported")
+                                                     and "user" in (row["from"], row["to"]))], marks.get(pair, baseline))}
                             for pair, rows in sorted(threads.items(), key=lambda item: -item[1][-1]["at"])]}
 
     def mark_read(self, payload):

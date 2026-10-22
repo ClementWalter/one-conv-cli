@@ -2088,7 +2088,11 @@ button {
     top: 0;
     left: 0;
     right: 0;
-    bottom: var(--keyboard-height, 0px);
+    /* iOS sizes an installed app's page (100%, bottom: 0) short of the screen by the status bar it draws
+       over, leaving a band at the bottom; the large viewport height is the whole screen. */
+    bottom: auto;
+    height: calc(100vh - var(--keyboard-height, 0px));
+    height: calc(100lvh - var(--keyboard-height, 0px));
     display: flex;
     flex-direction: column;
     width: 100%;

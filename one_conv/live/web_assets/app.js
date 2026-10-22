@@ -2384,6 +2384,28 @@ document.addEventListener("visibilitychange", () => {
   header();
   markRead();
 });
+// --- updates ------------------------------------------------------------------------------------
+// A deploy changes the version the change feed reports. The app then reloads itself, but only while
+// nothing is in progress: no draft, no image waiting, no field in use, no question half answered.
+function noteVersion(version) {
+  if (typeof version !== "string" || !version) return;
+  if (!model.version) model.version = version;
+  else if (version !== model.version) {
+    model.updateReady = true;
+    reloadWhenIdle();
+  }
+}
+function reloadWhenIdle() {
+  if (!model.updateReady || document.hidden) return;
+  const active = document.activeElement;
+  const busy = $("message-input").value.trim() || model.attachments.length
+    || (active && active.matches("input, textarea, select, [contenteditable]"))
+    || [...askState.values()].some((state) => !state.sent
+      && (Object.values(state.checked).some((list) => list.length) || Object.values(state.typed).some(Boolean)));
+  if (!busy) location.reload();
+}
+document.addEventListener("focusout", () => setTimeout(reloadWhenIdle, 300));
+document.addEventListener("visibilitychange", reloadWhenIdle);
 async function changeFeed() {
   // One loop per session: it waits for the server to report a change, then refreshes once.
   const generation = model.generation;
@@ -2411,6 +2433,7 @@ async function changeFeed() {
         // after it, and wait from that fingerprint so anything during the read is detected next.
         const first = fingerprint === "";
         fingerprint = data.fp;
+        noteVersion(data.version);
         if (data.changed || first) await refreshState();
         delay = 1000;
       } catch (_) {

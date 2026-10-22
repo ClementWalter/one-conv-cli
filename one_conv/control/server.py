@@ -234,7 +234,7 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
                 checked = loop.time()
             await asyncio.sleep(CHANGES_STEP)
         await run_in_threadpool(session_for, request)
-        return JSONResponse({"fp": current, "changed": bool(since) and current != since})
+        return JSONResponse({"fp": current, "changed": bool(since) and current != since, "version": web.VERSION})
 
     async def topic(request):
         return JSONResponse(await run_in_threadpool(store.topic, request.path_params["topic"]))

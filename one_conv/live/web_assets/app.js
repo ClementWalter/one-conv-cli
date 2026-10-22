@@ -566,11 +566,16 @@ function inline(parent, text) {
     else if (value.startsWith("~~")) inline(parent.appendChild(el("s")), value.slice(2, -2));
     else if (value.startsWith("*") || value.startsWith("_")) inline(parent.appendChild(el("em")), value.slice(1, -1));
     else {
-      const link = el("a", value);
-      link.href = value;
+      // Sentence punctuation after a bare URL, and a ")" it never opened, belong to the text, not the link.
+      let url = value;
+      while (/[.,;:!?'"*_]$/.test(url) || (url.endsWith(")") && url.split(")").length > url.split("(").length))
+        url = url.slice(0, -1);
+      const link = el("a", url);
+      link.href = url;
       link.target = "_blank";
       link.rel = "noopener noreferrer";
       parent.appendChild(link);
+      parent.appendChild(document.createTextNode(value.slice(url.length)));
     }
     start = match.index + value.length;
   }

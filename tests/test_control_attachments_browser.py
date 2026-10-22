@@ -188,6 +188,18 @@ def test_the_installed_layout_rules_come_after_the_phone_rules():
     assert web.STYLE.rindex("@media (display-mode: standalone)") > web.STYLE.rindex("@media (max-width: 760px)")
 
 
+def test_the_installed_composer_keeps_clear_of_the_home_indicator():
+    from one_conv.live import web
+    installed = web.STYLE[web.STYLE.rindex("@media (display-mode: standalone)"):]
+    assert "padding-bottom: max(10px, env(safe-area-inset-bottom))" in installed
+
+
+def test_the_installed_workspace_leaves_no_band_under_the_conversation():
+    from one_conv.live import web
+    installed = web.STYLE[web.STYLE.rindex("@media (display-mode: standalone)"):]
+    assert "env(safe-area-inset-bottom)" not in installed[:installed.index(".composer-area")]
+
+
 def test_the_installed_top_bar_keeps_its_controls_below_the_status_bar():
     from one_conv.live import web
     installed = web.STYLE[web.STYLE.rindex("@media (display-mode: standalone)"):]

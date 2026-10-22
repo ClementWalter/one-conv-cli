@@ -2024,6 +2024,7 @@ for (const type of ["dragover", "drop"]) {
 // iOS scrolls the page to bring a focused composer above its keyboard and may leave it shifted, with
 // the top bar cut off and the frame showing under the composer. The app follows the visual viewport
 // instead and never lets the page itself scroll.
+const fullViewport = { width: 0, height: 0 };
 function fitViewport() {
   const viewport = window.visualViewport;
   if (!viewport) return;
@@ -2036,11 +2037,12 @@ function fitViewport() {
   root.setProperty("--keyboard-height", (taken >= 120 ? taken : 0) + "px");
   // iOS may pan the visual viewport over the page instead of shrinking it, so an open keyboard pins
   // the app to the visible area wherever that is (see .keyboard-open in the phone rules). The installed
-  // app can shrink the window with the keyboard, hiding the difference, so a text field focused on a
-  // touch screen counts as an open keyboard too.
-  const editing = matchMedia("(pointer: coarse)").matches && document.activeElement
-    && document.activeElement.matches("input:not([type=file]):not([type=checkbox]), textarea, [contenteditable]");
-  document.documentElement.classList.toggle("keyboard-open", window.innerHeight - viewport.height >= 120 || Boolean(editing));
+  // app can shrink the window with the keyboard, hiding that difference, so the visible area's own
+  // full height (the tallest seen at this width) tells an open keyboard apart too.
+  if (Math.round(viewport.width) !== fullViewport.width) Object.assign(fullViewport, { width: Math.round(viewport.width), height: 0 });
+  fullViewport.height = Math.max(fullViewport.height, viewport.height);
+  const keyboard = Math.max(window.innerHeight, fullViewport.height) - viewport.height;
+  document.documentElement.classList.toggle("keyboard-open", keyboard >= 120);
   if (window.scrollY || window.scrollX || viewport.offsetTop) window.scrollTo(0, 0);
   const report = document.getElementById("layout-report");
   if (report) {
@@ -2055,7 +2057,6 @@ if (window.visualViewport) {
   window.visualViewport.addEventListener("resize", fitViewport);
   window.visualViewport.addEventListener("scroll", fitViewport);
   window.addEventListener("focusout", () => setTimeout(fitViewport, 50));
-  window.addEventListener("focusin", fitViewport);
   fitViewport();
 }
 $("message-input").addEventListener("input", () => {

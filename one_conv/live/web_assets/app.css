@@ -1943,7 +1943,11 @@ button {
     flex: 1 1 auto;
     min-height: 0;
     height: auto;
-    padding-bottom: 5px;
+    padding-bottom: 0;
+  }
+  /* The keyboard covers the home indicator, so the composer sits flush above it. */
+  html.keyboard-open .composer-area {
+    padding-bottom: 10px;
   }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -2024,7 +2028,15 @@ button {
     flex: 1 1 auto;
     min-height: 0;
     height: auto;
-    padding-bottom: max(5px, env(safe-area-inset-bottom));
+    padding-bottom: 0;
+  }
+  /* The conversation runs to the screen's bottom edge; the composer keeps clear of the home indicator. */
+  .conversation {
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+  }
+  .composer-area {
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
   }
   .sidebar,
   .sidebar-open .sidebar-overlay,

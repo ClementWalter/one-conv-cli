@@ -481,6 +481,13 @@ function header() {
   );
   $("member-count").textContent = current.length || "";
   $("members-toggle").hidden = !current.length;
+  // In the header, so a long channel can be archived without scrolling back to its start.
+  const archive = $("archive-toggle");
+  archive.hidden = view.kind !== "topic";
+  const archived = Boolean(view.kind === "topic" && (currentTopic() || {}).archived);
+  archive.classList.toggle("archived", archived);
+  archive.setAttribute("aria-label", archived ? "Bring back channel" : "Archive channel");
+  archive.title = archived ? "Show this channel in your list again" : "Hide this channel from your list; agents can still read it";
   const waiting = totalUnread();
   // On a phone the sidebar is closed, so its menu button carries the unread mark.
   $("sidebar-toggle").classList.toggle("has-unread", waiting > 0);
@@ -541,12 +548,7 @@ function intro() {
     );
     const live = el("span", null, "intro-chip");
     live.append(icon("bolt"), document.createTextNode("Live conversation"));
-    const archived = Boolean(topic.archived);
-    const archive = el("button", archived ? "Bring back" : "Archive", "intro-chip archive-channel");
-    archive.type = "button";
-    archive.title = archived ? "Show this channel in your list again" : "Hide this channel from your list; agents can still read it";
-    archive.addEventListener("click", () => archiveChannel(view.key, !archived));
-    chips.append(chip, live, archive);
+    chips.append(chip, live);
     box.appendChild(chips);
   }
 }
@@ -2294,6 +2296,9 @@ $("message-dialog").addEventListener("click", (event) => {
 });
 $("members-toggle").addEventListener("click", () => toggleDetails());
 $("details-toggle").addEventListener("click", () => toggleDetails());
+$("archive-toggle").addEventListener("click", () => {
+  if (model.view?.kind === "topic") archiveChannel(model.view.key, !(currentTopic() || {}).archived);
+});
 $("details-close").addEventListener("click", () => toggleDetails(false));
 $("nav-people").addEventListener("click", () => toggleDetails());
 $("nav-home").addEventListener("click", () => {

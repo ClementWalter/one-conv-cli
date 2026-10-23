@@ -1836,7 +1836,7 @@ button {
   .members-toggle {
     font-size: 10px;
   }
-  .conversation-actions > .icon-button {
+  .conversation-actions > .icon-button:not(.archive-channel) {
     display: none;
   }
   .conversation-intro {
@@ -2075,7 +2075,10 @@ button {
 .archive-channel {
   border: 0;
   cursor: pointer;
-  font: inherit;
+}
+.archive-channel.archived {
+  color: var(--text);
+  background: var(--hover);
 }
 /* Installed on a phone's home screen. Last in the sheet, so it wins over the phone rules above: the
    page is a fixed column that never scrolls; the top bar extends under the status bar and keeps

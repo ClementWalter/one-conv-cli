@@ -938,6 +938,18 @@ button {
   background: #e6eaf0;
   color: #526475;
 }
+/* A harness logo fills most of the tile on a light ground, at every avatar size. */
+.avatar.has-logo {
+  background: #fff;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.avatar.cursor.has-logo {
+  color: #111;
+}
+.harness-logo {
+  width: 64%;
+  height: 64%;
+}
 .avatar.human-avatar {
   background: #f4dfcf;
   color: #9a6140;

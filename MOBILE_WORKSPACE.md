@@ -71,7 +71,9 @@ visible clears it. The workspace keeps one read position per conversation, so
 reading on your phone clears it on your laptop too; a position only moves
 forward. Your own messages never count, and a topic-tagged direct message counts
 in its direct thread, not in the channel. History from before unread tracking
-started counts as read. `one-conv live web` keeps the same read positions in
+started counts as read. An agent that has ended stays listed under
+its direct messages while they are unread, so every count in the title can be
+opened. An archived channel keeps its count on its own row but leaves the title. `one-conv live web` keeps the same read positions in
 `web-read.sqlite3` beside its message journal.
 
 ## Hosting and pairing

@@ -12,6 +12,17 @@ READ_COMMANDS = ("chats", "read", "thread", "search", "find", "unread")
 HELP_SETTINGS = {"help_option_names": ["-h", "--help"]}
 
 
+class SourceChoice(click.Choice):
+    """A --source choice that also takes `cursor-ide`, the Cursor IDE's name beside `cursor-cli`."""
+
+    def __init__(self, choices):
+        super().__init__((*choices, "cursor-ide") if "cursor" in choices else choices)
+
+    def convert(self, value, param, ctx):
+        value = super().convert(value, param, ctx)
+        return "cursor" if value == "cursor-ide" else value
+
+
 class NamespaceRoot(click.Group):
     """Keep legacy names callable without mixing them into the primary help."""
 
@@ -36,7 +47,7 @@ def _reader(command, sources, path):
     result.hidden = False
     for parameter in result.params:
         if parameter.name == "source_filter":
-            parameter.type = click.Choice(sources)
+            parameter.type = SourceChoice(sources)
             parameter.help = "Restrict to one source in this namespace."
     if command.name == "search":
         # Namespace readers inspect saved history; provider pulls own authentication.

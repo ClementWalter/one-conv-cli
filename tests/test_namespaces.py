@@ -478,3 +478,7 @@ def test_command_sync_failure_names_the_state_log(app, caplog, monkeypatch):
     monkeypatch.setenv("ONE_CONV_ARCHIVE_URL", "https://archive.example.test")
     app._archive_sync_health(sync_record({"failed": 1, "failures": ["cursor/x: ArchiveError: boom"], "finished": 1}), 5)
     assert str(app.STATE_DIR / "archive-sync.log") in caplog.text
+
+
+def test_cursor_ide_names_the_cursor_ide_source():
+    assert namespaces.SourceChoice(namespaces.LOCAL_SOURCES).convert("cursor-ide", None, None) == "cursor"

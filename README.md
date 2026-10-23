@@ -327,8 +327,9 @@ one-conv local search TEXT
 Replace `PROJECT` with a name from the listing. `local read` lists its sessions;
 `local thread` reads the newest one. Choose another with `--session ID` or
 `--nth 2`, or use `local read PROJECT --expand` to read all of them.
-`--source claude|codex|cursor|cursor-cli|omp|corpus` narrows the source: `cursor` is the
-Cursor IDE's chats, `cursor-cli` those of Cursor's terminal agent, the `agent` command. Local readers never
+`--source claude|codex|cursor|cursor-cli|omp|corpus` narrows the source: `cursor` (or
+`cursor-ide`) is the Cursor IDE's chats, `cursor-cli` those of Cursor's terminal agent, the
+`agent` command, which keeps them under `~/.cursor/chats`. Local readers never
 discover cloud accounts.
 
 For agent workflows, `local fork` starts a new Claude Code thread from an
@@ -427,7 +428,9 @@ one-conv live send @reviewer 'fyi: CI is green' --fyi --yes   # lands in its fee
 Sessions started before the install are reachable only for Claude Code and
 Codex. Cursor's stop hook runs in the IDE and in interactive `cursor-agent`, not
 in `cursor-agent -p`. A Cursor IDE chat cannot be identified as a sender, so its
-messages carry `from="cursor:?unknown"` and cannot be answered.
+messages carry `from="cursor:?unknown"` and cannot be answered. Both share the
+`cursor:<id>` address; `live ls` and the workspace label each session `cursor-cli`
+(a chat the `agent` command stored under `~/.cursor/chats`) or `cursor-ide`.
 
 ### Names and topics
 
@@ -550,7 +553,7 @@ An agent can start teammates from any harness without anyone opening a terminal:
 ```bash
 one-conv live spawn codex 'review the diff on this branch' --yes
 one-conv live spawn claude 'write the tests' --model sonnet --cwd ../repo --trust-folder --yes
-one-conv live spawn cursor 'review the diff' --trust-folder --arg=--force --arg=--approve-mcps --yes
+one-conv live spawn cursor-cli 'review the diff' --trust-folder --arg=--force --arg=--approve-mcps --yes
 one-conv live spawned                     # running spawned agents
 one-conv live stop codex:01a1…            # end one
 ```
@@ -562,8 +565,8 @@ receiving `live send` messages after its first answer, unlike `codex exec` or
 teammates. Watch one with `tmux attach -t NAME`. It runs with your usual permission
 settings for that harness, so an unattended agent can stop at a prompt: pass that
 harness's own flags with `--arg`. Claude Code asks whether to trust a folder it has not
-seen; `spawn` stops and says so unless `--trust-folder` answers yes. `cursor` (or `agent`)
-starts Cursor's terminal agent, the `agent` command; `--trust-folder` passes its `--trust`, and a
+seen; `spawn` stops and says so unless `--trust-folder` answers yes. `cursor-cli` (or
+`agent`, or `cursor`) starts Cursor's terminal agent, the `agent` command; `--trust-folder` passes its `--trust`, and a
 message to it is typed into its tmux pane, since an idle Cursor chat runs no hook to read its
 inbox. Oh My Pi needs the live extension from `live install`. A stopped Codex thread stays loaded in Codex's
 app-server for a few minutes, but `live ls` no longer lists it.

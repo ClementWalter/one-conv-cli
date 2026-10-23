@@ -98,6 +98,34 @@ def test_a_name_given_to_two_sessions_is_refused(two_nodes):
     assert call(url, "/v1/sessions", mac, "PUT", {"sessions": sessions})[0] == 409
 
 
+def test_the_directory_carries_a_published_product(two_nodes):
+    _, url, mac, _ = two_nodes
+    call(url, "/v1/sessions", mac, "PUT", {"sessions": [{"address": "cursor:k1", "product": "cursor-cli"}]})
+    sessions = call(url, "/v1/sessions", mac)[1]["sessions"]
+    assert next(s for s in sessions if s["address"] == "mac/cursor:k1")["product"] == "cursor-cli"
+
+
+def test_a_session_without_a_product_lists_an_empty_one(two_nodes):
+    _, url, mac, _ = two_nodes
+    sessions = call(url, "/v1/sessions", mac)[1]["sessions"]
+    assert next(s for s in sessions if s["address"] == "mac/claude:aaa")["product"] == ""
+
+
+def test_an_unknown_product_is_refused(two_nodes):
+    _, url, mac, _ = two_nodes
+    sessions = [{"address": "cursor:k1", "product": "cursor-web"}]
+    assert call(url, "/v1/sessions", mac, "PUT", {"sessions": sessions})[0] == 400
+
+
+def test_a_hub_from_before_products_gains_the_column(tmp_path):
+    path = tmp_path / "old.db"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE sessions (node TEXT NOT NULL, address TEXT NOT NULL, name TEXT, title TEXT, cwd TEXT,"
+                   " status TEXT, updated REAL NOT NULL, PRIMARY KEY (node, address))")
+        db.execute("INSERT INTO sessions VALUES ('mac', 'claude:aaa', NULL, '', '', '', 1.0)")
+    assert Hub(str(path)).directory()[0]["product"] == ""
+
+
 def test_two_unnamed_sessions_publish(two_nodes):
     _, url, mac, _ = two_nodes
     sessions = [{"address": "claude:aaa"}, {"address": "claude:ccc"}]

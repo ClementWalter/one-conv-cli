@@ -439,11 +439,14 @@ function sidebar() {
     );
     const label = button.querySelector(".row-label");
     label.classList.add("agent-label");
+    // A session without an @name goes by its own name (Claude Code's session name, a thread or chat title);
+    // the harness and short id it would otherwise show move to the context line.
+    const named = !p.name.startsWith("@") && session.title;
     label.replaceChildren(
-      el("span", p.name, "agent-name"),
-      el("small", personContext(p), "agent-context"),
+      el("span", named ? session.title : p.name, "agent-name"),
+      el("small", named ? [p.name, p.machine, p.project].filter(Boolean).join(" · ") : personContext(p), "agent-context"),
     );
-    if (session.title) label.appendChild(el("small", "Context: " + session.title, "agent-context agent-session-context"));
+    if (session.title && !named) label.appendChild(el("small", "Context: " + session.title, "agent-context agent-session-context"));
     label.appendChild(el("small", presenceText(p), "agent-context agent-state"));
     const presence = el(
       "span",

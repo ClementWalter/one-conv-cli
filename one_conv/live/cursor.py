@@ -64,10 +64,22 @@ def _hook_chats() -> list[LiveSession]:
             continue
         if now - data.get("updatedAt", 0) > RECENT_SECONDS:
             continue
-        sessions.append(LiveSession("cursor", data["conversationId"], data.get("cwd", ""), "",
+        sessions.append(LiveSession("cursor", data["conversationId"], data.get("cwd", ""), title(data["conversationId"]),
                                     "turn ended", None, "stop hook", str(inbox(data["conversationId"])),
                                     product=product(data["conversationId"])))
     return sessions
+
+
+def title(conversation_id: str) -> str:
+    """The title the `agent` CLI stored in the chat's meta.json; the IDE's chats have none here."""
+    for path in (cursor_home() / "chats").glob(f"*/{conversation_id}/meta.json"):
+        try:
+            value = json.loads(path.read_text()).get("title")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 def product(conversation_id: str) -> str:

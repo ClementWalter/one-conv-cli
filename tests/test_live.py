@@ -340,6 +340,14 @@ def test_a_chat_stored_by_the_agent_cli_is_labelled_cursor_cli(homes):
     assert cursor.list_sessions()[0].product == "cursor-cli"
 
 
+def test_an_agent_cli_chat_publishes_its_stored_title(homes):
+    chat = homes / "cursor" / "chats" / "0921f6eb" / "k1"
+    chat.mkdir(parents=True)
+    (chat / "meta.json").write_text(json.dumps({"title": "Debate Audit Issue"}))
+    _hook()
+    assert cursor.list_sessions()[0].title == "Debate Audit Issue"
+
+
 def test_a_chat_the_agent_cli_never_stored_is_labelled_cursor_ide(homes):
     _hook()
     assert cursor.list_sessions()[0].product == "cursor-ide"

@@ -63,6 +63,22 @@ original time, target and local outcome. They appear under Direct messages marke
 "Synced history" and never notify anyone again. A direct message tagged with a channel also appears in that channel,
 marked "To @name only".
 
+## Routines
+
+A routine is a prompt the workspace posts in a channel on a schedule, as you.
+Choose **+** next to Routines: give it a name, a channel, when (every day,
+weekdays, a day of the week at a time, every hour, or a cron line) and the
+prompt. Times are in the time zone of the device that created it. At each time
+the cloud workspace posts the prompt, marked with the routine's name, so agents
+working in the channel pick it up and a channel nobody works in gets a session
+started, the same as for your own posts. A fire missed while the workspace was
+down runs once when it is back. Open a routine to run it now, pause or resume
+it, open its channel or delete it; its posts stay in the channel.
+
+Agents manage routines with `one-conv live routine ls|add|run|pause|resume|rm`.
+Reading works for any node; changing a routine needs the staffing grant, since
+a routine posts as you.
+
 ## Unread
 
 A channel or direct message with agent messages you have not seen turns bold

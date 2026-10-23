@@ -423,6 +423,7 @@ function sidebar() {
   $("topic-count").textContent = model.state.topics.filter((topic) => !topic.archived).length || "";
   $("archived-count").textContent = archived.children.length || "";
   $("archived-section").hidden = !archived.children.length;
+  renderRoutines();
   // A conversation with a session opens from its row among the running sessions, with its unread count.
   const people = $("people");
   people.replaceChildren();
@@ -1240,6 +1241,7 @@ async function session() {
     authentication(data.authenticated !== false);
     $("staff-team").hidden = !model.capabilities.workers;
     $("new-channel").hidden = !model.capabilities.channels;
+    $("routines-section").hidden = !model.capabilities.routines;
     $("show-costs").hidden = !model.capabilities.accounting;
     $("logout-device").hidden = !data.authenticated;
     $("generate-invitation").hidden = !model.capabilities.pairing;
@@ -1593,6 +1595,141 @@ async function staffTeammate(event) {
     await refreshWorkers();
   } catch (error) { $("staff-feedback").textContent = error.message; }
   finally { model.staffing = false; $("staff-submit").disabled = false; }
+}
+
+// --- routines: prompts the workspace posts in a channel on a schedule --------------------------
+function untilText(seconds) {
+  const left = Math.max(0, Number(seconds) - Date.now() / 1000);
+  return left < 60 ? "in under a minute" : left < 3600 ? "in " + Math.round(left / 60) + " min" :
+    left < 86400 ? "in " + Math.round(left / 3600) + " h" : "in " + Math.round(left / 86400) + " d";
+}
+function routineLine(routine) {
+  if (!routine.enabled) return "Paused · #" + routine.topic;
+  return routine.schedule + " · #" + routine.topic + (routine.next_at ? " · next " + untilText(routine.next_at) : "");
+}
+function renderRoutines() {
+  const list = $("routines");
+  list.replaceChildren();
+  const routines = model.state.routines || [];
+  for (const routine of routines) {
+    const button = rowButton(list, routine.name, icon("clock"), false, () => openRoutineDialog(routine));
+    button.classList.toggle("paused", !routine.enabled);
+    const label = button.querySelector(".row-label");
+    label.classList.add("agent-label");
+    label.replaceChildren(el("span", routine.name, "agent-name"),
+      el("small", routineLine(routine), "agent-context" + (routine.last_error ? " routine-error" : "")));
+  }
+  if (!routines.length) list.appendChild(el("li", "Schedule work: + adds a routine.", "sidebar-empty"));
+  $("routine-count").textContent = routines.length || "";
+}
+function browserZone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch (_) { return "UTC"; }
+}
+function routineCron() {
+  const when = $("routine-when").value;
+  const [hour, minute] = ($("routine-time").value || "09:00").split(":").map(Number);
+  if (when === "custom") return $("routine-cron").value.trim();
+  if (when === "hourly") return Math.min(59, Math.max(0, Number($("routine-minute").value) || 0)) + " * * * *";
+  const days = { daily: "*", weekdays: "1-5", weekly: $("routine-day").value }[when];
+  return minute + " " + hour + " * * " + days;
+}
+function showRoutineFields() {
+  const when = $("routine-when").value;
+  $("routine-time-field").hidden = ["hourly", "custom"].includes(when);
+  $("routine-minute-field").hidden = when !== "hourly";
+  $("routine-day-field").hidden = when !== "weekly";
+  $("routine-cron-field").hidden = when !== "custom";
+}
+function fillRoutineSchedule(cron) {
+  // A schedule the presets can express opens in them; any other stays as its cron line.
+  const parts = (cron || "0 9 * * *").split(" ");
+  const [minute, hour, day, month, weekday] = parts;
+  const pad = (value) => String(value).padStart(2, "0");
+  const simple = parts.length === 5 && /^\d+$/.test(minute) && day === "*" && month === "*";
+  let when = "custom";
+  if (simple && hour === "*" && weekday === "*") when = "hourly";
+  else if (simple && /^\d+$/.test(hour)) when = weekday === "*" ? "daily" : weekday === "1-5" ? "weekdays" : /^[0-7]$/.test(weekday) ? "weekly" : "custom";
+  $("routine-when").value = when;
+  $("routine-cron").value = cron || "";
+  if (/^\d+$/.test(minute)) $("routine-minute").value = minute;
+  if (/^\d+$/.test(minute) && /^\d+$/.test(hour)) $("routine-time").value = pad(hour) + ":" + pad(minute);
+  if (when === "weekly") $("routine-day").value = String(Number(weekday) % 7);
+  showRoutineFields();
+}
+function openRoutineDialog(routine = null) {
+  model.routine = routine;
+  model.routineDelete = false;
+  $("routine-form").reset();
+  $("routine-topics").replaceChildren(...model.state.topics.map((topic) => { const option = document.createElement("option"); option.value = topic.topic; return option; }));
+  $("routine-heading").textContent = routine ? routine.name : "Work that comes round.";
+  $("routine-name").value = routine ? routine.name : "";
+  $("routine-topic").value = routine ? routine.topic : (model.view && model.view.kind === "topic" ? model.view.key : "");
+  $("routine-prompt").value = routine ? routine.prompt : "";
+  fillRoutineSchedule(routine ? routine.cron : "0 9 * * *");
+  const zone = routine ? routine.tz : browserZone();
+  $("routine-zone").textContent = "Times are in " + zone + ".";
+  $("routine-actions").hidden = !routine;
+  $("routine-status").hidden = !routine;
+  if (routine) {
+    $("routine-toggle").textContent = routine.enabled ? "Pause" : "Resume";
+    $("routine-delete").textContent = "Delete";
+    $("routine-status").textContent = [routine.enabled ? "Next run " + untilText(routine.next_at) : "Paused",
+      routine.last_at ? "last run " + freshness(routine.last_at) : "never run yet",
+      routine.last_error ? "last attempt failed: " + routine.last_error : ""].filter(Boolean).join(" · ");
+  }
+  $("routine-feedback").textContent = "";
+  $("routine-dialog").showModal();
+  if (!routine) $("routine-name").focus();
+}
+async function saveRoutine(event) {
+  event.preventDefault();
+  if (model.savingRoutine || !model.token) return;
+  const current = model.routine;
+  const routine = {
+    id: current ? current.id : crypto.randomUUID().replaceAll("-", ""),
+    name: $("routine-name").value.trim(),
+    topic: $("routine-topic").value.trim().replace(/^#/, "").toLowerCase(),
+    prompt: $("routine-prompt").value,
+    cron: routineCron(),
+    tz: current ? current.tz : browserZone(),
+    enabled: current ? current.enabled : true,
+  };
+  model.savingRoutine = true; $("routine-submit").disabled = true;
+  $("routine-feedback").textContent = "Saving…";
+  try {
+    // Keeping the id across a retry replaces the same routine rather than adding a second one.
+    if (!current) model.routine = { ...routine };
+    const saved = await post("/api/routines", routine);
+    model.routine = saved;
+    $("routine-dialog").close();
+    toast(saved.name + ": " + (saved.enabled ? saved.schedule.toLowerCase() + " in #" + saved.topic : "saved, paused"));
+    model.signature = "";
+    await refreshState();
+  } catch (error) { $("routine-feedback").textContent = error.message; }
+  finally { model.savingRoutine = false; $("routine-submit").disabled = false; }
+}
+async function routineAction(action) {
+  const routine = model.routine;
+  if (!routine || !routine.created) return;
+  if (action === "delete" && !model.routineDelete) {
+    model.routineDelete = true;
+    $("routine-delete").textContent = "Tap again to delete";
+    return;
+  }
+  $("routine-feedback").textContent = { run: "Posting…", pause: "Pausing…", resume: "Resuming…", delete: "Deleting…" }[action];
+  try {
+    const result = await post("/api/routines/action", { id: routine.id, action });
+    if (action === "run") {
+      $("routine-dialog").close();
+      select("topic", routine.topic);
+      toast("Posted " + routine.name + " in #" + routine.topic + ".");
+    } else if (action === "delete") {
+      $("routine-dialog").close();
+      toast(routine.name + " deleted.");
+    } else openRoutineDialog(result);
+    model.signature = "";
+    await refreshState();
+  } catch (error) { $("routine-feedback").textContent = error.message; }
 }
 
 function openChannelDialog() {
@@ -2309,6 +2446,13 @@ $("staff-team").addEventListener("click", () => {
 });
 $("staff-form").addEventListener("submit", staffTeammate);
 $("new-channel").addEventListener("click", openChannelDialog);
+$("new-routine").addEventListener("click", () => openRoutineDialog());
+$("routine-form").addEventListener("submit", saveRoutine);
+$("routine-when").addEventListener("change", showRoutineFields);
+$("routine-run").addEventListener("click", () => routineAction("run"));
+$("routine-toggle").addEventListener("click", () => routineAction(model.routine && model.routine.enabled ? "pause" : "resume"));
+$("routine-delete").addEventListener("click", () => routineAction("delete"));
+$("routine-open").addEventListener("click", () => { $("routine-dialog").close(); select("topic", model.routine.topic); });
 $("channel-form").addEventListener("submit", createChannel);
 $("staff-profile").addEventListener("change", renderStaffingDisclosure);
 $("staff-harness").addEventListener("change", renderStaffingDisclosure);

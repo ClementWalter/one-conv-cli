@@ -106,6 +106,9 @@
         <symbol id="i-archive" viewBox="0 0 24 24">
           <path d="M3 4h18v4H3zM5 8v12h14V8M10 12h4" />
         </symbol>
+        <symbol id="i-clock" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" />
+        </symbol>
         <symbol id="i-list" viewBox="0 0 24 24">
           <path d="M9 6h12M9 12h12M9 18h12M3 6h.01M3 12h.01M3 18h.01" />
         </symbol>
@@ -225,6 +228,13 @@
             </button>
             <button id="new-channel" class="section-add" type="button" aria-label="Create a channel" title="Create a channel" hidden>+</button>
             <ul id="topics" class="conversation-list"></ul>
+          </section>
+          <section id="routines-section" class="sidebar-section" hidden>
+            <button class="section-heading" data-section="routines" type="button" aria-expanded="true">
+              <svg class="icon tiny" aria-hidden="true"><use href="#i-chevron" /></svg><span>Routines</span><span id="routine-count" class="section-count"></span>
+            </button>
+            <button id="new-routine" class="section-add" type="button" aria-label="Add a routine" title="Add a routine">+</button>
+            <ul id="routines" class="conversation-list"></ul>
           </section>
           <section id="archived-section" class="sidebar-section" hidden>
             <button class="section-heading" data-section="archived-topics" type="button" aria-expanded="false">
@@ -516,6 +526,42 @@
         </div>
         <p id="channel-feedback" class="quiet-copy" role="status"></p>
         <button id="channel-submit" class="primary-button" type="submit">Create channel</button>
+      </form>
+    </dialog>
+    <dialog id="routine-dialog" class="message-dialog staff-dialog">
+      <form id="routine-form">
+        <div class="dialog-heading"><div><span class="eyebrow">ROUTINE</span><h2 id="routine-heading">Work that comes round.</h2></div><button class="icon-button" type="button" data-close="routine-dialog" aria-label="Close routine">×</button></div>
+        <p class="dialog-description">At each time the workspace posts the prompt in the channel as you. Agents working there pick it up; if nobody is there, a session starts.</p>
+        <div class="field-grid">
+          <label class="full-field">Name<input id="routine-name" required maxlength="80" placeholder="e.g. Daily review" autocomplete="off" /></label>
+          <label class="full-field">Channel<input id="routine-topic" required maxlength="64" pattern="#?[a-z0-9][a-z0-9-]*" placeholder="e.g. reviews" list="routine-topics" autocomplete="off" autocapitalize="off" /></label>
+          <datalist id="routine-topics"></datalist>
+          <label>When<select id="routine-when">
+            <option value="daily">Every day</option>
+            <option value="weekdays">Weekdays</option>
+            <option value="weekly">Every week</option>
+            <option value="hourly">Every hour</option>
+            <option value="custom">Custom (cron)</option>
+          </select></label>
+          <label id="routine-time-field">Time<input id="routine-time" type="time" value="09:00" required /></label>
+          <label id="routine-minute-field" hidden>Minute past the hour<input id="routine-minute" type="number" min="0" max="59" value="0" /></label>
+          <label id="routine-day-field" hidden>Day<select id="routine-day">
+            <option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option>
+            <option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option><option value="0">Sunday</option>
+          </select></label>
+          <label id="routine-cron-field" class="full-field" hidden>Cron (minute hour day month weekday)<input id="routine-cron" placeholder="0 21 * * *" autocomplete="off" autocapitalize="off" spellcheck="false" /></label>
+          <label class="full-field">Prompt<textarea id="routine-prompt" required maxlength="32000" rows="4" placeholder="What should happen each time?"></textarea></label>
+        </div>
+        <p id="routine-zone" class="quiet-copy"></p>
+        <p id="routine-status" class="quiet-copy" hidden></p>
+        <div id="routine-actions" class="routine-actions" hidden>
+          <button id="routine-run" class="secondary-button" type="button">Run now</button>
+          <button id="routine-toggle" class="secondary-button" type="button">Pause</button>
+          <button id="routine-open" class="secondary-button" type="button">Open channel</button>
+          <button id="routine-delete" class="secondary-button" type="button">Delete</button>
+        </div>
+        <p id="routine-feedback" class="quiet-copy" role="status"></p>
+        <button id="routine-submit" class="primary-button" type="submit">Save routine</button>
       </form>
     </dialog>
     <dialog id="costs-dialog" class="message-dialog costs-dialog">

@@ -467,9 +467,11 @@ def build_live_group(launcher: list[str]) -> click.Group:
 
     from ..control.cli import build_control_group
     from .bridge_cli import add_bridge_commands
+    from .routine_cli import add_routine_commands
     from .spawn_cli import add_spawn_commands
     add_bridge_commands(live)
     add_spawn_commands(live)
+    add_routine_commands(live)
     live.add_command(build_control_group())
 
     return live

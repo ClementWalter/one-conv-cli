@@ -2119,6 +2119,10 @@ button {
 @media (prefers-reduced-motion: reduce) {
   .working-dots span { animation: none; opacity: 0.6; }
 }
+/* A routine's row reads its schedule and next run; a paused one is dimmed, a failed one marked. */
+#routines button.paused { opacity: 0.6; }
+.routine-error { color: var(--red, #b42318); }
+.routine-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 12px; }
 /* Archive or bring back the open channel; agents still read archived channels. */
 .archive-channel {
   border: 0;

@@ -24,6 +24,7 @@ from ..live.hub import (
     split_address,
 )
 from ..live.hub import NODE as PEER_NODE
+from .routines import Routines
 from .presence import (
     channel_delivery,
     message_activity,
@@ -157,6 +158,8 @@ class ControlStore:
             db.execute("INSERT OR IGNORE INTO members (topic, node, address, joined) VALUES (?, ?, 'user', ?)",
                        (GENERAL, NODE, time.time()))
         self.refresh_human()
+        # Routines post in their channel exactly as the human's own messages do.
+        self.routines = Routines(hub, self.send)
 
     @staticmethod
     def _operator_node(node):
@@ -280,6 +283,7 @@ class ControlStore:
                         "participants": [display_address(route) for route in topic["participants"]],
                         "unread": unseen.get(topic["topic"], 0)}
                        for topic in self.hub.topics()],
+            "routines": self.routines.listing(),
             "bridge": {"node": NODE, "running": True, "mode": "cloud"}, "error": None}
 
     @staticmethod
@@ -374,7 +378,11 @@ class ControlStore:
                 "  AS row FROM staffing ORDER BY task, version)),"
                 # A session acking a post adds a check mark under it; archiving moves a channel.
                 " (SELECT COUNT(*) FROM post_acks),"
-                " (SELECT IFNULL(group_concat(topic, ','), '') FROM archived_topics)", (NODE,)).fetchone()
+                " (SELECT IFNULL(group_concat(topic, ','), '') FROM archived_topics),"
+                # A routine saved, paused or fired changes its row in the list.
+                " (SELECT IFNULL(group_concat(row, ','), '') FROM (SELECT id || '@' || updated || '/' || enabled || '/'"
+                "  || IFNULL(next_at, '') || '/' || IFNULL(last_at, '') || '/' || last_error AS row FROM routines"
+                "  ORDER BY id))", (NODE,)).fetchone()
         return hashlib.sha256(json.dumps(values).encode()).hexdigest()[:32]
 
     def topic(self, topic: str):

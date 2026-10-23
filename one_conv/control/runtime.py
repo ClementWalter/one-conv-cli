@@ -185,6 +185,8 @@ def conversation_archive(directory, hub):
 
 
 # Who the hub starts in the cloud for a request no running session can take.
+# How often due routines are looked for; a routine fires within this many seconds of its minute.
+ROUTINE_STEP = 15
 STAFF_HARNESS = "claude"
 STAFF_PROFILE = "default"
 
@@ -268,6 +270,22 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
             return JSONResponse({"error": "Worker operation is not confirmed; inspect its tracked status"}, status_code=503)
 
     app.router.routes.append(Route("/v1/workers", agent_workers, methods=["GET", "POST"]))
+
+    async def agent_routines(request):
+        """Any node reads routines; changing them takes staffing authority, since a routine posts as the human."""
+        try:
+            authenticate = app.state.store.staffing_node if request.method == "POST" else app.state.hub.authenticated_node
+            await run_in_threadpool(authenticate, request)
+            if request.method == "GET":
+                return JSONResponse({"routines": await run_in_threadpool(store.routines.listing)})
+            payload = await bounded_json(request)
+            if isinstance(payload, dict) and payload.get("action") == "save" and set(payload) == {"action", "routine"}:
+                return JSONResponse(await run_in_threadpool(store.routines.save, payload["routine"]))
+            return JSONResponse(await run_in_threadpool(store.routines.act, payload))
+        except HubError as error:
+            return JSONResponse({"error": str(error)}, status_code=error.status)
+
+    app.router.routes.append(Route("/v1/routines", agent_routines, methods=["GET", "POST"]))
     archive = conversation_archive(directory, app.state.hub)
     if archive is not None:
         app.router.routes.append(Mount(ARCHIVE_PATH, app=archive))
@@ -291,10 +309,18 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
                 log.error("Cloud staffing could not complete a step")
             await asyncio.sleep(2)
 
+    async def fire_routines():
+        while True:
+            try:
+                await run_in_threadpool(store.routines.fire_due)
+            except (OSError, RuntimeError, ValueError, HubError):
+                log.error("Routines could not complete a step")
+            await asyncio.sleep(ROUTINE_STEP)
+
     @asynccontextmanager
     async def lifespan(current):
         async with original_lifespan(current):
-            loops = [asyncio.create_task(staff_requests())]
+            loops = [asyncio.create_task(staff_requests()), asyncio.create_task(fire_routines())]
             if workers is not None:
                 loops.append(asyncio.create_task(advance_workers()))
             try:

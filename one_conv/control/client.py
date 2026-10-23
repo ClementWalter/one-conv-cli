@@ -10,6 +10,13 @@ def workers(method="GET", payload=None):
     return client.request(method, "/v1/workers", payload)
 
 
+def routines(method="GET", payload=None):
+    client = hubclient.configured()
+    if client is None:
+        raise ValueError("Configure live serve or ONE_CONV_HUB_URL/TOKEN before using routines")
+    return client.request(method, "/v1/routines", payload)
+
+
 def submit(spec, ident):
     """An unknown response leaves the durable ID with the caller for an explicit retry."""
     try:

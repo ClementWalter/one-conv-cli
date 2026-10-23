@@ -172,7 +172,8 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
                              "human": {"address": "user", "route": HUMAN, "name": "You", "kind": "human"},
                              "capabilities": {"workers": "workers" in provider_map, "accounting": "accounting" in provider_map,
                                               "pairing": True, "channels": True, "changes": True,
-                                              "unread": True, "acks": True, "sign_out_others": True, "stop": True}})
+                                              "unread": True, "acks": True, "sign_out_others": True, "stop": True,
+                                              "routines": True}})
 
     async def pair_device(request):
         """An authenticated owner can connect another device without exporting its session cookie."""
@@ -279,6 +280,14 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         payload = await bounded_json(request)
         return JSONResponse(await run_in_threadpool(store.archive_channel, payload))
 
+    async def save_routine(request):
+        payload = await bounded_json(request)
+        return JSONResponse(await run_in_threadpool(store.routines.save, payload))
+
+    async def routine_action(request):
+        payload = await bounded_json(request)
+        return JSONResponse(await run_in_threadpool(store.routines.act, payload))
+
     async def stop_session(request):
         payload = await bounded_json(request)
         return JSONResponse(await run_in_threadpool(store.stop_session, payload))
@@ -330,6 +339,8 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         Route("/api/channels", endpoint(channel, write=True), methods=["POST"]),
         Route("/api/channels/archive", endpoint(archive, write=True), methods=["POST"]),
         Route("/api/read", endpoint(read, write=True), methods=["POST"]),
+        Route("/api/routines", endpoint(save_routine, write=True), methods=["POST"]),
+        Route("/api/routines/action", endpoint(routine_action, write=True), methods=["POST"]),
         Route("/api/sessions/stop", endpoint(stop_session, write=True), methods=["POST"]),
         Route("/api/providers/{name}", endpoint(provider), methods=["GET", "POST"]),
         *hub_application(store.hub).routes,

@@ -206,7 +206,8 @@ def _cursor_chat(tmux_name: str) -> str | None:
         if root else None
 
 
-def _pane(tmux_name: str) -> str:
+def screen(tmux_name: str) -> str:
+    """The visible text of the pane."""
     return subprocess.run(["tmux", "capture-pane", "-p", "-t", tmux_name], capture_output=True, text=True,
                           check=False).stdout
 
@@ -220,7 +221,7 @@ def wait_for_session(harness: str, cwd: Path, before: set[str], tmux_name: str, 
     while time.monotonic() < deadline:
         if not _alive(tmux_name):
             raise SpawnError(f"{harness} exited before registering; inspect it with a manual run in {cwd}")
-        if harness == "claude" and not answered and TRUST_QUESTION in _pane(tmux_name):
+        if harness == "claude" and not answered and TRUST_QUESTION in screen(tmux_name):
             if not trust_folder:
                 raise SpawnError(f"Claude Code is asking whether to trust {cwd}. Answer it with "
                                  f"`tmux attach -t {tmux_name}`, or spawn again with --trust-folder.")

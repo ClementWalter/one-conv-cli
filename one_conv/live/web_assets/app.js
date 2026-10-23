@@ -1207,11 +1207,13 @@ function updateComposer() {
     model.view && model.view.kind === "direct"
       ? "This is an agent-to-agent conversation."
       : "Pick a conversation to write to your team.";
-  $("message-input").placeholder = destination
-    ? "Message " +
-      (destination.startsWith("#") ? destination : person(destination).name)
+  // Written only when they change: iOS drops suggestions and autocorrect for a field rewritten as it is typed in.
+  const input = $("message-input");
+  const placeholder = destination
+    ? "Message " + (destination.startsWith("#") ? destination : person(destination).name)
     : "Message your team";
-  $("message-input").disabled = model.sending;
+  if (input.placeholder !== placeholder) input.placeholder = placeholder;
+  if (input.disabled !== model.sending) input.disabled = model.sending;
   $("send-message").disabled =
     !destination ||
     !model.token ||
@@ -2258,10 +2260,17 @@ $("message-input").addEventListener("input", () => {
   const destination = target();
   for (const entry of model.outbox.values()) if (entry.target === destination) entry.restored = false;
 });
-$("message-input").addEventListener("input", () => {
+$("message-input").addEventListener("input", (event) => {
+  // The box grows when the text overflows and is measured again only when text goes away, so a
+  // keystroke that fits leaves it untouched and iOS keeps its suggestions and autocorrect.
   const input = $("message-input");
-  input.style.height = "auto";
-  input.style.height = Math.min(input.scrollHeight, 180) + "px";
+  const shrinking = !input.value || !event.inputType || event.inputType.startsWith("delete");
+  if (shrinking || input.scrollHeight > input.clientHeight) {
+    const before = input.style.height;
+    if (shrinking) input.style.height = "auto";
+    const height = Math.min(input.scrollHeight, 180) + "px";
+    if (height !== before || shrinking) input.style.height = height;
+  }
   updateComposer();
 });
 $("message-input").addEventListener("keydown", (event) => {

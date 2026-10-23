@@ -1,4 +1,4 @@
-"""On the phone, at 320 and 390 px: archiving a channel folds it away, and signing out other devices keeps this one."""
+"""On the phone: the header's archive button folds a channel away, and signing out other devices keeps this one."""
 
 import pytest
 
@@ -38,10 +38,15 @@ def phone(browser, workspace, request):
     context.close()
 
 
+def test_the_archive_button_shows_in_a_channel_header(phone):
+    page, _ = phone
+    assert page.locator("#archive-toggle").is_visible() is True
+
+
 @pytest.fixture
 def archived(phone):
     page, workspace = phone
-    page.locator(".archive-channel").click()
+    page.get_by_role("button", name="Archive channel").click()
     page.locator("#archived-section").wait_for(state="visible", timeout=15000)
     page.get_by_role("button", name="Open workspace sidebar").click()
     return page, workspace
@@ -67,6 +72,22 @@ def test_an_archived_channel_is_stored_as_archived(archived):
 def test_the_archived_list_does_not_overflow(archived):
     page, _ = archived
     assert page.evaluate(OVERFLOW) is True
+
+
+@pytest.fixture
+def brought_back(phone):
+    page, workspace = phone
+    page.get_by_role("button", name="Archive channel").click()
+    page.locator("#archived-section").wait_for(state="visible", timeout=15000)
+    page.get_by_role("button", name="Bring back channel").click()
+    page.locator("#archived-section").wait_for(state="hidden", timeout=15000)
+    return page, workspace
+
+
+def test_a_brought_back_channel_is_stored_as_not_archived(brought_back):
+    _, workspace = brought_back
+    topics = workspace["browser"].get("/api/state").json()["topics"]
+    assert next(topic for topic in topics if topic["topic"] == "release")["archived"] is False
 
 
 @pytest.fixture

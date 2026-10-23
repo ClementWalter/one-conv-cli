@@ -49,9 +49,13 @@ def test_an_at_name_still_comes_first(workspace_ui):
     assert workspace_ui.locator("#people .agent-name").nth(1).inner_text() == "@lead"
 
 
-def test_the_avatar_names_the_harness(workspace_ui):
-    assert workspace_ui.locator("#people .avatar").nth(0).inner_text() == "CC"
+def test_the_avatar_shows_the_harness_logo(workspace_ui):
+    assert workspace_ui.locator("#people .avatar").nth(0).locator("svg.harness-logo").count() == 1
 
 
-def test_a_renamed_agent_avatar_still_names_the_harness(workspace_ui):
-    assert workspace_ui.locator("#people .avatar").nth(1).inner_text() == "CC"
+def test_a_renamed_agent_avatar_still_shows_the_harness_logo(workspace_ui):
+    assert workspace_ui.locator("#people .avatar").nth(1).locator("svg.harness-logo").count() == 1
+
+
+def test_a_logo_avatar_carries_no_letters(workspace_ui):
+    assert workspace_ui.locator("#people .avatar").nth(0).inner_text() == ""

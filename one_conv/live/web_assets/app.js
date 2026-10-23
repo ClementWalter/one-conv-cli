@@ -325,7 +325,9 @@ function threadUnread(pair) {
   return thread ? unreadOf(pair, thread.unread) : 0;
 }
 function totalUnread() {
-  return model.state.topics.reduce((sum, topic) => sum + unreadOf("#" + topic.topic, topic.unread), 0) +
+  // An archived channel keeps its count on its own row but no longer adds to the title.
+  return model.state.topics.filter((topic) => !topic.archived)
+    .reduce((sum, topic) => sum + unreadOf("#" + topic.topic, topic.unread), 0) +
     model.threads.reduce((sum, thread) => sum + unreadOf(thread.pair, thread.unread), 0);
 }
 async function markRead() {
@@ -411,10 +413,16 @@ function sidebar() {
   const people = $("people");
   people.replaceChildren();
   // Sessions come and go: only the running ones are listed; past ones live on in their channels.
-  for (const session of model.state.sessions) {
+  // An ended session stays listed while its direct messages are unread, so every unread count is reachable.
+  const listed = model.state.sessions.map((session) => session.address);
+  const kept = (pair) => threadUnread(pair) > 0 || (model.view?.kind === "direct" && model.view.key === pair);
+  const ended = model.threads.filter((thread) => thread.pair.split(" ").includes("user") && kept(thread.pair))
+    .map((thread) => thread.pair.split(" ").find((address) => address !== "user"))
+    .filter((address) => address && !listed.includes(address)).map((address) => ({ address }));
+  for (const session of [...model.state.sessions, ...ended]) {
     const p = person(session.address);
     const state = presenceOf(p);
-    if (state.state === "offline") continue;
+    if (state.state === "offline" && !kept(pairOf(session.address))) continue;
     const button = rowButton(
       people,
       p.name,

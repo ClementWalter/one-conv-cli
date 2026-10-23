@@ -331,7 +331,7 @@ class Bridge:
 
     def _publish(self) -> int:
         rows = [{"address": s.address, "name": team.name_for(s.address), "title": s.title, "cwd": s.cwd,
-                 "status": s.status} for s in router.list_all()]
+                 "status": s.status, "product": s.product} for s in router.list_all()]
         config = spawn_settings()
         offer = {"spawn": config["harness"]} if config else {}
         try:

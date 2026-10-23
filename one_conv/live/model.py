@@ -21,6 +21,8 @@ class LiveSession:
     pid: int | None = None
     delivery: str = ""
     endpoint: str = field(default="", compare=False)
+    # Which app of a harness that has several, like "cursor-cli" or "cursor-ide"; empty otherwise.
+    product: str = field(default="", compare=False)
 
     @property
     def address(self) -> str:

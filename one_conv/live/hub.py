@@ -70,6 +70,8 @@ SPAWN_FALLBACK_SECONDS = 90.0
 # Only requests created or released this recently are staffed, so old unowned ones never start sessions.
 STAFF_WINDOW_SECONDS = 3600.0
 SPAWN_HARNESSES = ("claude", "codex", "omp")
+# The apps a published session can name beside its harness.
+PRODUCTS = ("cursor-cli", "cursor-ide")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tokens (node TEXT PRIMARY KEY, hash TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS nodes (node TEXT PRIMARY KEY, seen REAL NOT NULL);
@@ -155,6 +157,10 @@ class Hub:
             # 1 for the channel the session works in; memberships from before only watch.
             if "work" not in members:
                 db.execute("ALTER TABLE members ADD COLUMN work INTEGER NOT NULL DEFAULT 0")
+            sessions = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
+            # Which app of the harness the session runs in, from PRODUCTS, or empty.
+            if "product" not in sessions:
+                db.execute("ALTER TABLE sessions ADD COLUMN product TEXT NOT NULL DEFAULT ''")
             deliveries = {row[1] for row in db.execute("PRAGMA table_info(deliveries)")}
             # A delivery can wake its recipient while the same post only informs the others.
             for column in ("mode",):
@@ -234,14 +240,18 @@ class Hub:
                 if name in names:
                     raise HubError(409, f"@{name} is given to two sessions")
                 names.add(name)
+            product = item.get("product") or ""
+            if product and product not in PRODUCTS:
+                raise HubError(400, f"product is one of {', '.join(PRODUCTS)}, or absent")
             rows.append((node, item["address"], name, str(item.get("title") or ""), str(item.get("cwd") or ""),
-                         str(item.get("status") or ""), time.time()))
+                         str(item.get("status") or ""), time.time(), product))
         with self.lock, self._db() as db:
             for name in names:
                 if db.execute("SELECT 1 FROM sessions WHERE name = ? AND node != ?", (name, node)).fetchone():
                     raise HubError(409, f"@{name} is already used on another node")
             db.execute("DELETE FROM sessions WHERE node = ?", (node,))
-            db.executemany("INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+            db.executemany("INSERT INTO sessions (node, address, name, title, cwd, status, updated, product)"
+                           " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
             now = time.time()
             db.executemany("INSERT OR REPLACE INTO session_seen VALUES (?, ?, ?)", [(node, r[1], now) for r in rows])
             db.executemany("UPDATE members SET seen = ? WHERE node = ? AND address = ?", [(now, node, r[1]) for r in rows])
@@ -416,12 +426,12 @@ class Hub:
         now = time.time()
         with self._db() as db:
             seen = dict(db.execute("SELECT node, seen FROM nodes"))
-            rows = db.execute("SELECT node, address, name, title, cwd, status, updated FROM sessions "
+            rows = db.execute("SELECT node, address, name, title, cwd, status, updated, product FROM sessions "
                               "ORDER BY node, address").fetchall()
         return [{"address": f"{node}/{address}", "node": node, "local": address, "name": name, "title": title,
-                 "cwd": cwd, "status": status, "seen": seen.get(node),
+                 "cwd": cwd, "status": status, "product": product, "seen": seen.get(node),
                  "published_at": published, "online": _online(seen.get(node, 0.0), published, now)}
-                for node, address, name, title, cwd, status, published in rows]
+                for node, address, name, title, cwd, status, published, product in rows]
 
     def _published(self, db, node: str, address: str) -> bool:
         return db.execute("SELECT 1 FROM sessions WHERE node = ? AND address = ?", (node, address)).fetchone() is not None

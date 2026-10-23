@@ -306,3 +306,11 @@ def test_a_resumed_codex_thread_is_reachable_again(ended_thread):
     lock(ended_thread)
     os.utime(ended_thread / "codex" / "thread-writer-locks" / f"{THREAD}.lock", (time.time() + 5, time.time() + 5))
     assert router.resolve(f"codex:{THREAD}").address == f"codex:{THREAD}"
+
+
+@pytest.mark.parametrize("name", ["cursor-cli", "agent", "cursor"])
+def test_every_cursor_cli_name_starts_the_agent_command(name):
+    from click.testing import CliRunner
+    from one_conv.live.cli import build_live_group
+    result = CliRunner().invoke(build_live_group(["one-conv"]), ["spawn", name, "hello"])
+    assert "in tmux: agent " in result.output

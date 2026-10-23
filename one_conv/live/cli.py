@@ -57,7 +57,9 @@ def build_live_group(launcher: list[str]) -> click.Group:
                        "may not be reachable (omp, Cursor).", err=True)
         width = max((len(s.address) for s in sessions), default=0)
         for s in sessions:
-            click.echo(f"{s.address:<{width}}  {s.status or '-':<10}  {s.delivery:<15}  {s.title or s.cwd}")
+            # A Cursor session names its app, since the IDE and the `agent` CLI share the cursor: address.
+            context = (f"[{s.product}] " if s.product else "") + (s.title or s.cwd)
+            click.echo(f"{s.address:<{width}}  {s.status or '-':<10}  {s.delivery:<15}  {context}")
 
     @live.command("send", context_settings=HELP)
     @click.argument("target")

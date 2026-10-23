@@ -28,9 +28,9 @@ def add_spawn_commands(live: click.Group) -> None:
                   epilog="\b\nExamples:\n  one-conv live spawn codex 'review the diff on this branch' --yes\n"
                          "  one-conv live spawn claude 'write the tests' --model sonnet --cwd ../repo --yes\n"
                          "  one-conv live spawn omp --stdin --yes < brief.md\n"
-                         "  one-conv live spawn cursor 'review the diff' --trust-folder --arg=--force --arg=--approve-mcps --yes\n"
+                         "  one-conv live spawn cursor-cli 'review the diff' --trust-folder --arg=--force --arg=--approve-mcps --yes\n"
                          "  one-conv live spawn codex 'review the release' --cloud --name jack --topic release --yes")
-    @click.argument("harness", type=click.Choice((*spawn.HARNESSES, "agent")))
+    @click.argument("harness", type=click.Choice(("claude", "codex", "omp", "cursor-cli", "agent", "cursor")))
     @click.argument("prompt", required=False)
     @click.option("--stdin", "from_stdin", is_flag=True, help="Read the first prompt from stdin.")
     @click.option("--model", help="Model for the new agent, in that harness's own naming.")
@@ -52,9 +52,10 @@ def add_spawn_commands(live: click.Group) -> None:
     @click.option("--json", "as_json", is_flag=True, help="Emit the spawned agent as JSON.")
     def spawn_command(harness, prompt, from_stdin, model, cloud, name, topic, profile, request_id, cwd, extra,
                       no_intro, trust_folder, wait_seconds, yes, as_json):
-        """Start a resident Claude Code, Codex, Oh My Pi or Cursor teammate, locally or in the cloud.
+        """Start a resident Claude Code, Codex, Oh My Pi or cursor-cli teammate, locally or in the cloud.
 
-        `cursor` and `agent` both start Cursor's terminal agent, the `agent` command.
+        `cursor-cli` starts Cursor's terminal agent, the `agent` command; `agent` and `cursor` are
+        other names for it. The Cursor IDE (cursor-ide) cannot be started from here.
 
         With --cloud, the configured workspace prepares repositories, tools and provider
         access in a shared worker box. --name and --topic are required. The receipt gives
@@ -65,7 +66,7 @@ def add_spawn_commands(live: click.Group) -> None:
         end it with `live stop`. It inherits your usual permission settings for that harness,
         so an unattended agent may wait on a prompt: pass the harness's own flags with --arg.
         """
-        harness = "cursor" if harness == "agent" else harness
+        harness = "cursor" if harness in ("cursor-cli", "agent") else harness
         if from_stdin:
             prompt = sys.stdin.read()
         if not prompt:

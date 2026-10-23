@@ -2824,7 +2824,7 @@ def _print_handle_list(cwd_label: str, handles: list[SessionHandle], as_json: bo
 # ---------------------------------------------------------------------------
 
 
-from one_conv.namespaces import NamespaceRoot, install as install_namespaces, selected_sources
+from one_conv.namespaces import NamespaceRoot, SourceChoice, install as install_namespaces, selected_sources
 
 
 @click.group(cls=NamespaceRoot, context_settings={"help_option_names": ["-h", "--help"]},
@@ -2839,7 +2839,7 @@ def cli() -> None:
 _SOURCE_OPTION = click.option(
     "--source",
     "source_filter",
-    type=click.Choice(SOURCES),
+    type=SourceChoice(SOURCES),
     help="Restrict to one source (default: claude + codex + cursor + cursor-cli + omp + chatgpt, all at once).",
 )
 
@@ -3148,7 +3148,7 @@ def _export_all(out_root: Path, machine: str, sources: tuple[str, ...], cutoff: 
 @cli.command()
 @click.option("--out", "out_dir", required=True, help="Root of the corpus checkout, e.g. ~/Documents/corpus.")
 @click.option("--machine", default=None, help="Folder name for this machine (default: hostname).")
-@click.option("--source", "source_filter", type=click.Choice(SOURCES), default=None, help="Only this backend.")
+@click.option("--source", "source_filter", type=SourceChoice(SOURCES), default=None, help="Only this backend.")
 @click.option("--since", default=None, help="Only sessions active at/after this ISO date (default: all).")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
 def export(out_dir: str, machine: str | None, source_filter: str | None, since: str | None, as_json: bool) -> None:

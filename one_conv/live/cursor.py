@@ -44,7 +44,7 @@ def _bridge_threads() -> list[LiveSession]:
         return []
     rows = rows.get("threads", rows) if isinstance(rows, dict) else rows
     return [LiveSession("cursor", row["id"], "", row.get("title", ""), row.get("status", ""), None,
-                        "desktop bridge")
+                        "desktop bridge", product="cursor-ide")
             for row in rows if isinstance(row, dict) and row.get("id") and row.get("source") != "draft"]
 
 
@@ -59,8 +59,14 @@ def _hook_chats() -> list[LiveSession]:
         if now - data.get("updatedAt", 0) > RECENT_SECONDS:
             continue
         sessions.append(LiveSession("cursor", data["conversationId"], data.get("cwd", ""), "",
-                                    "turn ended", None, "stop hook", str(inbox(data["conversationId"]))))
+                                    "turn ended", None, "stop hook", str(inbox(data["conversationId"])),
+                                    product=product(data["conversationId"])))
     return sessions
+
+
+def product(conversation_id: str) -> str:
+    """The `agent` CLI keeps each chat under `~/.cursor/chats/<workspace hash>/<id>`; the IDE keeps its own elsewhere."""
+    return "cursor-cli" if any((cursor_home() / "chats").glob(f"*/{conversation_id}")) else "cursor-ide"
 
 
 def list_sessions() -> list[LiveSession]:

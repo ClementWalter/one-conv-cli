@@ -296,6 +296,17 @@ def test_cursor_stop_hook_registers_chat(homes):
     assert [(s.address, s.cwd) for s in cursor.list_sessions()] == [("cursor:k1", "/work/ui")]
 
 
+def test_a_chat_stored_by_the_agent_cli_is_labelled_cursor_cli(homes):
+    (homes / "cursor" / "chats" / "0921f6eb" / "k1").mkdir(parents=True)
+    _hook()
+    assert cursor.list_sessions()[0].product == "cursor-cli"
+
+
+def test_a_chat_the_agent_cli_never_stored_is_labelled_cursor_ide(homes):
+    _hook()
+    assert cursor.list_sessions()[0].product == "cursor-ide"
+
+
 def _inbox_with_bad_file(homes):
     directory = cursor.inbox("k1")
     directory.mkdir(parents=True)

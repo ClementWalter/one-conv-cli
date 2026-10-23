@@ -46,6 +46,8 @@ const harnesses = {
   cursor: "Cursor",
   boat: "Boat",
 };
+// A harness with several apps names the one a session runs in.
+const products = { "cursor-cli": "cursor-cli", "cursor-ide": "cursor-ide" };
 const pairingFragment = new URLSearchParams(location.hash.slice(1));
 let pairingToken = pairingFragment.get("pair");
 // Invitation secrets never remain in navigation history or reach later requests.
@@ -127,16 +129,17 @@ function person(address) {
     (s) => s.address === address || (localIdentity && s.address === local),
   );
   const kind = local.split(":")[0];
+  const label = (session && products[session.product]) || harnesses[kind];
   const alias = Object.entries(model.state.names || {}).find(
     ([, bound]) => bound === address || (localIdentity && bound === local),
   );
   const boundName = (session && session.name) || (alias && alias[0]);
   const name = boundName ? "@" + String(boundName).replace(/^@/, "") :
-    (harnesses[kind] || "Agent") + " · " + (local.split(":").slice(1).join(":") || local).slice(0, 8);
+    (label || "Agent") + " · " + (local.split(":").slice(1).join(":") || local).slice(0, 8);
   return {
     address,
     name,
-    kind: harnesses[kind] || "Agent",
+    kind: label || "Agent",
     color: kind,
     initials: alias
       ? name.slice(0, 2).toUpperCase()

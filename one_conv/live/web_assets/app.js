@@ -48,6 +48,7 @@ const harnesses = {
 };
 // A harness with several apps names the one a session runs in.
 const products = { "cursor-cli": "cursor-cli", "cursor-ide": "cursor-ide" };
+const marks = { claude: "CC", codex: "CX", omp: "π", cursor: "Cu", "cursor-cli": "CL", "cursor-ide": "CI", boat: "B" };
 const pairingFragment = new URLSearchParams(location.hash.slice(1));
 let pairingToken = pairingFragment.get("pair");
 // Invitation secrets never remain in navigation history or reach later requests.
@@ -141,10 +142,8 @@ function person(address) {
     name,
     kind: label || "Agent",
     color: kind,
-    initials: alias
-      ? name.slice(0, 2).toUpperCase()
-      : { claude: "C", codex: "◈", omp: "π", cursor: "↗", boat: "B" }[kind] ||
-        name.slice(0, 2).toUpperCase(),
+    // The avatar names the harness, so a renamed agent still shows what it runs on.
+    initials: marks[session && session.product] || marks[kind] || name.replace(/^@/, "").slice(0, 2).toUpperCase(),
     status: session && session.online !== false ? session.status : "offline",
     machine: (session && session.node) || (slash > 0 ? address.slice(0, slash) : localNode) || "This machine",
     project: session && session.cwd ? String(session.cwd).replace(/[\\/]+$/, "").split(/[\\/]/).pop() : "",

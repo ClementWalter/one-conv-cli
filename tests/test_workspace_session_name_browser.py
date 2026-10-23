@@ -47,3 +47,11 @@ def test_the_harness_and_short_id_move_to_the_context_line(workspace_ui):
 
 def test_an_at_name_still_comes_first(workspace_ui):
     assert workspace_ui.locator("#people .agent-name").nth(1).inner_text() == "@lead"
+
+
+def test_the_avatar_names_the_harness(workspace_ui):
+    assert workspace_ui.locator("#people .avatar").nth(0).inner_text() == "CC"
+
+
+def test_a_renamed_agent_avatar_still_names_the_harness(workspace_ui):
+    assert workspace_ui.locator("#people .avatar").nth(1).inner_text() == "CC"

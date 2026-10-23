@@ -43,3 +43,7 @@ def test_an_agent_cli_session_is_labelled_cursor_cli(workspace_ui):
 
 def test_an_ide_session_is_labelled_cursor_ide(workspace_ui):
     assert workspace_ui.locator("#people .agent-name").nth(1).inner_text() == "cursor-ide · ide00001"
+
+
+def test_an_agent_cli_avatar_reads_cl(workspace_ui):
+    assert workspace_ui.locator("#people .avatar").nth(0).inner_text() == "CL"

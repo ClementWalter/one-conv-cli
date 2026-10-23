@@ -222,6 +222,22 @@ function members() {
   if (model.view.kind === "direct") return model.view.key.split(" ");
   return model.state.sessions.map((s) => s.address);
 }
+function workingText(names) {
+  if (!names.length) return "";
+  if (names.length === 1) return names[0] + " is working…";
+  if (names.length === 2) return names[0] + " and " + names[1] + " are working…";
+  return names[0] + ", " + names[1] + " and " + (names.length - 2) + " more are working…";
+}
+function renderWorking() {
+  // Agents whose bridge reports them busy, so a channel shows it is being worked on between replies.
+  const view = model.view;
+  const names = view && ["topic", "direct"].includes(view.kind)
+    ? [...new Set(members())].filter((address) => address !== "user")
+      .map((address) => person(address)).filter((p) => presenceOf(p).state === "busy").map((p) => p.name)
+    : [];
+  $("working-text").textContent = workingText(names);
+  $("working").hidden = !names.length;
+}
 function target() {
   if (!model.view) return null;
   if (model.view.kind === "topic") return "#" + model.view.key;
@@ -493,6 +509,7 @@ function header() {
   $("sidebar-toggle").classList.toggle("has-unread", waiting > 0);
   $("sidebar-toggle").title = waiting ? waiting + " unread" : "";
   document.title = (waiting ? "(" + waiting + ") " : "") + (view.kind === "topic" ? "# " : "") + title + " · OneConv";
+  renderWorking();
   if (model.details) renderDetails();
   updateComposer();
 }

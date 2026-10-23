@@ -166,6 +166,41 @@ def test_claude_lists_running_session(homes):
     assert [s.address for s in claude.list_sessions()] == ["claude:c1"]
 
 
+def _transcript(homes, *entries):
+    """Session c1's transcript under /work/app, as Claude Code names its project folder."""
+    folder = homes / "claude" / "projects" / "-work-app"
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "c1.jsonl").open("a") as handle:
+        for entry in entries:
+            handle.write(json.dumps({**entry, "sessionId": "c1"}) + "\n")
+
+
+def test_claude_session_without_titles_keeps_its_name(homes):
+    _claude_record(homes, os.getpid())
+    assert claude.list_sessions()[0].title == "app-01"
+
+
+def test_claude_session_takes_the_title_claude_code_generated(homes):
+    _claude_record(homes, os.getpid())
+    _transcript(homes, {"type": "ai-title", "aiTitle": "Slack channel archiving"})
+    assert claude.list_sessions()[0].title == "Slack channel archiving"
+
+
+def test_claude_session_prefers_its_rename_over_the_generated_title(homes):
+    _claude_record(homes, os.getpid())
+    _transcript(homes, {"type": "custom-title", "customTitle": "archive-ui"},
+                {"type": "ai-title", "aiTitle": "Slack channel archiving"})
+    assert claude.list_sessions()[0].title == "archive-ui"
+
+
+def test_claude_session_picks_up_a_rename_made_after_the_last_read(homes):
+    _claude_record(homes, os.getpid())
+    _transcript(homes, {"type": "custom-title", "customTitle": "first"})
+    claude.list_sessions()
+    _transcript(homes, {"type": "custom-title", "customTitle": "second"})
+    assert claude.list_sessions()[0].title == "second"
+
+
 def test_claude_skips_exited_session(homes, dead_pid):
     _claude_record(homes, dead_pid)
     assert claude.list_sessions() == []

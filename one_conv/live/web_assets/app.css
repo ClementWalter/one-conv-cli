@@ -2071,6 +2071,42 @@ button {
 .ask-send {
   align-self: flex-start;
 }
+/* "Name is working…" above the composer while a member's bridge reports it busy. */
+.working {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 2px 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.working > span:last-child {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.working-dots {
+  display: inline-flex;
+  gap: 3px;
+  flex: none;
+}
+.working-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: working-pulse 1.2s infinite ease-in-out;
+}
+.working-dots span:nth-child(2) { animation-delay: 0.2s; }
+.working-dots span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes working-pulse {
+  0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
+  40% { opacity: 1; transform: translateY(-2px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .working-dots span { animation: none; opacity: 0.6; }
+}
 /* Archive or bring back the open channel; agents still read archived channels. */
 .archive-channel {
   border: 0;

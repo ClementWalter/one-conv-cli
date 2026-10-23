@@ -324,6 +324,10 @@
           New messages <span aria-hidden="true">↓</span>
         </button>
         <section class="composer-area" aria-label="Write a message">
+          <div id="working" class="working" role="status" aria-live="polite" hidden>
+            <span class="working-dots" aria-hidden="true"><span></span><span></span><span></span></span
+            ><span id="working-text"></span>
+          </div>
           <div id="observer-note" class="observer-note" hidden>
             <span>This is an agent-to-agent conversation.</span
             ><button id="start-human-message" type="button">

@@ -85,7 +85,7 @@ def test_preflight_needs_the_omp_extension(homes, monkeypatch):
 
 def stub_tmux(monkeypatch, alive=True, pane="", owned=lambda session, name: True):
     monkeypatch.setattr(spawn, "_alive", lambda name: alive)
-    monkeypatch.setattr(spawn, "_pane", lambda name: pane)
+    monkeypatch.setattr(spawn, "screen", lambda name: pane)
     monkeypatch.setattr(spawn, "owned_by_spawn", owned)
     sent = []
     monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: sent.append(argv))

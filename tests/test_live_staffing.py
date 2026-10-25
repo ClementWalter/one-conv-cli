@@ -183,6 +183,12 @@ def test_with_the_preferred_spawner_offline_the_other_is_asked(two_spawners):
     assert staffing(two_spawners, post(two_spawners)) == ("cloudbox/spawn:claude", "node")
 
 
+def test_a_spawner_whose_bridge_stopped_is_skipped_even_if_its_node_still_calls(two_spawners):
+    with sqlite3.connect(two_spawners.path) as db:
+        db.execute("UPDATE spawners SET updated = ? WHERE node = 'mac'", (time.time() - hub_module.LEASE_SECONDS - 1,))
+    assert staffing(two_spawners, post(two_spawners)) == ("cloudbox/spawn:claude", "node")
+
+
 def test_a_refused_spawn_moves_to_the_next_spawner(two_spawners):
     key = post(two_spawners)
     two_spawners.ack("mac", spawn_orders(two_spawners)[0]["delivery"], "refused")

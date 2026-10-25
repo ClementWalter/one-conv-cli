@@ -311,8 +311,10 @@ class Hub:
 
     def _spawners(self, db, now: float, tried=()) -> list[tuple[str, str]]:
         """Connected spawners not yet tried, the preferred first."""
+        # Only a bridge publication renews `updated`; MCP calls on that node keep `nodes.seen` fresh without a bridge.
         rows = db.execute("SELECT s.node, s.harness FROM spawners s JOIN nodes n ON n.node = s.node"
-                          " WHERE n.seen >= ? ORDER BY s.priority DESC, n.seen DESC", (now - LEASE_SECONDS,)).fetchall()
+                          " WHERE n.seen >= ? AND s.updated >= ? ORDER BY s.priority DESC, s.updated DESC",
+                          (now - LEASE_SECONDS, now - LEASE_SECONDS)).fetchall()
         return [(node, harness) for node, harness in rows if node not in tried]
 
     @staticmethod

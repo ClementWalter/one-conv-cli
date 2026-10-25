@@ -43,7 +43,8 @@ logger = logging.getLogger(__name__)
 PUBLISH_SECONDS = 15.0
 # Harness histories a node syncs to its hub's archive, so any session can read them by live address.
 ARCHIVE_SOURCES = ("claude", "codex", "omp", "cursor", "cursor-cli")
-ARCHIVE_SYNC_MINUTES = 5.0
+# Short: a session on a machine that goes away can only be taken over up to its last sync.
+ARCHIVE_SYNC_MINUTES = 1.0
 ARCHIVE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "archive-sync.py"
 LAUNCHER = Path(__file__).resolve().parents[2] / "bin" / "one-conv"
 # How long one inbox long-poll waits; also how long a stop request can take to be noticed.

@@ -46,6 +46,14 @@ cloud box otherwise. **It can disappear at any moment**, so nothing that is not 
 - `set_name` gives you a name others can reach as `@name`; `list_live_sessions` shows who runs where.
 - Same from a shell: `one-conv live send '#topic' 'text' --yes`, `one-conv live ls`, `one-conv live --help`.
 
+## Taking over: any agent can continue any session
+
+This is the core of one-conv: any agent can read any agent's session from any machine and pick
+up its work at any time. When your first prompt lists sessions that worked in the channel
+before, read the most recent one with `read_conversation` first and continue where it stopped.
+Every machine uploads its sessions to the hub's archive about every minute, so even one on a
+machine that is now asleep or gone can be read.
+
 ## Reading and searching any session, on any machine
 
 - `search_conversations` (namespace `local`) searches every machine's archived agent sessions;

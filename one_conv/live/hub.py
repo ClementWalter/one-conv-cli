@@ -328,7 +328,7 @@ class Hub:
         from_node, _, sender = post["created_by"].partition("/")
         digest = hashlib.sha256(json.dumps(["spawn", post["key"], node]).encode()).hexdigest()
         self._insert(db, from_node, self._spawn_id(post["key"], node, first), digest, route, sender, post["topic"],
-                     "expected", "push", self.spawn_prompt(post), [(node, f"spawn:{harness}", None)], kind="system")
+                     "expected", "push", self.spawn_prompt(post, self._predecessors(db, post["topic"])), [(node, f"spawn:{harness}", None)], kind="system")
         return route
 
     def _staff(self, db, post: dict, now: float) -> dict:
@@ -347,12 +347,29 @@ class Hub:
                    " VALUES (?, 1, ?, 'node', '', ?, ?, ?)", (post["key"], route, now, now, node))
         return {"route": route, "state": "node"}
 
+    def _predecessors(self, db, topic: str | None, limit: int = 3) -> list[str]:
+        """Agent sessions that posted in this channel, the most recent first: the work a new session takes over."""
+        if not topic:
+            return []
+        rows = db.execute("SELECT from_node, sender FROM posts WHERE topic = ? AND sender != 'user' AND kind IS NULL"
+                          " GROUP BY from_node, sender ORDER BY MAX(seq) DESC LIMIT ?", (topic, limit)).fetchall()
+        return [f"{node}/{sender}" for node, sender in rows if ":" in sender]
+
     @staticmethod
-    def spawn_prompt(post: dict) -> str:
-        """The first prompt of a session started for a human post: join, ack, sync, answer."""
+    def spawn_prompt(post: dict, predecessors: list[str] = ()) -> str:
+        """The first prompt of a session started for a human post: take over, join, ack, sync, answer."""
         ident = post["key"].partition(":")[2]
+        takeover = ""
+        if predecessors:
+            # Any agent can read any session from any machine: that is what lets this one continue the work.
+            takeover = ("Sessions that worked in this channel before, the most recent first (they are not running now;"
+                        " their machine may be asleep or gone):\n" + "".join(f"- {a}\n" for a in predecessors) +
+                        "Take over their work: before anything else, read the most recent one with read_conversation"
+                        " (query=its address, namespace=\"local\"; around=a message id to zoom in), and the others as"
+                        " needed, then continue exactly where it stopped. Its pushed branches are on the remote; work it"
+                        " did not push is lost, so redo it.\n\n")
         return (f"{post['created_by']} posted in #{post['topic']} and no session was running there, so this session"
-                f" was started for it.\n\nMessage:\n{post['text']}\n\n"
+                f" was started for it.\n\nMessage:\n{post['text']}\n\n{takeover}"
                 f"1. Join #{post['topic']} with the join_topic tool (work=true): it is your work channel, and"
                 " only its posts wake you.\n"
                 f"2. Ack the message with the ack tool (message_id=\"{ident}\").\n"
@@ -436,7 +453,7 @@ class Hub:
                 node, _, ident = key.partition(":")
                 seq = db.execute("SELECT seq FROM posts WHERE from_node = ? AND id = ?", (node, ident)).fetchone()
                 post = self._human_post(db, seq[0])
-                due.append({"task": key, "version": 1, "topic": post["topic"], "prompt": self.spawn_prompt(post)})
+                due.append({"task": key, "version": 1, "topic": post["topic"], "prompt": self.spawn_prompt(post, self._predecessors(db, post["topic"]))})
             return due
 
     def staffing_mark(self, key: str, version: int, state: str, detail: str = "") -> None:

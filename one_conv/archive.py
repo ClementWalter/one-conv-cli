@@ -23,9 +23,6 @@ SYNC_STATE = "archive-sync.json"
 SYNC_LOCK = "archive-sync.lock"
 SYNC_LOG = "archive-sync.log"
 LISTING_CACHE = "archive-listing.json"
-# A running sync refreshes its lock after every conversation; one conversation's upload
-# can take minutes on a slow link, so only a much older lock belongs to a stopped sync.
-SYNC_STALE_SECONDS = 3600
 # Python's socket timeout bounds a whole send, so upload deadlines grow with the body,
 # assuming at least 1 Mbit/s of upstream bandwidth.
 MIN_UPLOAD_BYTES_PER_SECOND = 128 * 1024

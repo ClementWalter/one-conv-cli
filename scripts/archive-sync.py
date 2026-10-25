@@ -9,6 +9,7 @@ import argparse
 import base64
 import dataclasses
 import errno
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
@@ -30,7 +31,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from one_conv.archive import (
     SYNC_LOCK,
-    SYNC_STALE_SECONDS,
     SYNC_STATE,
     ArchiveError,
     configured_client,
@@ -385,18 +385,19 @@ def history_roots(reader, source):
 
 
 def acquire_lock(path):
-    for _ in range(2):
-        try:
-            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-            return True
-        except FileExistsError:
-            try:
-                if time.time() - path.stat().st_mtime < SYNC_STALE_SECONDS:
-                    return False
-                path.unlink()  # The previous sync stopped without releasing it.
-            except FileNotFoundError:
-                pass
-    return False
+    """Hold the sync lock for the rest of this process.
+
+    The OS releases it when the process ends, even killed or with its machine put to sleep,
+    so an interrupted sync never blocks the next one: a session on a machine that goes away
+    can only be taken over up to its last upload.
+    """
+    descriptor = os.open(path, os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return False
+    return True
 
 
 def running_reason(handle, paths):
@@ -608,15 +609,13 @@ def main():
         error = f"{type(exception).__name__}: {exception}"
         raise
     finally:
-        try:
-            finished = time.time()
-            state = {"requested": started, **read_json(state_path), **result, "started": started, "finished": finished,
-                     "error": error, "failed": len(failures), "failures": failures[:5]}
-            if not error and not failures:
-                state["succeeded"] = finished
-            write_json(state_path, state)
-        finally:
-            lock.unlink(missing_ok=True)
+        # The lock file stays: unlinking it would let a second sync lock a fresh inode.
+        finished = time.time()
+        state = {"requested": started, **read_json(state_path), **result, "started": started, "finished": finished,
+                 "error": error, "failed": len(failures), "failures": failures[:5]}
+        if not error and not failures:
+            state["succeeded"] = finished
+        write_json(state_path, state)
     print(json.dumps(result))
     return 1 if failures else 0
 

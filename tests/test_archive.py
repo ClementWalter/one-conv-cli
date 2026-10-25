@@ -27,7 +27,6 @@ from archive.server import create_app
 from archive.store import SQLiteStore
 from one_conv.archive import (
     CHUNK_BYTES,
-    SYNC_STALE_SECONDS,
     ArchiveClient,
     ArchiveError,
     pack,
@@ -1643,19 +1642,39 @@ def test_damaged_state_files_and_settings_do_not_break_commands(tmp_path, archiv
             assert not (state / name).exists() or (state / name).stat().st_mode & 0o777 == 0o600, name
 
 
-def test_only_one_sync_runs_and_a_stopped_sync_does_not_block_later_ones(tmp_path, archive):
+def held_sync_lock(env):
+    """Another process holds the sync lock, as a running sync does."""
+    lock = Path(env["ONE_CONV_STATE_DIR"]) / "archive-sync.lock"
+    lock.parent.mkdir(exist_ok=True)
+    return subprocess.Popen([sys.executable, "-c", "import fcntl,sys,time; f=open(sys.argv[1],'w');"
+                             " fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(60)", str(lock)],
+                            stdout=subprocess.PIPE, text=True)
+
+
+def test_a_running_sync_makes_another_skip(tmp_path, archive):
     _, _, url = archive
     env = fixture_env(tmp_path)
     write_claude(env)
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
-    lock = Path(env["ONE_CONV_STATE_DIR"]) / "archive-sync.lock"
-    lock.parent.mkdir()
-    lock.touch()
-    assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"skipped": "another sync is running"}
-    stopped = time.time() - SYNC_STALE_SECONDS - 60
-    os.utime(lock, (stopped, stopped))
+    holder = held_sync_lock(env)
+    holder.stdout.readline()
+    try:
+        assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"skipped": "another sync is running"}
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_a_killed_sync_does_not_block_the_next_one(tmp_path, archive):
+    _, _, url = archive
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    holder = held_sync_lock(env)
+    holder.stdout.readline()
+    holder.kill()
+    holder.wait()
     assert run(env, "scripts/archive-sync.py", "--source", "claude") == {"uploaded": 1, "unchanged": 0}
-    assert not lock.exists()
 
 
 def test_offline_archive_keeps_archived_conversations_listed(tmp_path):

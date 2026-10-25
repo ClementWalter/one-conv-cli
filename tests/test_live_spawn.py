@@ -177,6 +177,22 @@ def test_wait_answers_the_trust_question_when_asked(monkeypatch, tmp_path):
     assert [argv[-1] for argv in sent] == ["Down", "Enter"]
 
 
+def test_wait_accepts_the_bypass_consent_for_a_bypass_spawn(monkeypatch, tmp_path):
+    sent = stub_tmux(monkeypatch, pane="WARNING: Claude Code running in Bypass Permissions mode")
+    calls = iter([[], [LiveSession("claude", "new", str(tmp_path))]])
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: next(calls))
+    spawn.wait_for_session("claude", tmp_path, set(), "t", 5, accept_bypass=True)
+    assert [argv[-1] for argv in sent] == ["Down", "Enter"]
+
+
+def test_wait_leaves_the_bypass_consent_alone_otherwise(monkeypatch, tmp_path):
+    sent = stub_tmux(monkeypatch, pane="WARNING: Claude Code running in Bypass Permissions mode")
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
+    with pytest.raises(spawn.SpawnError):
+        spawn.wait_for_session("claude", tmp_path, set(), "t", 0.1)
+    assert sent == []
+
+
 def test_wait_gives_up_after_the_deadline(monkeypatch, tmp_path):
     stub_tmux(monkeypatch)
     monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])

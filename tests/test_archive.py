@@ -1665,6 +1665,20 @@ def test_a_running_sync_makes_another_skip(tmp_path, archive):
         holder.wait()
 
 
+def test_a_running_sync_does_not_block_another_lane(tmp_path, archive):
+    _, _, url = archive
+    env = fixture_env(tmp_path)
+    write_claude(env)
+    env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
+    holder = held_sync_lock(env)
+    holder.stdout.readline()
+    try:
+        assert run(env, "scripts/archive-sync.py", "--source", "claude", "--lane", "ide") == {"uploaded": 1, "unchanged": 0}
+    finally:
+        holder.kill()
+        holder.wait()
+
+
 def test_a_killed_sync_does_not_block_the_next_one(tmp_path, archive):
     _, _, url = archive
     env = fixture_env(tmp_path)

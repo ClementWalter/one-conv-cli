@@ -325,6 +325,34 @@ def test_bridge_sync_waits_for_its_interval(recorder):
     assert sync.poll("https://hub.example.test", "node-token", "macbook") is False
 
 
+@pytest.fixture
+def lanes_recorded(tmp_path):
+    """Both lanes started once with a stand-in script that records each run's arguments."""
+    script = tmp_path / "record.py"
+    script.write_text("import json, os, sys, uuid\n"
+                      f"open(os.path.join({str(tmp_path)!r}, uuid.uuid4().hex + '.run'), 'w').write(json.dumps(sys.argv[1:]))\n")
+    lanes = bridge.ArchiveLanes(minutes=1, script=script)
+    lanes.poll("https://hub.example.test", "node-token", "macbook")
+    for lane in lanes.lanes:
+        lane.process.wait(timeout=30)
+    return [json.loads(path.read_text()) for path in tmp_path.glob("*.run")]
+
+
+def test_the_agent_lane_leaves_out_the_cursor_ide(lanes_recorded):
+    agents, = [argv for argv in lanes_recorded if "--lane" not in argv]
+    assert "cursor" not in agents
+
+
+def test_the_ide_lane_runs_with_its_own_lane_name(lanes_recorded):
+    ide, = [argv for argv in lanes_recorded if "--lane" in argv]
+    assert ide == ["--source", "cursor", "--lane", "ide"]
+
+
+def test_the_ide_lane_runs_less_often():
+    agents, ide = bridge.ArchiveLanes(minutes=1).lanes
+    assert ide.seconds == bridge.IDE_SYNC_MINUTES * 60
+
+
 def test_bridge_sync_turned_off_never_starts(recorder):
     assert bridge.ArchiveSync(minutes=0, script=recorder[0]).poll("https://hub.example.test", "t", "macbook") is False
 

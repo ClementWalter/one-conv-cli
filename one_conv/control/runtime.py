@@ -4,11 +4,12 @@ import asyncio
 import hashlib
 import logging
 import re
+import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from ..hr import RateError, RateStore, make_card, quote
-from ..live.hub import HubError
+from ..live.hub import LEASE_SECONDS, HubError
 
 log = logging.getLogger(__name__)
 
@@ -216,6 +217,33 @@ def staff_from_cloud(hub, workers) -> list[dict]:
     return submitted
 
 
+# A stopped cloud spawner is resumed at most this often, so a box that cannot start is not hammered.
+SPAWNER_RETRY_SECONDS = 300
+SPAWNER_STEP = 30
+SPAWNER_UNIT = "one-conv-bridge.service"
+
+
+def keep_spawner_up(hub, boat, spawner: dict, state: dict) -> str:
+    """Resume the cloud spawner's box and restart its bridge once its node stops polling the hub.
+
+    The cloud box is the spawner that answers when the Mac is asleep, so it must never stay
+    down: Boat stops idle sandboxes, and a stopped box polls nothing.
+    """
+    seen = hub.node_seen(spawner["node"])
+    now = time.time()
+    if seen is not None and 0 <= now - seen <= LEASE_SECONDS:
+        return "online"
+    if now - state.get("tried", 0.0) < SPAWNER_RETRY_SECONDS:
+        return "waiting"
+    state["tried"] = now
+    from .workers import machine_status
+    if machine_status(boat.info(spawner["box"]).get("state")) != "available":
+        boat.resume_pool(spawner["box"])
+    boat._exec(spawner["box"], ["systemctl", "--user", "restart", SPAWNER_UNIT])
+    log.warning("cloud spawner %s was offline; resumed box %s and restarted its bridge", spawner["node"], spawner["box"])
+    return "restarted"
+
+
 def application(directory, public_origin, *, worker_config=None, session_seconds=30 * 86400):
     """Keep browser cookies and agent bearer authorization on separate API routes."""
     from starlette.concurrency import run_in_threadpool
@@ -301,13 +329,28 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
                 log.error("Worker supervisor could not complete a step")
             await asyncio.sleep(2)
 
+    # A configured cloud spawner takes every request the Mac does not, through the hub's own fallback.
+    spawner = (worker_config or {}).get("spawner")
+
     async def staff_requests():
         while True:
             try:
-                await run_in_threadpool(staff_from_cloud, store.hub, workers)
+                if spawner is None:
+                    await run_in_threadpool(staff_from_cloud, store.hub, workers)
+                else:
+                    await run_in_threadpool(store.hub.sweep)
             except (OSError, RuntimeError, ValueError, HubError):
                 log.error("Cloud staffing could not complete a step")
             await asyncio.sleep(2)
+
+    async def watch_spawner():
+        state = {}
+        while True:
+            try:
+                await run_in_threadpool(keep_spawner_up, store.hub, workers.manager.boat, spawner, state)
+            except (OSError, RuntimeError, ValueError, KeyError, HubError):
+                log.error("Cloud spawner could not be brought back")
+            await asyncio.sleep(SPAWNER_STEP)
 
     async def fire_routines():
         while True:
@@ -323,6 +366,8 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
             loops = [asyncio.create_task(staff_requests()), asyncio.create_task(fire_routines())]
             if workers is not None:
                 loops.append(asyncio.create_task(advance_workers()))
+                if spawner is not None:
+                    loops.append(asyncio.create_task(watch_spawner()))
             try:
                 yield
             finally:

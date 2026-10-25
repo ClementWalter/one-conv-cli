@@ -15,8 +15,8 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
-from one_conv.control.runtime import staff_from_cloud
-from one_conv.live import bridge, hubclient, spawn
+from one_conv.control.runtime import keep_spawner_up, staff_from_cloud
+from one_conv.live import bridge, hubclient, spawn, workspace
 from one_conv.live import hub as hub_module
 from one_conv.live.bridge_cli import add_bridge_commands
 from one_conv.live.hub import Hub, HubError, application
@@ -157,6 +157,94 @@ def test_a_spawn_order_handed_out_after_an_ack_starts_nothing(spawner):
     assert spawn_orders(spawner)[0]["mode"] == "fyi"
 
 
+# --- several spawners: the preferred first, the next one when it fails --------------------------
+
+
+@pytest.fixture
+def two_spawners(hub):
+    """The Mac (preferred) and a cloud box are both connected and offer to start claude sessions."""
+    hub.publish("cloudbox", [], spawn="claude", priority=0)
+    hub.publish("mac", [], spawn="claude", priority=10)
+    return hub
+
+
+def test_the_preferred_spawner_is_asked_first(two_spawners):
+    assert staffing(two_spawners, post(two_spawners)) == ("mac/spawn:claude", "node")
+
+
+def test_the_preferred_spawner_wins_even_if_another_polled_later(two_spawners):
+    two_spawners.publish("cloudbox", [], spawn="claude", priority=0)
+    assert staffing(two_spawners, post(two_spawners)) == ("mac/spawn:claude", "node")
+
+
+def test_with_the_preferred_spawner_offline_the_other_is_asked(two_spawners):
+    with sqlite3.connect(two_spawners.path) as db:
+        db.execute("UPDATE nodes SET seen = ? WHERE node = 'mac'", (time.time() - hub_module.LEASE_SECONDS - 1,))
+    assert staffing(two_spawners, post(two_spawners)) == ("cloudbox/spawn:claude", "node")
+
+
+def test_a_refused_spawn_moves_to_the_next_spawner(two_spawners):
+    key = post(two_spawners)
+    two_spawners.ack("mac", spawn_orders(two_spawners)[0]["delivery"], "refused")
+    two_spawners.sweep()
+    assert staffing(two_spawners, key) == ("cloudbox/spawn:claude", "node")
+
+
+def test_the_next_spawner_receives_its_own_spawn_order(two_spawners):
+    post(two_spawners)
+    two_spawners.ack("mac", spawn_orders(two_spawners)[0]["delivery"], "refused")
+    two_spawners.sweep()
+    assert [item["to"] for item in spawn_orders(two_spawners, "cloudbox")] == ["spawn:claude"]
+
+
+def test_a_spawn_nobody_acks_in_time_moves_to_the_next_spawner(two_spawners, monkeypatch):
+    key = post(two_spawners)
+    monkeypatch.setattr(hub_module, "SPAWN_FALLBACK_SECONDS", -1.0)
+    two_spawners.sweep()
+    assert staffing(two_spawners, key) == ("cloudbox/spawn:claude", "node")
+
+
+def test_when_every_spawner_failed_the_request_goes_to_the_cloud(two_spawners, monkeypatch):
+    key = post(two_spawners)
+    monkeypatch.setattr(hub_module, "SPAWN_FALLBACK_SECONDS", -1.0)
+    two_spawners.sweep()
+    two_spawners.sweep()
+    assert staffing(two_spawners, key) == ("cloud", "cloud")
+
+
+def test_an_ack_after_a_fallback_silences_every_spawn_order(two_spawners, monkeypatch):
+    key = post(two_spawners)
+    monkeypatch.setattr(hub_module, "SPAWN_FALLBACK_SECONDS", -1.0)
+    two_spawners.sweep()
+    monkeypatch.setattr(hub_module, "SPAWN_FALLBACK_SECONDS", 90.0)
+    started_and_acked(two_spawners, key)
+    two_spawners.sweep()
+    assert [item["mode"] for item in spawn_orders(two_spawners, "cloudbox")] == ["fyi"]
+
+
+def test_a_spawner_that_connects_later_takes_a_waiting_request(hub):
+    key = post(hub)
+    hub.publish("cloudbox", [], spawn="claude")
+    assert staffing(hub, key) == ("cloudbox/spawn:claude", "node")
+
+
+def test_a_spawner_that_connects_later_skips_an_old_request(hub, monkeypatch):
+    key = post(hub)
+    monkeypatch.setattr(hub_module, "STAFF_WINDOW_SECONDS", -1.0)
+    hub.publish("cloudbox", [], spawn="claude")
+    assert staffing(hub, key) == ("cloud", "cloud")
+
+
+def test_a_non_integer_spawn_priority_is_refused(hub):
+    with pytest.raises(HubError):
+        hub.publish("mac", [], spawn="claude", priority="high")
+
+
+def test_the_spawn_order_tells_the_session_to_push(spawner):
+    post(spawner)
+    assert "commit and push every change" in spawn_orders(spawner)[0]["text"]
+
+
 def test_an_old_post_is_not_staffed(hub, monkeypatch):
     monkeypatch.setattr(hub_module, "STAFF_WINDOW_SECONDS", -1.0)
     hub.publish("mac", [{"address": "claude:one"}])
@@ -233,6 +321,61 @@ def test_without_cloud_workers_the_post_is_marked_unavailable(hub):
     assert staffing(hub, key) == ("cloud", "unavailable")
 
 
+# --- the control service keeps the cloud spawner up -------------------------------------------
+
+
+class StubBoat:
+    """Records Boat calls against one sandbox in a given machine state."""
+
+    def __init__(self, state):
+        self.state, self.calls = state, []
+
+    def info(self, box):
+        self.calls.append(("info", box))
+        return {"id": box, "state": self.state}
+
+    def resume_pool(self, box):
+        self.calls.append(("resume", box))
+
+    def _exec(self, box, command):
+        self.calls.append(("exec", box, tuple(command)))
+        return ""
+
+
+CLOUD_SPAWNER = {"box": "bx_cloud", "node": "cloudbox"}
+
+
+def test_an_online_cloud_spawner_is_left_alone(hub):
+    hub.publish("cloudbox", [], spawn="claude")
+    boat = StubBoat("idle")
+    keep_spawner_up(hub, boat, CLOUD_SPAWNER, {})
+    assert boat.calls == []
+
+
+def test_a_stopped_cloud_spawner_box_is_resumed(hub):
+    boat = StubBoat("stopped")
+    keep_spawner_up(hub, boat, CLOUD_SPAWNER, {})
+    assert ("resume", "bx_cloud") in boat.calls
+
+
+def test_an_offline_cloud_spawner_gets_its_bridge_restarted(hub):
+    boat = StubBoat("idle")
+    keep_spawner_up(hub, boat, CLOUD_SPAWNER, {})
+    assert boat.calls[-1] == ("exec", "bx_cloud", ("systemctl", "--user", "restart", "one-conv-bridge.service"))
+
+
+def test_a_running_box_is_not_resumed(hub):
+    boat = StubBoat("idle")
+    keep_spawner_up(hub, boat, CLOUD_SPAWNER, {})
+    assert ("resume", "bx_cloud") not in boat.calls
+
+
+def test_a_recent_attempt_is_not_repeated(hub):
+    boat = StubBoat("stopped")
+    keep_spawner_up(hub, boat, CLOUD_SPAWNER, {"tried": time.time()})
+    assert boat.calls == []
+
+
 # --- the Mac's bridge starts the session --------------------------------------------------------
 
 
@@ -242,6 +385,7 @@ def started(tmp_path, monkeypatch):
     monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
     calls = []
     monkeypatch.setattr(spawn, "preflight", lambda harness: None)
+    monkeypatch.setattr(workspace, "pull", lambda repository: False)
     monkeypatch.setattr(spawn, "start", lambda *args, **kwargs: calls.append((args, kwargs))
                         or spawn.Spawned("oneconv-claude-1", "claude", str(tmp_path), "claude:new"))
     bridge.save_spawn_settings({"harness": "claude", "cwd": str(tmp_path), "model": None,
@@ -271,7 +415,9 @@ def test_a_started_session_gets_the_configured_arguments(started):
 
 
 def test_a_spawn_order_is_accepted(started):
-    assert bridge.deliver_inbound(order())[0] == "accepted"
+    outcome = bridge.deliver_inbound(order())[0]
+    wait_for(started)  # The start thread must not outlive this test's stubs.
+    assert outcome == "accepted"
 
 
 def test_a_spawn_order_after_an_ack_starts_nothing(started):
@@ -359,6 +505,32 @@ def test_the_spawner_command_turns_spawning_off(cli, tmp_path):
 def test_the_spawner_command_needs_harness_and_cwd_together(cli):
     runner, group = cli
     assert runner.invoke(group, ["spawner", "--harness", "claude", "--yes"]).exit_code != 0
+
+
+def test_the_spawner_command_saves_the_priority(cli, tmp_path):
+    runner, group = cli
+    runner.invoke(group, ["spawner", "--harness", "claude", "--cwd", str(tmp_path), "--priority", "10", "--yes"])
+    assert bridge.spawn_settings()["priority"] == 10
+
+
+def test_the_bridge_publishes_its_spawn_priority(started, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge.router, "list_all", lambda harness=None: [])
+    bridge.save_spawn_settings({**bridge.spawn_settings(), "priority": 10})
+    state = Hub(str(tmp_path / "hub.db"))
+    url, stop = serve_app(application(state))
+    try:
+        bridge.Bridge(hubclient.HubClient(url, state.add_token("mac"), "mac"), "mac",
+                      bridge.Ingress(tmp_path / "ingress.db")).publish()
+        with sqlite3.connect(state.path) as db:
+            assert db.execute("SELECT priority FROM spawners WHERE node = 'mac'").fetchone() == (10,)
+    finally:
+        stop()
+
+
+def test_a_spawn_order_writes_the_workspace_guide(started, tmp_path):
+    bridge.deliver_inbound(order())
+    wait_for(started)
+    assert (tmp_path / "AGENTS.md").read_text().startswith(workspace.MARKER)
 
 
 def test_a_started_session_is_published_at_once(started):

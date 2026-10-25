@@ -246,6 +246,29 @@ def test_a_non_integer_spawn_priority_is_refused(hub):
         hub.publish("mac", [], spawn="claude", priority="high")
 
 
+def test_the_spawn_order_names_the_session_that_worked_in_the_channel(spawner):
+    spawner.publish("oldmac", [{"address": "claude:old"}])
+    spawner.send("oldmac", {"id": "c" * 32, "from": "claude:old", "to": "#work", "text": "halfway there",
+                            "reply": "none", "mode": "push"}, join_sender=True)
+    spawner.publish("oldmac", [])  # Its machine went away.
+    post(spawner)
+    assert "oldmac/claude:old" in spawn_orders(spawner)[0]["text"]
+
+
+def test_the_spawn_order_tells_the_session_to_read_its_predecessor(spawner):
+    spawner.publish("oldmac", [{"address": "claude:old"}])
+    spawner.send("oldmac", {"id": "c" * 32, "from": "claude:old", "to": "#work", "text": "halfway there",
+                            "reply": "none", "mode": "push"}, join_sender=True)
+    spawner.publish("oldmac", [])  # Its machine went away.
+    post(spawner)
+    assert "Take over their work" in spawn_orders(spawner)[0]["text"]
+
+
+def test_a_fresh_channel_has_no_takeover_section(spawner):
+    post(spawner)
+    assert "Take over" not in spawn_orders(spawner)[0]["text"]
+
+
 def test_the_spawn_order_tells_the_session_to_push(spawner):
     post(spawner)
     assert "commit and push every change" in spawn_orders(spawner)[0]["text"]

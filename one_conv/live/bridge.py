@@ -30,7 +30,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ask, history, hubclient, router, spawn, team, tunnel
+from . import ask, history, hubclient, router, spawn, team, tunnel, workspace
 from .model import envelope, live_home, parse_address
 
 try:
@@ -74,7 +74,7 @@ def _read(path: Path) -> dict:
 
 
 def spawn_settings() -> dict | None:
-    """How this machine starts a session for the hub ({harness, cwd, model, args}), or None if it starts none."""
+    """How this machine starts a session for the hub ({harness, cwd, model, args, priority}), or None if it starts none."""
     data = _read(bridge_dir() / "spawn.json")
     return data if data.get("harness") in spawn.HARNESSES and data.get("cwd") else None
 
@@ -94,6 +94,7 @@ def _start_for_hub(harness: str, prompt: str, config: dict, on_started=None) -> 
     accepts a claim only from a session this node published.
     """
     try:
+        workspace.prepare(Path(config["cwd"]), settings().get("node", ""))
         started = spawn.start(harness, prompt, Path(config["cwd"]), config.get("model"),
                               tuple(config.get("args") or ()), trust_folder=True)
         logger.info("started %s for the hub in tmux session %s", started.address, started.tmux)
@@ -333,7 +334,7 @@ class Bridge:
         rows = [{"address": s.address, "name": team.name_for(s.address), "title": s.title, "cwd": s.cwd,
                  "status": s.status, "product": s.product} for s in router.list_all()]
         config = spawn_settings()
-        offer = {"spawn": config["harness"]} if config else {}
+        offer = {"spawn": config["harness"], "spawn_priority": int(config.get("priority") or 0)} if config else {}
         try:
             count = self.client.request("PUT", "/v1/sessions", {"sessions": rows, **offer})["published"]
             self.notes = []

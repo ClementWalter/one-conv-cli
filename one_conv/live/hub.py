@@ -65,7 +65,7 @@ LEASE_SECONDS = 60.0
 # A member whose session has not been published for this long leaves its topics; a bridge
 # restart is shorter, so a running session keeps its channels.
 MEMBER_GRACE_SECONDS = 600.0
-# A spawn order nobody has turned into a claim by then goes to the cloud instead.
+# A spawn order nobody has turned into a claim by then goes to the next spawner, else the cloud.
 SPAWN_FALLBACK_SECONDS = 90.0
 # Only requests created or released this recently are staffed, so old unowned ones never start sessions.
 STAFF_WINDOW_SECONDS = 3600.0
@@ -157,6 +157,12 @@ class Hub:
             # 1 for the channel the session works in; memberships from before only watch.
             if "work" not in members:
                 db.execute("ALTER TABLE members ADD COLUMN work INTEGER NOT NULL DEFAULT 0")
+            # Higher first: a machine the user does not pay for outranks a cloud box.
+            if "priority" not in {row[1] for row in db.execute("PRAGMA table_info(spawners)")}:
+                db.execute("ALTER TABLE spawners ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+            # Space-separated spawner nodes already ordered to start a session for this request.
+            if "tried" not in {row[1] for row in db.execute("PRAGMA table_info(staffing)")}:
+                db.execute("ALTER TABLE staffing ADD COLUMN tried TEXT NOT NULL DEFAULT ''")
             sessions = {row[1] for row in db.execute("PRAGMA table_info(sessions)")}
             # Which app of the harness the session runs in, from PRODUCTS, or empty.
             if "product" not in sessions:
@@ -219,16 +225,20 @@ class Hub:
     def _seen(self, db, node: str) -> None:
         db.execute("INSERT OR REPLACE INTO nodes VALUES (?, ?)", (node, time.time()))
 
-    def publish(self, node: str, sessions, spawn: object = None) -> int:
+    def publish(self, node: str, sessions, spawn: object = None, priority: object = 0) -> int:
         """Replace this node's published sessions and renew its lease; a name already taken is refused.
 
         `spawn` is the harness this node's bridge starts a session with when the hub asks it to,
-        or None when it starts none.
+        or None when it starts none; spawners with a higher `priority` are asked first.
         """
         if not isinstance(sessions, list):
             raise HubError(400, "sessions must be a list")
         if spawn is not None and spawn not in SPAWN_HARNESSES:
             raise HubError(400, f"spawn is one of {', '.join(SPAWN_HARNESSES)}, or absent")
+        if priority is None:
+            priority = 0
+        if type(priority) is not int or not -1000 <= priority <= 1000:
+            raise HubError(400, "spawn_priority is an integer between -1000 and 1000")
         rows, names = [], set()
         for item in sessions:
             if not isinstance(item, dict) or not isinstance(item.get("address"), str) or "/" in item["address"]:
@@ -258,7 +268,8 @@ class Hub:
             if spawn is None:
                 db.execute("DELETE FROM spawners WHERE node = ?", (node,))
             else:
-                db.execute("INSERT OR REPLACE INTO spawners VALUES (?, ?, ?)", (node, spawn, now))
+                db.execute("INSERT OR REPLACE INTO spawners (node, harness, updated, priority) VALUES (?, ?, ?, ?)",
+                           (node, spawn, now, priority))
             self._seen(db, node)
             # A clock read before _seen would put this node's lease in the future and count its sessions offline.
             self._sweep(db, time.time())
@@ -298,24 +309,40 @@ class Hub:
         return {"key": f"{node}:{ident}", "seq": seq, "topic": topic, "text": text, "created": created,
                 "created_by": f"{node}/{sender}"}
 
+    def _spawners(self, db, now: float, tried=()) -> list[tuple[str, str]]:
+        """Connected spawners not yet tried, the preferred first."""
+        rows = db.execute("SELECT s.node, s.harness FROM spawners s JOIN nodes n ON n.node = s.node"
+                          " WHERE n.seen >= ? ORDER BY s.priority DESC, n.seen DESC", (now - LEASE_SECONDS,)).fetchall()
+        return [(node, harness) for node, harness in rows if node not in tried]
+
+    @staticmethod
+    def _spawn_id(key: str, node: str, first: bool) -> str:
+        """The first order keeps the id it always had, so an order sent before a fallback is still found."""
+        return hashlib.sha256(f"{key}:spawn{'' if first else ':' + node}".encode()).hexdigest()[:32]
+
+    def _order_spawn(self, db, post: dict, node: str, harness: str, first: bool) -> str:
+        """Queue a spawn order for this post to one spawner; returns its route."""
+        route = f"{node}/spawn:{harness}"
+        from_node, _, sender = post["created_by"].partition("/")
+        digest = hashlib.sha256(json.dumps(["spawn", post["key"], node]).encode()).hexdigest()
+        self._insert(db, from_node, self._spawn_id(post["key"], node, first), digest, route, sender, post["topic"],
+                     "expected", "push", self.spawn_prompt(post), [(node, f"spawn:{harness}", None)], kind="system")
+        return route
+
     def _staff(self, db, post: dict, now: float) -> dict:
         """Start a session for a human post nobody runs to read: a spawn order to a connected spawner, else the cloud."""
         row = db.execute("SELECT route, state FROM staffing WHERE task = ? AND version = 1", (post["key"],)).fetchone()
         if row:
             return {"route": row[0], "state": row[1]}
-        spawner = db.execute("SELECT s.node, s.harness FROM spawners s JOIN nodes n ON n.node = s.node"
-                             " WHERE n.seen >= ? ORDER BY n.seen DESC LIMIT 1", (now - LEASE_SECONDS,)).fetchone()
-        if spawner is None:
-            db.execute("INSERT INTO staffing VALUES (?, 1, 'cloud', 'cloud', '', ?, ?)", (post["key"], now, now))
+        spawners = self._spawners(db, now)
+        if not spawners:
+            db.execute("INSERT INTO staffing (task, version, route, state, detail, created, updated)"
+                       " VALUES (?, 1, 'cloud', 'cloud', '', ?, ?)", (post["key"], now, now))
             return {"route": "cloud", "state": "cloud"}
-        node, harness = spawner
-        route = f"{node}/spawn:{harness}"
-        msg_id = hashlib.sha256(f"{post['key']}:spawn".encode()).hexdigest()[:32]
-        from_node, _, sender = post["created_by"].partition("/")
-        digest = hashlib.sha256(json.dumps(["spawn", post["key"]]).encode()).hexdigest()
-        self._insert(db, from_node, msg_id, digest, route, sender, post["topic"], "expected", "push",
-                     self.spawn_prompt(post), [(node, f"spawn:{harness}", None)], kind="system")
-        db.execute("INSERT INTO staffing VALUES (?, 1, ?, 'node', '', ?, ?)", (post["key"], route, now, now))
+        node, harness = spawners[0]
+        route = self._order_spawn(db, post, node, harness, first=True)
+        db.execute("INSERT INTO staffing (task, version, route, state, detail, created, updated, tried)"
+                   " VALUES (?, 1, ?, 'node', '', ?, ?, ?)", (post["key"], route, now, now, node))
         return {"route": route, "state": "node"}
 
     @staticmethod
@@ -329,10 +356,12 @@ class Hub:
                 f"2. Ack the message with the ack tool (message_id=\"{ident}\").\n"
                 f"3. Work it and answer in #{post['topic']}. Other sessions may join: before starting a piece of work,"
                 " say in the channel what you take, and leave anything already taken to whoever took it. To dig into"
-                " an earlier session, read it with read_conversation using a message's sender address.")
+                " an earlier session, read it with read_conversation using a message's sender address.\n"
+                "4. This machine can disappear at any time: `git pull` every repository before working in it, and"
+                " commit and push every change as soon as it is made. AGENTS.md in this folder has the details.")
 
     def _staff_waiting(self, db, now: float) -> None:
-        """Staff recent human posts nobody acked or runs to read, move stalled spawn orders to the cloud, close the rest."""
+        """Staff recent human posts nobody acked or runs to read, pass stalled spawn orders on to the next spawner, close the rest."""
         humans = tuple(f"{node}" for node in self.trusted_humans)
         if humans:
             rows = db.execute(
@@ -344,30 +373,56 @@ class Hub:
                 post = self._human_post(db, seq)
                 if not self._running(db, post["topic"], now):
                     self._staff(db, post, now)
-        for key, route, created in db.execute(
-                "SELECT task, route, created FROM staffing WHERE state IN ('node', 'cloud', 'submitted')").fetchall():
+        for key, route, state, updated, tried in db.execute(
+                "SELECT task, route, state, updated, tried FROM staffing WHERE state IN ('node', 'cloud', 'submitted')"
+                ).fetchall():
             node, _, ident = key.partition(":")
+            # Rows staffed before `tried` existed name their only spawner in the route.
+            tried = tried.split() or ([route.partition("/")[0]] if route != "cloud" else [])
+            spawn_ids = [self._spawn_id(key, n, i == 0) for i, n in enumerate(tried)]
             seq = db.execute("SELECT seq, topic FROM posts WHERE from_node = ? AND id = ?", (node, ident)).fetchone()
             acked = seq is not None and db.execute("SELECT 1 FROM post_acks WHERE post = ?", (seq[0],)).fetchone()
             if seq is None or acked:
                 db.execute("UPDATE staffing SET state = 'done', updated = ? WHERE task = ?", (now, key))
                 # A spawn order not yet handed out starts nothing once a session has read the post.
-                db.execute("UPDATE deliveries SET mode = 'fyi' WHERE outcome IS NULL AND post IN (SELECT seq FROM"
-                           " posts WHERE from_node = ? AND id = ? AND kind = 'system')",
-                           (node, hashlib.sha256(f"{key}:spawn".encode()).hexdigest()[:32]))
+                if spawn_ids:
+                    db.execute(f"UPDATE deliveries SET mode = 'fyi' WHERE outcome IS NULL AND post IN (SELECT seq FROM"
+                               f" posts WHERE from_node = ? AND kind = 'system' AND id IN ({','.join('?' * len(spawn_ids))}))",
+                               (node, *spawn_ids))
                 continue
             if route == "cloud":
+                # A spawner that connects later, such as a cloud box coming back, takes a request still waiting.
+                post = self._human_post(db, seq[0])
+                if (state == "cloud" and post["created"] >= now - STAFF_WINDOW_SECONDS
+                        and (spawners := self._spawners(db, now, tried))):
+                    spawner_node, harness = spawners[0]
+                    route = self._order_spawn(db, post, spawner_node, harness, first=not tried)
+                    db.execute("UPDATE staffing SET route = ?, state = 'node', updated = ?, tried = ? WHERE task = ?",
+                               (route, now, " ".join([*tried, spawner_node]), key))
                 continue
             spawner_node, _, address = route.partition("/")
             outcome = db.execute("SELECT d.outcome FROM deliveries d JOIN posts p ON p.seq = d.post WHERE p.kind = 'system'"
                                  " AND p.from_node = ? AND p.id = ? AND d.to_node = ? AND d.to_address = ?",
-                                 (node, hashlib.sha256(f"{key}:spawn".encode()).hexdigest()[:32], spawner_node,
-                                  address)).fetchone()
+                                 (node, spawn_ids[-1], spawner_node, address)).fetchone()
             refused = outcome is not None and outcome[0] == "refused"
-            if refused or created < now - SPAWN_FALLBACK_SECONDS:
-                db.execute("UPDATE staffing SET route = 'cloud', state = 'cloud', detail = ?, updated = ? WHERE task = ?",
-                           (f"{route} {'refused the spawn' if refused else 'started no session that acked in time'}",
-                            now, key))
+            if refused or updated < now - SPAWN_FALLBACK_SECONDS:
+                why = f"{route} {'refused the spawn' if refused else 'started no session that acked in time'}"
+                spawners = self._spawners(db, now, tried)
+                if spawners:
+                    post = self._human_post(db, seq[0])
+                    next_node, harness = spawners[0]
+                    next_route = self._order_spawn(db, post, next_node, harness, first=False)
+                    db.execute("UPDATE staffing SET route = ?, detail = ?, updated = ?, tried = ? WHERE task = ?",
+                               (next_route, why, now, " ".join([*tried, next_node]), key))
+                else:
+                    db.execute("UPDATE staffing SET route = 'cloud', state = 'cloud', detail = ?, updated = ? WHERE task = ?",
+                               (why, now, key))
+
+    def node_seen(self, node: str) -> float | None:
+        """When this node last published or polled, or None if it never did."""
+        with self.lock, self._db() as db:
+            row = db.execute("SELECT seen FROM nodes WHERE node = ?", (node,)).fetchone()
+        return row[0] if row else None
 
     def staffing_due(self) -> list[dict]:
         """Human posts waiting for a cloud worker, with the first prompt that worker gets."""
@@ -994,8 +1049,8 @@ def application(hub: Hub):
 
     async def sessions(request):
         if request.method == "PUT":
-            return await handle(request, lambda node, body, _: {"published": hub.publish(node, body.get("sessions"),
-                                                                                          body.get("spawn"))})
+            return await handle(request, lambda node, body, _: {"published": hub.publish(
+                node, body.get("sessions"), body.get("spawn"), body.get("spawn_priority", 0))})
         return await handle(request, lambda node, body, _: {"sessions": hub.directory()})
 
     async def messages(request):

@@ -43,6 +43,12 @@ logger = logging.getLogger(__name__)
 PUBLISH_SECONDS = 15.0
 # Harness histories a node syncs to its hub's archive, so any session can read them by live address.
 ARCHIVE_SOURCES = ("claude", "codex", "omp", "cursor", "cursor-cli")
+# Cursor IDE chats are rows of one multi-gigabyte database: checking each costs a third of a
+# second, against milliseconds for a file. They sync in their own slower lane, so the agent
+# sessions another machine may need to take over are never queued behind them.
+AGENT_SOURCES = tuple(source for source in ARCHIVE_SOURCES if source != "cursor")
+IDE_SOURCES = ("cursor",)
+IDE_SYNC_MINUTES = 15.0
 # Short: a session on a machine that goes away can only be taken over up to its last sync.
 ARCHIVE_SYNC_MINUTES = 1.0
 ARCHIVE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "archive-sync.py"
@@ -422,9 +428,11 @@ class ArchiveSync:
     conversations, so frequent runs cost a listing and a stat per conversation.
     """
 
-    def __init__(self, minutes: float | None = None, script: Path = ARCHIVE_SCRIPT):
+    def __init__(self, minutes: float | None = None, script: Path = ARCHIVE_SCRIPT,
+                 sources: tuple[str, ...] = ARCHIVE_SOURCES, lane: str = ""):
         self.seconds = (archive_sync_minutes() if minutes is None else minutes) * 60
         self.script, self.process, self.started = script, None, None
+        self.sources, self.lane = sources, lane
 
     def poll(self, url: str, token: str, node: str) -> bool:
         """Start a sync when none runs and the last one started at least the interval ago."""
@@ -438,12 +446,13 @@ class ArchiveSync:
         # The token travels in the environment, never in argv where other users could read it.
         env = {**os.environ, "ONE_CONV_ARCHIVE_URL": url + HUB_ARCHIVE_PATH, "ONE_CONV_ARCHIVE_TOKEN": token,
                "ONE_CONV_ARCHIVE_ORIGIN": node}
-        sources = [argument for source in ARCHIVE_SOURCES for argument in ("--source", source)]
-        log_path = bridge_dir() / "archive-sync.log"
+        sources = [argument for source in self.sources for argument in ("--source", source)]
+        lane = ["--lane", self.lane] if self.lane else []
+        log_path = bridge_dir() / f"archive-sync{'-' + self.lane if self.lane else ''}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         output = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
-            self.process = subprocess.Popen([sys.executable, str(self.script), *sources], env=env,
+            self.process = subprocess.Popen([sys.executable, str(self.script), *sources, *lane], env=env,
                                             stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
         except OSError as error:
             logger.warning("archive sync could not start: %s", error)
@@ -461,6 +470,24 @@ class ArchiveSync:
                 self.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.process.kill()
+
+
+class ArchiveLanes:
+    """The agent-session lane every interval and the Cursor IDE lane every IDE_SYNC_MINUTES, side by side."""
+
+    def __init__(self, minutes: float | None = None, script: Path = ARCHIVE_SCRIPT):
+        agents = ArchiveSync(minutes, script, AGENT_SOURCES)
+        ide = ArchiveSync(minutes, script, IDE_SOURCES, lane="ide")
+        if ide.seconds > 0:
+            ide.seconds = max(ide.seconds, IDE_SYNC_MINUTES * 60)
+        self.lanes = (agents, ide)
+
+    def poll(self, url: str, token: str, node: str) -> bool:
+        return any([lane.poll(url, token, node) for lane in self.lanes])
+
+    def stop(self) -> None:
+        for lane in self.lanes:
+            lane.stop()
 
 
 def _report(**state) -> None:
@@ -514,7 +541,7 @@ class PromptSync:
 
 
 def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
-          archive: ArchiveSync | None = None, prompts: PromptSync | None = None) -> int:
+          archive: "ArchiveSync | ArchiveLanes | None" = None, prompts: PromptSync | None = None) -> int:
     """Run the bridge until SIGTERM/SIGINT or `stopping()`; returns the exit status."""
     lock_path = bridge_dir() / "serve.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -532,7 +559,7 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
     stopping = stopping or (lambda: False)
     forward = tunnel.Tunnel(tunnel.destination(hub), hub_port) if hub.startswith("ssh://") else None
     ingress, backoff = Ingress(bridge_dir() / "ingress.db"), 1.0
-    archive, prompts = archive or ArchiveSync(), prompts or PromptSync()
+    archive, prompts = archive or ArchiveLanes(), prompts or PromptSync()
     _report(hub=hub, node=node, started=time.time(), last_error=None)
     try:
         while not (stop_requested or stopping()):

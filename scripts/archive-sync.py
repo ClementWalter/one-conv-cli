@@ -188,16 +188,24 @@ def source_stamp(reader, handle, paths):
     return digest(encode(fingerprint(paths)))
 
 
-def load_stamps(reader):
+def lane_file(name, lane):
+    """A state file of one sync lane; lanes run concurrently, so each keeps its own lock, state and stamps."""
+    if not lane:
+        return name
+    stem, dot, suffix = name.rpartition(".")
+    return f"{stem}-{lane}{dot}{suffix}"
+
+
+def load_stamps(reader, lane=""):
     try:
-        stamps = json.loads((reader.STATE_DIR / "archive-stamps.json").read_text())
+        stamps = json.loads((reader.STATE_DIR / lane_file("archive-stamps.json", lane)).read_text())
     except (OSError, ValueError):
         return {}
     return stamps if isinstance(stamps, dict) else {}
 
 
-def save_stamps(reader, stamps):
-    path = reader.STATE_DIR / "archive-stamps.json"
+def save_stamps(reader, stamps, lane=""):
+    path = reader.STATE_DIR / lane_file("archive-stamps.json", lane)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     partial.write_text(json.dumps(stamps, sort_keys=True))
@@ -578,6 +586,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", choices=reader.SOURCES, action="append")
     parser.add_argument("--project", help="Restrict to project paths containing this text")
+    parser.add_argument("--lane", default="", choices=("", "ide"),
+                        help="Run as a separate lane with its own lock and state, beside the default sync")
     parser.add_argument("--limit", type=int, default=0, help="Maximum conversations (0 = all)")
     parser.add_argument("--free-older-than", type=int, metavar="DAYS",
                         help=f"After syncing, delete native {'/'.join(FREEABLE_SOURCES)} files unchanged for DAYS "
@@ -597,11 +607,11 @@ def main():
     # A live node uploads under its node name, which its NODE/harness:id addresses carry.
     origin = configured_origin() or origin_id(reader)
     reader.STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock = reader.STATE_DIR / SYNC_LOCK
+    lock = reader.STATE_DIR / lane_file(SYNC_LOCK, args.lane)
     if not acquire_lock(lock):
         print(json.dumps({"skipped": "another sync is running"}))
         return 0
-    state_path, started = reader.STATE_DIR / SYNC_STATE, time.time()
+    state_path, started = reader.STATE_DIR / lane_file(SYNC_STATE, args.lane), time.time()
     result, failures, error = {}, [], None
     try:
         result, failures = sync(reader, client, origin, args, lock)
@@ -633,7 +643,7 @@ def sync(reader, client, origin, args, lock):
     print(f"{datetime.now():%Y-%m-%d %H:%M:%S} sync of {len(handles)} conversations", file=sys.stderr)
     result = {"uploaded": 0, "unchanged": 0}
     failures = []
-    stamps = load_stamps(reader)
+    stamps = load_stamps(reader, args.lane)
     for key, handle in keyed:
         lock.touch()
         try:
@@ -671,7 +681,7 @@ def sync(reader, client, origin, args, lock):
         except SYNC_ERRORS + (reader.click.ClickException,) as error:
             failures.append(f"{handle.source}/{handle.uuid}: {type(error).__name__}: {error}")
             print(failures[-1], file=sys.stderr)
-    save_stamps(reader, stamps)
+    save_stamps(reader, stamps, args.lane)
     if args.free_older_than:
         result.update(free_older(reader, client, keyed, existing, time.time() - args.free_older_than * 86400, lock))
     if failures:

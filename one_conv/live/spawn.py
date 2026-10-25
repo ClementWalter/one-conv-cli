@@ -113,7 +113,8 @@ def start(harness: str, prompt: str, cwd: Path, model: str | None = None, extra:
     rows = _load()
     rows[name] = spawned.to_json()
     _save(rows)
-    spawned.address = wait_for_session(harness, cwd, before, name, wait_seconds, trust_folder)
+    spawned.address = wait_for_session(harness, cwd, before, name, wait_seconds, trust_folder,
+                                       accept_bypass=BYPASS_FLAG in extra)
     rows = _load()
     rows[name] = spawned.to_json()
     _save(rows)
@@ -155,6 +156,9 @@ def _alive(tmux_name: str) -> bool:
 
 # Claude Code's first-visit question for a folder; its default answer is "No, exit".
 TRUST_QUESTION = "Is this a project you created or one you trust?"
+# Claude Code's one-time consent to --dangerously-skip-permissions on a machine; its default is also "No, exit".
+BYPASS_QUESTION = "running in Bypass Permissions mode"
+BYPASS_FLAG = "--dangerously-skip-permissions"
 
 
 def _pane_pid(tmux_name: str) -> int | None:
@@ -212,12 +216,23 @@ def screen(tmux_name: str) -> str:
                           check=False).stdout
 
 
+def _choose_second(tmux_name: str) -> None:
+    """Move from a Claude Code dialog's default "No, exit" to its "Yes" answer, then confirm."""
+    subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Down"], check=False)
+    time.sleep(0.5)
+    subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"], check=False)
+
+
 def wait_for_session(harness: str, cwd: Path, before: set[str], tmux_name: str, wait_seconds: float,
-                     trust_folder: bool = False) -> str:
-    """The address of the session started in tmux session `tmux_name`; refuses if it never registers."""
+                     trust_folder: bool = False, accept_bypass: bool = False) -> str:
+    """The address of the session started in tmux session `tmux_name`; refuses if it never registers.
+
+    `accept_bypass` confirms the bypass-permissions consent a machine shows once, for a spawn
+    that was explicitly given --dangerously-skip-permissions.
+    """
     deadline = time.monotonic() + wait_seconds
     resolved = str(cwd.resolve())
-    answered = False
+    answered = consented = False
     while time.monotonic() < deadline:
         if not _alive(tmux_name):
             raise SpawnError(f"{harness} exited before registering; inspect it with a manual run in {cwd}")
@@ -225,11 +240,11 @@ def wait_for_session(harness: str, cwd: Path, before: set[str], tmux_name: str, 
             if not trust_folder:
                 raise SpawnError(f"Claude Code is asking whether to trust {cwd}. Answer it with "
                                  f"`tmux attach -t {tmux_name}`, or spawn again with --trust-folder.")
-            # Move from the default "No, exit" to "Yes, I trust this folder", then confirm.
-            subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Down"], check=False)
-            time.sleep(0.5)
-            subprocess.run(["tmux", "send-keys", "-t", tmux_name, "Enter"], check=False)
+            _choose_second(tmux_name)
             answered = True
+        elif harness == "claude" and accept_bypass and not consented and BYPASS_QUESTION in screen(tmux_name):
+            _choose_second(tmux_name)
+            consented = True
         if harness == "cursor":
             # A Cursor chat registers only when its first turn ends; `live send` already reaches it by id.
             if chat := _cursor_chat(tmux_name):

@@ -7,6 +7,7 @@ import re
 import secrets
 import sqlite3
 import time
+import unicodedata
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
@@ -37,6 +38,7 @@ HUMAN = "workspace/user"
 TEXT_LIMIT = 32_000
 MESSAGES_SHOWN = 300
 MEMBERS_LIMIT = 50
+CHANNEL_FIELDS = {"id", "topic", "purpose", "directory", "members"}
 # How long a stop request waits for the agent's bridge to report; its inbox long-poll picks orders up within a second.
 STOP_WAIT = 10.0
 
@@ -95,24 +97,58 @@ def validate_message(payload: object) -> dict:
     return {"attachments": attachments, "id": ident, "target": target, "text": text}
 
 
+# Words that say nothing about a channel's subject, left out of a name derived from its kickoff.
+FILLER = frozenset("""
+a an and are as at be but by can could do does for from get have how i if in into is it its let me my need of on
+or our please should so that the their then there this to up us want we what when where which who why will with
+would you your au aux avec ce ces dans de des du en est et il je la le les ma mes mon ne nous on ou par pas pour
+qu que qui sa se ses son sur ta te tes ton tu un une vos votre vous faut faire peux veux voudrais
+""".split())
+NAME_WORDS = 4
+NAME_CHARS = 40
+DIRECTORY_LIMIT = 512
+
+
+def channel_slug(text: str, filler: frozenset = frozenset()) -> str:
+    """Lowercase ASCII words joined by dashes, so any casing or spacing a human types is a valid channel name."""
+    plain = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
+    words = [word for word in re.findall(r"[a-z0-9]+", plain) if word not in filler]
+    if filler:
+        words = words[:NAME_WORDS]
+    name = ""
+    for word in words:
+        joined = f"{name}-{word}" if name else word
+        if len(joined) > (NAME_CHARS if filler else 64):
+            break
+        name = joined
+    return name
+
+
 def validate_channel(payload: object) -> dict:
-    """A new channel: a stable retry ID, its name, a kickoff message and the agents to add."""
-    if not isinstance(payload, dict) or set(payload) != {"id", "topic", "purpose", "members"}:
-        raise HubError(400, "Provide only id, topic, purpose and members.")
-    ident, topic, purpose, members = (payload[key] for key in ("id", "topic", "purpose", "members"))
+    """A new channel: a stable retry ID and a kickoff message; the name, directory and agents to add are optional."""
+    if not isinstance(payload, dict) or not {"id", "purpose"} <= set(payload) <= CHANNEL_FIELDS:
+        raise HubError(400, "Provide id and purpose, and optionally topic, directory and members.")
+    ident, purpose = payload["id"], payload["purpose"]
+    topic, directory, members = payload.get("topic", ""), payload.get("directory", ""), payload.get("members", [])
     if not isinstance(ident, str) or not MESSAGE_ID.fullmatch(ident):
         raise HubError(400, "id must be 32 lowercase hexadecimal characters, unchanged on retry")
-    if not isinstance(topic, str) or not TOPIC.fullmatch(topic):
-        raise HubError(400, "A channel name uses lowercase letters, digits and dashes.")
+    if not isinstance(topic, str) or len(topic) > 200:
+        raise HubError(400, "A channel name is text of at most 64 letters, digits and dashes.")
     if not isinstance(purpose, str) or not purpose.strip():
         raise HubError(400, "Say what this channel is for; it is posted as the first message.")
     if len(purpose) > TEXT_LIMIT:
         raise HubError(413, "The channel purpose is too large.")
+    if not isinstance(directory, str) or len(directory) > DIRECTORY_LIMIT or "\n" in directory:
+        raise HubError(400, f"directory is one line of at most {DIRECTORY_LIMIT} characters.")
     if (not isinstance(members, list) or len(members) > MEMBERS_LIMIT
             or any(not isinstance(member, str) or member == HUMAN for member in members)
             or len(set(members)) != len(members)):
         raise HubError(400, f"members is a list of at most {MEMBERS_LIMIT} distinct agent routes.")
-    return {"id": ident, "topic": topic, "purpose": purpose,
+    # A typed name is only normalized; an empty one is derived from the kickoff when the channel is created.
+    topic = channel_slug(topic.lstrip("#"))
+    if topic and not TOPIC.fullmatch(topic):
+        raise HubError(400, "A channel name uses lowercase letters, digits and dashes.")
+    return {"id": ident, "topic": topic, "purpose": purpose, "directory": directory.strip(),
             "members": [split_address(member) for member in members]}
 
 
@@ -468,23 +504,34 @@ class ControlStore:
         return self.hub.archive(payload["topic"], payload["archived"])
 
     def create_channel(self, payload):
-        """Add the human and the chosen agents, post the kickoff in the channel and announce it in #general.
+        """Add the human and any chosen agents, post the kickoff in the channel and announce it in #general.
 
-        The request, its members and the announcement text commit together, so a retry under the same
-        ID finishes exactly that channel, and the same ID with any other content is refused.
+        With no agent chosen, the kickoff is an unanswered human post, so staffing starts a session for it.
+        The request, its name, members and announcement commit together, so a retry under the same ID
+        finishes exactly that channel, and the same ID with any other content is refused.
         """
         payload = validate_channel(payload)
-        topic, ident = payload["topic"], payload["id"]
-        digest = hashlib.sha256(json.dumps([topic, payload["purpose"], sorted(payload["members"])]).encode()).hexdigest()
+        ident, named = payload["id"], payload["topic"]
+        kickoff_text = payload["purpose"] + (f"\n\nDirectory: {payload['directory']}" if payload["directory"] else "")
+        digest = hashlib.sha256(json.dumps([named, payload["purpose"], sorted(payload["members"]), payload["directory"]])
+                                .encode()).hexdigest()
         with self.hub.lock, self.hub._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            request = db.execute("SELECT digest, announcement FROM channel_requests WHERE id = ?", (ident,)).fetchone()
+            request = db.execute("SELECT digest, announcement, topic FROM channel_requests WHERE id = ?",
+                                 (ident,)).fetchone()
             if request is not None and request[0] != digest:
                 raise HubError(409, "This request ID was already used for a different channel; start a new request.")
             if request is None:
-                if (db.execute("SELECT 1 FROM members WHERE topic = ?", (topic,)).fetchone()
-                        or db.execute("SELECT 1 FROM posts WHERE topic = ?", (topic,)).fetchone()):
-                    raise HubError(409, f"#{topic} already exists; open it from Channels.")
+                def taken(name):
+                    return (db.execute("SELECT 1 FROM members WHERE topic = ?", (name,)).fetchone()
+                            or db.execute("SELECT 1 FROM posts WHERE topic = ?", (name,)).fetchone())
+
+                if named and taken(named):
+                    raise HubError(409, f"#{named} already exists; open it from Channels.")
+                # A name derived from the kickoff never collides: a number tells it apart from an older channel.
+                base = named or channel_slug(payload["purpose"], FILLER) or "channel"
+                topic = next(name for name in (base if n == 1 else f"{base[:60]}-{n}" for n in range(1, 10_000))
+                             if not taken(name))
                 now = time.time()
                 for node, local in payload["members"]:
                     lease = db.execute("SELECT n.seen, s.updated FROM sessions s JOIN nodes n ON n.node = s.node "
@@ -506,8 +553,8 @@ class ControlStore:
                 db.executemany("UPDATE members SET work = (topic = ?) WHERE node = ? AND address = ?",
                                [(topic, node, local) for node, local in payload["members"]])
             else:
-                announcement = request[1]
-        kickoff = self.hub.send(NODE, {"id": ident, "from": "user", "to": f"#{topic}", "text": payload["purpose"],
+                announcement, topic = request[1], request[2]
+        kickoff = self.hub.send(NODE, {"id": ident, "from": "user", "to": f"#{topic}", "text": kickoff_text,
                                        "reply": "expected", "mode": "push"}, join_sender=True)
         self.hub.send(NODE, {"id": hashlib.sha256(f"{ident}:{GENERAL}".encode()).hexdigest()[:32], "from": "user",
                              "to": f"#{GENERAL}", "text": announcement, "reply": "none", "mode": "push"},

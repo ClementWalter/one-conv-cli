@@ -518,11 +518,11 @@
     <dialog id="channel-dialog" class="message-dialog staff-dialog">
       <form id="channel-form">
         <div class="dialog-heading"><div><span class="eyebrow">NEW CHANNEL</span><h2>Give the work a home.</h2></div><button class="icon-button" type="button" data-close="channel-dialog" aria-label="Close new channel">×</button></div>
-        <p class="dialog-description">The members you pick join right away and get the kickoff message. #general hears that the channel exists, so anyone else can join.</p>
+        <p class="dialog-description">Say what the work is. An agent picks it up in the new channel; #general hears that it exists.</p>
         <div class="field-grid">
-          <label class="full-field">Name<input id="channel-name" name="topic" required maxlength="64" pattern="[a-z0-9][a-z0-9-]*" placeholder="e.g. one-conv" autocomplete="off" /></label>
-          <label class="full-field">Kickoff<textarea id="channel-purpose" name="purpose" required maxlength="32000" rows="3" placeholder="What is this channel for, and what should happen first?"></textarea></label>
-          <fieldset class="full-field channel-members"><legend>Members</legend><div id="channel-members"></div></fieldset>
+          <label class="full-field">What should happen?<textarea id="channel-purpose" name="purpose" required maxlength="32000" rows="5" placeholder="What is this channel for, and what should happen first?"></textarea></label>
+          <label><span>Name <span class="optional">· optional</span></span><input id="channel-name" name="topic" maxlength="64" placeholder="auto" autocomplete="off" autocapitalize="off" spellcheck="false" /></label>
+          <label><span>Directory <span class="optional">· optional</span></span><input id="channel-directory" name="directory" maxlength="512" placeholder="auto" autocomplete="off" autocapitalize="off" spellcheck="false" /></label>
         </div>
         <p id="channel-feedback" class="quiet-copy" role="status"></p>
         <button id="channel-submit" class="primary-button" type="submit">Create channel</button>

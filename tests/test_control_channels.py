@@ -127,7 +127,8 @@ def test_a_channel_can_start_with_only_the_human(store, channel):
 
 
 @pytest.mark.parametrize("change", [
-    {"topic": "Bad Name"}, {"purpose": "  "}, {"members": "worker/omp:agent"},
+    {"topic": 7}, {"topic": "x" * 201}, {"purpose": "  "}, {"directory": "a\nb"}, {"directory": "d" * 513},
+    {"members": "worker/omp:agent"},
     {"members": ["worker/omp:agent", "worker/omp:agent"]}, {"members": ["workspace/user"]}, {"id": "short"},
 ])
 def test_invalid_channel_requests_are_refused(store, channel, change):
@@ -136,8 +137,66 @@ def test_invalid_channel_requests_are_refused(store, channel, change):
 
 
 def test_extra_fields_are_refused(store, channel):
-    with pytest.raises(HubError, match="only id, topic, purpose and members"):
+    with pytest.raises(HubError, match="Provide id and purpose"):
         store.create_channel({**channel, "from": "worker/omp:agent"})
+
+
+# --- name, directory and staffing from the prompt alone -------------------------------------------------
+
+
+@pytest.fixture
+def prompt_only():
+    return {"id": "f" * 32, "purpose": "Please fix the iPhone keyboard autocorrect in the workspace app."}
+
+
+@pytest.mark.parametrize("typed, name", [
+    ("Release", "release"), ("#One Conv", "one-conv"), ("  my_Topic!  ", "my-topic"), ("Équipe Café", "equipe-cafe"),
+])
+def test_a_typed_name_has_its_case_and_spacing_fixed(store, channel, typed, name):
+    assert store.create_channel({**channel, "topic": typed})["topic"] == name
+
+
+def test_an_empty_name_is_derived_from_the_prompt(store, prompt_only):
+    assert store.create_channel(prompt_only)["topic"] == "fix-iphone-keyboard-autocorrect"
+
+
+def test_a_name_made_only_of_filler_falls_back_to_the_prompt(store, prompt_only):
+    assert store.create_channel({**prompt_only, "topic": "!!"})["topic"] == "fix-iphone-keyboard-autocorrect"
+
+
+def test_a_prompt_without_words_gets_a_plain_name(store, prompt_only):
+    assert store.create_channel({**prompt_only, "purpose": "?!"})["topic"] == "channel"
+
+
+def test_a_derived_name_is_told_apart_from_an_existing_channel(store, prompt_only):
+    store.create_channel(prompt_only)
+    assert store.create_channel({**prompt_only, "id": "e" * 32})["topic"] == "fix-iphone-keyboard-autocorrect-2"
+
+
+def test_a_retried_derived_channel_keeps_its_first_name(store, prompt_only):
+    first = store.create_channel(prompt_only)["topic"]
+    assert store.create_channel(prompt_only)["topic"] == first
+
+
+def test_a_channel_without_agents_starts_one_for_its_kickoff(store, prompt_only):
+    topic = store.create_channel(prompt_only)["topic"]
+    assert [row["topic"] for row in store.hub.staffing_due()] == [topic]
+
+
+def test_the_directory_is_given_in_the_kickoff(store, prompt_only):
+    topic = store.create_channel({**prompt_only, "directory": "~/Documents/one-conv-cli"})["topic"]
+    assert _texts(store, topic)[0].endswith("\n\nDirectory: ~/Documents/one-conv-cli")
+
+
+def test_no_directory_leaves_the_kickoff_as_typed(store, prompt_only):
+    topic = store.create_channel(prompt_only)["topic"]
+    assert _texts(store, topic) == [prompt_only["purpose"]]
+
+
+def test_same_id_with_another_directory_is_refused(store, prompt_only):
+    store.create_channel(prompt_only)
+    with pytest.raises(HubError, match="different channel"):
+        store.create_channel({**prompt_only, "directory": "elsewhere"})
 
 
 # --- retries -------------------------------------------------------------------------------------------

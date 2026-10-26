@@ -145,7 +145,7 @@ def test_unit_holds_no_token(linux):
 
 def test_linux_install_writes_the_unit(linux):
     serve("--install", "--yes")
-    assert service.unit_path().read_text() == service.unit(service.os.environ.get("PATH", "/usr/bin:/bin"))
+    assert service.unit_path().read_text() == service.unit(service.service_path(service.os.environ.get("PATH", "/usr/bin:/bin")))
 
 
 def test_linux_install_enables_and_restarts_the_unit(linux):
@@ -172,3 +172,12 @@ def test_linux_uninstall_stops_the_unit(linux):
     serve("--install", "--yes")
     serve("--uninstall", "--yes")
     assert ["disable", "--now", service.UNIT] in linux
+
+
+def test_service_path_drops_the_launchers_environment():
+    private = str(service.Path(service.sys.executable).parent)
+    assert service.service_path(f"{private}:/usr/bin") == "/usr/bin"
+
+
+def test_service_path_keeps_the_first_of_repeated_entries():
+    assert service.service_path("/a:/b:/a") == "/a:/b"

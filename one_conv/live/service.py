@@ -84,6 +84,17 @@ def definition(path_env: str) -> dict:
     }
 
 
+def service_path(path_env: str) -> str:
+    """The installer's PATH without the launcher's private uv environment, whose folder changes with
+    its dependencies and whose python would shadow the system one in spawned sessions."""
+    private = str(Path(sys.executable).parent)
+    kept = []
+    for entry in path_env.split(os.pathsep):
+        if entry and entry != private and entry not in kept:
+            kept.append(entry)
+    return os.pathsep.join(kept)
+
+
 def installed() -> bool:
     return path().is_file()
 
@@ -127,7 +138,7 @@ def install() -> list[str]:
         if not _wait_until_stopped():
             raise RuntimeError("The running bridge did not stop; stop it with `one-conv live serve --stop` and retry.")
         notes.append("stopped the bridge that was running outside the login service")
-    path_env = os.environ.get("PATH", "/usr/bin:/bin")
+    path_env = service_path(os.environ.get("PATH", "/usr/bin:/bin"))
     if sys.platform != "darwin":
         return notes + _install_systemd(path_env)
     target = plist_path()

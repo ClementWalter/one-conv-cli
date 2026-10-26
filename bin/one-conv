@@ -2327,7 +2327,15 @@ def _iter_all_projects(sources: tuple[str, ...]):
 
 
 def _cloud_documents():
+    """(path, listing fields) of every saved cloud conversation, read once per command.
+
+    Each document holds a whole transcript; listing reads every one, so a command reads them only once.
+    """
+    context = click.get_current_context(silent=True)
+    if context is not None and "cloud_documents" in context.meta:
+        return context.meta["cloud_documents"]
     root = Path(os.environ.get("ONE_CONV_CLOUD_CACHE", str(Path.home() / ".cache/one-conv-cli/cloud")))
+    documents = []
     for path in root.glob("*/*.json"):
         if path.name.startswith("."):
             continue
@@ -2338,10 +2346,15 @@ def _cloud_documents():
         if (isinstance(document, dict) and isinstance(document.get("turns"), list)
                 and isinstance(document.get("cwd"), str) and isinstance(document.get("session"), str)
                 and document.get("source") in (*CLOUD_SOURCES, "chatgpt")):
-            yield path, document
+            documents.append((path, {field: document.get(field) for field in ("source", "cwd", "session", "title")}))
+    if context is not None:
+        context.meta["cloud_documents"] = documents
+    return documents
 
 
 def _cloud_projects(sources):
+    if not set(sources) & {*CLOUD_SOURCES, "chatgpt"}:
+        return
     seen = set()
     for _, document in _cloud_documents():
         source, cwd = document["source"], document["cwd"]

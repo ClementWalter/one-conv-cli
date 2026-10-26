@@ -613,7 +613,7 @@ def started(tmp_path, monkeypatch):
     """Spawn settings for claude in tmp_path; spawn.start calls are recorded instead of run."""
     monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
     calls = []
-    monkeypatch.setattr(spawn, "preflight", lambda harness: None)
+    monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: None)
     monkeypatch.setattr(workspace, "pull", lambda repository: False)
     monkeypatch.setattr(spawn, "start", lambda *args, **kwargs: calls.append((args, kwargs))
                         or spawn.Spawned("oneconv-claude-1", "claude", str(tmp_path), "claude:new"))
@@ -655,6 +655,18 @@ def test_a_spawn_order_after_an_ack_starts_nothing(started):
     assert started == []
 
 
+def test_a_spawn_order_is_refused_while_the_env_file_is_missing(started, tmp_path):
+    bridge.save_spawn_settings({**bridge.spawn_settings(), "env_file": str(tmp_path / "absent.sh")})
+    assert bridge.deliver_inbound(order())[0] == "refused"
+
+
+def test_a_started_session_gets_the_env_file_variables(started, tmp_path):
+    (tmp_path / "env.sh").write_text("export CLAUDE_CODE_OAUTH_TOKEN=fresh\n")
+    bridge.save_spawn_settings({**bridge.spawn_settings(), "env_file": str(tmp_path / "env.sh")})
+    bridge.deliver_inbound(order())
+    assert wait_for(started)[0][1]["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "fresh"
+
+
 def test_a_spawn_order_without_settings_is_refused(started):
     bridge.save_spawn_settings(None)
     assert bridge.deliver_inbound(order())[0] == "refused"
@@ -665,7 +677,7 @@ def test_a_spawn_order_for_another_harness_is_refused(started):
 
 
 def test_a_missing_tmux_refuses_the_spawn_order(started, monkeypatch):
-    monkeypatch.setattr(spawn, "preflight", lambda harness: (_ for _ in ()).throw(spawn.SpawnError("no tmux")))
+    monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: (_ for _ in ()).throw(spawn.SpawnError("no tmux")))
     assert bridge.deliver_inbound(order())[0] == "refused"
 
 
@@ -767,3 +779,10 @@ def test_a_started_session_is_published_at_once(started):
     bridge.deliver_inbound(order(), on_started=lambda: published.append(True))
     wait_for(published)
     assert published == [True]
+
+
+def test_the_spawner_command_saves_the_env_file(cli, tmp_path):
+    runner, group = cli
+    runner.invoke(group, ["spawner", "--harness", "claude", "--cwd", str(tmp_path),
+                          "--env-file", str(tmp_path / "env.sh"), "--yes"])
+    assert bridge.spawn_settings()["env_file"] == str((tmp_path / "env.sh").resolve())

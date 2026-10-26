@@ -80,7 +80,7 @@ def test_preflight_refuses_a_logged_out_claude(monkeypatch):
 
 def test_start_hands_the_pane_this_processs_credentials(homes, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
-    monkeypatch.setattr(spawn, "preflight", lambda harness: None)
+    monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: None)
     monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
     monkeypatch.setattr(spawn, "wait_for_session", lambda *args, **kw: "claude:x")
     started = []
@@ -88,6 +88,54 @@ def test_start_hands_the_pane_this_processs_credentials(homes, monkeypatch):
                         lambda argv, **kw: started.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
     spawn.start("claude", "do it", homes)
     assert "CLAUDE_CODE_OAUTH_TOKEN=tok" in started[0][:started[0].index("--")]
+
+
+def test_environment_reads_an_exported_variable(tmp_path):
+    (tmp_path / "env.sh").write_text("# credentials\nexport CLAUDE_CODE_OAUTH_TOKEN=tok\n")
+    assert spawn.environment(str(tmp_path / "env.sh"))["CLAUDE_CODE_OAUTH_TOKEN"] == "tok"
+
+
+def test_environment_unquotes_a_value(tmp_path):
+    (tmp_path / "env.sh").write_text("BOX_ID='bx 1'\n")
+    assert spawn.environment(str(tmp_path / "env.sh"))["BOX_ID"] == "bx 1"
+
+
+def test_environment_file_wins_over_this_process(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "stale")
+    (tmp_path / "env.sh").write_text("export CLAUDE_CODE_OAUTH_TOKEN=fresh\n")
+    assert spawn.environment(str(tmp_path / "env.sh"))["CLAUDE_CODE_OAUTH_TOKEN"] == "fresh"
+
+
+def test_environment_skips_lines_that_set_nothing(tmp_path, monkeypatch):
+    for var in spawn.AUTH_ENV:
+        monkeypatch.delenv(var, raising=False)
+    (tmp_path / "env.sh").write_text("set -e\n\nexport A=1\n")
+    assert spawn.environment(str(tmp_path / "env.sh")) == {"A": "1"}
+
+
+def test_environment_refuses_a_missing_file(tmp_path):
+    with pytest.raises(spawn.SpawnError, match="cannot read the spawner's env file"):
+        spawn.environment(str(tmp_path / "absent.sh"))
+
+
+def test_preflight_checks_claude_with_the_given_environment(monkeypatch):
+    monkeypatch.setattr(spawn.shutil, "which", lambda name: f"/bin/{name}")
+    seen = []
+    monkeypatch.setattr(spawn.subprocess, "run",
+                        lambda argv, **kw: seen.append(kw["env"]) or subprocess.CompletedProcess(argv, 0, "", ""))
+    spawn.preflight("claude", {"CLAUDE_CODE_OAUTH_TOKEN": "tok"})
+    assert seen[0]["CLAUDE_CODE_OAUTH_TOKEN"] == "tok"
+
+
+def test_start_hands_the_pane_the_given_environment(homes, monkeypatch):
+    monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: None)
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
+    monkeypatch.setattr(spawn, "wait_for_session", lambda *args, **kw: "claude:x")
+    started = []
+    monkeypatch.setattr(spawn.subprocess, "run",
+                        lambda argv, **kw: started.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
+    spawn.start("claude", "do it", homes, env={"BOX_ID": "bx1"})
+    assert started[0][started[0].index("--") - 2:started[0].index("--")] == ["-e", "BOX_ID=bx1"]
 
 
 def test_preflight_needs_tmux(monkeypatch):
@@ -165,7 +213,7 @@ def test_a_codex_thread_naming_another_spawn_is_not_owned(homes):
 
 
 def test_start_names_the_spawn_in_a_codex_prompt(homes, monkeypatch):
-    monkeypatch.setattr(spawn, "preflight", lambda harness: None)
+    monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: None)
     monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
     monkeypatch.setattr(spawn, "wait_for_session", lambda *args, **kw: "codex:x")
     started = []

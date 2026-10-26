@@ -81,7 +81,8 @@ def _read(path: Path) -> dict:
 
 
 def spawn_settings() -> dict | None:
-    """How this machine starts a session for the hub ({harness, cwd, model, args, priority}), or None if it starts none."""
+    """How this machine starts a session for the hub ({harness, cwd, model, args, priority, env_file}),
+    or None if it starts none."""
     data = _read(bridge_dir() / "spawn.json")
     return data if data.get("harness") in spawn.HARNESSES and data.get("cwd") else None
 
@@ -93,7 +94,7 @@ def save_spawn_settings(data: dict | None) -> None:
         _write_private(bridge_dir() / "spawn.json", data)
 
 
-def _start_for_hub(harness: str, prompt: str, config: dict, on_started=None) -> None:
+def _start_for_hub(harness: str, prompt: str, config: dict, env: dict[str, str], on_started=None) -> None:
     """Start the session in tmux, wait for it to register, then call `on_started`; failures are only logged.
 
     The hub moves a request whose spawned session never claims it to the cloud, so a failure
@@ -103,7 +104,7 @@ def _start_for_hub(harness: str, prompt: str, config: dict, on_started=None) -> 
     try:
         workspace.prepare(Path(config["cwd"]), settings().get("node", ""))
         started = spawn.start(harness, prompt, Path(config["cwd"]), config.get("model"),
-                              tuple(config.get("args") or ()), trust_folder=True)
+                              tuple(config.get("args") or ()), trust_folder=True, env=env)
         logger.info("started %s for the hub in tmux session %s", started.address, started.tmux)
         if on_started is not None:
             on_started()
@@ -121,11 +122,13 @@ def deliver_spawn(item: dict, on_started=None) -> tuple[str, str]:
         # A session acked the post before this order was handed out.
         return "accepted", "not started: a session already read the post"
     try:
-        spawn.preflight(harness)
+        env = spawn.environment(config.get("env_file"))
+        spawn.preflight(harness, env)
     except spawn.SpawnError as error:
         return "refused", str(error)
     # Registration takes up to a minute; deliveries go on meanwhile.
-    threading.Thread(target=_start_for_hub, args=(harness, item["text"], config, on_started), daemon=True).start()
+    threading.Thread(target=_start_for_hub, args=(harness, item["text"], config, env, on_started),
+                     daemon=True).start()
     return "accepted", f"starting a {harness} session in {config['cwd']}"
 
 

@@ -327,7 +327,11 @@ one-conv local search 'bridge reconnect' --ranked
 
 `local search` matches TEXT as one exact substring, newest first. `--ranked` matches
 turns holding every word of TEXT in any order, each as a word or the start of one,
-and orders them by BM25 relevance.
+and orders them by BM25 relevance. It reads a full-text index kept in the state
+directory (`$ONE_CONV_SEARCH_INDEX` overrides its path). Each search re-indexes
+only the sessions that changed, so the first ranked search indexes all history
+once and later ones skip parsing. Archived conversations join the index the
+first time the hub lists them for a query.
 
 Replace `PROJECT` with a name from the listing. `local read` lists its sessions;
 `local thread` reads the newest one. Choose another with `--session ID` or

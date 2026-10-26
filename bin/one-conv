@@ -2024,35 +2024,61 @@ def _corpus_load(path: Path) -> dict | None:
     return doc
 
 
+CORPUS_LISTING = "corpus-listing.json"
+
+
+def _corpus_listing_entry(path: Path, stat: os.stat_result) -> dict | None:
+    """What a listing needs of one corpus document, or None when it is not listed."""
+    doc = _corpus_load(path)
+    if doc is None:
+        return None
+    last = doc.get("last") or doc.get("started") or ""
+    try:
+        mtime = datetime.fromisoformat(last).timestamp() if last else stat.st_mtime
+    except ValueError:
+        mtime = stat.st_mtime
+    return {"cwd": doc.get("cwd") or "brain", "uuid": str(doc.get("session")),
+            "mtime": float(doc.get("mtime") or mtime), "title": doc.get("title")}
+
+
 def _corpus_project_index() -> dict[str, list[SessionHandle]]:
-    """Scan once per CLI invocation without retaining complete transcripts in memory."""
+    """Scan once per CLI invocation without retaining complete transcripts in memory.
+
+    A document is parsed only when its size or modification time changed since the last scan:
+    the corpus holds tens of thousands of documents, and reading them all dominates every command.
+    """
+    from one_conv.archive import read_json, write_json
     context = click.get_current_context(silent=True)
     if context is not None and "corpus_index" in context.meta:
         return context.meta["corpus_index"]
+    cache_path = Path(os.environ.get("ONE_CONV_CORPUS_LISTING", str(STATE_DIR / CORPUS_LISTING)))
+    cached = read_json(cache_path)
+    # Inclusion depends on this machine's name, so a listing saved under another name is not reused.
+    known = cached.get("files", {}) if cached.get("machine") == _THIS_MACHINE else {}
+    files: dict[str, list] = {}
     grouped: dict[str, list[SessionHandle]] = {}
     for root in _corpus_roots():
         for path in root.rglob("*.json"):
             if path.name.startswith("."):
                 continue
-            doc = _corpus_load(path)
-            if doc is None:
-                continue
-            cwd = doc.get("cwd") or "brain"
-            last = doc.get("last") or doc.get("started") or ""
             try:
-                mtime = datetime.fromisoformat(last).timestamp() if last else path.stat().st_mtime
-            except ValueError:
-                mtime = path.stat().st_mtime
-            grouped.setdefault(cwd, []).append(
-                SessionHandle(
-                    source="corpus",
-                    uuid=str(doc.get("session")),
-                    project_cwd=cwd,
-                    mtime=float(doc.get("mtime") or mtime),
-                    path=path,
-                    title_hint=doc.get("title"),
-                )
-            )
+                stat = path.stat()
+            except OSError:
+                continue
+            stamp = [stat.st_mtime_ns, stat.st_size]
+            previous = known.get(str(path))
+            entry = previous[2] if previous and previous[:2] == stamp else _corpus_listing_entry(path, stat)
+            files[str(path)] = [*stamp, entry]
+            if entry is None:
+                continue
+            grouped.setdefault(entry["cwd"], []).append(
+                SessionHandle(source="corpus", uuid=entry["uuid"], project_cwd=entry["cwd"], mtime=entry["mtime"],
+                              path=path, title_hint=entry["title"]))
+    if files != known:
+        try:
+            write_json(cache_path, {"machine": _THIS_MACHINE, "files": files})
+        except OSError as error:
+            log.warning("Could not save the corpus listing: %s", error)
     for handles in grouped.values():
         handles.sort(key=lambda h: h.mtime, reverse=True)
     if context is not None:
@@ -3226,6 +3252,96 @@ def _online_search(text: str, limit: int, project_query: str | None = None) -> l
     return rows
 
 
+def _exact_search(needle, sessions, sources, candidates, limit):
+    """The first `limit` turns holding `needle` as a substring, in session order, prefiltered without parsing."""
+    from one_conv.ranking import snippet
+    # bytes.lower() folds only ASCII, so a non-ASCII needle skips the raw-bytes prefilter.
+    probe = needle.encode("utf-8") if needle.isascii() else None
+    cursor_ids = None
+    if "cursor" in sources:
+        # None means Cursor is not installed, so nothing filters its (absent) sessions.
+        cursor_ids = _cursor_composer_ids_matching(needle)
+    results = []
+    for h in sessions:
+        if not h.archive and h.source in ("claude", "codex", "omp") and probe:
+            with h.path.open("rb") as f:
+                if probe not in f.read().lower():
+                    continue
+        elif not h.archive and h.source == "cursor" and cursor_ids is not None and h.composer_id not in cursor_ids:
+            continue
+        if h.archive and h.archive["key"] not in candidates:
+            continue
+        try:
+            turns = _handle_iter_turns(h, include_subagents=False)
+        except click.ClickException as error:  # One unreadable archived conversation must not hide the rest.
+            log.warning("%s: %s", h.uuid, error.message)
+            continue
+        for turn in turns:
+            rendered = _render_turn(turn, raw=False)
+            if not rendered or needle not in rendered.lower():
+                continue
+            results.append(_search_row(h, turn.ts, turn.role, snippet(rendered, [needle])))
+            if len(results) >= limit:
+                return results
+    return results
+
+
+def _search_row(handle, ts, role, text):
+    row = {"ts": ts, "source": handle.source, "cwd": handle.project_cwd, "session": handle.uuid,
+           "role": role, "text": text}
+    address = _handle_address(handle)
+    if address:
+        row["address"] = address
+    return row
+
+
+SEARCH_INDEX = "search-index.sqlite"
+
+
+def _index_identity(handle):
+    """(key, stamp) of a session in the search index; the stamp changes whenever its content may have."""
+    if handle.archive:
+        return f"archive:{handle.archive['key']}", handle.archive["revision"]
+    if handle.path is not None:
+        stat = handle.path.stat()
+        return f"{handle.source}:{handle.path}", f"{stat.st_mtime_ns}:{stat.st_size}"
+    return f"{handle.source}:{handle.composer_id or handle.uuid}", repr(handle.mtime)
+
+
+def _ranked_search(needles, sessions, candidates, limit, complete_sources):
+    """Best `limit` turns holding every needle, from the persistent index refreshed for changed sessions.
+
+    Archived sessions are indexed only once the hub lists them as candidates, so a search never
+    downloads the whole archive. `complete_sources`, when `sessions` lists every session of those
+    sources, drops their indexed sessions that no longer exist.
+    """
+    from one_conv.ranking import SearchIndex, snippet
+    index = SearchIndex(Path(os.environ.get("ONE_CONV_SEARCH_INDEX", str(STATE_DIR / SEARCH_INDEX))))
+    stamps = index.stamps()
+    scope, present = {}, set()
+    for h in sessions:
+        try:
+            key, stamp = _index_identity(h)
+        except OSError:  # Deleted since it was listed.
+            continue
+        present.add(key)
+        if h.archive and h.archive["key"] not in candidates:
+            continue
+        if stamps.get(key) != stamp:
+            try:
+                turns = _handle_iter_turns(h, include_subagents=False)
+            except click.ClickException as error:  # One unreadable archived conversation must not hide the rest.
+                log.warning("%s: %s", h.uuid, error.message)
+                continue
+            index.replace(key, h.source, stamp, ((turn.ts, turn.role, rendered) for turn in turns
+                                       if (rendered := _render_turn(turn, raw=False))))
+        scope[key] = h
+    if complete_sources:
+        index.forget(complete_sources, present)
+    return [_search_row(scope[key], ts, role, snippet(text, needles))
+            for key, ts, role, text in index.top(needles, scope, limit)]
+
+
 @cli.command()
 @click.argument("text")
 @_SOURCE_OPTION
@@ -3246,15 +3362,18 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
     check for claude/codex/omp's flat JSONL files, one batched SQL LIKE query
     for cursor's SQLite store (no single-file check is possible there) — so
     searching everywhere stays fast even with a lot of history.
+
+    --ranked reads a full-text index kept in the state directory
+    ($ONE_CONV_SEARCH_INDEX overrides its path). Each search re-indexes only
+    the sessions that changed since the last one, so the first ranked search
+    indexes all history once and later ones parse only what changed.
     """
-    from one_conv.ranking import Ranking, snippet, words
+    from one_conv.ranking import words
 
     sources = selected_sources(source_filter, SOURCES)
     needles = words(text) if ranked else [text.lower()]
     if ranked and not needles:
         raise click.BadParameter("The query holds no word to rank.", param_hint="TEXT")
-    # bytes.lower() folds only ASCII, so non-ASCII needles skip the raw-bytes prefilter.
-    probes = [needle.encode("utf-8") for needle in needles if needle.isascii()]
     sessions = _sessions_for_scope(project_query, sources)
     archive = _archive_state()
     candidates = set()
@@ -3262,54 +3381,19 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
         log.warning("Archived conversations were not searched.")
     elif archive and any(h.archive for h in sessions):
         from one_conv.archive import ArchiveError
+        from concurrent.futures import ThreadPoolExecutor
         try:  # Copies are merged on the full listing; only archived ones holding every needle are read.
-            listings = [{row["key"] for row in archive["client"].list_conversations(query=needle)} for needle in needles]
+            # One hub round trip per needle; in parallel, a several-word query costs about one.
+            with ThreadPoolExecutor(len(needles)) as pool:
+                listings = list(pool.map(lambda needle: {row["key"] for row in archive["client"].list_conversations(query=needle)},
+                                         needles))
             candidates = set.intersection(*listings)
         except ArchiveError as error:
             log.warning("%s Archived conversations were not searched.", error)
-    cursor_ids = None
-    if "cursor" in sources:
-        matching = [_cursor_composer_ids_matching(needle) for needle in needles]
-        # None means Cursor is not installed, so nothing filters its (absent) sessions.
-        cursor_ids = None if None in matching else set.intersection(*matching)
-
-    ranking = Ranking(needles) if ranked else None
-    results = []
-    for h in sessions:
-        if not h.archive and h.source in ("claude", "codex", "omp") and probes:
-            with h.path.open("rb") as f:
-                content = f.read().lower()
-            if not all(probe in content for probe in probes):
-                continue
-        elif not h.archive and h.source == "cursor" and cursor_ids is not None and h.composer_id not in cursor_ids:
-            continue
-        if h.archive and h.archive["key"] not in candidates:
-            continue
-        try:
-            turns = _handle_iter_turns(h, include_subagents=False)
-        except click.ClickException as error:  # One unreadable archived conversation must not hide the rest.
-            log.warning("%s: %s", h.uuid, error.message)
-            continue
-        for turn in turns:
-            rendered = _render_turn(turn, raw=False)
-            if not rendered or not ranked and needles[0] not in rendered.lower():
-                continue
-            row = {"ts": turn.ts, "source": h.source, "cwd": h.project_cwd, "session": h.uuid,
-                   "role": turn.role, "text": snippet(rendered, needles)}
-            address = _handle_address(h)
-            if address:
-                row["address"] = address
-            if ranked:
-                ranking.add(row, rendered)
-                continue
-            results.append(row)
-            if len(results) >= limit:
-                break
-        if len(results) >= limit:
-            break
-
     if ranked:
-        results = ranking.top(limit)
+        results = _ranked_search(needles, sessions, candidates, limit, () if project_query else sources)
+    else:
+        results = _exact_search(needles[0], sessions, sources, candidates, limit)
     if not offline and (source_filter is None or source_filter == "chatgpt"):
         results.extend(_online_search(text, limit, project_query))
     unique = {(row["source"], row["cwd"], row["session"], row["text"]): row for row in results}

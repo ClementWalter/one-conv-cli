@@ -274,16 +274,21 @@ def _age(stamp: str, now: float) -> float:
 
 
 def _start_spawner(boat, spawner: dict, state: dict, now: float, why: str) -> str:
-    """Resume the box and restart its bridge, at most once per SPAWNER_RETRY_SECONDS."""
+    """Resume a stopped box, or restart the bridge of a running one, at most once per SPAWNER_RETRY_SECONDS.
+
+    A resumed box brings its bridge back by itself; restarting it then would kill the spawn it is starting.
+    """
     if now - state.get("tried", 0.0) < SPAWNER_RETRY_SECONDS:
         return "waiting"
     state["tried"] = now
     from .workers import machine_status
     if machine_status(boat.info(spawner["box"]).get("state")) != "available":
         boat.resume_pool(spawner["box"])
+        log.warning("cloud spawner %s started: %s; resumed box %s", spawner["node"], why, spawner["box"])
+        return "resumed"
     boat._exec(spawner["box"], ["systemctl", "--user", "restart", SPAWNER_UNIT])
-    log.warning("cloud spawner %s started: %s; resumed box %s and restarted its bridge", spawner["node"], why, spawner["box"])
-    return "started"
+    log.warning("cloud spawner %s started: %s; restarted the bridge on box %s", spawner["node"], why, spawner["box"])
+    return "restarted"
 
 
 def application(directory, public_origin, *, worker_config=None, session_seconds=30 * 86400):

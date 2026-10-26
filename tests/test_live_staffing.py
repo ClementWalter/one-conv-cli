@@ -400,6 +400,52 @@ def test_without_cloud_workers_the_post_is_marked_unavailable(hub):
     assert staffing(hub, key) == ("cloud", "unavailable")
 
 
+class FailingManager:
+    def submit(self, spec, id):
+        raise ValueError("worker limit reached")
+
+
+@pytest.fixture
+def unavailable(hub):
+    """The cloud refused the request's worker once."""
+    key = post(hub)
+    staff_from_cloud(hub, SimpleNamespace(manager=FailingManager(), rate_card=lambda job: None))
+    return key
+
+
+def test_an_unavailable_request_waits_before_its_retry(hub, unavailable):
+    hub.sweep()
+    assert staffing(hub, unavailable) == ("cloud", "unavailable")
+
+
+def test_an_unavailable_request_goes_back_to_the_cloud(hub, unavailable, monkeypatch):
+    monkeypatch.setattr(hub_module, "UNAVAILABLE_RETRY_SECONDS", -1.0)
+    hub.sweep()
+    assert staffing(hub, unavailable) == ("cloud", "cloud")
+
+
+def test_an_unavailable_request_is_submitted_again(hub, unavailable, workers, monkeypatch):
+    monkeypatch.setattr(hub_module, "UNAVAILABLE_RETRY_SECONDS", -1.0)
+    hub.sweep()
+    staff_from_cloud(hub, workers)
+    assert staffing(hub, unavailable) == ("cloud", "submitted")
+
+
+def test_an_old_unavailable_request_is_not_retried(hub, unavailable, monkeypatch):
+    monkeypatch.setattr(hub_module, "UNAVAILABLE_RETRY_SECONDS", -1.0)
+    monkeypatch.setattr(hub_module, "STAFF_WINDOW_SECONDS", -1.0)
+    hub.sweep()
+    assert staffing(hub, unavailable) == ("cloud", "unavailable")
+
+
+def test_an_ack_closes_an_unavailable_request(hub, unavailable):
+    hub.publish("mac", [{"address": "claude:new"}])
+    hub.join("mac", "work", "claude:new")
+    hub.acknowledge("mac", "claude:new", unavailable.partition(":")[2])
+    hub.sweep()
+    assert staffing(hub, unavailable) == ("cloud", "done")
+
+
 # --- the control service runs the cloud spawner's box only while there is work -----------------
 
 

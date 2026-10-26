@@ -10,7 +10,6 @@ def isolated_session_vault(tmp_path, monkeypatch):
     # Live relay state must never reach the user's real inboxes or registries.
     monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live-relay"))
     # Caches derived from history must not land in the user's state directory either.
-    monkeypatch.setenv("ONE_CONV_CORPUS_LISTING", str(tmp_path / "corpus-listing.json"))
     monkeypatch.setenv("ONE_CONV_SEARCH_INDEX", str(tmp_path / "search-index.sqlite"))
 
 

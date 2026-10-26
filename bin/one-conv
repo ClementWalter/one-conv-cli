@@ -1982,182 +1982,7 @@ def _chatgpt_epoch(value) -> float:
         return 0.0
 
 
-# ---------------------------------------------------------------------------
-# Shared corpus (other machines + dedicated mouths)
-# ---------------------------------------------------------------------------
-
-_MOUTH_SOURCES = {"whatsapp", "telegram", "shortcut", "voicememo", "iphone", "brain", "chatgpt", "memo"}
 _THIS_MACHINE = socket.gethostname().split(".")[0]
-
-
-def _corpus_roots() -> list[Path]:
-    env = os.environ.get("ONE_CONV_CORPUS") or os.environ.get("AGENT_CONV_CORPUS")
-    if env:
-        return [Path(part).expanduser() for part in env.split(":") if part.strip()]
-    corpus = Path.home() / "Documents" / "corpus"
-    local = Path.home() / "Documents" / "Brain" / "log"
-    if corpus.is_dir():
-        return [corpus]
-    if local.is_dir():
-        return [local]
-    return []
-
-
-def _corpus_should_include(doc: dict) -> bool:
-    """Skip this machine's local agent sessions — those are read live."""
-    source = doc.get("source") or ""
-    machine = doc.get("machine") or ""
-    if source in _MOUTH_SOURCES or source == "corpus":
-        return True
-    return machine != _THIS_MACHINE
-
-
-def _corpus_load(path: Path) -> dict | None:
-    try:
-        doc = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return None
-    if not isinstance(doc, dict) or "turns" not in doc or "session" not in doc:
-        return None
-    if not _corpus_should_include(doc):
-        return None
-    return doc
-
-
-CORPUS_LISTING = "corpus-listing.json"
-
-
-def _corpus_listing_entry(path: Path, stat: os.stat_result) -> dict | None:
-    """What a listing needs of one corpus document, or None when it is not listed."""
-    doc = _corpus_load(path)
-    if doc is None:
-        return None
-    last = doc.get("last") or doc.get("started") or ""
-    try:
-        mtime = datetime.fromisoformat(last).timestamp() if last else stat.st_mtime
-    except ValueError:
-        mtime = stat.st_mtime
-    return {"cwd": doc.get("cwd") or "brain", "uuid": str(doc.get("session")),
-            "mtime": float(doc.get("mtime") or mtime), "title": doc.get("title")}
-
-
-def _corpus_project_index() -> dict[str, list[SessionHandle]]:
-    """Scan once per CLI invocation without retaining complete transcripts in memory.
-
-    A document is parsed only when its size or modification time changed since the last scan:
-    the corpus holds tens of thousands of documents, and reading them all dominates every command.
-    """
-    from one_conv.archive import read_json, write_json
-    context = click.get_current_context(silent=True)
-    if context is not None and "corpus_index" in context.meta:
-        return context.meta["corpus_index"]
-    cache_path = Path(os.environ.get("ONE_CONV_CORPUS_LISTING", str(STATE_DIR / CORPUS_LISTING)))
-    cached = read_json(cache_path)
-    # Inclusion depends on this machine's name, so a listing saved under another name is not reused.
-    known = cached.get("files", {}) if cached.get("machine") == _THIS_MACHINE else {}
-    files: dict[str, list] = {}
-    grouped: dict[str, list[SessionHandle]] = {}
-    for root in _corpus_roots():
-        for path in root.rglob("*.json"):
-            if path.name.startswith("."):
-                continue
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            stamp = [stat.st_mtime_ns, stat.st_size]
-            previous = known.get(str(path))
-            entry = previous[2] if previous and previous[:2] == stamp else _corpus_listing_entry(path, stat)
-            files[str(path)] = [*stamp, entry]
-            if entry is None:
-                continue
-            grouped.setdefault(entry["cwd"], []).append(
-                SessionHandle(source="corpus", uuid=entry["uuid"], project_cwd=entry["cwd"], mtime=entry["mtime"],
-                              path=path, title_hint=entry["title"]))
-    if files != known:
-        try:
-            write_json(cache_path, {"machine": _THIS_MACHINE, "files": files})
-        except OSError as error:
-            log.warning("Could not save the corpus listing: %s", error)
-    for handles in grouped.values():
-        handles.sort(key=lambda h: h.mtime, reverse=True)
-    if context is not None:
-        context.meta["corpus_index"] = grouped
-    return grouped
-
-
-
-def _corpus_iter_projects():
-    for cwd in _corpus_project_index():
-        yield ProjectHandle(source="corpus", cwd=cwd, key=cwd)
-
-
-def _corpus_project_sessions(project: ProjectHandle) -> list[SessionHandle]:
-    return _corpus_project_index().get(project.key, [])
-
-
-def _corpus_iter_turns(path: Path) -> list[Turn]:
-    try:
-        doc = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return []
-    turns = []
-    for row in doc.get("turns") or []:
-        text = row.get("text") or ""
-        if not text:
-            continue
-        turns.append(Turn(ts=row.get("ts") or "", role=row.get("role") or "user", blocks=[{"type": "text", "text": text}]))
-    return turns
-
-
-def _append_log_turn(mouth: str, role: str, text: str, machine: str | None = None) -> Path:
-    """Write one turn into the shared brain session (same schema as export)."""
-    text = (text or "").strip()
-    if not text:
-        raise click.ClickException("empty turn")
-    if role not in ("user", "assistant"):
-        raise click.ClickException(f"bad role {role!r}")
-    support = Path(os.environ.get("BRAIN_SUPPORT", str(Path.home() / "Library/Application Support/Brain")))
-    config_path = support / "runtime.json"
-    if config_path.exists():
-        config = json.loads(config_path.read_text())
-        if config.get("mode") == "active" and config.get("runtime"):
-            # The installed engine journals the turn before attempting cross-host sync.
-            result = subprocess.run([config["runtime"], "append-stdin"],
-                input=json.dumps({"mouth": mouth, "role": role, "text": text, "machine": machine}),
-                capture_output=True, text=True, timeout=60)
-            if result.returncode:
-                raise click.ClickException("Brain could not confirm the append; check its saved-input status before retrying.")
-            return Path(json.loads(result.stdout)["path"])
-    machine = machine or _THIS_MACHINE
-    roots = _corpus_roots()
-    root = roots[0] if roots else Path.home() / "Documents" / "corpus"
-    path = root / machine / "brain" / "brain" / "brain.json"
-    if path.exists():
-        try:
-            doc = json.loads(path.read_text())
-        except (OSError, ValueError):
-            doc = {}
-    else:
-        doc = {}
-    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    turns = list(doc.get("turns") or [])
-    turns.append({"ts": now, "role": role, "text": text, "mouth": mouth})
-    doc.update({
-        "source": "brain",
-        "session": "brain",
-        "machine": machine,
-        "cwd": "brain",
-        "title": doc.get("title") or "brain",
-        "author": "human",
-        "mtime": datetime.now(timezone.utc).timestamp(),
-        "started": doc.get("started") or now,
-        "last": now,
-        "turns": turns,
-    })
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(doc, ensure_ascii=False, indent=1) + "\n")
-    return path
 
 
 def _native_projects(sources: tuple[str, ...]):
@@ -2175,12 +2000,10 @@ def _native_projects(sources: tuple[str, ...]):
         yield from _omp_iter_projects()
     if "chatgpt" in sources:
         yield from _chatgpt_iter_projects()
-    if "corpus" in sources:
-        yield from _corpus_iter_projects()
     yield from _cloud_projects(sources)
 
 
-ARCHIVE_SYNC_SOURCES = tuple(source for source in SOURCES if source != "corpus")  # Corpus holds other machines' exports.
+ARCHIVE_SYNC_SOURCES = tuple(source for source in SOURCES if source != "corpus")  # Corpus rows are imported copies, never native.
 
 
 def _archive_state():
@@ -2390,8 +2213,6 @@ def _native_project_sessions(project: ProjectHandle) -> list[SessionHandle]:
         return _omp_project_sessions(project)
     if project.source == "chatgpt":
         return _chatgpt_project_sessions(project)
-    if project.source == "corpus":
-        return _corpus_project_sessions(project)
     return []
 
 
@@ -2543,8 +2364,6 @@ def _handle_iter_turns(handle: SessionHandle, include_subagents: bool) -> list[T
         return list(_omp_iter_turns(handle.path))
     if handle.source == "chatgpt":
         return _chatgpt_iter_turns(handle.path)
-    if handle.source == "corpus":
-        return list(_corpus_iter_turns(handle.path))
     return []
 
 
@@ -3122,12 +2941,10 @@ def thread(
         click.echo(f"{marker}{_local_ts(m['ts'])}  {m['role']}: {m['text']}\n")
 
 
-# --- export: the conversation corpus ------------------------------------------
+# --- export: text-only session snapshots for `tune` ----------------------------
 #
 # Every session, every source, as one small JSON file of user/assistant text:
-# what was said and answered, never tool output. That is 2% of the raw logs
-# and is what "my conversations, everywhere" needs: a private git repo synced
-# from each machine, readable by this CLI or by an agent looking for context.
+# what was said and answered, never tool output.
 
 # Token-shaped strings that tool output leaks into transcripts. Each pattern is
 # replaced by a marker so a transcript can never re-leak a credential.
@@ -3198,33 +3015,6 @@ def _export_all(out_root: Path, machine: str, sources: tuple[str, ...], cutoff: 
             else:
                 written.append(str(path.relative_to(out_root)))
     return written, skipped
-
-
-@cli.command()
-@click.option("--out", "out_dir", required=True, help="Root of the corpus checkout, e.g. ~/Documents/corpus.")
-@click.option("--machine", default=None, help="Folder name for this machine (default: hostname).")
-@click.option("--source", "source_filter", type=SourceChoice(SOURCES), default=None, help="Only this backend.")
-@click.option("--since", default=None, help="Only sessions active at/after this ISO date (default: all).")
-@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
-def export(out_dir: str, machine: str | None, source_filter: str | None, since: str | None, as_json: bool) -> None:
-    """Export every session as text to OUT/<machine>/<source>/<cwd>/<uuid>.json.
-
-    Only user and assistant text blocks are kept: tool calls, tool output,
-    thinking and sub-agent turns are dropped, and token-shaped strings are
-    redacted. A session
-    whose stored copy is already as recent as the source is skipped, so the
-    command is cheap to run hourly. Each file carries `author`: "human" for
-    sessions a person drove, "system" for heartbeat/worker prompts.
-    """
-    out_root = Path(out_dir).expanduser()
-    machine = machine or socket.gethostname().split(".")[0]
-    sources = selected_sources(source_filter, SOURCES)
-    cutoff = datetime.fromisoformat(since).timestamp() if since else 0.0
-    written, skipped = _export_all(out_root, machine, sources, cutoff)
-    if as_json:
-        click.echo(json.dumps({"machine": machine, "written": written, "skipped": skipped}))
-        return
-    click.echo(f"{machine}: {len(written)} session(s) written, {skipped} already current, under {out_root}")
 
 
 def _sessions_for_scope(project_query: str | None, sources: tuple[str, ...]) -> list[SessionHandle]:
@@ -4135,17 +3925,6 @@ def chatgpt_search(text: str, limit: int, account_filter: str | None, as_json: b
                    f"`one-conv chatgpt sync` pulls their text down.", err=True)
 
 
-@cli.command("append")
-@click.argument("mouth")
-@click.argument("role", type=click.Choice(("user", "assistant")))
-@click.argument("text")
-@click.option("--machine", default=None, help="Folder name for this machine (default: hostname).")
-def append(mouth: str, role: str, text: str, machine: str | None) -> None:
-    """Write one turn into the shared brain log (seconds-fresh on every host after sync)."""
-    path = _append_log_turn(mouth, role, text, machine=machine)
-    click.echo(str(path))
-
-
 @cli.command("cloud", context_settings={"ignore_unknown_options": True, "allow_extra_args": True}, add_help_option=False)
 @click.pass_context
 def cloud_command(context):
@@ -4250,7 +4029,7 @@ install_namespaces(cli, lambda: _chatgpt_accounts(), lambda: _claude_accounts(),
 
 
 def _tune_snapshot(out_root: Path) -> tuple[int, int]:
-    # The corpus source re-reads exports, so excluding it avoids training on duplicates.
+    # Corpus rows are archive copies of other sessions, so excluding them avoids training on duplicates.
     sources = tuple(source for source in SOURCES if source != "corpus")
     written, skipped = _export_all(out_root, _THIS_MACHINE, sources)
     return len(written), skipped
@@ -4258,7 +4037,7 @@ def _tune_snapshot(out_root: Path) -> tuple[int, int]:
 
 from one_conv.tune.cli import build_tune_group  # noqa: E402
 
-cli.add_command(build_tune_group(_tune_snapshot, _corpus_roots))
+cli.add_command(build_tune_group(_tune_snapshot, lambda: []))
 
 from one_conv.live.cli import build_live_group  # noqa: E402
 

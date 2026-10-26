@@ -10,7 +10,7 @@ for cloud hosting, shared worker boxes and team accounting.
 | Namespace | Sources |
 | --- | --- |
 | `cloud` | ChatGPT, Claude Chat, Codex cloud, Cowork cloud |
-| `local` | Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi, shared corpus files |
+| `local` | Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi, on this machine and every machine syncing to the archive |
 | `live` | Agent messaging, topics, spawning, hub and mobile workspace |
 | `hr` | Shared or local rate cards, usage evidence and expected ask costs |
 
@@ -338,7 +338,8 @@ Replace `PROJECT` with a name from the listing. `local read` lists its sessions;
 `--nth 2`, or use `local read PROJECT --expand` to read all of them.
 `--source claude|codex|cursor|cursor-cli|omp|corpus` narrows the source: `cursor` (or
 `cursor-ide`) is the Cursor IDE's chats, `cursor-cli` those of Cursor's terminal agent, the
-`agent` command, which keeps them under `~/.cursor/chats`. Local readers never
+`agent` command, which keeps them under `~/.cursor/chats`. `corpus` is sessions imported
+into the archive from the retired shared corpus. Local readers never
 discover cloud accounts.
 
 For agent workflows, `local fork` starts a new Claude Code thread from an
@@ -348,9 +349,7 @@ seeds a new Claude Code or Codex session from another conversation. These
 commands default to dry-run and require `--yes` to launch an agent. Execution
 can modify files or use tools.
 
-`local export` writes normalized transcripts to a corpus, `local append` writes
-a turn to the shared log, and `local skill-usage` reports recorded Claude Code
-skill invocations. Each command's `--help` describes its options.
+`local skill-usage` reports recorded Claude Code skill invocations. Each command's `--help` describes its options.
 
 ## Storage and coverage
 

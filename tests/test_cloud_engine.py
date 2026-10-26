@@ -191,7 +191,6 @@ def cli_module(monkeypatch, tmp_path):
     monkeypatch.setattr(module, "_cursor_iter_projects", lambda: iter(()))
     monkeypatch.setattr(module, "_omp_iter_projects", lambda: iter(()))
     monkeypatch.setattr(module, "_chatgpt_iter_projects", lambda: iter(()))
-    monkeypatch.setattr(module, "_corpus_iter_projects", lambda: iter(()))
     monkeypatch.setattr(module, "_cursor_composer_ids_matching", lambda _: set())
     monkeypatch.setenv("ONE_CONV_CLOUD_CACHE", str(tmp_path))
     return module

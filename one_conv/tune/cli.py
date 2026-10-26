@@ -123,7 +123,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
     @tune.command(context_settings=HELP)
     @click.option("--name", default="base", show_default=True, help="Dataset folder name.")
     @click.option("--corpus", "extra_roots", multiple=True, type=click.Path(path_type=Path),
-                  help="Additional export roots. Defaults: the snapshot plus the shared corpus.")
+                  help="Additional export roots, read after the snapshot.")
     @click.option("--source", "sources", multiple=True, type=click.Choice(AGENT_SOURCES),
                   help="Only these sources (repeatable). Default: every agent source.")
     @click.option("--rule", type=click.Choice(sorted(RULES)), default=None,

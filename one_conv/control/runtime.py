@@ -275,6 +275,23 @@ SPAWNER_DEFAULTS = {"profile": "default", "harness": "claude", "args": ["--dange
                     "priority": 0, "env_file": BOAT_SECRETS_FILE}
 
 
+SPAWNER_KEYS = {"node", "box", "git_user", *SPAWNER_DEFAULTS}
+
+
+def check_spawner(spawner, profiles) -> None:
+    """Refuse a spawner block the controller could not provision, when it starts rather than at the box."""
+    if (not isinstance(spawner, dict) or set(spawner) - SPAWNER_KEYS or not isinstance(spawner.get("node"), str)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", spawner["node"])
+            or spawner.get("box") is not None and not isinstance(spawner["box"], str)
+            or spawner.get("profile", "default") not in profiles
+            or spawner.get("harness", "claude") not in ("claude", "codex", "omp")
+            or type(spawner.get("priority", 0)) is not int
+            or not isinstance(spawner.get("args", []), list)
+            or spawner.get("git_user") is not None and (not isinstance(spawner["git_user"], dict)
+                                                         or set(spawner["git_user"]) != {"name", "email"})):
+        raise ValueError(f"the spawner block takes node and optionally {', '.join(sorted(SPAWNER_KEYS - {'node'}))}")
+
+
 def _revision() -> str:
     """The commit this controller runs; a new one re-provisions the spawner box with it."""
     import subprocess
@@ -303,7 +320,7 @@ def spawner_payload(manager, spawner: dict) -> dict:
     profile = manager.profiles[settings["profile"]]
     return {"operation": "spawner", "job_id": "spawner",
             "profile": {"repositories": profile["repositories"], "credential_refs": {}, "revisions": {}},
-            "git_user": settings["git_user"],
+            "git_user": settings.get("git_user"),
             "spawner": {key: settings[key] for key in ("harness", "args", "priority", "env_file")},
             "hub": {"url": manager.config["public_hub_url"], "node": settings["node"]}}
 
@@ -323,16 +340,25 @@ def provision_spawner(manager, spawner: dict, wanted: bool) -> str:
     """
     import json
 
-    from .workers import machine_status, private_json
+    from .workers import Gone, machine_status, private_json
     settings = {**SPAWNER_DEFAULTS, **spawner}
     record_path = manager.directory / "spawner.json"
     record = json.loads(record_path.read_text()) if record_path.exists() else {}
-    box = spawner.get("box") or record.get("box")
+    # The box this controller created or last provisioned outranks the configured one, which only seeds it.
+    box = record.get("box") or settings.get("box")
+    try:
+        state = manager.boat.info(box).get("state") if box else None
+    except Gone:
+        log.warning("cloud spawner box %s no longer exists; creating another", box)
+        box, state = None, None
     if box is None:
         box = manager.boat.create(manager.profiles[settings["profile"]], settings["node"], auto_stop=False)
-        record["box"] = box
+        record = {"box": box}
         private_json(record_path, record)
-        log.warning("created cloud spawner box %s for node %s", box, spawner["node"])
+        state = "available"
+        log.warning("created cloud spawner box %s for node %s", box, settings["node"])
+    elif record.get("box") != box:
+        record = {"box": box}
     spawner["box"] = box
     payload = spawner_payload(manager, spawner)
     fingerprint = _fingerprint(payload, _revision())
@@ -340,7 +366,7 @@ def provision_spawner(manager, spawner: dict, wanted: bool) -> str:
         return "current"
     if wanted or time.time() - record.get("tried", 0.0) < SPAWNER_RETRY_SECONDS:
         return "waiting"
-    if machine_status(manager.boat.info(box).get("state")) != "available":
+    if machine_status(state) != "available":
         return "asleep"
     record["tried"] = time.time()
     private_json(record_path, record)
@@ -469,6 +495,8 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
 
     # A configured cloud spawner takes every request the Mac does not, through the hub's own fallback.
     spawner = (worker_config or {}).get("spawner")
+    if spawner is not None:
+        check_spawner(spawner, workers.manager.profiles if workers else {})
 
     async def staff_requests():
         while True:

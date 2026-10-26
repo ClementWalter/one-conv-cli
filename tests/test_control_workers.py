@@ -1035,3 +1035,19 @@ def test_native_credentials_profiles_preserve_boat_agent_auth(monkeypatch, enabl
     monkeypatch.setattr(boat, "preflight", lambda profile: {"agent_credentials": enabled})
     boat.create({**DEFAULT_PROFILE, "boat_agent_credentials": enabled}, "pool-id")
     assert ("--no-env" in commands[0]) is expected
+
+
+def test_boat_reports_a_deleted_sandbox_as_gone(monkeypatch):
+    from one_conv.control.workers import Gone
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 1, '{"code":"not_found","error":"not found (404)","event":"error","status":404}', ""))
+    with pytest.raises(Gone):
+        BoatCLI().info("bx_deleted")
+
+
+def test_boat_reports_another_failure_as_unconfirmed(monkeypatch):
+    from one_conv.control.workers import Gone
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 1, "", "timeout"))
+    with pytest.raises(Unconfirmed) as raised:
+        BoatCLI().info("bx_known")
+    assert not isinstance(raised.value, Gone)

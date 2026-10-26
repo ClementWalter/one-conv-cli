@@ -124,7 +124,8 @@ def validate_spawner(data):
     if (not isinstance(profile, dict) or not _repositories(profile.get("repositories"))
             or profile.get("credential_refs") != {} or profile.get("revisions") != {}
             or not _hub(data.get("hub")) or not _secret(data.get("service_account")) or not _secret(data["hub"].get("token"))
-            or not isinstance(git_user, dict) or not _text(git_user.get("name")) or not _text(git_user.get("email"))
+            or git_user is not None and (not isinstance(git_user, dict) or not _text(git_user.get("name"))
+                                         or not _text(git_user.get("email")))
             or not isinstance(spawner, dict) or spawner.get("harness") not in SPAWNER_HARNESSES
             or type(spawner.get("priority")) is not int or not -1000 <= spawner["priority"] <= 1000
             or not isinstance(spawner.get("args"), list) or len(spawner["args"]) > 32
@@ -715,6 +716,13 @@ def install_uv():
     return Path.home() / ".local/bin/uv"
 
 
+def github_identity(env):
+    """Commit as the GitHub account the box logs in with; a private email becomes its noreply address."""
+    user = json.loads(run(["gh", "api", "user"], stage="git-identity", env=env).stdout)
+    email = user.get("email") or f"{user['id']}+{user['login']}@users.noreply.github.com"
+    return {"name": user.get("name") or user["login"], "email": email}
+
+
 def provision_spawner(data):
     """Make this box a spawner node from nothing: clones, git identity, uv, hub settings, the live
     install, spawner settings and the bridge's systemd unit. Every step is idempotent.
@@ -727,7 +735,7 @@ def provision_spawner(data):
     run(["git", "-C", str(checkout), "checkout", "-q", "main"], stage="checkout-main", env=env)
     run(["git", "-C", str(checkout), "pull", "-q", "--ff-only"], stage="checkout-pull", env=env)
     revision = run(["git", "-C", str(checkout), "rev-parse", "HEAD"], stage="checkout-head", env=env).stdout.strip()
-    git_user = data["git_user"]
+    git_user = data["git_user"] or github_identity(env)
     run(["git", "config", "--global", "user.name", git_user["name"]], stage="git-identity")
     run(["git", "config", "--global", "user.email", git_user["email"]], stage="git-identity")
     uv = install_uv()

@@ -499,6 +499,17 @@ one-conv live spawner --harness claude --cwd ~/work --env-file /run/secrets/env.
   machine whose bridge offers to (`live spawner`), else on a cloud worker when no
   such machine is connected, refuses, or no session acks within 90 s. The post
   shows "Starting a session…" until a session acks it.
+- The cloud spawner is a Boat box the controller builds and runs itself. Its
+  worker config takes `"spawner": {"node": "<hub node>"}`, plus optionally `box`
+  (an existing box to adopt), `git_user` (`{"name", "email"}`; else the box's
+  GitHub account), `profile`, `harness`, `args`, `priority` and `env_file`
+  (default `/run/ascii-secrets/env.sh`, where Boat writes the agent credentials).
+  With no box, or once Boat no longer knows it, the controller creates one
+  (auto-stop off). Whenever the controller's revision or these settings change,
+  it provisions the box from nothing: clones, GitHub login, git identity, hub
+  settings, `live install`, `live spawner`, and the bridge's systemd unit
+  (`live serve --install`). It sleeps the box after 30 idle minutes and wakes it
+  when a post waits.
 - Limits: the hub authenticates machines, not each process, so a session on a
   machine is trusted as that machine's agent.
 

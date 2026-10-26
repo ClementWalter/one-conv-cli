@@ -117,3 +117,40 @@ def test_a_failed_provisioning_waits_before_retrying(manager):
     manager.boat.health = {"status": "failed", "stage": "github-login"}
     provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=False)
     assert provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=False) == "waiting"
+
+
+def test_a_deleted_box_is_replaced(manager, monkeypatch):
+    from one_conv.control.workers import Gone
+
+    def gone(box):
+        raise Gone("deleted")
+    monkeypatch.setattr(manager.boat, "info", gone)
+    provision_spawner(manager, {**SPAWNER, "box": "bx_deleted"}, wanted=False)
+    assert manager.boat.calls[0] == ("create", "cloudbox", False)
+
+
+def test_the_box_the_controller_created_outranks_the_configured_one(manager):
+    (manager.directory / "spawner.json").write_text(json.dumps({"box": "bx_created"}))
+    provision_spawner(manager, {**SPAWNER, "box": "bx_configured"}, wanted=False)
+    assert manager.boat.calls == [("bootstrap", "bx_created")]
+
+
+def test_git_identity_is_left_to_the_box_when_not_configured(manager):
+    provision_spawner(manager, {"node": "cloudbox", "box": "bx_cloud"}, wanted=False)
+    assert manager.boat.payloads[0]["git_user"] is None
+
+
+def test_a_spawner_block_needs_only_a_node():
+    runtime.check_spawner({"node": "cloudbox"}, {"default": DEFAULT_PROFILE})
+
+
+@pytest.mark.parametrize("spawner", [
+    {"box": "bx_1"},
+    {"node": "Bad Node"},
+    {"node": "cloudbox", "colour": "red"},
+    {"node": "cloudbox", "profile": "absent"},
+    {"node": "cloudbox", "git_user": {"name": "Ada"}},
+])
+def test_a_bad_spawner_block_is_refused(spawner):
+    with pytest.raises(ValueError, match="spawner block"):
+        runtime.check_spawner(spawner, {"default": DEFAULT_PROFILE})

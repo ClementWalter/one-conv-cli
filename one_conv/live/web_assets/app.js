@@ -1733,36 +1733,22 @@ async function routineAction(action) {
 }
 
 function openChannelDialog() {
-  const list = $("channel-members");
-  list.replaceChildren();
-  const online = model.state.sessions.filter(
-    (s) => !s.history_only && (!s.presence || s.presence.state !== "offline"),
-  );
-  for (const s of online) {
-    const box = document.createElement("input");
-    box.type = "checkbox";
-    box.value = s.address;
-    const p = person(s.address);
-    const label = el("label");
-    label.append(box, el("span", p.name + " · " + (s.title || s.cwd || s.address)));
-    list.appendChild(label);
-  }
-  if (!online.length) list.appendChild(el("p", "No agent is connected; you can still create the channel and invite them later.", "quiet-copy"));
   $("channel-feedback").textContent = "";
   $("channel-dialog").showModal();
-  $("channel-name").focus();
+  $("channel-purpose").focus();
 }
 
 async function createChannel(event) {
   event.preventDefault();
   if (model.creatingChannel || !model.token) return;
+  // The workspace fixes the name's case and spacing, or derives it from the prompt when left empty.
   const spec = {
-    topic: $("channel-name").value.trim().replace(/^#/, "").toLowerCase(),
+    topic: $("channel-name").value.trim(),
     purpose: $("channel-purpose").value.trim(),
-    members: [...$("channel-members").querySelectorAll("input:checked")].map((box) => box.value),
+    directory: $("channel-directory").value.trim(),
   };
   model.creatingChannel = true; $("channel-submit").disabled = true;
-  $("channel-feedback").textContent = "Creating #" + spec.topic + "…";
+  $("channel-feedback").textContent = "Creating the channel…";
   try {
     // The same form contents keep the same request ID, so a retry finishes the same channel.
     const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(spec))))]

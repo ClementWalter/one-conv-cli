@@ -28,6 +28,8 @@ COMMANDS = {
     "cursor": lambda prompt, model: ["agent", *(["--model", model] if model else []), prompt],
 }
 SESSION_PREFIX = "oneconv-"
+# Harness credentials handed to every spawned pane.
+AUTH_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CURSOR_API_KEY")
 
 
 class SpawnError(Exception):
@@ -86,6 +88,10 @@ def preflight(harness: str) -> None:
     binary = BINARIES.get(harness, harness)
     if shutil.which(binary) is None:
         raise SpawnError(f"{binary} is not on PATH")
+    if harness == "claude" and subprocess.run(["claude", "auth", "status"], capture_output=True,
+                                              check=False).returncode:
+        # A logged-out Claude Code registers, then answers every prompt with "Not logged in".
+        raise SpawnError("claude is not logged in on this machine")
     if harness == "omp" and not omp.extension_path().exists():
         # Without the extension an omp session never registers, so nothing could message it.
         raise SpawnError("omp sessions register only with the live extension; run `one-conv live install --yes` first")
@@ -105,8 +111,10 @@ def start(harness: str, prompt: str, cwd: Path, model: str | None = None, extra:
         prompt = f"{prompt}\n\n(one-conv spawn {name})"
     argv = command(harness, prompt, model, extra, trust_folder)
     before = {s.address for s in router.list_all(harness)}
+    # A tmux server keeps the environment it started with, which may predate the credentials this process has.
+    credentials = [flag for var in AUTH_ENV if var in os.environ for flag in ("-e", f"{var}={os.environ[var]}")]
     result = subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", str(cwd), "-x", "200", "-y", "50",
-                             "--", *argv], capture_output=True, text=True, check=False)
+                             *credentials, "--", *argv], capture_output=True, text=True, check=False)
     if result.returncode:
         raise SpawnError(f"tmux could not start {harness}: {result.stderr.strip() or result.returncode}")
     spawned = Spawned(name, harness, str(cwd))

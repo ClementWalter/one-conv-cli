@@ -166,6 +166,12 @@ def test_claude_lists_running_session(homes):
     assert [s.address for s in claude.list_sessions()] == ["claude:c1"]
 
 
+def test_claude_lists_a_session_resumed_twice_once(homes):
+    _claude_record(homes, os.getpid(), updatedAt=2)
+    _claude_record(homes, os.getppid(), updatedAt=1)
+    assert [s.pid for s in claude.list_sessions()] == [os.getpid()]
+
+
 def _transcript(homes, *entries):
     """Session c1's transcript under /work/app, as Claude Code names its project folder."""
     folder = homes / "claude" / "projects" / "-work-app"

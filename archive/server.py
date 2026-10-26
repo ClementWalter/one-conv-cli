@@ -10,6 +10,8 @@ from importlib import import_module
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
+from starlette.middleware import Middleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
@@ -173,7 +175,9 @@ def create_app(store: ConversationStore, token=None, max_request_bytes=MAX_REQUE
         data = await run_in_threadpool(store.read_chunk, request.path_params["digest"])
         return Response(data, media_type="application/octet-stream") if data else JSONResponse({"error": "Not found"}, status_code=404)
 
-    return Starlette(routes=[Route("/v1/conversations", conversations, methods=["GET", "POST"]),
+    # Metadata pages repeat paths and keys; compression keeps listing transfers small.
+    return Starlette(middleware=[Middleware(GZipMiddleware, minimum_size=1000, compresslevel=6)],
+                     routes=[Route("/v1/conversations", conversations, methods=["GET", "POST"]),
                              Route("/v1/conversations/{key}", conversation),
                              Route("/v1/chunks", upload, methods=["POST"]),
                              Route("/v1/chunks/missing", missing, methods=["POST"]),

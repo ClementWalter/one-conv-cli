@@ -2,6 +2,7 @@
 import base64
 import copy
 import dataclasses
+import gzip
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -19,6 +20,7 @@ import types
 import zlib
 from pathlib import Path
 from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 import pytest
 import uvicorn
@@ -57,6 +59,72 @@ def archive(tmp_path):
     yield store, ArchiveClient(url, "test-secret"), url
     stop()
     store.engine.dispose()
+
+
+@pytest.fixture
+def large_listing(archive):
+    """Repeated metadata makes HTTP compression observable over a real socket."""
+    store, client, url = archive
+    metadata = {"mtime": 1, "title": "A conversation in a shared project " * 100}
+    store.put("key", "revision", metadata, "", {}, None)
+    return client, url, {"items": [{**metadata, "key": "key", "revision": "revision"}], "next": None}
+
+
+@pytest.mark.parametrize("encoding,expected", [("gzip", "gzip"), ("identity", None)])
+def test_listing_compression_is_negotiated(large_listing, encoding, expected):
+    _, url, _ = large_listing
+    request = Request(url + "/v1/conversations", headers={
+        "Authorization": "Bearer test-secret", "Accept-Encoding": encoding})
+    with urlopen(request) as response:
+        assert response.headers.get("Content-Encoding") == expected
+
+
+def test_compressed_listing_reduces_wire_bytes(large_listing):
+    _, url, expected = large_listing
+    request = Request(url + "/v1/conversations", headers={
+        "Authorization": "Bearer test-secret", "Accept-Encoding": "gzip"})
+    with urlopen(request) as response:
+        assert len(response.read()) < len(json.dumps(expected).encode()) / 4
+
+
+def test_archive_client_decodes_compressed_listing(large_listing):
+    client, _, expected = large_listing
+    assert list(client.list_conversations()) == expected["items"]
+
+
+@pytest.mark.parametrize("payload", [b"invalid gzip", gzip.compress(b"{}", mtime=0)[0:12]],
+                         ids=["invalid-header", "truncated-stream"])
+def test_archive_client_reports_invalid_compression(payload):
+    from starlette.applications import Starlette
+    from starlette.responses import Response
+    from starlette.routing import Route
+
+    async def compressed(request):
+        return Response(payload, headers={"Content-Encoding": "gzip"})
+
+    url, stop = serve(Starlette(routes=[Route("/v1/conversations", compressed)]))
+    try:
+        with pytest.raises(ArchiveError, match="invalid response"):
+            ArchiveClient(url, "test-secret").request("conversations")
+    finally:
+        stop()
+
+
+def test_archive_client_decodes_compressed_errors():
+    from starlette.applications import Starlette
+    from starlette.responses import Response
+    from starlette.routing import Route
+
+    async def compressed(request):
+        return Response(gzip.compress(b'{"error":"compressed reason"}'), status_code=409,
+                        headers={"Content-Encoding": "gzip"})
+
+    url, stop = serve(Starlette(routes=[Route("/v1/conversations", compressed)]))
+    try:
+        with pytest.raises(ArchiveError, match="409.*compressed reason"):
+            ArchiveClient(url, "test-secret").request("conversations")
+    finally:
+        stop()
 
 
 def fixture_env(tmp_path):

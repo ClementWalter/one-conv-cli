@@ -355,7 +355,7 @@ def provision_spawner(manager, spawner: dict, wanted: bool) -> str:
         box = manager.boat.create(manager.profiles[settings["profile"]], settings["node"], auto_stop=False)
         record = {"box": box}
         private_json(record_path, record)
-        state = "available"
+        state = manager.boat.info(box).get("state")
         log.warning("created cloud spawner box %s for node %s", box, settings["node"])
     elif record.get("box") != box:
         record = {"box": box}

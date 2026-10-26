@@ -154,3 +154,7 @@ def test_a_spawner_block_needs_only_a_node():
 def test_a_bad_spawner_block_is_refused(spawner):
     with pytest.raises(ValueError, match="spawner block"):
         runtime.check_spawner(spawner, {"default": DEFAULT_PROFILE})
+
+
+def test_a_created_box_is_provisioned_at_once(manager):
+    assert provision_spawner(manager, dict(SPAWNER), wanted=False) == "provisioned"

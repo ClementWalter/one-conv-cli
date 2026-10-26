@@ -67,6 +67,9 @@ LEASE_SECONDS = 60.0
 MEMBER_GRACE_SECONDS = 600.0
 # A spawn order nobody has turned into a claim by then goes to the next spawner, else the cloud.
 SPAWN_FALLBACK_SECONDS = 90.0
+# Spawn orders one request gets at most: every connected spawner first, then the same ones again,
+# so a start that failed by accident is retried and a machine that always fails starts no loop.
+SPAWN_ATTEMPTS = 3
 # Only requests created or released this recently are staffed, so old unowned ones never start sessions.
 STAFF_WINDOW_SECONDS = 3600.0
 SPAWN_HARNESSES = ("claude", "codex", "omp")
@@ -319,17 +322,38 @@ class Hub:
                           (now - LEASE_SECONDS, now - LEASE_SECONDS)).fetchall()
         return [(node, harness) for node, harness in rows if node not in tried]
 
-    @staticmethod
-    def _spawn_id(key: str, node: str, first: bool) -> str:
-        """The first order keeps the id it always had, so an order sent before a fallback is still found."""
-        return hashlib.sha256(f"{key}:spawn{'' if first else ':' + node}".encode()).hexdigest()[:32]
+    def _next_spawner(self, db, now: float, tried: list[str], refused=()) -> tuple[str, str] | None:
+        """A connected spawner not yet tried, the preferred first; once all were, any that did not refuse,
+        within SPAWN_ATTEMPTS orders."""
+        spawners = self._spawners(db, now, tried)
+        if not spawners and len(tried) < SPAWN_ATTEMPTS:
+            spawners = [s for s in self._spawners(db, now) if s[0] not in refused]
+        return spawners[0] if spawners else None
 
-    def _order_spawn(self, db, post: dict, node: str, harness: str, first: bool) -> str:
+    def _refusers(self, db, node: str, tried: list[str], spawn_ids: list[str]) -> set[str]:
+        """The spawners that refused this request's orders."""
+        if not spawn_ids:
+            return set()
+        refused = {row[0] for row in db.execute(
+            f"SELECT p.id FROM posts p JOIN deliveries d ON d.post = p.seq WHERE p.from_node = ? AND p.kind = 'system'"
+            f" AND d.outcome = 'refused' AND p.id IN ({','.join('?' * len(spawn_ids))})", (node, *spawn_ids))}
+        return {n for n, ident in zip(tried, spawn_ids) if ident in refused}
+
+    @staticmethod
+    def _spawn_id(key: str, earlier: list[str], node: str) -> str:
+        """The id of the order sent to `node` after orders to `earlier`; each order of a request has its own.
+
+        The first order and each node's first fallback order keep the ids they always had.
+        """
+        suffix = "" if not earlier else f":{node}" if node not in earlier else f":{node}:{len(earlier)}"
+        return hashlib.sha256(f"{key}:spawn{suffix}".encode()).hexdigest()[:32]
+
+    def _order_spawn(self, db, post: dict, node: str, harness: str, earlier: list[str]) -> str:
         """Queue a spawn order for this post to one spawner; returns its route."""
         route = f"{node}/spawn:{harness}"
         from_node, _, sender = post["created_by"].partition("/")
-        digest = hashlib.sha256(json.dumps(["spawn", post["key"], node]).encode()).hexdigest()
-        self._insert(db, from_node, self._spawn_id(post["key"], node, first), digest, route, sender, post["topic"],
+        digest = hashlib.sha256(json.dumps(["spawn", post["key"], node, len(earlier)]).encode()).hexdigest()
+        self._insert(db, from_node, self._spawn_id(post["key"], earlier, node), digest, route, sender, post["topic"],
                      "expected", "push", self.spawn_prompt(post, self._predecessors(db, post["topic"])), [(node, f"spawn:{harness}", None)], kind="system")
         return route
 
@@ -338,13 +362,13 @@ class Hub:
         row = db.execute("SELECT route, state FROM staffing WHERE task = ? AND version = 1", (post["key"],)).fetchone()
         if row:
             return {"route": row[0], "state": row[1]}
-        spawners = self._spawners(db, now)
-        if not spawners:
+        spawner = self._next_spawner(db, now, [])
+        if spawner is None:
             db.execute("INSERT INTO staffing (task, version, route, state, detail, created, updated)"
                        " VALUES (?, 1, 'cloud', 'cloud', '', ?, ?)", (post["key"], now, now))
             return {"route": "cloud", "state": "cloud"}
-        node, harness = spawners[0]
-        route = self._order_spawn(db, post, node, harness, first=True)
+        node, harness = spawner
+        route = self._order_spawn(db, post, node, harness, [])
         db.execute("INSERT INTO staffing (task, version, route, state, detail, created, updated, tried)"
                    " VALUES (?, 1, ?, 'node', '', ?, ?, ?)", (post["key"], route, now, now, node))
         return {"route": route, "state": "node"}
@@ -400,7 +424,7 @@ class Hub:
             node, _, ident = key.partition(":")
             # Rows staffed before `tried` existed name their only spawner in the route.
             tried = tried.split() or ([route.partition("/")[0]] if route != "cloud" else [])
-            spawn_ids = [self._spawn_id(key, n, i == 0) for i, n in enumerate(tried)]
+            spawn_ids = [self._spawn_id(key, tried[:i], n) for i, n in enumerate(tried)]
             seq = db.execute("SELECT seq, topic FROM posts WHERE from_node = ? AND id = ?", (node, ident)).fetchone()
             acked = seq is not None and db.execute("SELECT 1 FROM post_acks WHERE post = ?", (seq[0],)).fetchone()
             if seq is None or acked:
@@ -415,9 +439,9 @@ class Hub:
                 # A spawner that connects later, such as a cloud box coming back, takes a request still waiting.
                 post = self._human_post(db, seq[0])
                 if (state == "cloud" and post["created"] >= now - STAFF_WINDOW_SECONDS
-                        and (spawners := self._spawners(db, now, tried))):
-                    spawner_node, harness = spawners[0]
-                    route = self._order_spawn(db, post, spawner_node, harness, first=not tried)
+                        and (spawner := self._next_spawner(db, now, tried, self._refusers(db, node, tried, spawn_ids)))):
+                    spawner_node, harness = spawner
+                    route = self._order_spawn(db, post, spawner_node, harness, tried)
                     db.execute("UPDATE staffing SET route = ?, state = 'node', updated = ?, tried = ? WHERE task = ?",
                                (route, now, " ".join([*tried, spawner_node]), key))
                 continue
@@ -428,11 +452,15 @@ class Hub:
             refused = outcome is not None and outcome[0] == "refused"
             if refused or updated < now - SPAWN_FALLBACK_SECONDS:
                 why = f"{route} {'refused the spawn' if refused else 'started no session that acked in time'}"
-                spawners = self._spawners(db, now, tried)
-                if spawners:
+                # An order its spawner never took starts nothing once the request has moved on.
+                db.execute("UPDATE deliveries SET mode = 'fyi' WHERE outcome IS NULL AND post IN"
+                           " (SELECT seq FROM posts WHERE from_node = ? AND kind = 'system' AND id = ?)",
+                           (node, spawn_ids[-1]))
+                spawner = self._next_spawner(db, now, tried, self._refusers(db, node, tried, spawn_ids))
+                if spawner:
                     post = self._human_post(db, seq[0])
-                    next_node, harness = spawners[0]
-                    next_route = self._order_spawn(db, post, next_node, harness, first=False)
+                    next_node, harness = spawner
+                    next_route = self._order_spawn(db, post, next_node, harness, tried)
                     db.execute("UPDATE staffing SET route = ?, detail = ?, updated = ?, tried = ? WHERE task = ?",
                                (next_route, why, now, " ".join([*tried, next_node]), key))
                 else:
@@ -448,7 +476,7 @@ class Hub:
                               (node, now - LEASE_SECONDS, now - LEASE_SECONDS)).fetchone() is not None
             busy = busy or db.execute("SELECT 1 FROM staffing WHERE state = 'node' AND route LIKE ?",
                                       (f"{node}/%",)).fetchone() is not None
-            wanted = any(node not in tried.split() for (tried,) in db.execute(
+            wanted = any(node not in tried.split() or len(tried.split()) < SPAWN_ATTEMPTS for (tried,) in db.execute(
                 "SELECT tried FROM staffing WHERE state = 'cloud' AND created >= ?", (now - STAFF_WINDOW_SECONDS,)))
         return {"busy": busy, "wanted": wanted}
 

@@ -886,3 +886,17 @@ def test_a_logged_out_spawner_needs_auth(provisioned, spawner_payload, monkeypat
     from one_conv.live import spawn
     monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: (_ for _ in ()).throw(spawn.SpawnError("no")))
     assert bootstrap.provision_spawner(spawner_payload)["status"] == "auth_needed"
+
+
+def test_the_images_uv_is_used(worker_home, monkeypatch):
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: "/usr/local/bin/uv")
+    monkeypatch.setattr(bootstrap, "run", lambda *args, **kwargs: pytest.fail("an installed uv is not replaced"))
+    assert bootstrap.install_uv() == Path("/usr/local/bin/uv")
+
+
+def test_a_missing_uv_is_installed_from_the_pinned_installer(worker_home, monkeypatch):
+    calls = []
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: None)
+    monkeypatch.setattr(bootstrap, "run", lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
+    bootstrap.install_uv()
+    assert calls[0][-1] == f"https://astral.sh/uv/{bootstrap.UV_VERSION}/install.sh"

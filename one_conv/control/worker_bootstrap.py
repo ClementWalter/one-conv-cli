@@ -702,18 +702,17 @@ def _launcher_link(checkout):
 
 
 def install_uv():
-    """The pinned uv from Astral's versioned installer, which runs the one-conv launcher."""
-    target = Path.home() / ".local/bin/uv"
-    if target.exists() and run([str(target), "--version"], stage="uv-version").stdout.split()[1:2] == [UV_VERSION]:
-        return target
-    with urllib.request.urlopen(f"https://astral.sh/uv/{UV_VERSION}/install.sh", timeout=60) as response:
-        script = response.read()
-    with tempfile.NamedTemporaryFile("wb", suffix=".sh") as installer:
-        installer.write(script)
-        installer.flush()
-        run(["sh", installer.name], stage="uv-install", env={**os.environ, "UV_NO_MODIFY_PATH": "1",
-                                                               "UV_INSTALL_DIR": str(target.parent)}, timeout=300)
-    return target
+    """The uv that runs the one-conv launcher: the image's own, else Astral's pinned installer's."""
+    existing = shutil.which("uv") or (Path.home() / ".local/bin/uv" if (Path.home() / ".local/bin/uv").exists() else None)
+    if existing:
+        return Path(existing)
+    with tempfile.TemporaryDirectory() as folder:
+        installer = Path(folder) / "install.sh"
+        # Astral's CDN refuses urllib's user agent.
+        run(["curl", "-LsSf", "-o", str(installer), f"https://astral.sh/uv/{UV_VERSION}/install.sh"], stage="uv-download")
+        run(["sh", str(installer)], stage="uv-install", timeout=300,
+            env={**os.environ, "UV_NO_MODIFY_PATH": "1", "UV_INSTALL_DIR": str(Path.home() / ".local/bin")})
+    return Path.home() / ".local/bin/uv"
 
 
 def provision_spawner(data):

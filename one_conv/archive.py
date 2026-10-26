@@ -1,6 +1,7 @@
 """Versioned archive transport and capture format, shared by the client and the server."""
 
 import base64
+import gzip
 import hashlib
 import json
 import math
@@ -129,6 +130,12 @@ class NoRedirect(HTTPRedirectHandler):
         return None  # Never forward credentials to another endpoint.
 
 
+def _response_bytes(response):
+    """Decode negotiated HTTP compression before parsing JSON or chunk content."""
+    data = response.read()
+    return gzip.decompress(data) if response.headers.get("Content-Encoding") == "gzip" else data
+
+
 def encode(value, *, sort_keys=False):
     return json.dumps(value, ensure_ascii=False, sort_keys=sort_keys, separators=(",", ":")).encode()
 
@@ -198,18 +205,21 @@ class ArchiveClient:
         data = encode(body) if body is not None else None
         request = Request(self.url + "/v1/" + path, data=data,
                           headers={"Authorization": "Bearer " + self.token,
-                                   "Content-Type": "application/json"})
+                                   "Content-Type": "application/json",
+                                   # Chunks already contain zlib data and do not benefit from gzip.
+                                   "Accept-Encoding": "identity" if raw else "gzip"})
         timeout = self.timeout + len(data or b"") / MIN_UPLOAD_BYTES_PER_SECOND
         try:
             with build_opener(NoRedirect).open(request, timeout=timeout) as response:
-                return response.read() if raw else json.load(response)
+                content = _response_bytes(response)
+                return content if raw else json.loads(content)
         except HTTPError as error:
             try:
-                reason = json.load(error)["error"]
-            except (OSError, ValueError, KeyError, TypeError):
+                reason = json.loads(_response_bytes(error))["error"]
+            except (OSError, EOFError, zlib.error, ValueError, KeyError, TypeError):
                 reason = error.reason
             raise ArchiveError(f"Archive returned HTTP {error.code} ({reason}); no changes acknowledged.") from error
-        except (URLError, TimeoutError, OSError, ValueError) as error:
+        except (URLError, TimeoutError, OSError, EOFError, zlib.error, ValueError) as error:
             raise ArchiveError("Archive unavailable or returned an invalid response.") from error
 
     def list_conversations(self, query=None):

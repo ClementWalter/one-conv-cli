@@ -1064,7 +1064,7 @@ def test_archived_trace_uses_existing_local_views(tmp_path, archive, source):
     raw = "\n".join(turn["text"] for turn in baseline[1]["turns"])
     assert thinking not in compact and "tool-result-marker" not in compact
     assert thinking in raw and tool in raw and "tool-result-marker" in raw
-    assert "original-tail" not in raw  # Existing local rendering remains summarized.
+    assert "original-tail" in raw  # A tool result under TOOL_RESULT_CHARS is shown whole.
     assert baseline[2] == []  # Search keeps its existing prose-only contract.
     env.update(ONE_CONV_ARCHIVE_URL=url, ONE_CONV_ARCHIVE_TOKEN="test-secret")
     run(env, "scripts/archive-sync.py", "--source", source)

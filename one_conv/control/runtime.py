@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from contextlib import asynccontextmanager, suppress
+from datetime import datetime
 from pathlib import Path
 
 from ..hr import RateError, RateStore, make_card, quote
@@ -221,18 +222,59 @@ def staff_from_cloud(hub, workers) -> list[dict]:
 SPAWNER_RETRY_SECONDS = 300
 SPAWNER_STEP = 30
 SPAWNER_UNIT = "one-conv-bridge.service"
+# The cloud box sleeps after this long without a busy session: a later post starts a new session that takes over.
+SPAWNER_IDLE_SECONDS = 30 * 60
+# Boat keeps a stopped box's data 14 days; one that slept a week is woken so a fresh snapshot keeps it.
+SPAWNER_SNAPSHOT_SECONDS = 7 * 86400
+SPAWNER_CHECK_SECONDS = 3600
 
 
-def keep_spawner_up(hub, boat, spawner: dict, state: dict) -> str:
-    """Resume the cloud spawner's box and restart its bridge once its node stops polling the hub.
+def manage_spawner(hub, boat, spawner: dict, state: dict) -> str:
+    """Run the cloud spawner's box only while there is work for it.
 
-    The cloud box is the spawner that answers when the Mac is asleep, so it must never stay
-    down: Boat stops idle sandboxes, and a stopped box polls nothing.
+    A post that no connected machine can take wakes the box; the box sleeps once no session on it has
+    been busy for SPAWNER_IDLE_SECONDS. Sleeping loses nothing pushed: every session is in the hub's
+    archive, and the session started for the next post reads it and takes over.
     """
-    seen = hub.node_seen(spawner["node"])
-    now = time.time()
-    if seen is not None and 0 <= now - seen <= LEASE_SECONDS:
-        return "online"
+    node, box, now = spawner["node"], spawner["box"], time.time()
+    seen = hub.node_seen(node)
+    online = seen is not None and 0 <= now - seen <= LEASE_SECONDS
+    activity = hub.spawner_activity(node)
+    if activity["wanted"]:
+        hub.resume_spawner(node)
+        state["active"] = now
+        if online:
+            return "online"
+        return _start_spawner(boat, spawner, state, now, "a request waits for it")
+    if online:
+        if activity["busy"] or "active" not in state:
+            state["active"] = now
+            return "online"
+        if now - state["active"] < SPAWNER_IDLE_SECONDS or not hub.pause_spawner(node):
+            return "online"
+        boat.stop_pool(box)
+        state.pop("active", None)
+        log.warning("cloud spawner %s had no busy session for %d minutes; stopped box %s",
+                    node, SPAWNER_IDLE_SECONDS // 60, box)
+        return "stopped"
+    if now - state.get("checked", 0.0) < SPAWNER_CHECK_SECONDS:
+        return "asleep"
+    state["checked"] = now
+    from .workers import machine_status
+    row = boat.info(box)
+    snapshot = row.get("snapshotCompletedAt") or ""
+    if machine_status(row.get("state")) == "stopped" and snapshot and _age(snapshot, now) > SPAWNER_SNAPSHOT_SECONDS:
+        hub.resume_spawner(node)
+        return _start_spawner(boat, spawner, state, now, "its snapshot is a week old")
+    return "asleep"
+
+
+def _age(stamp: str, now: float) -> float:
+    return now - datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+
+
+def _start_spawner(boat, spawner: dict, state: dict, now: float, why: str) -> str:
+    """Resume the box and restart its bridge, at most once per SPAWNER_RETRY_SECONDS."""
     if now - state.get("tried", 0.0) < SPAWNER_RETRY_SECONDS:
         return "waiting"
     state["tried"] = now
@@ -240,8 +282,8 @@ def keep_spawner_up(hub, boat, spawner: dict, state: dict) -> str:
     if machine_status(boat.info(spawner["box"]).get("state")) != "available":
         boat.resume_pool(spawner["box"])
     boat._exec(spawner["box"], ["systemctl", "--user", "restart", SPAWNER_UNIT])
-    log.warning("cloud spawner %s was offline; resumed box %s and restarted its bridge", spawner["node"], spawner["box"])
-    return "restarted"
+    log.warning("cloud spawner %s started: %s; resumed box %s and restarted its bridge", spawner["node"], why, spawner["box"])
+    return "started"
 
 
 def application(directory, public_origin, *, worker_config=None, session_seconds=30 * 86400):
@@ -347,7 +389,7 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
         state = {}
         while True:
             try:
-                await run_in_threadpool(keep_spawner_up, store.hub, workers.manager.boat, spawner, state)
+                await run_in_threadpool(manage_spawner, store.hub, workers.manager.boat, spawner, state)
             except (OSError, RuntimeError, ValueError, KeyError, HubError):
                 log.error("Cloud spawner could not be brought back")
             await asyncio.sleep(SPAWNER_STEP)

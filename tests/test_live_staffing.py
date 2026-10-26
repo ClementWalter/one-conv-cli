@@ -15,7 +15,8 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
-from one_conv.control.runtime import keep_spawner_up, staff_from_cloud
+from one_conv.control import runtime
+from one_conv.control.runtime import manage_spawner, staff_from_cloud
 from one_conv.live import bridge, hubclient, spawn, workspace
 from one_conv.live import hub as hub_module
 from one_conv.live.bridge_cli import add_bridge_commands
@@ -350,21 +351,24 @@ def test_without_cloud_workers_the_post_is_marked_unavailable(hub):
     assert staffing(hub, key) == ("cloud", "unavailable")
 
 
-# --- the control service keeps the cloud spawner up -------------------------------------------
+# --- the control service runs the cloud spawner's box only while there is work -----------------
 
 
 class StubBoat:
     """Records Boat calls against one sandbox in a given machine state."""
 
-    def __init__(self, state):
-        self.state, self.calls = state, []
+    def __init__(self, state, snapshot="2026-10-26T08:00:00Z"):
+        self.state, self.snapshot, self.calls = state, snapshot, []
 
     def info(self, box):
         self.calls.append(("info", box))
-        return {"id": box, "state": self.state}
+        return {"id": box, "state": self.state, "snapshotCompletedAt": self.snapshot}
 
     def resume_pool(self, box):
         self.calls.append(("resume", box))
+
+    def stop_pool(self, box):
+        self.calls.append(("stop", box))
 
     def _exec(self, box, command):
         self.calls.append(("exec", box, tuple(command)))
@@ -372,36 +376,121 @@ class StubBoat:
 
 
 CLOUD_SPAWNER = {"box": "bx_cloud", "node": "cloudbox"}
+IDLE = {"active": time.time() - runtime.SPAWNER_IDLE_SECONDS - 1}
 
 
-def test_an_online_cloud_spawner_is_left_alone(hub):
+@pytest.fixture
+def cloud_online(hub):
+    """The cloud box's bridge is connected and offers to start sessions; nothing runs on it."""
     hub.publish("cloudbox", [], spawn="claude")
+    return hub
+
+
+def test_an_online_cloud_spawner_with_recent_work_is_left_alone(cloud_online):
     boat = StubBoat("idle")
-    keep_spawner_up(hub, boat, CLOUD_SPAWNER, {})
+    manage_spawner(cloud_online, boat, CLOUD_SPAWNER, {"active": time.time()})
     assert boat.calls == []
 
 
-def test_a_stopped_cloud_spawner_box_is_resumed(hub):
+def test_an_idle_cloud_spawner_box_is_stopped(cloud_online):
+    boat = StubBoat("idle")
+    manage_spawner(cloud_online, boat, CLOUD_SPAWNER, dict(IDLE))
+    assert boat.calls == [("stop", "bx_cloud")]
+
+
+def test_a_stopping_cloud_spawner_gets_no_spawn_order(cloud_online):
+    manage_spawner(cloud_online, StubBoat("idle"), CLOUD_SPAWNER, dict(IDLE))
+    cloud_online.publish("cloudbox", [], spawn="claude")
+    assert staffing(cloud_online, post(cloud_online)) == ("cloud", "cloud")
+
+
+def test_a_busy_session_keeps_the_box_running(hub):
+    hub.publish("cloudbox", [{"address": "claude:a", "status": "busy"}], spawn="claude")
+    boat = StubBoat("idle")
+    manage_spawner(hub, boat, CLOUD_SPAWNER, dict(IDLE))
+    assert boat.calls == []
+
+
+def test_an_idle_session_does_not_keep_the_box_running(hub):
+    hub.publish("cloudbox", [{"address": "claude:a", "status": "idle"}], spawn="claude")
+    boat = StubBoat("idle")
+    manage_spawner(hub, boat, CLOUD_SPAWNER, dict(IDLE))
+    assert boat.calls == [("stop", "bx_cloud")]
+
+
+def test_a_spawn_order_in_flight_keeps_the_box_running(cloud_online):
+    post(cloud_online)
+    boat = StubBoat("idle")
+    manage_spawner(cloud_online, boat, CLOUD_SPAWNER, dict(IDLE))
+    assert boat.calls == []
+
+
+def test_the_idle_clock_starts_when_the_controller_first_sees_the_box(cloud_online):
+    boat = StubBoat("idle")
+    manage_spawner(cloud_online, boat, CLOUD_SPAWNER, {})
+    assert boat.calls == []
+
+
+def test_a_sleeping_box_with_no_request_stays_asleep(hub):
     boat = StubBoat("stopped")
-    keep_spawner_up(hub, boat, CLOUD_SPAWNER, {})
-    assert ("resume", "bx_cloud") in boat.calls
-
-
-def test_an_offline_cloud_spawner_gets_its_bridge_restarted(hub):
-    boat = StubBoat("idle")
-    keep_spawner_up(hub, boat, CLOUD_SPAWNER, {})
-    assert boat.calls[-1] == ("exec", "bx_cloud", ("systemctl", "--user", "restart", "one-conv-bridge.service"))
-
-
-def test_a_running_box_is_not_resumed(hub):
-    boat = StubBoat("idle")
-    keep_spawner_up(hub, boat, CLOUD_SPAWNER, {})
+    manage_spawner(hub, boat, CLOUD_SPAWNER, {})
     assert ("resume", "bx_cloud") not in boat.calls
 
 
-def test_a_recent_attempt_is_not_repeated(hub):
+def test_a_request_nobody_can_take_wakes_the_box(hub):
+    post(hub)
     boat = StubBoat("stopped")
-    keep_spawner_up(hub, boat, CLOUD_SPAWNER, {"tried": time.time()})
+    manage_spawner(hub, boat, CLOUD_SPAWNER, {})
+    assert ("resume", "bx_cloud") in boat.calls
+
+
+def test_a_woken_box_gets_its_bridge_restarted(hub):
+    post(hub)
+    boat = StubBoat("stopped")
+    manage_spawner(hub, boat, CLOUD_SPAWNER, {})
+    assert boat.calls[-1] == ("exec", "bx_cloud", ("systemctl", "--user", "restart", "one-conv-bridge.service"))
+
+
+def test_a_woken_box_takes_spawn_orders_again(cloud_online):
+    manage_spawner(cloud_online, StubBoat("idle"), CLOUD_SPAWNER, dict(IDLE))
+    key = post(cloud_online)
+    manage_spawner(cloud_online, StubBoat("stopped"), CLOUD_SPAWNER, {})
+    cloud_online.publish("cloudbox", [], spawn="claude")
+    assert staffing(cloud_online, key) == ("cloudbox/spawn:claude", "node")
+
+
+def test_a_running_box_with_a_dead_bridge_is_not_resumed(hub):
+    post(hub)
+    boat = StubBoat("idle")
+    manage_spawner(hub, boat, CLOUD_SPAWNER, {})
+    assert ("resume", "bx_cloud") not in boat.calls
+
+
+def test_a_request_the_box_already_failed_does_not_wake_it(hub):
+    key = post(hub)
+    with sqlite3.connect(hub.path) as db:
+        db.execute("UPDATE staffing SET tried = 'cloudbox' WHERE task = ?", (key,))
+    boat = StubBoat("stopped")
+    manage_spawner(hub, boat, CLOUD_SPAWNER, {})
+    assert ("resume", "bx_cloud") not in boat.calls
+
+
+def test_a_recent_wake_attempt_is_not_repeated(hub):
+    post(hub)
+    boat = StubBoat("stopped")
+    manage_spawner(hub, boat, CLOUD_SPAWNER, {"tried": time.time()})
+    assert boat.calls == []
+
+
+def test_a_box_asleep_for_a_week_is_woken_to_refresh_its_snapshot(hub):
+    boat = StubBoat("stopped", snapshot="2026-01-01T00:00:00Z")
+    manage_spawner(hub, boat, CLOUD_SPAWNER, {})
+    assert ("resume", "bx_cloud") in boat.calls
+
+
+def test_a_sleeping_box_is_checked_at_most_hourly(hub):
+    boat = StubBoat("stopped", snapshot="2026-01-01T00:00:00Z")
+    manage_spawner(hub, boat, CLOUD_SPAWNER, {"checked": time.time()})
     assert boat.calls == []
 
 

@@ -361,26 +361,27 @@ def _clean_text(text: str) -> str:
     return text.strip()
 
 
+# A session read to take it over needs every action whole; only a long tool output is cut, in its middle,
+# keeping its start and its end (where errors land).
+TOOL_RESULT_CHARS = 4000
+
+
 def _tool_summary(block: dict) -> str:
-    name = block.get("name", "?")
-    tool_input = block.get("input", {})
-    snippet = json.dumps(tool_input, ensure_ascii=False)
-    if len(snippet) > 120:
-        snippet = snippet[:117] + "..."
-    return f"→ {name}({snippet})"
+    return f"→ {block.get('name', '?')}({json.dumps(block.get('input', {}), ensure_ascii=False)})"
 
 
 def _tool_result_summary(block: dict) -> str:
     content = block.get("content")
     if isinstance(content, list):
-        text = " ".join(
+        text = "\n".join(
             b.get("text", "") for b in content if isinstance(b, dict) and b.get("text")
         )
     else:
         text = str(content or "")
-    text = text.replace("\n", " ").strip()
-    if len(text) > 200:
-        text = text[:197] + "..."
+    text = text.strip()
+    if len(text) > TOOL_RESULT_CHARS:
+        half = TOOL_RESULT_CHARS // 2
+        text = f"{text[:half]}\n[… {len(text) - 2 * half} characters cut …]\n{text[-half:]}"
     return f"← {text}"
 
 
@@ -855,7 +856,7 @@ def _cursor_iter_turns(composer_id: str) -> list[Turn]:
                     blocks.append({"type": "thinking", "thinking": tb["text"]})
             for tr in bubble.get("toolResults") or []:
                 if isinstance(tr, dict):
-                    blocks.append({"type": "tool_result", "content": json.dumps(tr, ensure_ascii=False)[:500]})
+                    blocks.append({"type": "tool_result", "content": json.dumps(tr, ensure_ascii=False)})
             if not blocks:
                 continue
             turns.append(Turn(ts=bubble.get("createdAt") or "", role=role, blocks=blocks))

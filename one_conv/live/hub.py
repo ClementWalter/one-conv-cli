@@ -138,6 +138,8 @@ class Hub:
         self.path, self.lock = path, threading.Lock()
         # Nodes whose "user" is an authenticated human (the workspace): its posts wake every running session.
         self.trusted_humans: set[str] = set()
+        # Spawners being put to sleep: their offer is ignored, so no spawn order reaches a machine that is stopping.
+        self.paused_spawners: set[str] = set()
         with self._db() as db:
             db.executescript(SCHEMA)
             posts = {row[1] for row in db.execute("PRAGMA table_info(posts)")}
@@ -265,7 +267,7 @@ class Hub:
             now = time.time()
             db.executemany("INSERT OR REPLACE INTO session_seen VALUES (?, ?, ?)", [(node, r[1], now) for r in rows])
             db.executemany("UPDATE members SET seen = ? WHERE node = ? AND address = ?", [(now, node, r[1]) for r in rows])
-            if spawn is None:
+            if spawn is None or node in self.paused_spawners:
                 db.execute("DELETE FROM spawners WHERE node = ?", (node,))
             else:
                 db.execute("INSERT OR REPLACE INTO spawners (node, harness, updated, priority) VALUES (?, ?, ?, ?)",
@@ -436,6 +438,37 @@ class Hub:
                 else:
                     db.execute("UPDATE staffing SET route = 'cloud', state = 'cloud', detail = ?, updated = ? WHERE task = ?",
                                (why, now, key))
+
+    def spawner_activity(self, node: str) -> dict:
+        """Whether this spawner has work (a busy session or a spawn order in flight) and whether a request waits for it."""
+        now = time.time()
+        with self.lock, self._db() as db:
+            busy = db.execute("SELECT 1 FROM sessions s JOIN nodes n ON n.node = s.node WHERE s.node = ?"
+                              " AND s.status = 'busy' AND s.updated >= ? AND n.seen >= ?",
+                              (node, now - LEASE_SECONDS, now - LEASE_SECONDS)).fetchone() is not None
+            busy = busy or db.execute("SELECT 1 FROM staffing WHERE state = 'node' AND route LIKE ?",
+                                      (f"{node}/%",)).fetchone() is not None
+            wanted = any(node not in tried.split() for (tried,) in db.execute(
+                "SELECT tried FROM staffing WHERE state = 'cloud' AND created >= ?", (now - STAFF_WINDOW_SECONDS,)))
+        return {"busy": busy, "wanted": wanted}
+
+    def pause_spawner(self, node: str) -> bool:
+        """Stop offering this spawner unless it has work; True when it is paused and its machine can stop."""
+        with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            if (db.execute("SELECT 1 FROM sessions WHERE node = ? AND status = 'busy' AND updated >= ?",
+                           (node, now - LEASE_SECONDS)).fetchone()
+                    or db.execute("SELECT 1 FROM staffing WHERE state = 'node' AND route LIKE ?", (f"{node}/%",)).fetchone()):
+                return False
+            self.paused_spawners.add(node)
+            db.execute("DELETE FROM spawners WHERE node = ?", (node,))
+        return True
+
+    def resume_spawner(self, node: str) -> None:
+        """Take this spawner's offer again from its next publication."""
+        with self.lock:
+            self.paused_spawners.discard(node)
 
     def node_seen(self, node: str) -> float | None:
         """When this node last published or polled, or None if it never did."""

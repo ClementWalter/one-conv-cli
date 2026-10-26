@@ -19,6 +19,8 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 FIELDS = ("turns", "turns_with_subagents", "search_text")
 DIGEST = re.compile(r"[0-9a-f]{64}")
 READ_WORKERS = 4
+# Starts of the key ranges a full listing reads in parallel; a key equal to a bound belongs to the range before it.
+LISTING_BOUNDS = ("", "4", "8", "c")
 # Files in one-conv's state directory shared by the sync script and readers.
 SYNC_STATE = "archive-sync.json"
 SYNC_LOCK = "archive-sync.lock"
@@ -223,13 +225,29 @@ class ArchiveClient:
             raise ArchiveError("Archive unavailable or returned an invalid response.") from error
 
     def list_conversations(self, query=None):
-        after = ""
+        """Every listed conversation in key order.
+
+        A full listing spans several pages and each page costs a round trip, so the key space is
+        read as the LISTING_BOUNDS ranges in parallel. Keys are hex digests, spread evenly over them.
+        """
+        bounds = LISTING_BOUNDS if query is None else ("",)
+        with ThreadPoolExecutor(len(bounds)) as pool:
+            ranges = pool.map(lambda index: self._list_range(bounds[index], (bounds[index + 1:] or (None,))[0], query),
+                              range(len(bounds)))
+            return [row for rows in ranges for row in rows]
+
+    def _list_range(self, after, last, query):
+        """Rows with `after` < key <= `last` (no upper bound when `last` is None)."""
+        rows = []
         while True:
             page = self.request("conversations?" + urlencode({"after": after, **({"query": query} if query is not None else {})}))
-            yield from page["items"]
+            for row in page["items"]:
+                if last is not None and row["key"] > last:
+                    return rows
+                rows.append(row)
             following = page["next"]
             if following is None:
-                break
+                return rows
             if following <= after:
                 raise ArchiveError("Archive pagination did not advance.")
             after = following

@@ -127,6 +127,32 @@ def test_archive_client_decodes_compressed_errors():
         stop()
 
 
+# Keys on, around and between the parallel listing ranges' bounds, plus a non-hex key.
+RANGE_KEYS = ["0a", "4", "40", "7f", "8", "8a", "c", "ff", "key"]
+
+
+@pytest.fixture
+def ranged_archive(archive):
+    store, client, _ = archive
+    for key in reversed(RANGE_KEYS):
+        store.put(key, "revision", {"mtime": 1}, key, {}, None)
+    return client
+
+
+def test_listing_returns_every_key_once_in_order(ranged_archive):
+    assert [row["key"] for row in ranged_archive.list_conversations()] == RANGE_KEYS
+
+
+def test_listing_follows_pages_within_a_range(ranged_archive, monkeypatch):
+    import archive.server
+    monkeypatch.setattr(archive.server, "PAGE_SIZE", 1)
+    assert [row["key"] for row in ranged_archive.list_conversations()] == RANGE_KEYS
+
+
+def test_filtered_listing_returns_matching_keys(ranged_archive):
+    assert [row["key"] for row in ranged_archive.list_conversations(query="8")] == ["8", "8a"]
+
+
 def fixture_env(tmp_path):
     env = {**os.environ, "CLAUDE_CONFIG_DIR": str(tmp_path / "claude"),
         "CODEX_HOME": str(tmp_path / "codex"), "CURSOR_USER_DIR": str(tmp_path / "cursor"),

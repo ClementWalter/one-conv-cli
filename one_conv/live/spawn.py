@@ -133,7 +133,7 @@ def start(harness: str, prompt: str, cwd: Path, model: str | None = None, extra:
     `trust_folder` answers Claude Code's first-visit folder-trust question with yes, and passes
     `--trust` to Cursor; without it, a spawn into an untrusted folder stops at that question.
     """
-    preflight(harness)
+    preflight(harness, env)
     name = f"{SESSION_PREFIX}{harness}-{uuid.uuid4().hex[:8]}"
     if harness == "codex":
         # Codex threads carry no pid, so the spawn name in the first prompt is what identifies this one.

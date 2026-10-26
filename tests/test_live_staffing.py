@@ -444,9 +444,16 @@ def test_a_request_nobody_can_take_wakes_the_box(hub):
     assert ("resume", "bx_cloud") in boat.calls
 
 
-def test_a_woken_box_gets_its_bridge_restarted(hub):
+def test_a_woken_box_keeps_the_bridge_it_resumes_with(hub):
     post(hub)
     boat = StubBoat("stopped")
+    manage_spawner(hub, boat, CLOUD_SPAWNER, {})
+    assert [call for call in boat.calls if call[0] == "exec"] == []
+
+
+def test_a_running_box_with_a_dead_bridge_gets_it_restarted(hub):
+    post(hub)
+    boat = StubBoat("idle")
     manage_spawner(hub, boat, CLOUD_SPAWNER, {})
     assert boat.calls[-1] == ("exec", "bx_cloud", ("systemctl", "--user", "restart", "one-conv-bridge.service"))
 

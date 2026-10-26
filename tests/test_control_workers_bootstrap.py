@@ -833,6 +833,7 @@ def test_a_spawner_payload_is_accepted(spawner_payload):
 
 @pytest.mark.parametrize("field, value", [
     ("git_user", {"name": "Ada\nEvil", "email": "ada@example.test"}),
+    ("git_user", None),
     ("spawner", {"harness": "aider", "args": [], "priority": 0, "env_file": None}),
     ("spawner", {"harness": "claude", "args": [], "priority": 0, "env_file": "relative/env.sh"}),
     ("spawner", {"harness": "claude", "args": [], "priority": 5000, "env_file": None}),
@@ -899,12 +900,3 @@ def test_a_missing_uv_is_installed_from_the_pinned_installer(worker_home, monkey
     monkeypatch.setattr(bootstrap, "run", lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
     bootstrap.install_uv()
     assert calls[0][-1] == f"https://astral.sh/uv/{bootstrap.UV_VERSION}/install.sh"
-
-
-def test_a_spawner_without_git_user_commits_as_its_github_account(provisioned, spawner_payload, monkeypatch):
-    calls = provisioned
-    monkeypatch.setattr(bootstrap, "run", lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(
-        argv, 0, '{"id": 7, "login": "ada", "name": null, "email": null}' if argv[:3] == ["gh", "api", "user"]
-        else "abc123\n", ""))
-    bootstrap.provision_spawner({**spawner_payload, "git_user": None})
-    assert ["git", "config", "--global", "user.email", "7+ada@users.noreply.github.com"] in calls

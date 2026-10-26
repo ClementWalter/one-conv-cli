@@ -97,6 +97,9 @@ CREATE TABLE IF NOT EXISTS welcomed (node TEXT NOT NULL, address TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS session_seen (node TEXT NOT NULL, address TEXT NOT NULL, seen REAL NOT NULL,
     PRIMARY KEY (node, address));
 CREATE TABLE IF NOT EXISTS spawners (node TEXT PRIMARY KEY, harness TEXT NOT NULL, updated REAL NOT NULL);
+-- The git identity each node's user commits as; a cloud box commits as the human's own machine does.
+CREATE TABLE IF NOT EXISTS git_identities (node TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL,
+    priority INTEGER NOT NULL, updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS archived_topics (topic TEXT PRIMARY KEY, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS post_acks (post INTEGER NOT NULL, node TEXT NOT NULL, address TEXT NOT NULL, at REAL NOT NULL,
     PRIMARY KEY (post, node, address));
@@ -232,12 +235,17 @@ class Hub:
     def _seen(self, db, node: str) -> None:
         db.execute("INSERT OR REPLACE INTO nodes VALUES (?, ?)", (node, time.time()))
 
-    def publish(self, node: str, sessions, spawn: object = None, priority: object = 0) -> int:
+    def publish(self, node: str, sessions, spawn: object = None, priority: object = 0, git_user: object = None) -> int:
         """Replace this node's published sessions and renew its lease; a name already taken is refused.
 
         `spawn` is the harness this node's bridge starts a session with when the hub asks it to,
         or None when it starts none; spawners with a higher `priority` are asked first.
+        `git_user` ({name, email}) is the identity this node's user commits as, kept after it goes offline.
         """
+        if git_user is not None and (not isinstance(git_user, dict) or set(git_user) != {"name", "email"}
+                                     or not all(isinstance(v, str) and 0 < len(v) <= 256
+                                                and not any(ord(c) < 32 for c in v) for v in git_user.values())):
+            raise HubError(400, "git_user is {name, email}, or absent")
         if not isinstance(sessions, list):
             raise HubError(400, "sessions must be a list")
         if spawn is not None and spawn not in SPAWN_HARNESSES:
@@ -280,6 +288,9 @@ class Hub:
             else:
                 db.execute("INSERT OR REPLACE INTO spawners (node, harness, updated, priority) VALUES (?, ?, ?, ?)",
                            (node, spawn, now, priority))
+            if git_user is not None:
+                db.execute("INSERT OR REPLACE INTO git_identities VALUES (?, ?, ?, ?, ?)",
+                           (node, git_user["name"], git_user["email"], priority, now))
             self._seen(db, node)
             # A clock read before _seen would put this node's lease in the future and count its sessions offline.
             self._sweep(db, time.time())
@@ -507,6 +518,13 @@ class Hub:
         """Take this spawner's offer again from its next publication."""
         with self.lock:
             self.paused_spawners.discard(node)
+
+    def git_identity(self, exclude: str) -> dict | None:
+        """The identity reported by the highest-priority spawner other than `exclude`: the human's own machine."""
+        with self.lock, self._db() as db:
+            row = db.execute("SELECT name, email FROM git_identities WHERE node != ? ORDER BY priority DESC, updated DESC",
+                             (exclude,)).fetchone()
+        return {"name": row[0], "email": row[1]} if row else None
 
     def node_seen(self, node: str) -> float | None:
         """When this node last published or polled, or None if it never did."""
@@ -1140,7 +1158,7 @@ def application(hub: Hub):
     async def sessions(request):
         if request.method == "PUT":
             return await handle(request, lambda node, body, _: {"published": hub.publish(
-                node, body.get("sessions"), body.get("spawn"), body.get("spawn_priority", 0))})
+                node, body.get("sessions"), body.get("spawn"), body.get("spawn_priority", 0), body.get("git_user"))})
         return await handle(request, lambda node, body, _: {"sessions": hub.directory()})
 
     async def messages(request):

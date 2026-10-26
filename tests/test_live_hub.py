@@ -98,6 +98,12 @@ def test_a_name_given_to_two_sessions_is_refused(two_nodes):
     assert call(url, "/v1/sessions", mac, "PUT", {"sessions": sessions})[0] == 409
 
 
+def test_an_address_listed_twice_is_refused(two_nodes):
+    _, url, mac, _ = two_nodes
+    sessions = [{"address": "claude:aaa", "status": "idle"}, {"address": "claude:aaa", "status": "busy"}]
+    assert call(url, "/v1/sessions", mac, "PUT", {"sessions": sessions})[0] == 400
+
+
 def test_the_directory_carries_a_published_product(two_nodes):
     _, url, mac, _ = two_nodes
     call(url, "/v1/sessions", mac, "PUT", {"sessions": [{"address": "cursor:k1", "product": "cursor-cli"}]})

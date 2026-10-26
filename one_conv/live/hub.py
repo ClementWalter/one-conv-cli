@@ -246,10 +246,13 @@ class Hub:
             priority = 0
         if type(priority) is not int or not -1000 <= priority <= 1000:
             raise HubError(400, "spawn_priority is an integer between -1000 and 1000")
-        rows, names = [], set()
+        rows, names, addresses = [], set(), set()
         for item in sessions:
             if not isinstance(item, dict) or not isinstance(item.get("address"), str) or "/" in item["address"]:
                 raise HubError(400, "each session needs a local address like claude:<id>")
+            if item["address"] in addresses:
+                raise HubError(400, f"{item['address']} is listed twice")
+            addresses.add(item["address"])
             name = item.get("name")
             if name is not None and (not isinstance(name, str) or not NODE.fullmatch(name)):
                 raise HubError(400, f"a name is lowercase letters, digits and dashes: {name!r}")

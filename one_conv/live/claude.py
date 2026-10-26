@@ -69,11 +69,17 @@ def session_title(session_id: str, cwd: str) -> str:
 
 
 def list_sessions() -> list[LiveSession]:
-    sessions = []
+    """One entry per session id: two processes resuming the same session are one address, the latest active."""
+    records: dict[str, dict] = {}
     for path in sorted((claude_home() / "sessions").glob("*.json")):
         data = _record(path)
         if not data or not pid_alive(data.get("pid")):
             continue
+        kept = records.get(data["sessionId"])
+        if kept is None or (data.get("updatedAt") or 0) > (kept.get("updatedAt") or 0):
+            records[data["sessionId"]] = data
+    sessions = []
+    for data in records.values():
         socket_path = data.get("messagingSocketPath") or ""
         sessions.append(LiveSession(
             "claude", data["sessionId"], data.get("cwd", ""),

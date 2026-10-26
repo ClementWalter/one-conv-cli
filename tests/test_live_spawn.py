@@ -71,6 +71,25 @@ def test_wait_returns_the_chat_the_cursor_pane_holds_open(monkeypatch, tmp_path)
     assert spawn.wait_for_session("cursor", tmp_path, set(), "t", 5) == f"cursor:{THREAD}"
 
 
+def test_preflight_refuses_a_logged_out_claude(monkeypatch):
+    monkeypatch.setattr(spawn.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", ""))
+    with pytest.raises(spawn.SpawnError, match="not logged in"):
+        spawn.preflight("claude")
+
+
+def test_start_hands_the_pane_this_processs_credentials(homes, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
+    monkeypatch.setattr(spawn, "preflight", lambda harness: None)
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
+    monkeypatch.setattr(spawn, "wait_for_session", lambda *args, **kw: "claude:x")
+    started = []
+    monkeypatch.setattr(spawn.subprocess, "run",
+                        lambda argv, **kw: started.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
+    spawn.start("claude", "do it", homes)
+    assert "CLAUDE_CODE_OAUTH_TOKEN=tok" in started[0][:started[0].index("--")]
+
+
 def test_preflight_needs_tmux(monkeypatch):
     monkeypatch.setattr(spawn.shutil, "which", lambda name: None if name == "tmux" else f"/bin/{name}")
     with pytest.raises(spawn.SpawnError, match="needs tmux"):

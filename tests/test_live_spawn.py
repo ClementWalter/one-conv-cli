@@ -138,6 +138,16 @@ def test_start_hands_the_pane_the_given_environment(homes, monkeypatch):
     assert started[0][started[0].index("--") - 2:started[0].index("--")] == ["-e", "BOX_ID=bx1"]
 
 
+def test_start_checks_the_harness_with_the_given_environment(homes, monkeypatch):
+    checked = []
+    monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: checked.append(env))
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
+    monkeypatch.setattr(spawn, "wait_for_session", lambda *args, **kw: "claude:x")
+    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+    spawn.start("claude", "do it", homes, env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"})
+    assert checked == [{"CLAUDE_CODE_OAUTH_TOKEN": "tok"}]
+
+
 def test_preflight_needs_tmux(monkeypatch):
     monkeypatch.setattr(spawn.shutil, "which", lambda name: None if name == "tmux" else f"/bin/{name}")
     with pytest.raises(spawn.SpawnError, match="needs tmux"):

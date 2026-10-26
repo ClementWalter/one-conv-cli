@@ -184,7 +184,8 @@ one-conv local skill-usage --json
 conversation, selecting the latest unless `--nth` or `--session` is supplied.
 `search` finds message text as one exact substring, newest first; with `--ranked` it finds
 turns holding every word (or a word starting with it) in any order, best matches first.
-Use `--ranked` for several keywords. `find` matches conversation titles.
+Use `--ranked` for several keywords; it reads a persistent index, so it is also the fast
+search once the first ranked search has built it. `find` matches conversation titles.
 
 PROJECT is a substring of the project's directory. When it matches several
 projects and none is exactly named PROJECT, `read` and `thread` exit 1 and list

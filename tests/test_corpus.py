@@ -89,3 +89,27 @@ def test_project_listing_loads_each_document_once(tmp_path, monkeypatch):
     monkeypatch.setattr(ac, "_corpus_load", load)
     CliRunner().invoke(ac.cli, ["local", "chats", "--source", "corpus", "--json"])
     assert load.call_count == 2
+
+
+def test_project_listing_reuses_the_saved_listing(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from unittest.mock import Mock
+    monkeypatch.setenv("ONE_CONV_CORPUS", str(tmp_path / "corpus"))
+    _write_session(tmp_path / "corpus", "box", "brain", "first", "one")
+    CliRunner().invoke(ac.cli, ["local", "chats", "--source", "corpus", "--json"])
+    load = Mock(wraps=ac._corpus_load)
+    monkeypatch.setattr(ac, "_corpus_load", load)
+    CliRunner().invoke(ac.cli, ["local", "chats", "--source", "corpus", "--json"])
+    assert load.call_count == 0
+
+
+def test_project_listing_rereads_a_changed_document(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    monkeypatch.setenv("ONE_CONV_CORPUS", str(tmp_path / "corpus"))
+    path = _write_session(tmp_path / "corpus", "box", "brain", "first", "one")
+    CliRunner().invoke(ac.cli, ["local", "chats", "--source", "corpus", "--json"])
+    document = json.loads(path.read_text())
+    document["cwd"] = "moved-project"
+    path.write_text(json.dumps(document, indent=2))
+    result = CliRunner().invoke(ac.cli, ["local", "chats", "--source", "corpus", "--json"])
+    assert "moved-project" in result.output

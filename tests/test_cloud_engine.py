@@ -273,3 +273,21 @@ def test_conversation_listed_twice_is_read_once(tmp_path, conversation):
     provider.pages = {None: ConversationPage((summary,), "next"), "next": ConversationPage((summary,))}
     synchronize(provider, "chatgpt", root=tmp_path)
     assert provider.reads == 1
+
+
+def test_cloud_listing_reads_each_document_once(cli_module, tmp_path, conversation, monkeypatch):
+    synchronize(ProviderStub(conversation), "claude-chat", root=tmp_path)
+    reads = []
+    original = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda path, *a, **k: reads.append(path) or original(path, *a, **k))
+    CliRunner().invoke(cli_module.cli, ["search", "durable-cloud-test", "--offline", "--json"])
+    assert len([path for path in reads if path.parent.parent == tmp_path and path.name != ".status.json"]) == 2
+
+
+def test_local_listing_reads_no_cloud_document(cli_module, tmp_path, conversation, monkeypatch):
+    synchronize(ProviderStub(conversation), "claude-chat", root=tmp_path)
+    reads = []
+    original = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda path, *a, **k: reads.append(path) or original(path, *a, **k))
+    CliRunner().invoke(cli_module.cli, ["local", "chats", "--json"])
+    assert [path for path in reads if path.parent.parent == tmp_path] == []

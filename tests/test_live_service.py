@@ -1,4 +1,4 @@
-"""The bridge's macOS login service: launchd job shape, install and removal, without touching the real launchd."""
+"""The bridge's login service: launchd job and systemd unit shape, install and removal, without touching either."""
 
 import plistlib
 import subprocess
@@ -75,8 +75,8 @@ def test_install_needs_saved_bridge_settings(macos):
 
 
 def test_install_refuses_other_systems(macos, monkeypatch):
-    monkeypatch.setattr(service.sys, "platform", "linux")
-    assert "only macOS" in serve("--install", "--yes").output
+    monkeypatch.setattr(service.sys, "platform", "win32")
+    assert "launchd (macOS) or systemd (Linux)" in serve("--install", "--yes").output
 
 
 def test_failed_bootstrap_is_reported(macos, monkeypatch):
@@ -99,3 +99,76 @@ def test_uninstall_unloads_the_job(macos):
 def test_status_says_whether_it_starts_at_login(macos):
     serve("--install", "--yes")
     assert "starts at login: yes" in serve("--status").output
+
+
+# --- Linux: systemd user unit ------------------------------------------------------------------
+
+
+@pytest.fixture
+def linux(monkeypatch, tmp_path):
+    """A Linux home in tmp_path with saved bridge settings; systemctl and loginctl calls are recorded, not run."""
+    calls = []
+    monkeypatch.setattr(service.sys, "platform", "linux")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(service, "_systemctl",
+                        lambda *args: calls.append(list(args)) or subprocess.CompletedProcess(args, 0, "", ""))
+    monkeypatch.setattr(service.subprocess, "run",
+                        lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "yes\n", ""))
+    bridge.save_settings("https://hub.example.test", "box", 8789, "synthetic-token")
+    return calls
+
+
+def test_unit_runs_the_launcher():
+    assert f'ExecStart="{service.LAUNCHER}" live serve' in service.unit("/usr/bin").splitlines()
+
+
+def test_unit_restarts_only_after_a_failure():
+    assert "Restart=on-failure" in service.unit("/usr/bin").splitlines()
+
+
+def test_unit_leaves_spawned_tmux_sessions_running():
+    assert "KillMode=process" in service.unit("/usr/bin").splitlines()
+
+
+def test_unit_keeps_the_installer_path():
+    assert 'Environment="PATH=/opt/tools/bin:/usr/bin"' in service.unit("/opt/tools/bin:/usr/bin").splitlines()
+
+
+def test_unit_doubles_a_percent_sign():
+    assert 'Environment="PATH=/opt/100%%/bin"' in service.unit("/opt/100%/bin").splitlines()
+
+
+def test_unit_holds_no_token(linux):
+    serve("--install", "--yes")
+    assert "synthetic-token" not in service.unit_path().read_text()
+
+
+def test_linux_install_writes_the_unit(linux):
+    serve("--install", "--yes")
+    assert service.unit_path().read_text() == service.unit(service.os.environ.get("PATH", "/usr/bin:/bin"))
+
+
+def test_linux_install_enables_and_restarts_the_unit(linux):
+    serve("--install", "--yes")
+    assert linux[:3] == [["daemon-reload"], ["enable", service.UNIT], ["restart", service.UNIT]]
+
+
+def test_linux_install_says_it_starts_at_boot_with_lingering(linux):
+    assert "starts at boot" in serve("--install", "--yes").output
+
+
+def test_failed_systemctl_is_reported(linux, monkeypatch):
+    monkeypatch.setattr(service, "_systemctl", lambda *args: subprocess.CompletedProcess(args, 1, "", "no bus"))
+    assert "systemctl --user daemon-reload failed: no bus" in serve("--install", "--yes").output
+
+
+def test_linux_uninstall_removes_the_unit(linux):
+    serve("--install", "--yes")
+    serve("--uninstall", "--yes")
+    assert not service.unit_path().exists()
+
+
+def test_linux_uninstall_stops_the_unit(linux):
+    serve("--install", "--yes")
+    serve("--uninstall", "--yes")
+    assert ["disable", "--now", service.UNIT] in linux

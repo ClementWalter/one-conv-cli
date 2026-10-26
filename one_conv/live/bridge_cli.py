@@ -35,7 +35,8 @@ def add_bridge_commands(live: click.Group) -> None:
     @click.option("--status", "show_status", is_flag=True, help="Show whether the bridge runs, and its last state.")
     @click.option("--stop", "stop_it", is_flag=True, help="Stop the running bridge.")
     @click.option("--install", "install_it", is_flag=True,
-                  help="Run the bridge as a macOS login service: it starts at login and restarts after a crash.")
+                  help="Run the bridge as a login service (launchd on macOS, systemd on Linux): it starts on its own"
+                       " and restarts after a crash.")
     @click.option("--uninstall", "uninstall_it", is_flag=True, help="Remove the login service.")
     @click.option("--yes", is_flag=True, help="Apply --install or --uninstall; without it, only show what would change.")
     @click.option("--json", "as_json", is_flag=True, help="Emit --status as JSON.")
@@ -50,7 +51,7 @@ def add_bridge_commands(live: click.Group) -> None:
         """
         if install_it or uninstall_it:
             if not yes:
-                click.echo(f"would {'install' if install_it else 'remove'} the login service {service.plist_path()}"
+                click.echo(f"would {'install' if install_it else 'remove'} the login service {service.path()}"
                            + (" and stop a bridge running outside it" if install_it and not service.installed()
                               and bridge.status()["running"] else "") + "; add --yes")
                 return
@@ -98,6 +99,7 @@ def add_bridge_commands(live: click.Group) -> None:
                          "  one-conv live spawner --harness claude --cwd ~/work --yes\n"
                          "  one-conv live spawner --harness claude --cwd ~/work --arg=--dangerously-skip-permissions --yes\n"
                          "  one-conv live spawner --harness claude --cwd ~/work --priority 10 --yes   # asked before others\n"
+                         "  one-conv live spawner --harness claude --cwd ~/work --env-file /run/secrets/env.sh --yes\n"
                          "  one-conv live spawner            # show the current settings\n"
                          "  one-conv live spawner --off --yes")
     @click.option("--harness", type=click.Choice(["claude", "codex", "omp"]), help="The agent this machine starts.")
@@ -107,10 +109,12 @@ def add_bridge_commands(live: click.Group) -> None:
     @click.option("--arg", "args", multiple=True, help="An extra argument for the harness command (repeatable).")
     @click.option("--priority", type=click.IntRange(-1000, 1000), default=0, show_default=True,
                   help="Spawners with a higher priority are asked first; the next one takes over if it is offline or silent.")
+    @click.option("--env-file", type=click.Path(dir_okay=False, resolve_path=True),
+                  help="A KEY=value (or `export KEY=value`) file read at every start; its variables reach each session.")
     @click.option("--off", is_flag=True, help="Start no sessions for the hub any more.")
     @click.option("--yes", is_flag=True, help="Save the change; without it, only show what would be saved.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the settings as JSON.")
-    def spawner_command(harness, cwd, model, args, priority, off, yes, as_json):
+    def spawner_command(harness, cwd, model, args, priority, env_file, off, yes, as_json):
         """Let the hub start a session on this machine when a request finds none running.
 
         The running bridge reads these settings at its next publication and offers to start
@@ -119,14 +123,16 @@ def add_bridge_commands(live: click.Group) -> None:
         in time. Before each start the spawner pulls its one-conv checkout and, when --cwd is
         not a repository, writes AGENTS.md there (how to use one-conv, git pull/push rules).
         Sessions start detached in tmux, unattended: --arg is how they get their permission
-        settings.
+        settings. --env-file is read at each start, so credentials written after the bridge
+        started, or rotated since, reach the session; a start is refused while it is unreadable.
         """
         if off:
             change = None
         elif harness or cwd:
             if not (harness and cwd):
                 raise click.UsageError("Give both --harness and --cwd, or --off.")
-            change = {"harness": harness, "cwd": cwd, "model": model, "args": list(args), "priority": priority}
+            change = {"harness": harness, "cwd": cwd, "model": model, "args": list(args), "priority": priority,
+                      "env_file": env_file}
         else:
             current = bridge.spawn_settings()
             click.echo(json.dumps(current) if as_json else

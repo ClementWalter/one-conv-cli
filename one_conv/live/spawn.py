@@ -6,6 +6,7 @@ turns, registers like any open session, and can be watched with `tmux attach` wh
 """
 
 import json
+import shlex
 import os
 import shutil
 import subprocess
@@ -30,6 +31,34 @@ COMMANDS = {
 SESSION_PREFIX = "oneconv-"
 # Harness credentials handed to every spawned pane.
 AUTH_ENV = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CURSOR_API_KEY")
+
+
+def environment(env_file: str | None = None) -> dict[str, str]:
+    """What a spawned pane gets on top of the tmux server's environment: this process's harness
+    credentials, then every variable `env_file` sets.
+
+    The file is read at each spawn, so a token written or rotated after the bridge started is used.
+    It holds `KEY=value` lines, optionally prefixed by `export` and shell-quoted.
+    """
+    found = {var: os.environ[var] for var in AUTH_ENV if var in os.environ}
+    if not env_file:
+        return found
+    try:
+        text = Path(env_file).read_text()
+    except OSError as error:
+        raise SpawnError(f"cannot read the spawner's env file {env_file}: {error.strerror or error}") from None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.removeprefix("export ").partition("=")
+        if separator and key.strip().isidentifier():
+            try:
+                parts = shlex.split(value)
+            except ValueError:
+                continue
+            found[key.strip()] = parts[0] if parts else ""
+    return found
 
 
 class SpawnError(Exception):
@@ -81,15 +110,15 @@ def command(harness: str, prompt: str, model: str | None, extra: tuple[str, ...]
     return [argv[0], *trust, *extra, *argv[1:]]
 
 
-def preflight(harness: str) -> None:
+def preflight(harness: str, env: dict[str, str] | None = None) -> None:
     """Refuse a spawn that could not end up reachable, before anything starts."""
     if shutil.which("tmux") is None:
         raise SpawnError("live spawn needs tmux on PATH")
     binary = BINARIES.get(harness, harness)
     if shutil.which(binary) is None:
         raise SpawnError(f"{binary} is not on PATH")
-    if harness == "claude" and subprocess.run(["claude", "auth", "status"], capture_output=True,
-                                              check=False).returncode:
+    if harness == "claude" and subprocess.run(["claude", "auth", "status"], capture_output=True, check=False,
+                                              env={**os.environ, **(env or {})}).returncode:
         # A logged-out Claude Code registers, then answers every prompt with "Not logged in".
         raise SpawnError("claude is not logged in on this machine")
     if harness == "omp" and not omp.extension_path().exists():
@@ -98,7 +127,7 @@ def preflight(harness: str) -> None:
 
 
 def start(harness: str, prompt: str, cwd: Path, model: str | None = None, extra: tuple[str, ...] = (),
-          wait_seconds: float = 60.0, trust_folder: bool = False) -> Spawned:
+          wait_seconds: float = 60.0, trust_folder: bool = False, env: dict[str, str] | None = None) -> Spawned:
     """Start the agent detached in tmux, then wait until it is listed as a live session.
 
     `trust_folder` answers Claude Code's first-visit folder-trust question with yes, and passes
@@ -112,7 +141,8 @@ def start(harness: str, prompt: str, cwd: Path, model: str | None = None, extra:
     argv = command(harness, prompt, model, extra, trust_folder)
     before = {s.address for s in router.list_all(harness)}
     # A tmux server keeps the environment it started with, which may predate the credentials this process has.
-    credentials = [flag for var in AUTH_ENV if var in os.environ for flag in ("-e", f"{var}={os.environ[var]}")]
+    variables = environment() if env is None else env
+    credentials = [flag for key, value in variables.items() for flag in ("-e", f"{key}={value}")]
     result = subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", str(cwd), "-x", "200", "-y", "50",
                              *credentials, "--", *argv], capture_output=True, text=True, check=False)
     if result.returncode:

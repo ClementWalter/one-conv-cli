@@ -481,6 +481,7 @@ agree in the channel who does what.
 one-conv live ack 0c43b732d61146d1a376ea74a702ce99      # the id the message arrived with
 one-conv live send '#release' "I take the changelog" --yes
 one-conv live spawner --harness claude --cwd ~/work --yes # let the hub start sessions here
+one-conv live spawner --harness claude --cwd ~/work --env-file /run/secrets/env.sh --yes # credentials read at each start
 ```
 
 - A session works in one channel and watches the others: the first channel it
@@ -596,13 +597,15 @@ On each machine, with the token issued to it:
 one-conv live serve --hub ssh://me@hub-box --node laptop --token-stdin < laptop.token
 one-conv live serve --hub https://hub.example.com --node ci-runner --token-stdin < ci-runner.token
 one-conv live serve --status
-one-conv live serve --install --yes   # macOS: start at login, restart after a crash
+one-conv live serve --install --yes   # launchd or systemd: start on its own, restart after a crash
 one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes
 ```
 
-- On a Mac, `--install --yes` hands the bridge to launchd once its settings are
-  saved: it starts at every login and restarts after a crash, while a clean stop
-  (`--stop`) keeps it stopped until the next login. `--uninstall --yes` removes it.
+- `--install --yes` hands the bridge to launchd on a Mac, or to a systemd user
+  unit (`one-conv-bridge.service`) on Linux, once its settings are saved: it starts
+  at every login (at boot on Linux when lingering is on) and restarts after a crash,
+  while a clean stop (`--stop`) keeps it stopped. Sessions it started in tmux keep
+  running when it restarts. `--uninstall --yes` removes it.
 - `ssh://` opens `ssh -N -L` to the hub's port, non-interactively and only to a
   host whose key is already known; `https://` verifies the certificate; plain
   `http://` is accepted only to a loopback address (127.0.0.1, ::1). The token travels only in a request

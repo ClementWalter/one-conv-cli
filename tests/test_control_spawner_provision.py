@@ -122,9 +122,13 @@ def test_a_failed_provisioning_waits_before_retrying(manager):
 def test_a_deleted_box_is_replaced(manager, monkeypatch):
     from one_conv.control.workers import Gone
 
-    def gone(box):
-        raise Gone("deleted")
-    monkeypatch.setattr(manager.boat, "info", gone)
+    known = manager.boat.info
+
+    def info(box):
+        if box == "bx_deleted":
+            raise Gone("deleted")
+        return known(box)
+    monkeypatch.setattr(manager.boat, "info", info)
     provision_spawner(manager, {**SPAWNER, "box": "bx_deleted"}, wanted=False)
     assert manager.boat.calls[0] == ("create", "cloudbox", False)
 

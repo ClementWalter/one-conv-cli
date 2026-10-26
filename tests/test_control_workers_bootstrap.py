@@ -791,3 +791,120 @@ def test_usage_owner_mapping_has_an_explicit_history_root(collector, worker_home
 
 def test_usage_scope_is_honestly_unknown_without_an_account_label(collector):
     assert collector["histories"][0]["billing_scope"] == "unknown-pool-pool-1"
+
+
+# --- the spawner box ------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def spawner_payload():
+    return {"operation": "spawner", "job_id": "spawner", "service_account": "private-op-token",
+            "profile": {"repositories": ["ClementWalter/one-conv-cli"], "credential_refs": {}, "revisions": {}},
+            "git_user": {"name": "Ada Lovelace", "email": "ada@example.test"},
+            "spawner": {"harness": "claude", "args": ["--dangerously-skip-permissions"], "priority": 0,
+                        "env_file": "/run/ascii-secrets/env.sh"},
+            "hub": {"url": "https://hub.example.test", "node": "spawner-box", "token": "private-hub-token"}}
+
+
+@pytest.fixture
+def provisioned(worker_home, monkeypatch, spawner_payload):
+    """provision_spawner with every command recorded; lingering is off and the harness is logged in."""
+    calls = []
+    (worker_home / "Documents/one-conv-cli/bin").mkdir(parents=True)
+    monkeypatch.setattr(bootstrap, "prepare_repositories", lambda data: {"PATH": os.environ["PATH"]})
+    monkeypatch.setattr(bootstrap, "install_uv", lambda: worker_home / ".local/bin/uv")
+    monkeypatch.setattr(bootstrap, "_hub_settings", lambda data: None)
+    monkeypatch.setattr(bootstrap, "run", lambda argv, **kw: calls.append(argv)
+                        or subprocess.CompletedProcess(argv, 0, "no\n" if argv[0] == "loginctl" else "abc123\n", ""))
+    from one_conv.live import spawn
+    monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: None)
+    monkeypatch.setattr(spawn, "environment", lambda env_file=None: {})
+    return calls
+
+
+def launched(calls, *words):
+    """The recorded one-conv command that runs `live <words>`."""
+    return next(argv for argv in calls if argv[4:5 + len(words)] == ["live", *words])
+
+
+def test_a_spawner_payload_is_accepted(spawner_payload):
+    assert bootstrap.validate_payload(spawner_payload) is spawner_payload
+
+
+@pytest.mark.parametrize("field, value", [
+    ("git_user", {"name": "Ada\nEvil", "email": "ada@example.test"}),
+    ("spawner", {"harness": "aider", "args": [], "priority": 0, "env_file": None}),
+    ("spawner", {"harness": "claude", "args": [], "priority": 0, "env_file": "relative/env.sh"}),
+    ("spawner", {"harness": "claude", "args": [], "priority": 5000, "env_file": None}),
+    ("profile", {"repositories": ["ClementWalter/one-conv-cli"], "credential_refs": {}, "revisions": {"x": "y"}}),
+    ("profile", {"repositories": ["ClementWalter/other"], "credential_refs": {}, "revisions": {}}),
+    ("service_account", "two words"),
+])
+def test_bad_spawner_payloads_are_refused(spawner_payload, field, value):
+    with pytest.raises(bootstrap.BootstrapError):
+        bootstrap.validate_payload({**spawner_payload, field: value})
+
+
+def test_a_spawner_follows_main(provisioned, spawner_payload):
+    bootstrap.provision_spawner(spawner_payload)
+    assert provisioned[:2] == [["git", "-C", str(Path.home() / "Documents/one-conv-cli"), "checkout", "-q", "main"],
+                               ["git", "-C", str(Path.home() / "Documents/one-conv-cli"), "pull", "-q", "--ff-only"]]
+
+
+def test_a_spawner_commits_as_the_configured_user(provisioned, spawner_payload):
+    bootstrap.provision_spawner(spawner_payload)
+    assert ["git", "config", "--global", "user.email", "ada@example.test"] in provisioned
+
+
+def test_a_spawner_reads_its_credentials_from_the_env_file(provisioned, spawner_payload):
+    bootstrap.provision_spawner(spawner_payload)
+    argv = launched(provisioned, "spawner")
+    assert argv[argv.index("--env-file") + 1] == "/run/ascii-secrets/env.sh"
+
+
+def test_a_spawner_passes_its_harness_arguments(provisioned, spawner_payload):
+    bootstrap.provision_spawner(spawner_payload)
+    assert "--arg=--dangerously-skip-permissions" in launched(provisioned, "spawner")
+
+
+def test_a_spawner_installs_the_bridge_service(provisioned, spawner_payload):
+    bootstrap.provision_spawner(spawner_payload)
+    assert launched(provisioned, "serve")[-2:] == ["--install", "--yes"]
+
+
+def test_a_spawner_turns_lingering_on(provisioned, spawner_payload):
+    bootstrap.provision_spawner(spawner_payload)
+    assert any(argv[:4] == ["sudo", "-n", "loginctl", "enable-linger"] for argv in provisioned)
+
+
+def test_a_provisioned_spawner_reports_its_revision(provisioned, spawner_payload):
+    assert bootstrap.provision_spawner(spawner_payload) == {"status": "ready", "revision": "abc123"}
+
+
+def test_a_logged_out_spawner_needs_auth(provisioned, spawner_payload, monkeypatch):
+    from one_conv.live import spawn
+    monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: (_ for _ in ()).throw(spawn.SpawnError("no")))
+    assert bootstrap.provision_spawner(spawner_payload)["status"] == "auth_needed"
+
+
+def test_the_images_uv_is_used(worker_home, monkeypatch):
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: "/usr/local/bin/uv")
+    monkeypatch.setattr(bootstrap, "run", lambda *args, **kwargs: pytest.fail("an installed uv is not replaced"))
+    assert bootstrap.install_uv() == Path("/usr/local/bin/uv")
+
+
+def test_a_missing_uv_is_installed_from_the_pinned_installer(worker_home, monkeypatch):
+    calls = []
+    monkeypatch.setattr(bootstrap.shutil, "which", lambda name: None)
+    monkeypatch.setattr(bootstrap, "run", lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
+    bootstrap.install_uv()
+    assert calls[0][-1] == f"https://astral.sh/uv/{bootstrap.UV_VERSION}/install.sh"
+
+
+def test_a_spawner_without_git_user_commits_as_its_github_account(provisioned, spawner_payload, monkeypatch):
+    calls = provisioned
+    monkeypatch.setattr(bootstrap, "run", lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(
+        argv, 0, '{"id": 7, "login": "ada", "name": null, "email": null}' if argv[:3] == ["gh", "api", "user"]
+        else "abc123\n", ""))
+    bootstrap.provision_spawner({**spawner_payload, "git_user": None})
+    assert ["git", "config", "--global", "user.email", "7+ada@users.noreply.github.com"] in calls

@@ -47,6 +47,10 @@ class Unconfirmed(WorkerError):
     """A side effect may have happened and must not be repeated blindly."""
 
 
+class Gone(WorkerError):
+    """Boat no longer knows the sandbox: it was deleted."""
+
+
 class PreflightRefused(WorkerError):
     """A verified unsafe configuration prevented sandbox allocation."""
 
@@ -187,6 +191,12 @@ class BoatCLI:
         except (OSError, subprocess.SubprocessError):
             raise Unconfirmed("Boat operation did not return a confirmed result") from None
         if result.returncode:
+            try:
+                gone = json.loads(result.stdout).get("code") == "not_found"
+            except (ValueError, AttributeError):
+                gone = False
+            if gone:
+                raise Gone("Boat does not know this sandbox")
             raise Unconfirmed("Boat operation did not return a confirmed result")
         if args[0] == "scp":
             return {}  # SCP acknowledges transport by exit status; helper execution checks the files.
@@ -245,11 +255,13 @@ class BoatCLI:
         return {"agent_credentials": True, "environment": profile["environment"], "effective": expected,
                 "safeForThirdParties": False, "proxyAiCredentials": False}
 
-    def create(self, profile, pool_id):
+    def create(self, profile, pool_id, *, auto_stop=True):
+        """`auto_stop=False` for a box whose owner stops it: Boat's auto-stop is a wall-clock TTL that kills busy work."""
         if profile["boat_agent_credentials"]:
             self.preflight(profile)
         result = self._call(["new", "--environment", profile["environment"], *([] if profile["boat_agent_credentials"] else ["--no-env"]),
-                             "--type", profile["type"], "--env", f"ONE_CONV_POOL_ID={pool_id}"])
+                             "--type", profile["type"], *([] if auto_stop else ["--no-auto-stop"]),
+                             "--env", f"ONE_CONV_POOL_ID={pool_id}"])
         box = result.get("sandbox", result).get("id") if isinstance(result, dict) else None
         if not isinstance(box, str) or not BOX.fullmatch(box):
             raise Unconfirmed("Boat created no identifiable sandbox receipt")

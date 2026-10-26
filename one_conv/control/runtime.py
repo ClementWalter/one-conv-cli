@@ -269,6 +269,123 @@ def manage_spawner(hub, boat, spawner: dict, state: dict) -> str:
     return "asleep"
 
 
+# Boat writes the box's agent credentials here at boot; the spawner reads it at every start.
+BOAT_SECRETS_FILE = "/run/ascii-secrets/env.sh"
+SPAWNER_DEFAULTS = {"profile": "default", "harness": "claude", "args": ["--dangerously-skip-permissions"],
+                    "priority": 0, "env_file": BOAT_SECRETS_FILE}
+
+
+SPAWNER_KEYS = {"node", "box", "git_user", *SPAWNER_DEFAULTS}
+
+
+def check_spawner(spawner, profiles) -> None:
+    """Refuse a spawner block the controller could not provision, when it starts rather than at the box."""
+    if (not isinstance(spawner, dict) or set(spawner) - SPAWNER_KEYS or not isinstance(spawner.get("node"), str)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", spawner["node"])
+            or spawner.get("box") is not None and not isinstance(spawner["box"], str)
+            or spawner.get("profile", "default") not in profiles
+            or spawner.get("harness", "claude") not in ("claude", "codex", "omp")
+            or type(spawner.get("priority", 0)) is not int
+            or not isinstance(spawner.get("args", []), list)
+            or spawner.get("git_user") is not None and (not isinstance(spawner["git_user"], dict)
+                                                         or set(spawner["git_user"]) != {"name", "email"})):
+        raise ValueError(f"the spawner block takes node and optionally {', '.join(sorted(SPAWNER_KEYS - {'node'}))}")
+
+
+def _revision() -> str:
+    """The commit this controller runs; a new one re-provisions the spawner box with it."""
+    import subprocess
+    result = subprocess.run(["git", "-C", str(Path(__file__).resolve().parents[2]), "rev-parse", "HEAD"],
+                            capture_output=True, text=True, check=False)
+    return result.stdout.strip()
+
+
+def _spawner_token(manager, node: str) -> str:
+    """The node's hub token: the one a worker pool on that node already holds, else a new one kept privately."""
+    import json
+
+    from .workers import _read, private_json
+    pool = next((pool for pool in _read(manager.state_path)["pools"].values() if pool.get("node") == node), None)
+    path = manager.directory / "tokens" / (f"{pool['id']}.json" if pool else f"spawner-{node}.json")
+    if path.exists():
+        return json.loads(path.read_text())["token"]
+    token = manager.config["hub"].add_token(node)
+    private_json(path, {"token": token})
+    return token
+
+
+def spawner_payload(manager, spawner: dict) -> dict:
+    """What the box helper needs to make the box a spawner node; the secrets stay out of the fingerprint."""
+    settings = {**SPAWNER_DEFAULTS, **spawner}
+    profile = manager.profiles[settings["profile"]]
+    return {"operation": "spawner", "job_id": "spawner",
+            "profile": {"repositories": profile["repositories"], "credential_refs": {}, "revisions": {}},
+            "git_user": settings.get("git_user"),
+            "spawner": {key: settings[key] for key in ("harness", "args", "priority", "env_file")},
+            "hub": {"url": manager.config["public_hub_url"], "node": settings["node"]}}
+
+
+def _fingerprint(payload: dict, revision: str) -> str:
+    import json
+    helper = (Path(__file__).with_name("worker_bootstrap.py")).read_bytes()
+    return hashlib.sha256(json.dumps([payload, revision], sort_keys=True).encode() + helper).hexdigest()
+
+
+def provision_spawner(manager, spawner: dict, wanted: bool) -> str:
+    """Keep the spawner box built from code: create it when there is none, and run the helper's
+    `spawner` operation on it whenever this controller's revision or the spawner settings change.
+
+    A sleeping box is provisioned when it next runs, and never while a request waits for it, since
+    provisioning restarts its bridge.
+    """
+    import json
+
+    from .workers import Gone, machine_status, private_json
+    settings = {**SPAWNER_DEFAULTS, **spawner}
+    record_path = manager.directory / "spawner.json"
+    record = json.loads(record_path.read_text()) if record_path.exists() else {}
+    # The box this controller created or last provisioned outranks the configured one, which only seeds it.
+    box = record.get("box") or settings.get("box")
+    try:
+        state = manager.boat.info(box).get("state") if box else None
+    except Gone:
+        log.warning("cloud spawner box %s no longer exists; creating another", box)
+        box, state = None, None
+    if box is None:
+        box = manager.boat.create(manager.profiles[settings["profile"]], settings["node"], auto_stop=False)
+        record = {"box": box}
+        private_json(record_path, record)
+        state = manager.boat.info(box).get("state")
+        log.warning("created cloud spawner box %s for node %s", box, settings["node"])
+    elif record.get("box") != box:
+        record = {"box": box}
+    spawner["box"] = box
+    payload = spawner_payload(manager, spawner)
+    fingerprint = _fingerprint(payload, _revision())
+    if record.get("fingerprint") == fingerprint:
+        return "current"
+    if wanted or time.time() - record.get("tried", 0.0) < SPAWNER_RETRY_SECONDS:
+        return "waiting"
+    if machine_status(state) != "available":
+        return "asleep"
+    record["tried"] = time.time()
+    private_json(record_path, record)
+    payload["service_account"] = manager.boat.credentials(manager.profiles[settings["profile"]])["service_account"]
+    payload["hub"]["token"] = _spawner_token(manager, settings["node"])
+    health = manager.boat.bootstrap(box, payload)
+    if not isinstance(health, dict) or health.get("status") != "ready":
+        stage = health.get("stage") if isinstance(health, dict) else None
+        log.error("cloud spawner box %s was not provisioned: %s at %s", box,
+                  health.get("status") if isinstance(health, dict) else "no receipt", stage)
+        return "failed"
+    record["fingerprint"] = fingerprint
+    # Only a failure delays the next attempt.
+    record.pop("tried", None)
+    private_json(record_path, record)
+    log.warning("provisioned cloud spawner box %s at one-conv %s", box, str(health.get("revision", ""))[:12])
+    return "provisioned"
+
+
 def _age(stamp: str, now: float) -> float:
     return now - datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
 
@@ -378,6 +495,8 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
 
     # A configured cloud spawner takes every request the Mac does not, through the hub's own fallback.
     spawner = (worker_config or {}).get("spawner")
+    if spawner is not None:
+        check_spawner(spawner, workers.manager.profiles if workers else {})
 
     async def staff_requests():
         while True:
@@ -394,6 +513,8 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
         state = {}
         while True:
             try:
+                wanted = (await run_in_threadpool(store.hub.spawner_activity, spawner["node"]))["wanted"]
+                await run_in_threadpool(provision_spawner, workers.manager, spawner, wanted)
                 await run_in_threadpool(manage_spawner, store.hub, workers.manager.boat, spawner, state)
             except (OSError, RuntimeError, ValueError, KeyError, HubError):
                 log.error("Cloud spawner could not be brought back")

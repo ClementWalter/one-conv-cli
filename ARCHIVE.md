@@ -179,10 +179,31 @@ Railway SDK, project ID or hostname belongs in the runtime. Verify the deploymen
 authenticated reads and persistence after redeployment, and configure volume backups
 before treating the service as durable storage.
 
+## Incremental metadata listing
+
+`GET /v1/conversations?since=0` lists all heads in change-sequence order. Each
+page returns `items` in the usual metadata shape, `next` (an integer cursor or
+`null`), `sequence` (the read snapshot's watermark), and `generation` (the
+database's persistent UUID). Request `since=next` until `next` is `null`, merge
+items by key, and save the final page's `sequence` for the next refresh. Repeated
+keys are replaced: a conversation can change between pages.
+
+Keep `generation` with the cached rows. If it changes on any page, discard the
+cache and restart from `since=0`; a replaced database has a new sequence space.
+Only publish the merged cache after every page succeeds. A server without these
+fields requires the legacy full listing. `since` cannot combine with `after` or
+`query`; requests without `since` retain key-based pagination and substring search.
+
+Successful head changes advance the sequence atomically; identical revisions
+and failed commits do not. Archived heads have no deletion API. Any future
+deletion API must expose tombstones or invalidate the database generation.
+Existing SQLite databases receive baseline sequences automatically on startup.
+
 ## Add a backend
 
 Implement `ConversationStore` in `archive/store.py`: paginated metadata listing
-with an optional literal substring filter over search text, manifest reads, chunk
+with an optional literal substring filter over search text, sequence-based delta
+listing with a persistent generation, manifest reads, chunk
 inventory, storage and reads, and an atomic commit that advances a conversation only
 from its expected revision. The server validates captures and derives keys,
 revisions and search text. Configure

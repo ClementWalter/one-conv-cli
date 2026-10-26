@@ -111,7 +111,7 @@ With an archive configured, one-conv commands start a sync in the background whe
 the last one started more than 15 minutes ago, and return without waiting. Nothing
 is installed on the machine: sync runs only while one-conv is used.
 `ONE_CONV_ARCHIVE_SYNC_MINUTES` changes the interval; `0` turns automatic sync off.
-Automatic sync covers every source except the shared corpus.
+Automatic sync covers every native source; `corpus` rows are imported copies with no native files.
 
 Each sync records its result in one-conv's state directory and appends to
 `archive-sync.log` there; these files are readable only by their owner. While the

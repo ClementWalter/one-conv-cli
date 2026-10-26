@@ -1,4 +1,4 @@
-"""The corpus export: secret redaction and authorship, loaded straight from the launcher file."""
+"""Session export for `tune`: secret redaction and authorship, loaded straight from the launcher file."""
 
 from __future__ import annotations
 

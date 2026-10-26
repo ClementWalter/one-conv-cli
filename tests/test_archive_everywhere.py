@@ -34,7 +34,7 @@ def history_env(root: Path) -> dict:
     """Provider homes and one-conv state under `root`, so no test reads the developer's own history."""
     return {"CLAUDE_CONFIG_DIR": str(root / "claude"), "CODEX_HOME": str(root / "codex"),
             "CURSOR_USER_DIR": str(root / "cursor"), "CURSOR_CLI_HOME": str(root / "cursor-cli"),
-            "OMP_HOME": str(root / "omp"), "ONE_CONV_CORPUS": str(root / "corpus"),
+            "OMP_HOME": str(root / "omp"),
             "ONE_CONV_CLOUD_CACHE": str(root / "cloud"), "ONE_CONV_CHATGPT_CACHE": str(root / "chatgpt"),
             "AGENT_CONV_CHATGPT_CACHE": str(root / "chatgpt"), "ONE_CONV_STATE_DIR": str(root / "state"),
             "AGENT_CONV_STATE_DIR": str(root / "state"), "ONE_CONV_LIVE_DIR": str(root / "live")}

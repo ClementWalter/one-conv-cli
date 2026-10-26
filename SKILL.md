@@ -3,7 +3,7 @@ name: one-conv-cli
 description: >-
   Read the user's AI conversation history with one-conv. Use cloud for ChatGPT,
   Claude Chat, Codex cloud and Cowork; use local for Claude Code, Codex CLI,
-  Cursor, Oh My Pi and the shared corpus on disk. Discover accounts, pull cloud
+  Cursor and Oh My Pi, on this machine and in the shared archive. Discover accounts, pull cloud
   history, list conversations, search messages and read threads. Message
   running Claude Code, Codex, Oh My Pi and Cursor sessions with live. Local agent
   continuation and live sends require explicit --yes. Cloud authentication reuses
@@ -91,7 +91,7 @@ one-conv local --help
 - `cloud claude`: Claude web chat, distinct from local Claude Code.
 - `cloud codex`: Codex cloud tasks, distinct from local Codex CLI.
 - `cloud cowork`: remote Cowork sessions and paginated event transcripts.
-- `local`: local Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi and corpus files.
+- `local`: Claude Code, Codex CLI, Cursor (IDE and CLI) and Oh My Pi, read on this machine and from the archive.
 
 Old top-level commands remain compatibility aliases. Prefer namespaces for new
 invocations so local work cannot implicitly scan cloud accounts. For legacy
@@ -220,7 +220,8 @@ one-conv local thread macbook/claude:2d69d3d1-... --around msg-42 --context 3 --
 - `search`: `{ts, source, cwd, session, role, text}`
 
 Local `--source` accepts `claude`, `codex`, `cursor` (the Cursor IDE), `cursor-cli` (Cursor's
-terminal agent, the `agent` command), `omp`, or `corpus`.
+terminal agent, the `agent` command), `omp`, or `corpus` (sessions imported into the archive from the
+retired shared corpus).
 Queries naming the same local project merge matching agent histories.
 `--raw` includes tool details. Reading updates local unread bookkeeping unless
 `--no-mark-read` is supplied. Consult each command's `--help` before less common
@@ -354,9 +355,6 @@ one-conv live spawn cursor "$(p cursor)" --cwd . --trust-folder --yes --json \
   suite.
 - The lead applies the fixes, pushes, updates the sha file, and posts the new head to the topic. It
   ends with `live stop` for each spawned agent.
-
-`local export` writes normalized history into a corpus checkout. `local append`
-writes one turn to the shared corpus log. These are writes, not history reads.
 
 ## Optional archive
 

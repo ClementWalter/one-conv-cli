@@ -157,7 +157,7 @@ def fixture_env(tmp_path):
     env = {**os.environ, "CLAUDE_CONFIG_DIR": str(tmp_path / "claude"),
         "CODEX_HOME": str(tmp_path / "codex"), "CURSOR_USER_DIR": str(tmp_path / "cursor"),
         "CURSOR_CLI_HOME": str(tmp_path / "cursor-cli"), "OMP_HOME": str(tmp_path / "omp"),
-        "ONE_CONV_CORPUS": str(tmp_path / "corpus"), "ONE_CONV_CLOUD_CACHE": str(tmp_path / "cloud"),
+        "ONE_CONV_CLOUD_CACHE": str(tmp_path / "cloud"),
         # Without this, sync reads the developer's own saved ChatGPT conversations.
         "ONE_CONV_CHATGPT_CACHE": str(tmp_path / "chatgpt"), "AGENT_CONV_CHATGPT_CACHE": str(tmp_path / "chatgpt"),
         "ONE_CONV_STATE_DIR": str(tmp_path / "state"), "AGENT_CONV_STATE_DIR": str(tmp_path / "state")}
@@ -1800,3 +1800,13 @@ def test_offline_archive_keeps_archived_conversations_listed(tmp_path):
     assert result.returncode == 0 and json.loads(result.stdout) == online and "archive's listing from" in result.stderr
     result = run(remote, "bin/one-conv", "local", "thread", "ancestry", "--source", "claude", "--json", success=False)
     assert result.returncode != 0 and "stored only in the archive, which is unavailable" in result.stderr
+
+
+def test_local_listing_ignores_corpus_files(tmp_path):
+    env = {**fixture_env(tmp_path), "ONE_CONV_CORPUS": str(tmp_path / "corpus")}
+    (tmp_path / "claude" / "projects").mkdir(parents=True)
+    path = tmp_path / "corpus" / "box" / "claude" / "-work" / "session.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"source": "claude", "session": "session", "machine": "box", "cwd": "/work",
+                                "turns": [{"ts": "2026-01-01T10:00:00Z", "role": "user", "text": "hello"}]}))
+    assert run(env, "bin/one-conv", "local", "chats", "--json") == []

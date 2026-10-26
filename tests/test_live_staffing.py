@@ -137,11 +137,52 @@ def test_a_refused_spawn_moves_to_the_cloud(spawner):
     assert staffing(spawner, key) == ("cloud", "cloud")
 
 
-def test_a_spawn_that_nobody_acks_in_time_moves_to_the_cloud(spawner, monkeypatch):
+def test_a_spawn_that_nobody_acks_in_time_is_retried_on_the_same_spawner(spawner, monkeypatch):
     key = post(spawner)
     monkeypatch.setattr(hub_module, "SPAWN_FALLBACK_SECONDS", -1.0)
     spawner.sweep()
+    assert staffing(spawner, key) == ("mac/spawn:claude", "node")
+
+
+def test_a_retried_spawn_is_a_new_order(spawner, monkeypatch):
+    post(spawner)
+    monkeypatch.setattr(hub_module, "SPAWN_FALLBACK_SECONDS", -1.0)
+    spawner.sweep()
+    assert len({item["id"] for item in spawn_orders(spawner)}) == 2
+
+
+def test_a_spawn_order_never_taken_is_retired_when_retried(spawner, monkeypatch):
+    post(spawner)
+    monkeypatch.setattr(hub_module, "SPAWN_FALLBACK_SECONDS", -1.0)
+    spawner.sweep()
+    assert [item["mode"] for item in spawn_orders(spawner)] == ["fyi", "push"]
+
+
+def test_after_spawn_attempts_orders_the_request_goes_to_the_cloud(spawner, monkeypatch):
+    key = post(spawner)
+    monkeypatch.setattr(hub_module, "SPAWN_FALLBACK_SECONDS", -1.0)
+    for _ in range(hub_module.SPAWN_ATTEMPTS):
+        spawner.sweep()
     assert staffing(spawner, key) == ("cloud", "cloud")
+
+
+def test_a_spawner_that_refused_is_not_retried(spawner, monkeypatch):
+    key = post(spawner)
+    spawner.ack("mac", spawn_orders(spawner)[0]["delivery"], "refused")
+    spawner.sweep()
+    spawner.publish("mac", [], spawn="claude")
+    assert staffing(spawner, key) == ("cloud", "cloud")
+
+
+def test_a_spawner_back_online_retries_a_request_it_failed(spawner, monkeypatch):
+    key = post(spawner)
+    with sqlite3.connect(spawner.path) as db:
+        db.execute("UPDATE nodes SET seen = ? WHERE node = 'mac'", (time.time() - hub_module.LEASE_SECONDS - 1,))
+    monkeypatch.setattr(hub_module, "SPAWN_FALLBACK_SECONDS", -1.0)
+    spawner.sweep()
+    monkeypatch.setattr(hub_module, "SPAWN_FALLBACK_SECONDS", 90.0)
+    spawner.publish("mac", [], spawn="claude")
+    assert staffing(spawner, key) == ("mac/spawn:claude", "node")
 
 
 def test_an_ack_closes_the_staffing(spawner):
@@ -211,11 +252,19 @@ def test_a_spawn_nobody_acks_in_time_moves_to_the_next_spawner(two_spawners, mon
     assert staffing(two_spawners, key) == ("cloudbox/spawn:claude", "node")
 
 
-def test_when_every_spawner_failed_the_request_goes_to_the_cloud(two_spawners, monkeypatch):
+def test_when_every_spawner_failed_the_preferred_one_is_retried(two_spawners, monkeypatch):
     key = post(two_spawners)
     monkeypatch.setattr(hub_module, "SPAWN_FALLBACK_SECONDS", -1.0)
     two_spawners.sweep()
     two_spawners.sweep()
+    assert staffing(two_spawners, key) == ("mac/spawn:claude", "node")
+
+
+def test_when_every_spawner_failed_spawn_attempts_times_the_request_goes_to_the_cloud(two_spawners, monkeypatch):
+    key = post(two_spawners)
+    monkeypatch.setattr(hub_module, "SPAWN_FALLBACK_SECONDS", -1.0)
+    for _ in range(hub_module.SPAWN_ATTEMPTS):
+        two_spawners.sweep()
     assert staffing(two_spawners, key) == ("cloud", "cloud")
 
 
@@ -473,10 +522,19 @@ def test_a_running_box_with_a_dead_bridge_is_not_resumed(hub):
     assert ("resume", "bx_cloud") not in boat.calls
 
 
-def test_a_request_the_box_already_failed_does_not_wake_it(hub):
+def test_a_request_the_box_failed_once_wakes_it_again(hub):
     key = post(hub)
     with sqlite3.connect(hub.path) as db:
         db.execute("UPDATE staffing SET tried = 'cloudbox' WHERE task = ?", (key,))
+    boat = StubBoat("stopped")
+    manage_spawner(hub, boat, CLOUD_SPAWNER, {})
+    assert ("resume", "bx_cloud") in boat.calls
+
+
+def test_a_request_the_box_failed_spawn_attempts_times_does_not_wake_it(hub):
+    key = post(hub)
+    with sqlite3.connect(hub.path) as db:
+        db.execute("UPDATE staffing SET tried = 'cloudbox cloudbox cloudbox' WHERE task = ?", (key,))
     boat = StubBoat("stopped")
     manage_spawner(hub, boat, CLOUD_SPAWNER, {})
     assert ("resume", "bx_cloud") not in boat.calls

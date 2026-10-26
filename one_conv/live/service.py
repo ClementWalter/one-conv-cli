@@ -126,6 +126,13 @@ def _wait_until_stopped(timeout: float = 20.0) -> bool:
     return True
 
 
+def _wait_until_unloaded(timeout: float = 20.0) -> None:
+    """bootout returns before launchd lets go of the job; a bootstrap until then fails with error 5."""
+    deadline = time.monotonic() + timeout
+    while _launchctl("print", f"{_domain()}/{LABEL}").returncode == 0 and time.monotonic() < deadline:
+        time.sleep(0.5)
+
+
 def install() -> list[str]:
     """Write the job and start it. A bridge already running outside launchd is stopped first,
     since only one bridge per machine can hold the serve lock."""
@@ -145,6 +152,7 @@ def install() -> list[str]:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(plistlib.dumps(definition(path_env)))
     _launchctl("bootout", f"{_domain()}/{LABEL}")  # Absent on a first install; reloads an edited job otherwise.
+    _wait_until_unloaded()
     loaded = _launchctl("bootstrap", _domain(), str(target))
     if loaded.returncode != 0:
         raise RuntimeError(f"launchctl bootstrap failed: {loaded.stderr.strip() or loaded.returncode}")

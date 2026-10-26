@@ -16,8 +16,9 @@ def macos(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(service.sys, "platform", "darwin")
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setattr(service, "_launchctl",
-                        lambda *args: calls.append(list(args)) or subprocess.CompletedProcess(args, 0, "", ""))
+    # `print` fails as for a job launchd has let go of.
+    monkeypatch.setattr(service, "_launchctl", lambda *args: calls.append(list(args))
+                        or subprocess.CompletedProcess(args, 113 if args[0] == "print" else 0, "", ""))
     bridge.save_settings("https://hub.example.test", "laptop", 8789, "synthetic-token")
     return calls
 
@@ -181,3 +182,13 @@ def test_service_path_drops_the_launchers_environment():
 
 def test_service_path_keeps_the_first_of_repeated_entries():
     assert service.service_path("/a:/b:/a") == "/a:/b"
+
+
+def test_install_loads_the_job_only_once_launchd_let_go_of_it(macos, monkeypatch):
+    held = iter([0, 0, 113])
+    calls = []
+    monkeypatch.setattr(service.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(service, "_launchctl", lambda *args: calls.append(args[0])
+                        or subprocess.CompletedProcess(args, next(held) if args[0] == "print" else 0, "", ""))
+    serve("--install", "--yes")
+    assert calls == ["bootout", "print", "print", "print", "bootstrap"]

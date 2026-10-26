@@ -72,6 +72,8 @@ SPAWN_FALLBACK_SECONDS = 90.0
 SPAWN_ATTEMPTS = 3
 # Only requests created or released this recently are staffed, so old unowned ones never start sessions.
 STAFF_WINDOW_SECONDS = 3600.0
+# A request the cloud could not take goes back to it after this long, within the staffing window.
+UNAVAILABLE_RETRY_SECONDS = 30.0
 SPAWN_HARNESSES = ("claude", "codex", "omp")
 # The apps a published session can name beside its harness.
 PRODUCTS = ("cursor-cli", "cursor-ide")
@@ -419,7 +421,7 @@ class Hub:
                 if not self._running(db, post["topic"], now):
                     self._staff(db, post, now)
         for key, route, state, updated, tried in db.execute(
-                "SELECT task, route, state, updated, tried FROM staffing WHERE state IN ('node', 'cloud', 'submitted')"
+                "SELECT task, route, state, updated, tried FROM staffing WHERE state IN ('node', 'cloud', 'submitted', 'unavailable')"
                 ).fetchall():
             node, _, ident = key.partition(":")
             # Rows staffed before `tried` existed name their only spawner in the route.
@@ -438,6 +440,11 @@ class Hub:
             if route == "cloud":
                 # A spawner that connects later, such as a cloud box coming back, takes a request still waiting.
                 post = self._human_post(db, seq[0])
+                # A failed cloud submit, such as a worker limit, is tried again rather than left unstaffed.
+                if (state == "unavailable" and updated < now - UNAVAILABLE_RETRY_SECONDS
+                        and post["created"] >= now - STAFF_WINDOW_SECONDS):
+                    db.execute("UPDATE staffing SET state = 'cloud', updated = ? WHERE task = ?", (now, key))
+                    state = "cloud"
                 if (state == "cloud" and post["created"] >= now - STAFF_WINDOW_SECONDS
                         and (spawner := self._next_spawner(db, now, tried, self._refusers(db, node, tried, spawn_ids)))):
                     spawner_node, harness = spawner

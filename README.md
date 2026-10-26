@@ -322,7 +322,12 @@ one-conv local chats
 one-conv local read PROJECT
 one-conv local thread PROJECT
 one-conv local search TEXT
+one-conv local search 'bridge reconnect' --ranked
 ```
+
+`local search` matches TEXT as one exact substring, newest first. `--ranked` matches
+turns holding every word of TEXT in any order, each as a word or the start of one,
+and orders them by BM25 relevance.
 
 Replace `PROJECT` with a name from the listing. `local read` lists its sessions;
 `local thread` reads the newest one. Choose another with `--session ID` or

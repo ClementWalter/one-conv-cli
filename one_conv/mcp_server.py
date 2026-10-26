@@ -23,7 +23,7 @@ LIVE_ADDRESS = re.compile(r"(?:[a-z0-9][a-z0-9-]{0,31}/)?(?:claude|codex|omp|cur
 def read_cli(namespace: Namespace, command: str, *, query: str | None = None,
              source: str | None = None, limit: int = 30, refresh: bool = False,
              raw: bool = False, session: str | None = None, around: str | None = None,
-             context: int = 5) -> dict:
+             context: int = 5, ranked: bool = False) -> dict:
     """Capture JSON and diagnostics separately without sharing Click's global state."""
     if namespace not in ("cloud", "local"):
         raise ToolError("namespace must be cloud or local")
@@ -57,6 +57,8 @@ def read_cli(namespace: Namespace, command: str, *, query: str | None = None,
             args += ["--session", session]
     if refresh:
         args.append("--refresh")
+    if ranked:
+        args.append("--ranked")
     if query is not None:
         args += ["--", query]
     try:
@@ -114,12 +116,14 @@ def create_server() -> MCPServer:
 
     @server.tool(annotations=readonly, structured_output=True)
     def search_conversations(query: str, namespace: Namespace = "cloud",
-                             source: str | None = None, limit: int = 30) -> dict[str, Any]:
+                             source: str | None = None, limit: int = 30, ranked: bool = False) -> dict[str, Any]:
         """Search saved message text, including every machine's archived agent sessions.
 
-        Agent session hits carry `address`, which read_conversation accepts with `around`.
+        By default `query` is one exact substring, newest hits first. ranked=true matches turns
+        holding every word (or a word starting with it) in any order, best matches first: use it
+        for several keywords. Agent session hits carry `address`, which read_conversation accepts with `around`.
         """
-        return read_cli(namespace, "search", query=query, source=source, limit=limit)
+        return read_cli(namespace, "search", query=query, source=source, limit=limit, ranked=ranked)
 
     @server.tool(annotations=readonly, structured_output=True)
     def find_conversations(query: str, namespace: Namespace = "cloud",

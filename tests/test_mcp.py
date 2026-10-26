@@ -44,6 +44,11 @@ def test_read_keeps_unread_state(reader_stub):
     assert "--no-mark-read" in reader_stub[0][0]
 
 
+def test_ranked_search_passes_its_flag(reader_stub):
+    mcp_server.read_cli("local", "search", query="bridge reconnect", ranked=True)
+    assert "--ranked" in reader_stub[0][0]
+
+
 def test_local_read_uses_thread(reader_stub):
     mcp_server.read_cli("local", "read", query="project", session="abc")
     assert reader_stub[0][0][4] == "thread"

@@ -3232,18 +3232,29 @@ def _online_search(text: str, limit: int, project_query: str | None = None) -> l
 @click.option("--project", "project_query", help="Restrict to projects matching this query (default: all).")
 @click.option("--limit", default=50, type=click.IntRange(min=1), help="Number of matches to show.")
 @click.option("--offline", is_flag=True, help="Search saved history only, without contacting online providers.")
+@click.option("--ranked", is_flag=True, help="Match turns holding every word, as a word or word prefix, in any order; best matches first.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
-def search(text: str, source_filter: str | None, project_query: str | None, limit: int, offline: bool, as_json: bool) -> None:
+def search(text: str, source_filter: str | None, project_query: str | None, limit: int, offline: bool,
+           ranked: bool, as_json: bool) -> None:
     """Full-text search across session transcripts, across every source.
+
+    By default TEXT matches as one exact substring, newest first. --ranked
+    matches turns holding every word of TEXT, each as a word or the start of
+    one ("build" finds "builds"), and orders them by BM25 relevance.
 
     A cheap pre-filter runs before any full parsing — a raw-bytes substring
     check for claude/codex/omp's flat JSONL files, one batched SQL LIKE query
     for cursor's SQLite store (no single-file check is possible there) — so
     searching everywhere stays fast even with a lot of history.
     """
+    from one_conv.ranking import Ranking, snippet, words
+
     sources = selected_sources(source_filter, SOURCES)
-    needle = text.lower()
-    needle_bytes = text.encode("utf-8")
+    needles = words(text) if ranked else [text.lower()]
+    if ranked and not needles:
+        raise click.BadParameter("The query holds no word to rank.", param_hint="TEXT")
+    # bytes.lower() folds only ASCII, so non-ASCII needles skip the raw-bytes prefilter.
+    probes = [needle.encode("utf-8") for needle in needles if needle.isascii()]
     sessions = _sessions_for_scope(project_query, sources)
     archive = _archive_state()
     candidates = set()
@@ -3251,19 +3262,25 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
         log.warning("Archived conversations were not searched.")
     elif archive and any(h.archive for h in sessions):
         from one_conv.archive import ArchiveError
-        try:  # Copies are merged on the full listing; only matching archived ones are read.
-            candidates = {row["key"] for row in archive["client"].list_conversations(query=text)}
+        try:  # Copies are merged on the full listing; only archived ones holding every needle are read.
+            listings = [{row["key"] for row in archive["client"].list_conversations(query=needle)} for needle in needles]
+            candidates = set.intersection(*listings)
         except ArchiveError as error:
             log.warning("%s Archived conversations were not searched.", error)
-    cursor_ids = _cursor_composer_ids_matching(text) if "cursor" in sources else None
+    cursor_ids = None
+    if "cursor" in sources:
+        matching = [_cursor_composer_ids_matching(needle) for needle in needles]
+        # None means Cursor is not installed, so nothing filters its (absent) sessions.
+        cursor_ids = None if None in matching else set.intersection(*matching)
 
+    ranking = Ranking(needles) if ranked else None
     results = []
     for h in sessions:
-        if not h.archive and h.source in ("claude", "codex", "omp") and text.isascii():
-            # bytes.lower() folds only ASCII, so non-ASCII queries skip this prefilter.
+        if not h.archive and h.source in ("claude", "codex", "omp") and probes:
             with h.path.open("rb") as f:
-                if needle_bytes.lower() not in f.read().lower():
-                    continue
+                content = f.read().lower()
+            if not all(probe in content for probe in probes):
+                continue
         elif not h.archive and h.source == "cursor" and cursor_ids is not None and h.composer_id not in cursor_ids:
             continue
         if h.archive and h.archive["key"] not in candidates:
@@ -3275,28 +3292,30 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
             continue
         for turn in turns:
             rendered = _render_turn(turn, raw=False)
-            if not rendered or needle not in rendered.lower():
+            if not rendered or not ranked and needles[0] not in rendered.lower():
                 continue
-            snippet = rendered.replace("\n", " ")
-            if len(snippet) > 200:
-                idx = snippet.lower().find(needle)
-                start = max(0, idx - 80)
-                snippet = ("…" if start else "") + snippet[start : start + 200] + "…"
             row = {"ts": turn.ts, "source": h.source, "cwd": h.project_cwd, "session": h.uuid,
-                   "role": turn.role, "text": snippet}
+                   "role": turn.role, "text": snippet(rendered, needles)}
             address = _handle_address(h)
             if address:
                 row["address"] = address
+            if ranked:
+                ranking.add(row, rendered)
+                continue
             results.append(row)
             if len(results) >= limit:
                 break
         if len(results) >= limit:
             break
 
+    if ranked:
+        results = ranking.top(limit)
     if not offline and (source_filter is None or source_filter == "chatgpt"):
         results.extend(_online_search(text, limit, project_query))
     unique = {(row["source"], row["cwd"], row["session"], row["text"]): row for row in results}
-    results = sorted(unique.values(), key=lambda r: r["ts"], reverse=True)[:limit]
+    # Ranked rows keep relevance order; the provider's own hits follow them.
+    order = list(unique.values()) if ranked else sorted(unique.values(), key=lambda r: r["ts"], reverse=True)
+    results = order[:limit]
     if as_json:
         click.echo(json.dumps(results, ensure_ascii=False))
         return

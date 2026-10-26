@@ -173,6 +173,7 @@ one-conv local chats --json
 one-conv local read PROJECT --source claude --json
 one-conv local thread PROJECT --source codex --no-mark-read --json
 one-conv local search QUERY --json
+one-conv local search 'bridge reconnect' --ranked --json
 one-conv local find QUERY --json
 one-conv local unread --json
 one-conv local skill-usage --json
@@ -181,7 +182,9 @@ one-conv local skill-usage --json
 `local chats` lists projects/accounts. `read QUERY` lists a project's conversations;
 `read QUERY --expand` includes their messages. `thread QUERY` reads one
 conversation, selecting the latest unless `--nth` or `--session` is supplied.
-`search` finds message text; `find` matches conversation titles.
+`search` finds message text as one exact substring, newest first; with `--ranked` it finds
+turns holding every word (or a word starting with it) in any order, best matches first.
+Use `--ranked` for several keywords. `find` matches conversation titles.
 
 PROJECT is a substring of the project's directory. When it matches several
 projects and none is exactly named PROJECT, `read` and `thread` exit 1 and list

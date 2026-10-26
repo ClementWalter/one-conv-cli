@@ -213,12 +213,28 @@ def _remember_member(topic: str, address: str) -> None:
     _write(_topic_dir(topic) / "meta.json", meta)
 
 
+# A session started with its prompt can reach join_topic before its bridge's next publication
+# (every 15 s) makes it known to the hub; the join waits that long for it.
+PUBLISH_WAIT_SECONDS = 20.0
+
+
+def _join_once_published(hub, topic: str, address: str, work: bool | None):
+    deadline = time.monotonic() + PUBLISH_WAIT_SECONDS
+    while True:
+        try:
+            return hub.join(topic, address, work)
+        except hubclient.HubRefused as error:
+            if error.status != 403 or time.monotonic() >= deadline:
+                raise
+        time.sleep(1.0)
+
+
 def join(topic: str, address: str, work: bool | None = None) -> str:
     """Join TOPIC; through a hub, `work` makes it the session's work channel (True) or only watches it (False)."""
     topic = _check("topic", topic)
     hub = _hub()
     if hub is not None:
-        _hub_call(lambda: hub.join(topic, address, work))
+        _hub_call(lambda: _join_once_published(hub, topic, address, work))
         with _locked():
             _remember_member(topic, address)
         return topic

@@ -77,9 +77,17 @@ def test_join_registers_the_member_on_the_hub(hub):
     assert state.topics()[0]["members"] == ["mac/claude:c1"]
 
 
-def test_join_of_an_unpublished_session_points_to_live_serve(hub):
+def test_join_of_an_unpublished_session_points_to_live_serve(hub, monkeypatch):
+    monkeypatch.setattr(team, "PUBLISH_WAIT_SECONDS", 0.0)
     with pytest.raises(team.TeamError, match="live serve"):
         team.join("release", "claude:not-published")
+
+
+def test_join_waits_for_the_bridge_to_publish_a_new_session(hub):
+    state, _, _ = hub
+    threading.Timer(1.5, lambda: state.publish("mac", [{"address": MAC_SESSION}, {"address": "claude:new"}])).start()
+    team.join("release", "claude:new")
+    assert state.topics()[0]["members"] == ["mac/claude:new"]
 
 
 def test_topic_send_reaches_members_on_every_node(hub):

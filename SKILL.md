@@ -183,6 +183,17 @@ one-conv local skill-usage --json
 conversation, selecting the latest unless `--nth` or `--session` is supplied.
 `search` finds message text; `find` matches conversation titles.
 
+PROJECT is a substring of the project's directory. When it matches several
+projects and none is exactly named PROJECT, `read` and `thread` exit 1 and list
+the candidates, most recent first: on stderr as text, or under `--json` as one
+stdout object `{error: "ambiguous", query, total, matches: [{n, source, cwd,
+threads}], hint}`. Re-run with `--match N` to pick candidate N, or pass a
+longer, more specific PROJECT.
+
+```bash
+one-conv local read cdefi-stack --json --match 1
+```
+
 `thread` also takes a live address, `NODE/harness:id` (as `live ls` and message
 envelopes show it), and reads that agent session from whichever machine ran it:
 native history on this node, the live hub's archive for any other node.

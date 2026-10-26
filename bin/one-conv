@@ -2614,7 +2614,9 @@ def _project_summary_handle(project: ProjectHandle, read_state: dict) -> dict:
     }
 
 
-def _resolve_projects(query: str, match: int, sources: tuple[str, ...]) -> list[ProjectHandle]:
+def _resolve_projects(
+    query: str, match: int, sources: tuple[str, ...], as_json: bool = False
+) -> list[ProjectHandle]:
     """Like `_resolve_one_project` but source-aware, and — this is the whole
     point of unifying — when a query exactly names one real directory that
     exists under more than one source, resolves to *all* of them at once
@@ -2645,10 +2647,23 @@ def _resolve_projects(query: str, match: int, sources: tuple[str, ...]) -> list[
     if len(candidates) == 1:
         return candidates
 
-    click.echo(f"Multiple projects match {query!r} — pick with --match N:", err=True)
     state = _load_read_state()
-    for i, p in enumerate(candidates[:20], 1):
-        summary = _project_summary_handle(p, state)
+    shown = [(i, p, _project_summary_handle(p, state)) for i, p in enumerate(candidates[:20], 1)]
+    if as_json:
+        # A --json caller parses stdout, so the ambiguity is reported there as an object.
+        click.echo(json.dumps({
+            "error": "ambiguous",
+            "query": query,
+            "total": len(candidates),
+            "matches": [
+                {"n": i, "source": p.source, "cwd": summary["cwd"], "threads": summary["threads"]}
+                for i, p, summary in shown
+            ],
+            "hint": "re-run with --match N",
+        }, ensure_ascii=False))
+        raise SystemExit(1)
+    click.echo(f"Multiple projects match {query!r} — pick with --match N:", err=True)
+    for i, p, summary in shown:
         click.echo(f"  {i}. [{p.source}] {summary['cwd']}  ({summary['threads']} threads)", err=True)
     raise SystemExit(1)
 
@@ -2929,7 +2944,7 @@ def read(
     `thread QUERY` (Slack's `thread <channel> <ts>`), not this command.
     """
     sources = selected_sources(source_filter, SOURCES)
-    projects = _resolve_projects(query, match, sources)
+    projects = _resolve_projects(query, match, sources, as_json)
     sessions = _all_sessions_for(projects)
     session_subset = sessions[:limit] if limit else sessions
     show_source = len({p.source for p in projects}) > 1 or len(sources) > 1
@@ -3034,7 +3049,7 @@ def thread(
             raise click.ClickException(f"Several conversations match {query!r}; use a longer ID: {choices}")
         handle = matches[0]
     else:
-        projects = _resolve_projects(query, match, sources)
+        projects = _resolve_projects(query, match, sources, as_json)
         sessions = _all_sessions_for(projects)
         handle = _pick_session_handle(sessions, session_uuid, nth)
     out = _handle_rendered_turns(handle, raw, include_subagents, limit)

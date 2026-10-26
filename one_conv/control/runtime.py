@@ -275,7 +275,7 @@ SPAWNER_DEFAULTS = {"profile": "default", "harness": "claude", "args": ["--dange
                     "priority": 0, "env_file": BOAT_SECRETS_FILE}
 
 
-SPAWNER_KEYS = {"node", "box", "git_user", *SPAWNER_DEFAULTS}
+SPAWNER_KEYS = {"node", "box", *SPAWNER_DEFAULTS}
 
 
 def check_spawner(spawner, profiles) -> None:
@@ -286,9 +286,7 @@ def check_spawner(spawner, profiles) -> None:
             or spawner.get("profile", "default") not in profiles
             or spawner.get("harness", "claude") not in ("claude", "codex", "omp")
             or type(spawner.get("priority", 0)) is not int
-            or not isinstance(spawner.get("args", []), list)
-            or spawner.get("git_user") is not None and (not isinstance(spawner["git_user"], dict)
-                                                         or set(spawner["git_user"]) != {"name", "email"})):
+            or not isinstance(spawner.get("args", []), list)):
         raise ValueError(f"the spawner block takes node and optionally {', '.join(sorted(SPAWNER_KEYS - {'node'}))}")
 
 
@@ -314,13 +312,13 @@ def _spawner_token(manager, node: str) -> str:
     return token
 
 
-def spawner_payload(manager, spawner: dict) -> dict:
+def spawner_payload(manager, spawner: dict, git_user: dict) -> dict:
     """What the box helper needs to make the box a spawner node; the secrets stay out of the fingerprint."""
     settings = {**SPAWNER_DEFAULTS, **spawner}
     profile = manager.profiles[settings["profile"]]
     return {"operation": "spawner", "job_id": "spawner",
             "profile": {"repositories": profile["repositories"], "credential_refs": {}, "revisions": {}},
-            "git_user": settings.get("git_user"),
+            "git_user": git_user,
             "spawner": {key: settings[key] for key in ("harness", "args", "priority", "env_file")},
             "hub": {"url": manager.config["public_hub_url"], "node": settings["node"]}}
 
@@ -333,7 +331,8 @@ def _fingerprint(payload: dict, revision: str) -> str:
 
 def provision_spawner(manager, spawner: dict, wanted: bool) -> str:
     """Keep the spawner box built from code: create it when there is none, and run the helper's
-    `spawner` operation on it whenever this controller's revision or the spawner settings change.
+    `spawner` operation on it whenever this controller's revision, the spawner settings, or the git
+    identity the human's machine reports change.
 
     A sleeping box is provisioned when it next runs, and never while a request waits for it, since
     provisioning restarts its bridge.
@@ -360,7 +359,11 @@ def provision_spawner(manager, spawner: dict, wanted: bool) -> str:
     elif record.get("box") != box:
         record = {"box": box}
     spawner["box"] = box
-    payload = spawner_payload(manager, spawner)
+    # The box commits as the human's own machine does; until one has reported its identity, nothing is set up.
+    git_user = manager.config["hub"].git_identity(exclude=settings["node"])
+    if git_user is None:
+        return "waiting"
+    payload = spawner_payload(manager, spawner, git_user)
     fingerprint = _fingerprint(payload, _revision())
     if record.get("fingerprint") == fingerprint:
         return "current"

@@ -11,7 +11,8 @@ from one_conv.control.runtime import provision_spawner
 from one_conv.control.workers import DEFAULT_PROFILE
 from one_conv.live.hub import Hub
 
-SPAWNER = {"node": "cloudbox", "git_user": {"name": "Ada", "email": "ada@example.test"}}
+SPAWNER = {"node": "cloudbox"}
+MAC_IDENTITY = {"name": "Ada", "email": "ada@example.test"}
 
 
 class StubBoat:
@@ -40,9 +41,11 @@ class StubBoat:
 def manager(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "_revision", lambda: "rev-1")
     (tmp_path / "workers.json").write_text(json.dumps({"jobs": {}, "pools": {}}))
+    hub = Hub(str(tmp_path / "hub.db"))
+    hub.publish("mac", [], spawn="claude", priority=10, git_user=MAC_IDENTITY)
     return SimpleNamespace(directory=tmp_path, state_path=tmp_path / "workers.json", boat=StubBoat(),
                            profiles={"default": DEFAULT_PROFILE},
-                           config={"public_hub_url": "https://hub.example.test", "hub": Hub(str(tmp_path / "hub.db"))})
+                           config={"public_hub_url": "https://hub.example.test", "hub": hub})
 
 
 def test_a_missing_box_is_created(manager):
@@ -139,9 +142,32 @@ def test_the_box_the_controller_created_outranks_the_configured_one(manager):
     assert manager.boat.calls == [("bootstrap", "bx_created")]
 
 
-def test_git_identity_is_left_to_the_box_when_not_configured(manager):
-    provision_spawner(manager, {"node": "cloudbox", "box": "bx_cloud"}, wanted=False)
-    assert manager.boat.payloads[0]["git_user"] is None
+def test_the_box_commits_as_the_mac_does(manager):
+    provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=False)
+    assert manager.boat.payloads[0]["git_user"] == MAC_IDENTITY
+
+
+def test_the_box_ignores_its_own_reported_identity(manager):
+    manager.config["hub"].publish("cloudbox", [], spawn="claude", priority=100, git_user={"name": "Box", "email": "b@x"})
+    provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=False)
+    assert manager.boat.payloads[0]["git_user"] == MAC_IDENTITY
+
+
+def test_the_highest_priority_machine_gives_the_identity(manager):
+    manager.config["hub"].publish("laptop", [], spawn="claude", priority=0, git_user={"name": "Old", "email": "o@x"})
+    provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=False)
+    assert manager.boat.payloads[0]["git_user"] == MAC_IDENTITY
+
+
+def test_nothing_is_set_up_before_a_machine_reports_an_identity(tmp_path, manager):
+    manager.config["hub"] = Hub(str(tmp_path / "empty.db"))
+    assert provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=False) == "waiting"
+
+
+def test_a_new_mac_identity_provisions_the_box_again(manager):
+    provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=False)
+    manager.config["hub"].publish("mac", [], spawn="claude", priority=10, git_user={"name": "Ada L", "email": "ada@example.test"})
+    assert provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=False) == "provisioned"
 
 
 def test_a_spawner_block_needs_only_a_node():
@@ -153,7 +179,7 @@ def test_a_spawner_block_needs_only_a_node():
     {"node": "Bad Node"},
     {"node": "cloudbox", "colour": "red"},
     {"node": "cloudbox", "profile": "absent"},
-    {"node": "cloudbox", "git_user": {"name": "Ada"}},
+    {"node": "cloudbox", "git_user": MAC_IDENTITY},
 ])
 def test_a_bad_spawner_block_is_refused(spawner):
     with pytest.raises(ValueError, match="spawner block"):

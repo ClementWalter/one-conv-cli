@@ -229,6 +229,25 @@ def test_publishing_lists_this_machines_sessions_on_the_hub(hub, box):
     assert "box/omp:worker-1" in box.directory
 
 
+def test_publishing_reports_this_machines_git_identity(hub, delivered, monkeypatch):
+    monkeypatch.setattr(bridge, "git_identity", lambda: {"name": "Ada", "email": "ada@example.test"})
+    bridge.Bridge(hubclient.HubClient(hub.url, hub.box_token, "box"), "box",
+                  bridge.Ingress(bridge.bridge_dir() / "ingress.db")).publish()
+    assert hub.state.git_identity(exclude="mac") == {"name": "Ada", "email": "ada@example.test"}
+
+
+def test_git_identity_reads_the_global_git_config(tmp_path, monkeypatch):
+    (tmp_path / "gitconfig").write_text("[user]\n\tname = Ada\n\temail = ada@example.test\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    assert bridge.git_identity() == {"name": "Ada", "email": "ada@example.test"}
+
+
+def test_git_identity_needs_both_name_and_email(tmp_path, monkeypatch):
+    (tmp_path / "gitconfig").write_text("[user]\n\tname = Ada\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    assert bridge.git_identity() is None
+
+
 def queued(text="queued while offline"):
     message = {"id": uuid.uuid4().hex, "to": "mac/claude:aaa", "from": "omp:worker-1", "text": text}
     hubclient.queue(message)

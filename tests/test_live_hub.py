@@ -104,6 +104,24 @@ def test_an_address_listed_twice_is_refused(two_nodes):
     assert call(url, "/v1/sessions", mac, "PUT", {"sessions": sessions})[0] == 400
 
 
+def test_a_published_git_identity_is_kept(tmp_path):
+    hub = Hub(str(tmp_path / "hub.db"))
+    hub.publish("mac", [], spawn="claude", priority=10, git_user={"name": "Ada", "email": "ada@example.test"})
+    assert hub.git_identity(exclude="box") == {"name": "Ada", "email": "ada@example.test"}
+
+
+def test_a_publication_without_identity_keeps_the_last_one(tmp_path):
+    hub = Hub(str(tmp_path / "hub.db"))
+    hub.publish("mac", [], git_user={"name": "Ada", "email": "ada@example.test"})
+    hub.publish("mac", [])
+    assert hub.git_identity(exclude="box") == {"name": "Ada", "email": "ada@example.test"}
+
+
+def test_a_bad_git_identity_is_refused(two_nodes):
+    _, url, mac, _ = two_nodes
+    assert call(url, "/v1/sessions", mac, "PUT", {"sessions": [], "git_user": {"name": "Ada"}})[0] == 400
+
+
 def test_the_directory_carries_a_published_product(two_nodes):
     _, url, mac, _ = two_nodes
     call(url, "/v1/sessions", mac, "PUT", {"sessions": [{"address": "cursor:k1", "product": "cursor-cli"}]})

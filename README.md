@@ -505,9 +505,11 @@ one-conv live spawner --harness claude --cwd ~/work --env-file /run/secrets/env.
   shows "Starting a session…" until a session acks it.
 - The cloud spawner is a Boat box the controller builds and runs itself. Its
   worker config takes `"spawner": {"node": "<hub node>"}`, plus optionally `box`
-  (an existing box to adopt), `git_user` (`{"name", "email"}`; else the box's
-  GitHub account), `profile`, `harness`, `args`, `priority` and `env_file`
-  (default `/run/ascii-secrets/env.sh`, where Boat writes the agent credentials).
+  (an existing box to adopt), `profile`, `harness`, `args`, `priority` and
+  `env_file` (default `/run/ascii-secrets/env.sh`, where Boat writes the agent
+  credentials). The box commits with the git identity the highest-priority other
+  spawner (the user's own machine) reports from its `git config --global`; until
+  one has, the box is not set up.
   With no box, or once Boat no longer knows it, the controller creates one
   (auto-stop off). Whenever the controller's revision or these settings change,
   it provisions the box from nothing: clones, GitHub login, git identity, hub

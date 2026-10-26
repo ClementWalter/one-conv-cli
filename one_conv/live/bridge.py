@@ -326,6 +326,18 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, on_sta
         return "refused", str(error)
 
 
+def git_identity() -> dict | None:
+    """This machine's global git identity, which cloud boxes reproduce; None unless both parts are set."""
+    values = []
+    for key in ("user.name", "user.email"):
+        try:
+            result = subprocess.run(["git", "config", "--global", key], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        values.append(result.stdout.strip())
+    return {"name": values[0], "email": values[1]} if all(values) else None
+
+
 class Bridge:
     def __init__(self, client: hubclient.HubClient, node: str, ingress: Ingress):
         self.client, self.node, self.ingress = client, node, ingress
@@ -341,10 +353,13 @@ class Bridge:
             return self._publish()
 
     def _publish(self) -> int:
+        identity = git_identity()
         rows = [{"address": s.address, "name": team.name_for(s.address), "title": s.title, "cwd": s.cwd,
                  "status": s.status, "product": s.product} for s in router.list_all()]
         config = spawn_settings()
         offer = {"spawn": config["harness"], "spawn_priority": int(config.get("priority") or 0)} if config else {}
+        if identity:
+            offer["git_user"] = identity
         try:
             count = self.client.request("PUT", "/v1/sessions", {"sessions": rows, **offer})["published"]
             self.notes = []

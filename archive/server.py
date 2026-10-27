@@ -143,6 +143,12 @@ def create_app(store: ConversationStore, token=None, max_request_bytes=MAX_REQUE
     @endpoint
     async def conversations(request):
         if request.method == "GET":
+            if "since" in request.query_params:
+                cursor = request.query_params["since"]
+                if (not cursor.isascii() or not cursor.isdecimal() or len(cursor) > 19
+                        or int(cursor) > 2 ** 63 - 1 or "query" in request.query_params or "after" in request.query_params):
+                    raise ValueError("since must be a non-negative SQLite integer, without query or after")
+                return JSONResponse(await run_in_threadpool(store.list_changes, int(cursor), PAGE_SIZE))
             return JSONResponse(await run_in_threadpool(store.list_conversations,
                 request.query_params.get("after", ""), request.query_params.get("query"), PAGE_SIZE))
         return JSONResponse(await run_in_threadpool(commit, await body(request), request.state.node))

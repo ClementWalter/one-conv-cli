@@ -2,8 +2,9 @@
 
 import json
 from typing import Protocol
+from uuid import uuid4
 
-from sqlalchemy import Column, Float, LargeBinary, MetaData, String, Table, Text, create_engine, select
+from sqlalchemy import Column, Float, Integer, LargeBinary, MetaData, String, Table, Text, create_engine, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.sqlite import insert
 
@@ -16,6 +17,7 @@ class Conflict(Exception):
 
 class ConversationStore(Protocol):
     def list_conversations(self, after: str, query: str | None, limit: int) -> dict: ...
+    def list_changes(self, since: int, limit: int) -> dict: ...
     def read_conversation(self, key: str, revision: str | None = None) -> dict | None: ...
     def missing_chunks(self, digests: list[str]) -> list[str]: ...
     def put_chunks(self, chunks: dict[str, bytes]) -> None: ...
@@ -34,13 +36,46 @@ class SQLiteStore:
         self.heads = Table("conversations_v1", schema,
             Column("key", String, primary_key=True), Column("revision", String, nullable=False),
             Column("mtime", Float, nullable=False), Column("metadata", Text, nullable=False),
-            Column("search_text", Text, nullable=False))
+            Column("search_text", Text, nullable=False),
+            Column("change_sequence", Integer, nullable=False, server_default="0"))
+        self.state = Table("archive_state_v1", schema,
+            Column("id", Integer, primary_key=True), Column("sequence", Integer, nullable=False),
+            Column("generation", String, nullable=False))
         self.revisions = Table("revisions_v1", schema,
             Column("key", String, primary_key=True), Column("revision", String, primary_key=True),
             Column("manifest", Text, nullable=False))
         self.chunks = Table("chunks_v1", schema,
             Column("digest", String, primary_key=True), Column("data", LargeBinary, nullable=False))
         schema.create_all(self.engine)
+        self._initialize_sequences()
+
+    def _initialize_sequences(self):
+        """Serialize schema migration so every existing head receives a stable sequence."""
+        with self.engine.connect() as conn:
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+            columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(conversations_v1)")}
+            if "change_sequence" not in columns:
+                conn.exec_driver_sql("ALTER TABLE conversations_v1 ADD COLUMN change_sequence INTEGER NOT NULL DEFAULT 0")
+                # Legacy rowids uniquely order the baseline; subsequent writes use the counter.
+                conn.exec_driver_sql("UPDATE conversations_v1 SET change_sequence = rowid")
+            sequence = conn.execute(select(func.coalesce(func.max(self.heads.c.change_sequence), 0))).scalar_one()
+            conn.execute(insert(self.state).values(id=1, sequence=sequence, generation=uuid4().hex).on_conflict_do_nothing())
+            conn.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS conversations_change_sequence ON conversations_v1(change_sequence)")
+            conn.commit()
+
+    def list_changes(self, since=0, limit=1000):
+        """Changed heads and a watermark from one read snapshot, ordered by sequence."""
+        h = self.heads
+        with self.engine.connect() as conn:
+            # SQLite otherwise starts a transaction only at the first write, not at SELECT.
+            conn.exec_driver_sql("BEGIN")
+            state = conn.execute(select(self.state).where(self.state.c.id == 1)).one()
+            rows = conn.execute(select(h.c.key, h.c.metadata, h.c.revision, h.c.change_sequence)
+                .where((h.c.change_sequence > since) & (h.c.change_sequence <= state.sequence))
+                .order_by(h.c.change_sequence).limit(limit + 1)).all()
+        return {"items": [{**json.loads(row.metadata), "key": row.key, "revision": row.revision} for row in rows[:limit]],
+                "next": rows[limit - 1].change_sequence if len(rows) > limit else None,
+                "sequence": state.sequence, "generation": state.generation}
 
     def list_conversations(self, after="", query=None, limit=1000):
         h = self.heads
@@ -88,6 +123,9 @@ class SQLiteStore:
                     return {"key": key, "revision": revision}
                 if (current.revision if current else None) != expected:
                     raise Conflict("Conversation changed; resync from its current source.")
+                # The counter and visible head commit together, including conflict rollback.
+                values["change_sequence"] = conn.execute(self.state.update().where(self.state.c.id == 1)
+                    .values(sequence=self.state.c.sequence + 1).returning(self.state.c.sequence)).scalar_one()
                 if current:
                     result = conn.execute(h.update().where((h.c.key == key) & (h.c.revision == expected)).values(**values))
                     if result.rowcount != 1:

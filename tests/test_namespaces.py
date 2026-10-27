@@ -1,3 +1,24 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pytest==9.1.1",
+#     "pytest-xdist==3.8.0",
+#     "click==8.3.3",
+#     "curl_cffi==0.13.0",
+#     "pycryptodome==3.23.0",
+#     "mcp==2.2.0",
+#     "websockets==17.2",
+#     "starlette==1.8.0",
+#     "uvicorn==0.54.0",
+#     "sqlalchemy==2.1.4",
+#     "pydantic==2.12.5",
+#     "httpx==0.28.1",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
+# ///
 """Namespace dispatch isolates history sources and preserves existing automation."""
 
 import importlib.machinery
@@ -17,7 +38,7 @@ from one_conv import cloud_cli, namespaces, native_auth
 
 @pytest.fixture
 def app(monkeypatch):
-    loader = importlib.machinery.SourceFileLoader("namespace_cli", str(Path(__file__).parents[1] / "bin/one-conv"))
+    loader = importlib.machinery.SourceFileLoader("namespace_cli", str(Path(__file__).parents[1] / "one_conv_cli.py"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, loader.name, module)
@@ -109,7 +130,7 @@ def test_claude_does_not_inherit_openai_account_label(app, saved_conversations, 
 
 
 def test_cloud_chats_process_lists_individual_conversations(saved_conversations):
-    result = subprocess.run([sys.executable, "-O", str(Path(__file__).parents[1] / "bin/one-conv"),
+    result = subprocess.run([sys.executable, "-O", str(Path(__file__).parents[1] / "one_conv_cli.py"),
                              "cloud", "claude", "chats", "--json"],
                             capture_output=True, text=True, check=True, timeout=10)
     assert [row["uuid"] for row in json.loads(result.stdout)] == ["second", "first"]
@@ -137,7 +158,7 @@ def test_cloud_read_refresh_is_available(app):
 
 
 def test_cloud_read_process_resolves_id(saved_conversations):
-    result = subprocess.run([sys.executable, "-O", str(Path(__file__).parents[1] / "bin/one-conv"),
+    result = subprocess.run([sys.executable, "-O", str(Path(__file__).parents[1] / "one_conv_cli.py"),
                              "cloud", "read", "sec", "--json", "--no-mark-read"],
                             capture_output=True, text=True, check=True, timeout=10)
     assert json.loads(result.stdout)["session"] == "second"
@@ -406,7 +427,7 @@ def test_public_process_reads_saved_claude_messages(tmp_path):
         "title": "Namespace example", "last": "2026-01-01T00:00:00Z",
         "turns": [{"role": "user", "text": "namespace-marker", "ts": "2026-01-01T00:00:00Z"}],
     }))
-    result = subprocess.run([sys.executable, "-O", str(Path(__file__).parents[1] / "bin/one-conv"),
+    result = subprocess.run([sys.executable, "-O", str(Path(__file__).parents[1] / "one_conv_cli.py"),
                              "cloud", "claude", "search", "namespace-marker", "--json"],
                             env={**os.environ, "ONE_CONV_CLOUD_CACHE": str(tmp_path)},
                             capture_output=True, text=True, check=True, timeout=10)

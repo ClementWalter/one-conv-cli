@@ -1,3 +1,24 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pytest==9.1.1",
+#     "pytest-xdist==3.8.0",
+#     "click==8.3.3",
+#     "curl_cffi==0.13.0",
+#     "pycryptodome==3.23.0",
+#     "mcp==2.2.0",
+#     "websockets==17.2",
+#     "starlette==1.8.0",
+#     "uvicorn==0.54.0",
+#     "sqlalchemy==2.1.4",
+#     "pydantic==2.12.5",
+#     "httpx==0.28.1",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
+# ///
 """Isolated OMP backend coverage for one-conv.
 
 Each test runs the real CLI against a temp $OMP_HOME so it never
@@ -13,7 +34,7 @@ from pathlib import Path
 
 import pytest
 
-CLI = Path(__file__).resolve().parents[1] / "bin" / "one-conv"
+CLI = Path(__file__).resolve().parents[1] / "one_conv_cli.py"
 
 SESSION_ID = "01a0test-0000-0000-0000-000000000001"
 CWD = "/tmp/one-conv-omp-fixture"

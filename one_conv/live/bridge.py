@@ -52,7 +52,7 @@ IDE_SYNC_MINUTES = 15.0
 # Short: a session on a machine that goes away can only be taken over up to its last sync.
 ARCHIVE_SYNC_MINUTES = 1.0
 ARCHIVE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "archive-sync.py"
-LAUNCHER = Path(__file__).resolve().parents[2] / "bin" / "one-conv"
+LAUNCHER = Path(__file__).resolve().parents[2] / "one_conv_cli.py"
 # How long one inbox long-poll waits; also how long a stop request can take to be noticed.
 POLL_SECONDS = 5.0
 MAX_BACKOFF = 30.0

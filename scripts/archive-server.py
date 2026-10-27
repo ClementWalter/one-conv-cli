@@ -1,7 +1,15 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["sqlalchemy==2.1.4", "starlette==1.8.0", "pydantic==2.12.5", "uvicorn==0.54.0"]
+# dependencies = [
+#     "sqlalchemy==2.1.4",
+#     "starlette==1.8.0",
+#     "pydantic==2.12.5",
+#     "uvicorn==0.54.0",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
 # ///
 import os
 import sys

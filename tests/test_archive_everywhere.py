@@ -1,3 +1,24 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pytest==9.1.1",
+#     "pytest-xdist==3.8.0",
+#     "click==8.3.3",
+#     "curl_cffi==0.13.0",
+#     "pycryptodome==3.23.0",
+#     "mcp==2.2.0",
+#     "websockets==17.2",
+#     "starlette==1.8.0",
+#     "uvicorn==0.54.0",
+#     "sqlalchemy==2.1.4",
+#     "pydantic==2.12.5",
+#     "httpx==0.28.1",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
+# ///
 """Every node's agent sessions are readable by live address from every other node, through the controller."""
 
 import json
@@ -97,7 +118,7 @@ def laptop(controller, synced, tmp_path):
 
 
 def one_conv(env, *args):
-    return subprocess.run([sys.executable, "-O", str(ROOT / "bin/one-conv"), *args], env=env, text=True,
+    return subprocess.run([sys.executable, "-O", str(ROOT / "one_conv_cli.py"), *args], env=env, text=True,
                           capture_output=True, check=False, timeout=120)
 
 

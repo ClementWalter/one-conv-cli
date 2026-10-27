@@ -1,7 +1,11 @@
 #!/usr/bin/env -S uv run
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = [
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
 # ///
 """Bootstrap selected cloud repositories and native agents from a private JSON payload.
 
@@ -352,7 +356,7 @@ def prepare_repositories(data):
               if key not in ("GH_TOKEN", "GITHUB_TOKEN", "OP_SERVICE_ACCOUNT_TOKEN")}
     run(["gh", "auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--with-token"],
         stage="github-login", env=native, input=token + "\n")
-    native.update(GH_TOKEN=token, GH_PROMPT_DISABLED="1", GIT_TERMINAL_PROMPT="0")
+    native.update(GH_TOKEN=token, GH_PROMPT_DISABLED="1", GIT_TERMINAL_PROMPT="0")  # gitleaks:allow
     run(["gh", "auth", "setup-git", "--hostname", "github.com"], stage="github-git", env=native)
     run(["gh", "api", "user"], stage="github-auth", env=native)
     documents = Path.home() / "Documents"

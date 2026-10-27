@@ -1,3 +1,24 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pytest==9.1.1",
+#     "pytest-xdist==3.8.0",
+#     "click==8.3.3",
+#     "curl_cffi==0.13.0",
+#     "pycryptodome==3.23.0",
+#     "mcp==2.2.0",
+#     "websockets==17.2",
+#     "starlette==1.8.0",
+#     "uvicorn==0.54.0",
+#     "sqlalchemy==2.1.4",
+#     "pydantic==2.12.5",
+#     "httpx==0.28.1",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
+# ///
 """Live relay: session discovery, sender identity, target resolution and per-harness delivery."""
 
 import json
@@ -20,7 +41,7 @@ from one_conv.live.cli import build_live_group
 from one_conv.live.model import LiveSession, envelope, is_session_id, parse_address
 
 THREAD = "01a13c8f-049a-71b1-b4e6-e0798600ccaa"
-CLI = Path(__file__).resolve().parents[1] / "bin" / "one-conv"
+CLI = Path(__file__).resolve().parents[1] / "one_conv_cli.py"
 
 
 @pytest.fixture
@@ -660,7 +681,7 @@ def test_router_imports_without_fcntl():
               "        if name == 'fcntl': raise ImportError(name)\n"
               "sys.meta_path.insert(0, Block())\nimport one_conv.live.router")
     result = subprocess.run([sys.executable, "-c", script], check=False, capture_output=True, text=True,
-                            cwd=CLI.parents[1])
+                            cwd=CLI.parent)
     assert result.returncode == 0, result.stderr
 
 

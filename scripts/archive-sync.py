@@ -1,7 +1,12 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["click==8.3.3"]
+# dependencies = [
+#     "click==8.3.3",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
 # ///
 """Copy native conversations into an archive. Native files change only through --free-older-than and --restore."""
 
@@ -46,11 +51,11 @@ from one_conv.archive import (
 )
 
 # Captures re-run when the reader or this capture code changes, even if sources did not.
-CAPTURE_VERSION = digest((ROOT / "bin/one-conv").read_bytes() + Path(__file__).read_bytes())
+CAPTURE_VERSION = digest((ROOT / "one_conv_cli.py").read_bytes() + Path(__file__).read_bytes())
 
 
 def load_reader():
-    loader = importlib.machinery.SourceFileLoader("archive_reader", str(ROOT / "bin/one-conv"))
+    loader = importlib.machinery.SourceFileLoader("archive_reader", str(ROOT / "one_conv_cli.py"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     reader = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = reader

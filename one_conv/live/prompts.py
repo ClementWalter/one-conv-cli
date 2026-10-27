@@ -155,7 +155,7 @@ def build_prompts_command(find_threads, live_addresses):
 
     from . import hubclient
 
-    @click.command("report-prompts", context_settings={"help_option_names": ["-h", "--help"]}, hidden=True)
+    @click.command("report-prompts", context_settings={"help_option_names": ["-h", "--help"]}, hidden=True, epilog="\b\nExamples:\n  one-conv report-prompts\n  one-conv report-prompts --json")
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
     def report_prompts(as_json):
         """Report the prompts typed into this machine's running sessions, and their replies, to the hub."""

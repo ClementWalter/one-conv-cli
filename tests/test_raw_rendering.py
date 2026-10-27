@@ -1,3 +1,24 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pytest==9.1.1",
+#     "pytest-xdist==3.8.0",
+#     "click==8.3.3",
+#     "curl_cffi==0.13.0",
+#     "pycryptodome==3.23.0",
+#     "mcp==2.2.0",
+#     "websockets==17.2",
+#     "starlette==1.8.0",
+#     "uvicorn==0.54.0",
+#     "sqlalchemy==2.1.4",
+#     "pydantic==2.12.5",
+#     "httpx==0.28.1",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
+# ///
 """Raw transcript lines: a session read to take it over shows every tool call whole."""
 
 from __future__ import annotations
@@ -9,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-loader = importlib.machinery.SourceFileLoader("agent_conv", str(Path(__file__).parent.parent / "bin" / "one-conv"))
+loader = importlib.machinery.SourceFileLoader("agent_conv", str(Path(__file__).parent.parent / "one_conv_cli.py"))
 spec = importlib.util.spec_from_loader("agent_conv", loader)
 ac = importlib.util.module_from_spec(spec)
 sys.modules["agent_conv"] = ac

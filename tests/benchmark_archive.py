@@ -54,7 +54,7 @@ def test_search_scale(tmp_path, archive):
         measurements = []
         for _ in range(3):
             start = time.perf_counter()
-            rows = run(env, "bin/one-conv", "local", "search", query, "--source", "claude", "--json")
+            rows = run(env, "one_conv_cli.py", "local", "search", query, "--source", "claude", "--json")
             measurements.append(round(time.perf_counter() - start, 3))
             assert len(rows) == expected
             assert all(query in row["text"] for row in rows)

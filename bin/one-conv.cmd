@@ -1,2 +1,2 @@
 @echo off
-uv run --script "%~dp0one-conv" %*
+uv run --script "%~dp0..\one_conv_cli.py" %*

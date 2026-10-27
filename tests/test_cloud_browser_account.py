@@ -1,3 +1,24 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pytest==9.1.1",
+#     "pytest-xdist==3.8.0",
+#     "click==8.3.3",
+#     "curl_cffi==0.13.0",
+#     "pycryptodome==3.23.0",
+#     "mcp==2.2.0",
+#     "websockets==17.2",
+#     "starlette==1.8.0",
+#     "uvicorn==0.54.0",
+#     "sqlalchemy==2.1.4",
+#     "pydantic==2.12.5",
+#     "httpx==0.28.1",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
+# ///
 """Explicit browser-account selection reuses existing session acquisition."""
 
 import importlib.machinery
@@ -85,7 +106,7 @@ def test_default_mode_does_not_acquire_browser_accounts(monkeypatch):
 
 def test_public_launcher_injects_existing_account_callback(monkeypatch, accounts):
     loader = importlib.machinery.SourceFileLoader(
-        "cloud_browser_account_cli", str(Path(__file__).parents[1] / "bin" / "one-conv")
+        "cloud_browser_account_cli", str(Path(__file__).parents[1] / "one_conv_cli.py")
     )
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)

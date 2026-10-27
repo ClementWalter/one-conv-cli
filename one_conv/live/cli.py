@@ -61,7 +61,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             context = (f"[{s.product}] " if s.product else "") + (s.title or s.cwd)
             click.echo(f"{s.address:<{width}}  {s.status or '-':<10}  {s.delivery:<15}  {context}")
 
-    @live.command("send", context_settings=HELP)
+    @live.command("send", context_settings=HELP, epilog="\b\nExamples:\n  one-conv live send @reviewer 'PR #20 is ready' --yes\n  one-conv live send '#release-4-2' 'blocked on the migration' --yes\n  one-conv live send codex:019a 'rerun the suite' --topic release-4-2 --yes\n  one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes\n  one-conv live send @reviewer 'build is green' --fyi --yes\n  one-conv live send codex:019a --stdin --yes < findings.md\n  one-conv live send workspace/user 'done, see the PR' --yes")
     @click.argument("target")
     @click.argument("message", required=False)
     @click.option("--stdin", "from_stdin", is_flag=True, help="Read the message from stdin.")
@@ -81,16 +81,6 @@ def build_live_group(launcher: list[str]) -> click.Group:
 
         A human post in a channel reaches every session there: ack it with `live ack`, then
         agree in the channel who does what before working.
-
-        \b
-        Examples:
-          one-conv live send @reviewer 'PR #20 is ready' --yes
-          one-conv live send '#release-4-2' 'blocked on the migration' --yes
-          one-conv live send codex:019a 'rerun the suite' --topic release-4-2 --yes
-          one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes
-          one-conv live send @reviewer 'build is green' --fyi --yes
-          one-conv live send codex:019a --stdin --yes < findings.md
-          one-conv live send workspace/user 'done, see the PR' --yes
         """
         if from_stdin:
             message = sys.stdin.read()
@@ -220,7 +210,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
         click.echo(json.dumps(record) if as_json else
                    f"{record['state']}: {record['address']} (op {op})\n{record['help']}")
 
-    @live.command("web", context_settings=HELP)
+    @live.command("web", context_settings=HELP, epilog="\b\nExamples:\n  one-conv live web            # then open http://127.0.0.1:8790")
     @click.option("--port", type=click.IntRange(1024, 65535), default=8790, show_default=True,
                   help="Port on 127.0.0.1.")
     def web_command(port):
@@ -228,10 +218,6 @@ def build_live_group(launcher: list[str]) -> click.Group:
 
         It listens on 127.0.0.1 only and has no login, so anyone who can use this machine
         can read it and send messages as You. Viewing topics never marks agents' messages read.
-
-        \b
-        Example:
-          one-conv live web            # then open http://127.0.0.1:8790
         """
         import os
         import shutil
@@ -446,7 +432,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
         if not yes:
             click.echo("Re-run with --yes to apply the missing steps. Running sessions pick them up on restart.")
 
-    @live.command("cursor-hook", hidden=True)
+    @live.command("cursor-hook", hidden=True, epilog=examples('one-conv live cursor-hook < hook-payload.json'))
     def cursor_hook_command():
         """Cursor `stop` hook entry point: reads the hook payload on stdin."""
         try:
@@ -455,7 +441,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             payload = {}
         click.echo(json.dumps(cursor.run_stop_hook(payload)))
 
-    @live.command("ask-hook", hidden=True)
+    @live.command("ask-hook", hidden=True, epilog=examples('one-conv live ask-hook < hook-payload.json'))
     def ask_hook_command():
         """Claude Code PreToolUse hook for AskUserQuestion: reads the hook payload on stdin."""
         from . import ask

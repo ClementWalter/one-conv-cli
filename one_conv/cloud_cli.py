@@ -101,12 +101,12 @@ def session_provider(product, path, organization):
     return CodexProvider(session, account.id, account.label)
 
 
-@click.group("cloud")
+@click.group("cloud", epilog="\b\nExamples:\n  one-conv cloud providers\n  one-conv cloud sync chatgpt --limit 10")
 def cloud_group():
     """Inspect and synchronize experimental cloud sources using managed sessions."""
 
 
-@cloud_group.command("providers")
+@cloud_group.command("providers", epilog="\b\nExamples:\n  one-conv cloud providers")
 def providers():
     """Show implemented coverage, distinct from live account verification."""
     click.echo(json.dumps([
@@ -117,7 +117,7 @@ def providers():
     ]))
 
 
-@cloud_group.command("sync")
+@cloud_group.command("sync", epilog="\b\nExamples:\n  one-conv cloud sync chatgpt --limit 10\n  one-conv cloud sync claude-chat --browser-account ORG --limit 10")
 @click.argument("product", type=click.Choice(PRODUCTS))
 @click.option("--session-file", type=click.Path(path_type=Path), envvar="ONE_CONV_SESSION_FILE", help="Private session provisioned by an authentication broker; never a browser database.")
 @click.option("--browser-account", metavar="EMAIL|ID|ORG", help="Explicitly reuse a signed-in ChatGPT/Codex account or Claude organization.")

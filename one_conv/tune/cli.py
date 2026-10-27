@@ -89,7 +89,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             raise click.ClickException("No exported sessions found. Run: one-conv tune snapshot")
         return load_sessions(roots, tuple(sources) or AGENT_SOURCES, include_system)
 
-    @click.group("tune", context_settings=HELP)
+    @click.group("tune", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune snapshot\n  one-conv tune label --dry-run\n  one-conv tune cloud nightly --dry-run")
     def tune():
         """Fine-tune a local model on your own agent history.
 
@@ -104,14 +104,10 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
           one-conv tune runs
         """
 
-    @tune.command("snapshot", context_settings=HELP)
+    @tune.command("snapshot", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune snapshot")
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
     def snapshot_command(as_json):
         """Export every plugged source on this machine into the tune workspace.
-
-        \b
-        Examples:
-          one-conv tune snapshot
         """
         out = tune_home() / "snapshot"
         written, skipped = snapshot(out)
@@ -120,7 +116,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             return
         click.echo(f"{written} session(s) written, {skipped} already current, under {out}")
 
-    @tune.command(context_settings=HELP)
+    @tune.command(context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune dataset --name base\n  one-conv tune dataset --name no-comments --rule no-comments")
     @click.option("--name", default="base", show_default=True, help="Dataset folder name.")
     @click.option("--corpus", "extra_roots", multiple=True, type=click.Path(path_type=Path),
                   help="Additional export roots, read after the snapshot.")
@@ -160,11 +156,6 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         correction ("no", "revert", "pas ça", ...) becomes the rejected side
         of a DPO pair. Splits are per session, so evaluation never sees a
         training conversation.
-
-        \b
-        Examples:
-          one-conv tune dataset --name base
-          one-conv tune dataset --name no-comments --rule no-comments
         """
         home = tune_home()
         sessions = _sessions(home, extra_roots, sources, include_system)
@@ -203,7 +194,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         if synth_rule:
             click.echo(f"  synthetic {synth_rule}: {manifest['synthetic_train_rows']} training row(s) added")
 
-    @tune.command(context_settings=HELP)
+    @tune.command(context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune label --dry-run\n  one-conv tune label --limit 50\n  one-conv tune label --provider subq\n  one-conv tune label --provider boundless --uncertain-from classifier --model gpt-6-luna\n  one-conv tune review")
     @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="classifier", show_default=True,
                   help="Decision model that labeled (or labels) the moments.")
     @click.option("--model", default=None, help="Judge model for --provider boundless (default gpt-6-luna).")
@@ -224,14 +215,6 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         are cached by content, so reruns only classify new moments.
         classifier.dev needs no key and is asked not to keep the text; SubQ
         Snap needs SUBQ_API_KEY and Jev needs TYPESAFE_API_KEY.
-
-        \b
-        Examples:
-          one-conv tune label --dry-run
-          one-conv tune label --limit 50
-          one-conv tune label --provider subq
-          one-conv tune label --provider boundless --uncertain-from classifier --model gpt-6-luna
-          one-conv tune review
         """
         home = tune_home()
         spec = PROVIDERS[provider]
@@ -271,7 +254,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             raise click.ClickException(f"{error}. Labels written so far are kept; rerun to resume.") from None
         click.echo(f"Labeled {count} moment(s) into {out}")
 
-    @tune.command(context_settings=HELP)
+    @tune.command(context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune mood --dry-run\n  one-conv tune mood --top 20")
     @click.option("--top", default=15, show_default=True, help="Sessions to list, most heated first.")
     @click.option("--dry-run", is_flag=True, help="Count moments still to rate without calling the API.")
     def mood(top, dry_run):
@@ -279,11 +262,6 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
 
         Uses classifier.dev, free and asked not to keep the text. Ratings are
         cached by content, so reruns only rate new moments.
-
-        \b
-        Examples:
-          one-conv tune mood --dry-run
-          one-conv tune mood --top 20
         """
         home = tune_home()
         out = home / "labels" / "mood-classifier.jsonl"
@@ -312,7 +290,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             click.echo(f"{heat['heated']:3} heated of {heat['reactions']:3}  peak {heat['peak']:.1f}  "
                        f"[{session.source}] {session.cwd[-50:]}  {session.session[:8]}")
 
-    @tune.command(context_settings=HELP)
+    @tune.command(context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune view")
     @click.option("--provider", default="classifier", show_default=True, help="Labels file for reply reactions.")
     @click.option("--no-open", is_flag=True, help="Write the file without opening it.")
     def view(provider, no_open):
@@ -320,10 +298,6 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
 
         Sessions can be searched, filtered by source and sorted by how heated
         they got (see `tune mood`). The file stays on this machine.
-
-        \b
-        Examples:
-          one-conv tune view
         """
         home = tune_home()
         out = home / "viewer.html"
@@ -333,7 +307,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         if not no_open:
             click.launch(str(out))
 
-    @tune.group("cloud", context_settings=HELP)
+    @tune.group("cloud", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune cloud push --dataset adjudicated\n  one-conv tune cloud train --dataset adjudicated --run cloud-1\n  one-conv tune cloud pull --run cloud-1")
     def cloud():
         """Run synthesis, training, evaluation and probes on a Modal H100.
 
@@ -369,7 +343,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         # Detached, a dropped connection leaves the GPU job running and its results on the volume.
         _modal("run", "--detach", f"one_conv/tune/modal_app.py::{fn}", *flags)
 
-    @cloud.command("push", context_settings=HELP)
+    @cloud.command("push", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune cloud push --dataset adjudicated")
     @click.option("--dataset", "dataset_name", required=True)
     def cloud_push(dataset_name):
         """Upload a local dataset to the Modal volume."""
@@ -379,7 +353,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         _ensure_volume()
         _modal("volume", "put", "--force", "one-conv-tune", str(local), f"/datasets/{dataset_name}")
 
-    @cloud.command("synth", context_settings=HELP)
+    @cloud.command("synth", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune cloud synth --rule no-comments --limit 2000")
     @click.option("--rule", type=click.Choice(sorted(RULES)), required=True)
     @click.option("--limit", default=2000, show_default=True)
     @click.option("--max-new-tokens", default=512, show_default=True)
@@ -395,7 +369,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         _remote("synthesize", rule=rule, limit=limit, max_new_tokens=max_new_tokens)
         _modal("volume", "get", "--force", "one-conv-tune", f"/synth/{rule}/answers.jsonl", str(folder / "answers.jsonl"))
 
-    @cloud.command("train", context_settings=HELP)
+    @cloud.command("train", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune cloud train --dataset adjudicated --run cloud-1")
     @click.option("--dataset", "dataset_name", required=True)
     @click.option("--run", "run", required=True)
     @click.option("--epochs", default=1.0, show_default=True)
@@ -409,7 +383,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         _remote("train", dataset=dataset_name, run=run, epochs=epochs, learning_rate=learning_rate,
                 rank=rank, max_steps=max_steps, batch_size=batch_size, grad_accum=grad_accum)
 
-    @cloud.command("dpo", context_settings=HELP)
+    @cloud.command("dpo", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune cloud dpo --dataset adjudicated --run dpo-1 --on cloud-1")
     @click.option("--dataset", "dataset_name", required=True)
     @click.option("--run", "run", required=True)
     @click.option("--on", "base_adapter", required=True, help="SFT run to start from; it is also the DPO reference.")
@@ -421,14 +395,14 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         _remote("train_dpo", dataset=dataset_name, run=run, base_adapter=base_adapter, epochs=epochs,
                 learning_rate=learning_rate, beta=beta)
 
-    @cloud.command("eval", context_settings=HELP)
+    @cloud.command("eval", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune cloud eval --run cloud-1 --dataset adjudicated")
     @click.option("--run", "run", required=True)
     @click.option("--dataset", "dataset_name", required=True)
     def cloud_eval(run, dataset_name):
         """Score base vs adapter on the held-out split, on the GPU."""
         _remote("evaluate", run=run, dataset=dataset_name)
 
-    @cloud.command("probe", context_settings=HELP)
+    @cloud.command("probe", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune cloud probe --run cloud-1 --dataset adjudicated --rule no-comments")
     @click.option("--run", "run", required=True)
     @click.option("--dataset", "dataset_name", required=True)
     @click.option("--rule", type=click.Choice(sorted(RULES)), required=True)
@@ -438,13 +412,13 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         """Run the drift probe with several samples per task, on the GPU."""
         _remote("probe", run=run, dataset=dataset_name, rule=rule, samples=samples, lengths=lengths)
 
-    @cloud.command("benchmark", context_settings=HELP)
+    @cloud.command("benchmark", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune cloud benchmark --run cloud-1")
     @click.option("--run", "run", required=True)
     def cloud_benchmark(run):
         """HumanEval pass@1, base vs adapter, to catch lost general coding ability."""
         _remote("benchmark", run=run)
 
-    @cloud.command("nightly", context_settings=HELP)
+    @cloud.command("nightly", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune cloud nightly --dry-run\n  one-conv tune cloud nightly")
     @click.option("--rule", type=click.Choice(sorted(RULES)), default="no-comments", show_default=True)
     @click.option("--judge", default="boundless-claude-opus-5.5", show_default=True,
                   help="Labels file that overrides uncertain labels; new uncertain moments wait for it.")
@@ -455,14 +429,9 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         Snapshots this machine, labels and rates new moments (free), rebuilds
         the dataset with the newest sessions held out, then trains, evaluates,
         benchmarks and probes a run named nightly-YYYY-MM-DD, and pulls it back.
-
-        \b
-        Examples:
-          one-conv tune cloud nightly --dry-run
-          one-conv tune cloud nightly
         """
         run = "nightly-" + datetime.now().date().isoformat()
-        me = [sys.executable, str(PACKAGE_ROOT / "bin" / "one-conv"), "tune"]
+        me = [sys.executable, str(PACKAGE_ROOT / "one_conv_cli.py"), "tune"]
         steps = [
             ["snapshot"], ["label"], ["mood", "--top", "0"],
             ["dataset", "--name", "nightly", "--labels", "--judge", judge, "--rule", rule]
@@ -480,7 +449,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
                 raise click.ClickException(f"Nightly stopped at: one-conv tune {shlex.join(step)}")
         click.echo(f"Run {run} ready. Compare with: one-conv tune runs")
 
-    @cloud.command("pull", context_settings=HELP)
+    @cloud.command("pull", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune cloud pull --run cloud-1")
     @click.option("--run", "run", required=True)
     def cloud_pull(run):
         """Download a run's results (adapter, metrics, eval, probe) into the local workspace."""
@@ -492,7 +461,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
                            cwd=PACKAGE_ROOT, check=False)
         click.echo(f"Pulled into {local}")
 
-    @cloud.command("clean", context_settings=HELP)
+    @cloud.command("clean", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune cloud clean --yes")
     @click.option("--yes", is_flag=True, help="Confirm deleting the volume and everything uploaded to it.")
     def cloud_clean(yes):
         """Delete the Modal volume, including uploaded sessions and the model cache."""
@@ -500,7 +469,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             raise click.ClickException("This deletes every file in the one-conv-tune volume. Rerun with --yes.")
         _modal("volume", "delete", "--yes", "one-conv-tune")
 
-    @tune.command(context_settings=HELP)
+    @tune.command(context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune annotate -n 50\n  one-conv tune compare human boundless-claude-opus-5.5 classifier")
     @click.option("-n", "count", default=100, show_default=True, help="Moments to label in this sitting.")
     @click.option("--uncertain-from", "uncertain_from", default="classifier", show_default=True,
                   help="Labels file whose low-confidence moments you label.")
@@ -513,11 +482,6 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         for a key: 1 accepted, 2 moved on, 3 correction (avoidable), 4 correction
         (new facts), 5 question, 6 unclear, s skip, q quit. Each answer is saved
         immediately to labels/human.jsonl, so you can stop and resume.
-
-        \b
-        Examples:
-          one-conv tune annotate -n 50
-          one-conv tune compare human boundless-claude-opus-5.5 classifier
         """
         home = tune_home()
         out = home / "labels" / "human.jsonl"
@@ -554,16 +518,12 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
                 click.echo(f"→ {keys[key]}")
         click.echo(f"\n{labeled} labeled this sitting, {len(done) + labeled} in total → {out}")
 
-    @tune.command(context_settings=HELP)
+    @tune.command(context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune compare boundless-claude-opus-5.5 boundless-gpt-6-luna classifier")
     @click.argument("reference")
     @click.argument("candidates", nargs=-1, required=True)
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
     def compare(reference, candidates, as_json):
         """Agreement of labels files with a reference, on the moments both labeled.
-
-        \b
-        Examples:
-          one-conv tune compare boundless-claude-opus-5.5 boundless-gpt-6-luna classifier
         """
         folder = tune_home() / "labels"
         ref = load_labels(folder / f"{reference}.jsonl")
@@ -582,7 +542,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             score = f"{row['agreement']:.0%}" if row["agreement"] is not None else "n/a"
             click.echo(f"{row['candidate']:36} {score:>5} agreement on {row['shared']} moments")
 
-    @tune.command(context_settings=HELP)
+    @tune.command(context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune review\n  one-conv tune review --label correction_preference -n 30")
     @click.option("--provider", type=click.Choice(sorted(PROVIDERS)), default="classifier", show_default=True,
                   help="Decision model that labeled (or labels) the moments.")
     @click.option("-n", "count", default=20, show_default=True, help="Moments to show.")
@@ -590,11 +550,6 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
     @click.option("--seed", default=0, show_default=True)
     def review(provider, count, only, seed):
         """Show label counts and a random sample to check the classifier against your own judgment.
-
-        \b
-        Examples:
-          one-conv tune review
-          one-conv tune review --label correction_preference -n 30
         """
         home = tune_home()
         labels = load_labels(home / "labels" / f"{provider}.jsonl")
@@ -611,7 +566,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             click.echo("  reply: " + state["assistant_reply"][:200].replace("\n", " "))
             click.echo("  you:   " + state["user_next_message"][:300].replace("\n", " "))
 
-    @tune.command(context_settings=HELP)
+    @tune.command(context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune synth --rule no-comments --dry-run\n  one-conv tune synth --rule no-comments --limit 2000\n  one-conv tune dataset --name nocom --labels --rule no-comments --synth no-comments")
     @click.option("--rule", type=click.Choice(sorted(RULES)), required=True)
     @click.option("--model", default=DEFAULT_MODEL, show_default=True, help="Generator; the base model keeps its style.")
     @click.option("--limit", default=2000, show_default=True, help="New answers to generate in this run.")
@@ -627,12 +582,6 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         with the rule as a system prompt, then rewritten to obey it. Answers
         are appended, so reruns continue where the last one stopped. Add them
         to a dataset with `tune dataset --synth RULE`.
-
-        \b
-        Examples:
-          one-conv tune synth --rule no-comments --dry-run
-          one-conv tune synth --rule no-comments --limit 2000
-          one-conv tune dataset --name nocom --labels --rule no-comments --synth no-comments
         """
         home = tune_home()
         folder = home / "synth" / rule
@@ -647,7 +596,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         _execute(mlx_python("one_conv.tune.score", "synthesize", "--job", str(job), "--out", str(folder / "synth.result.json")),
                  dry_run)
 
-    @tune.command(context_settings=HELP)
+    @tune.command(context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune train --dataset base --run first --dry-run\n  one-conv tune train --dataset base --run first --iters 600")
     @click.option("--dataset", "dataset_name", default="base", show_default=True)
     @click.option("--run", "run", required=True, help="Run name; adapters land in runs/<run>/adapters.")
     @click.option("--model", default=DEFAULT_MODEL, show_default=True, help="MLX model repo or path.")
@@ -662,11 +611,6 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
 
         The loss covers assistant targets only (--mask-prompt). DPO training
         is not wired yet; the DPO split is used by `eval` instead.
-
-        \b
-        Examples:
-          one-conv tune train --dataset base --run first --dry-run
-          one-conv tune train --dataset base --run first --iters 600
         """
         home = tune_home()
         data = home / "datasets" / dataset_name
@@ -683,7 +627,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             }, indent=1) + "\n")
         _execute(command, dry_run, None if dry_run else run_dir / "train.log")
 
-    @tune.command("eval", context_settings=HELP)
+    @tune.command("eval", context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune eval --run first")
     @click.option("--run", "run", required=True)
     @click.option("--limit", default=200, show_default=True, help="Held-out examples and pairs to score.")
     @click.option("--max-tokens", default=4096, show_default=True, help="Skip sequences longer than this.")
@@ -694,10 +638,6 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         Reports test perplexity on your accepted answers (lower is better)
         and preference shift on correction pairs: how often training moved
         probability toward the answer you accepted, relative to the base.
-
-        \b
-        Examples:
-          one-conv tune eval --run first
         """
         home = tune_home()
         run_dir = _run_dir(home, run)
@@ -710,7 +650,7 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             for key, value in eval_metrics(json.loads((run_dir / "eval.json").read_text())).items():
                 click.echo(f"{key}: {value:.4g}")
 
-    @tune.command(context_settings=HELP)
+    @tune.command(context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune probe --run no-comments --rule no-comments\n  one-conv tune probe --run no-comments --rule no-comments --lengths 0,32000")
     @click.option("--run", "run", required=True)
     @click.option("--rule", type=click.Choice(sorted(RULES)), required=True)
     @click.option("--lengths", default="0,2000,8000,16000", show_default=True,
@@ -725,11 +665,6 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
         model with the rule as a system prompt, and the adapter with no
         instruction. A rule learned in the weights should stay flat while the
         prompt version drifts.
-
-        \b
-        Examples:
-          one-conv tune probe --run no-comments --rule no-comments
-          one-conv tune probe --run no-comments --rule no-comments --lengths 0,32000
         """
         home = tune_home()
         run_dir = _run_dir(home, run)
@@ -744,17 +679,12 @@ def build_tune_group(snapshot: Callable[[Path], tuple[int, int]],
             for variant, rates in table.items():
                 click.echo(f"{variant:8} " + "  ".join(f"@{length}: {rate:.0%}" for length, rate in rates.items()))
 
-    @tune.command(context_settings=HELP)
+    @tune.command(context_settings=HELP, epilog="\b\nExamples:\n  one-conv tune runs\n  one-conv tune runs --sort adapter_test_ppl --lower-is-better")
     @click.option("--sort", "metric", default="pref_shift", show_default=True, help="Metric to rank by.")
     @click.option("--lower-is-better", is_flag=True, help="Rank ascending, e.g. for perplexity or violation rates.")
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
     def runs(metric, lower_is_better, as_json):
         """Rank trained runs by an evaluation metric.
-
-        \b
-        Examples:
-          one-conv tune runs
-          one-conv tune runs --sort adapter_test_ppl --lower-is-better
         """
         ranked = rank_runs(load_runs(tune_home()), metric, higher_is_better=not lower_is_better)
         if as_json:

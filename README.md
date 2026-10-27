@@ -1,5 +1,7 @@
 # one-conv
 
+**Visibility: public.**
+
 Read and search your AI conversations from one CLI. Pull cloud conversations
 into a local history, or read sessions already saved by your coding tools.
 
@@ -22,9 +24,11 @@ by the project where the agent ran.
 You need Python 3.11+ and [uv](https://docs.astral.sh/uv/). The launcher declares
 its dependencies inline; uv resolves them on first use.
 
-Clone this repository and run `./bin/one-conv --help`. The executable is
-[`bin/one-conv`](bin/one-conv). Add the checkout's `bin` directory to your `PATH`
-to use the shorter `one-conv` command shown below.
+Clone this repository and run `./bin/one-conv --help`. The CLI is
+[`one_conv_cli.py`](one_conv_cli.py); `bin/one-conv` and `bin/agent-conv` are
+symlinks to it, and `bin/one-conv.cmd` launches it on Windows. Add the
+checkout's `bin` directory to your `PATH` to use the shorter `one-conv` command
+shown below.
 
 The repository also includes an [agent skill](SKILL.md). Install the checkout
 as a skill in your agent runtime to give it the same launcher and usage guide.
@@ -891,3 +895,12 @@ from root help. Their project-based behavior differs from the cloud namespace.
 [LEGACY_COMMANDS.md](LEGACY_COMMANDS.md) documents that interface, including the
 older ChatGPT sync and asset-download workflow. Use `cloud` and `local` for new
 integrations.
+
+## Tests
+
+Each test file is a PEP 723 script with the same exact pins. Run the offline
+suite in parallel:
+
+```sh
+uv run --no-project --with-requirements tests/conftest.py python -m pytest -n auto tests
+```

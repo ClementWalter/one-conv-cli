@@ -1,0 +1,4 @@
+# Synthetic fixtures in tests/test_export.py history (scrubber tests).
+^xoxc-1234567890-abcdefghijklmnopqrstuvwxyz$
+# The OpenSSH header alone; gitleaks still flags any real key body.
+^-----BEGIN OPENSSH PRIVATE KEY$

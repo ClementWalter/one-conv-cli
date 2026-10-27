@@ -15,7 +15,7 @@ from mcp.types import ToolAnnotations
 from .namespaces import CLOUD_PRODUCTS, LOCAL_SOURCES
 
 Namespace = Literal["cloud", "local"]
-LAUNCHER = Path(__file__).resolve().parents[1] / "bin" / "one-conv"
+LAUNCHER = Path(__file__).resolve().parents[1] / "one_conv_cli.py"
 # A live session's address, NODE/harness:id, names a local conversation on whichever machine ran it.
 LIVE_ADDRESS = re.compile(r"(?:[a-z0-9][a-z0-9-]{0,31}/)?(?:claude|codex|omp|cursor):[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 

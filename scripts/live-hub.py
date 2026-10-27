@@ -1,7 +1,13 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["starlette==1.8.0", "uvicorn==0.54.0"]
+# dependencies = [
+#     "starlette==1.8.0",
+#     "uvicorn==0.54.0",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
 # ///
 """Run the live hub, or manage its node tokens, on the machine that hosts it.
 

@@ -1,3 +1,24 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "pytest==9.1.1",
+#     "pytest-xdist==3.8.0",
+#     "click==8.3.3",
+#     "curl_cffi==0.13.0",
+#     "pycryptodome==3.23.0",
+#     "mcp==2.2.0",
+#     "websockets==17.2",
+#     "starlette==1.8.0",
+#     "uvicorn==0.54.0",
+#     "sqlalchemy==2.1.4",
+#     "pydantic==2.12.5",
+#     "httpx==0.28.1",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
+# ///
 """CLI coverage exercises explicit registration, reusable estimates and real process entry."""
 
 import json
@@ -72,7 +93,7 @@ def test_human_quote_explains_allocation(cli, registration):
 @pytest.fixture
 def public_cli(tmp_path):
     def run(*arguments):
-        return subprocess.run([sys.executable, "-O", str(Path(__file__).parents[1] / "bin/one-conv"), "hr", *arguments],
+        return subprocess.run([sys.executable, "-O", str(Path(__file__).parents[1] / "one_conv_cli.py"), "hr", *arguments],
                               env={**os.environ, "ONE_CONV_HR_DIR": str(tmp_path / "public-hr")},
                               capture_output=True, text=True, check=True, timeout=15)
     return run

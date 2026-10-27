@@ -1,7 +1,11 @@
 #!/usr/bin/env -S uv run
 # /// script
 # requires-python = ">=3.11"
-# dependencies = []
+# dependencies = [
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
 # ///
 """Install a pinned cloud controller from a private, disposable JSON payload.
 

@@ -39,6 +39,22 @@ def selected_sources(source, defaults):
     return (source,) if source else scope
 
 
+# Placeholders in capitals stand for what discovery returns; the rest runs as written.
+READER_EXAMPLES = {
+    "chats": ("--limit 10", "--json"),
+    "read": ("PROJECT --json", "PROJECT --expand --limit 2"),
+    "thread": ("PROJECT --no-mark-read --json", "PROJECT --around 2026-10-27T10:00:00Z --context 3"),
+    "search": ("'rate limit' --json", "'bridge reconnect' --ranked --limit 10"),
+    "find": ("QUERY --json",),
+    "unread": ("--json", "--limit 10"),
+    "fork": ("PROJECT", "PROJECT --nth 2 --yes"),
+    "port": ("PROJECT --into codex", "PROJECT --into claude --limit 20 --print --yes"),
+    "send": ("PROJECT 'summarize the open TODOs'", "PROJECT 'run the tests' --fork --yes"),
+    "skill-usage": ("--since-days 30 --json",),
+    "feed": ("--follow ADDRESS", "--peek --json"),
+}
+
+
 def _reader(command, sources, path):
     """Clone options so scoped help cannot mutate compatibility commands."""
     result = copy(command)
@@ -72,8 +88,9 @@ def _reader(command, sources, path):
                 parameter.type = click.IntRange(min=0)
                 parameter.help = "Number of conversations to list (0 = all)."
                 parameter.show_default = True
-    example_args = " QUERY" if command.name in ("read", "thread", "search", "find", "fork", "port", "send") else ""
-    result.epilog = f"\b\nExamples:\n  {path} {command.name}{example_args} --help"
+    examples = READER_EXAMPLES.get(command.name)
+    if examples:
+        result.epilog = "\b\nExamples:\n" + "\n".join(f"  {path} {command.name} {args}" for args in examples)
     if command.name in READ_COMMANDS and set(sources).issubset(CLOUD_PRODUCTS.values()):
         callback = result.callback
 

@@ -412,8 +412,7 @@ One `live send` reaches any of these, and defaults to a dry run until `--yes`:
 | Target | Reaches |
 | --- | --- |
 | `claude:<id>`, `codex:<id>`, `omp:<id>`, `cursor:<id>` | a session on this machine; a unique id prefix or a substring of its title or folder works too |
-| `boat:<sandbox>/<conversation>` | an agent in a Boat sandbox |
-| `NODE/claude:<full id>` (also `codex`, `omp`, `cursor`) | a session on another machine, through a hub (see [Working across machines](#working-across-machines)); the id must be complete, and Boat conversations keep their own route |
+| `NODE/claude:<full id>` (also `codex`, `omp`, `cursor`) | a session on another machine, through a hub (see [Working across machines](#working-across-machines)); the id must be complete |
 | `@name` | the agent on this machine that chose that name |
 | `#topic` | every member of the topic but you |
 
@@ -652,44 +651,6 @@ one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun t
   published with each session and shown on received messages, but `@name`
   resolves only on the sender's machine for now: address a remote agent as
   `NODE/harness:id`, which is also what its messages give as the reply address.
-
-### Agents in Boat sandboxes
-
-`boat:<sandbox>/<conversation>` addresses a coding agent running in a
-[Boat](https://boat.dev) sandbox, through the `box` CLI and your Boat account.
-The conversation id is Boat's, not the agent's own session id.
-
-```bash
-one-conv live ls --harness boat            # running sandboxes' conversations, idle or busy
-one-conv live send boat:bx_ab12/2ab1… "run the tests" --yes
-one-conv live pull boat:bx_ab12/2ab1…      # read the agent's answers back
-```
-
-- An idle conversation gets `box prompt --resume`; a busy one gets `box steer`.
-  Boat wraps a steered text as a message from you and may stop the command the
-  agent was running, so the envelope inside it is what names the real sender. If
-  the turn ends just before the steer, the message is prompted instead.
-- The remote agent cannot message this machine, so the envelope asks it to answer
-  in its own conversation, and `live pull` reads that back with `box events`.
-- If Boat has not confirmed a prompt within 45 seconds, the send reports
-  `pending` with an operation id instead of failing, because the prompt may still
-  arrive. The same applies when `box prompt` exits without Boat accepting or
-  refusing (`unconfirmed`): only an explicit refusal from Boat means it was not
-  delivered. Do not resend: `one-conv live status OP` shows the outcome, and
-  another send to that conversation is refused until it is accepted, refused, or
-  checked with `live pull` and marked `live status OP --resolve`.
-- `--fyi` cannot reach a sandbox. Boat is listed only when asked for by name
-  (`--harness boat` or a `boat:` address), since listing calls Boat's API.
-
-Tested against real sandboxes, with the agent logins stored in the tester's Boat
-account:
-
-| Boat provider | Status |
-| --- | --- |
-| Claude Code | Verified: idle push and pull through one-conv; a busy conversation took `box steer` byte for byte when run by hand |
-| pi | Verified: idle push and pull; the first reply took about four minutes |
-| Codex | Not verified: not configured on the tested account (`provider_not_configured`) |
-| Cursor | Not supported: Boat has no Cursor provider |
 
 ### Keeping multi-agent exchanges readable
 

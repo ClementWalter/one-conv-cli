@@ -194,8 +194,7 @@ These agents can modify files or use tools, so preserve the user's action scope.
 ### Messaging running sessions
 
 `one-conv live ls` lists running sessions with addresses such as
-`claude:<id>`, `codex:<id>`, `omp:<id>`, `cursor:<id>` and
-`boat:<sandbox>/<conversation>`. `one-conv live send TARGET MESSAGE --yes`
+`claude:<id>`, `codex:<id>`, `omp:<id>` and `cursor:<id>`. `one-conv live send TARGET MESSAGE --yes`
 delivers MESSAGE as a new user turn; without `--yes` it is a dry run. TARGET is an
 address, id prefix, title/cwd substring, `@name` of an agent on this machine,
 `#topic` (every member), or `NODE/harness:<full id>` for an agent on another

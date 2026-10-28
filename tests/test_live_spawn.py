@@ -503,3 +503,62 @@ def test_every_cursor_cli_name_starts_the_agent_command(name):
     from one_conv.live.cli import build_live_group
     result = CliRunner().invoke(build_live_group(["one-conv"]), ["spawn", name, "hello"])
     assert "in tmux: agent " in result.output
+
+
+# --- idle agents are retired ------------------------------------------------------------------------
+
+HOUR = 3600.0
+
+
+@pytest.fixture
+def ended(homes, monkeypatch):
+    """tmux ends whatever it is told to; records the names it was told to end."""
+    names = []
+
+    def run(argv, **kw):
+        if argv[1] == "kill-session":
+            names.append(argv[-1])
+        return subprocess.CompletedProcess(argv, 1, "", "can't find session")
+    monkeypatch.setattr(spawn.subprocess, "run", run)
+    return names
+
+
+def idle(address="claude:x"):
+    return [LiveSession("claude", address.partition(":")[2], status="idle")]
+
+
+def test_an_agent_first_seen_idle_starts_its_idle_clock(ended):
+    spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": "claude:x"}})
+    spawn.retire_idle(idle(), now=1000.0, idle_hours=24)
+    assert spawn._load()["oneconv-c"]["active_at"] == 1000.0
+
+
+def test_an_agent_idle_past_the_limit_is_ended(ended):
+    spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": "claude:x", "active_at": 0.0}})
+    spawn.retire_idle(idle(), now=25 * HOUR, idle_hours=24)
+    assert ended == ["oneconv-c"]
+
+
+def test_an_ended_idle_agent_leaves_the_registry(ended):
+    spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": "claude:x", "active_at": 0.0}})
+    spawn.retire_idle(idle(), now=25 * HOUR, idle_hours=24)
+    assert spawn._load() == {}
+
+
+def test_an_agent_idle_within_the_limit_is_kept(ended):
+    spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": "claude:x", "active_at": 0.0}})
+    spawn.retire_idle(idle(), now=23 * HOUR, idle_hours=24)
+    assert ended == []
+
+
+@pytest.mark.parametrize("status", ["busy", "waiting"])
+def test_an_agent_at_work_or_waiting_on_the_human_resets_its_clock(ended, status):
+    spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": "claude:x", "active_at": 0.0}})
+    spawn.retire_idle([LiveSession("claude", "x", status=status)], now=25 * HOUR, idle_hours=24)
+    assert spawn._load()["oneconv-c"]["active_at"] == 25 * HOUR
+
+
+def test_an_agent_not_yet_registered_is_kept(ended):
+    spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": "", "active_at": 0.0}})
+    spawn.retire_idle([], now=25 * HOUR, idle_hours=24)
+    assert ended == []

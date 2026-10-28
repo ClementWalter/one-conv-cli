@@ -431,6 +431,8 @@ class Bridge:
     def step(self, wait: float | None = None) -> None:
         wait = POLL_SECONDS if wait is None else wait
         if time.monotonic() - self.published_at >= PUBLISH_SECONDS:
+            for row in spawn.retire_idle(router.list_all()):
+                logger.info("ended %s, idle for %g hours", row.get("address") or row["tmux"], spawn.IDLE_HOURS)
             self.publish()
         self.drain_outbox()
         self.report_history()

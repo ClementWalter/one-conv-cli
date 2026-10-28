@@ -2072,6 +2072,10 @@ button {
 .ask-send {
   align-self: flex-start;
 }
+/* A question its agent no longer waits on: kept for reading, not for answering. */
+.ask-options.closed {
+  opacity: 0.6;
+}
 /* "Name is working…" above the composer while a member's bridge reports it busy. */
 .working {
   display: flex;

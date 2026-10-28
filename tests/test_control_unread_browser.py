@@ -219,3 +219,28 @@ def test_several_questions_are_answered_by_header(two_questions):
     two_questions.locator(".ask-send").click()
     two_questions.locator(".message-body p", has_text="Extras: Router, Store").wait_for()
     assert "Framework: Vue" in two_questions.locator(".message-body p", has_text="Extras: Router, Store").inner_text()
+
+
+@pytest.fixture
+def moved_on(browser, real_http_workspace):
+    """The agent posted again after its question, so it no longer waits on it."""
+    real_http_workspace["worker"].post("/v1/messages", json={"id": "f" * 32, "from": "omp:agent", "to": "workspace/user",
+                                                             "text": ask_text(FRAMEWORK)}).raise_for_status()
+    real_http_workspace["worker"].post("/v1/messages", json={"id": "d" * 32, "from": "omp:agent", "to": "workspace/user",
+                                                             "text": "Went with React."}).raise_for_status()
+    context, page = paired(browser, real_http_workspace, "direct=user%20worker%2Fomp%3Aagent", 1280)
+    page.locator(".ask-option").first.wait_for()
+    yield page
+    context.close()
+
+
+def test_a_question_the_agent_moved_past_takes_no_answer(moved_on):
+    assert moved_on.locator(".ask-option input").first.is_disabled()
+
+
+def test_a_question_the_agent_moved_past_says_it_is_closed(moved_on):
+    assert moved_on.locator(".ask-send").inner_text() == "Question closed"
+
+
+def test_an_open_question_still_takes_an_answer(question):
+    assert question.locator(".ask-option input").first.is_enabled()

@@ -132,7 +132,7 @@ def plan(launcher: list[str]) -> list[Step]:
              "you can then inject user turns into every Claude Code session, including bypass ones",
              inbound_done, inbound_apply),
         Step("claude", f"add the AskUserQuestion hook to {settings}, so a question can be answered from the "
-             "workspace (the terminal asks after 30 min without an answer)", ask_hook_done, ask_hook_apply),
+             "workspace (after 30 min unanswered, the agent moves on and the answer arrives as a message)", ask_hook_done, ask_hook_apply),
         Step("codex", "register the one-conv MCP server",
              lambda: _registered(["codex", "mcp", "get", "one-conv"], mcp),
              lambda: _replace(["codex", "mcp", "remove", "one-conv"],

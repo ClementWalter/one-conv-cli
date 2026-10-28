@@ -23,7 +23,7 @@ by the project where the agent ran.
 
 ## Install
 
-You need Python 3.11+ and [uv](https://docs.astral.sh/uv/). The launcher declares
+You need Python 3.12+ and [uv](https://docs.astral.sh/uv/). The launcher declares
 its dependencies inline; uv resolves them on first use.
 
 Clone this repository and run `./bin/one-conv --help`. The CLI is

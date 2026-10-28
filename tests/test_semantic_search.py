@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.12"
 # dependencies = [
 #     "pytest==9.1.1",
 #     "pytest-xdist==3.8.0",
@@ -14,7 +14,7 @@
 #     "sqlalchemy==2.1.4",
 #     "pydantic==2.12.5",
 #     "httpx==0.28.1",
-#     "numpy==2.4.6",
+#     "numpy==2.5.4",
 # ]
 #
 # [tool.uv]

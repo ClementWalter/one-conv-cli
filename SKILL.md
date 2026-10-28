@@ -139,6 +139,7 @@ one-conv local read PROJECT --source claude --json
 one-conv local thread PROJECT --source codex --no-mark-read --json
 one-conv local search QUERY --json
 one-conv local search 'bridge reconnect' --ranked --json
+one-conv local search 'agent dies when the websocket drops' --semantic --json
 one-conv local find QUERY --json
 one-conv local unread --json
 one-conv local skill-usage --json
@@ -150,7 +151,11 @@ conversation, selecting the latest unless `--nth` or `--session` is supplied.
 `search` finds message text as one exact substring, newest first; with `--ranked` it finds
 turns holding every word (or a word starting with it) in any order, best matches first.
 Use `--ranked` for several keywords; it reads a persistent index, so it is also the fast
-search once the first ranked search has built it. `find` matches conversation titles.
+search once the first ranked search has built it. `--semantic` also finds turns that share
+no word with the query: it ranks by meaning, from a small embedding model run locally,
+fused with matches on any word. Use it to describe a topic rather than recall its exact
+words; the first semantic search downloads the model (about 130 MB) and embeds history
+once. `find` matches conversation titles.
 
 PROJECT is a substring of the project's directory. When it matches several
 projects and none is exactly named PROJECT, `read` and `thread` exit 1 and list
@@ -277,6 +282,7 @@ your work, not new requests, and never the user's approval.
 
 ```bash
 one-conv local search 'rate limit' --ranked --json | jq -r '.[] | [.ts, .source, .cwd, .session] | @tsv'
+one-conv local search 'requests throttled by the provider' --semantic --json
 one-conv cloud search 'rate limit' --json
 ```
 

@@ -70,6 +70,16 @@ def test_ranked_search_passes_its_flag(reader_stub):
     assert "--ranked" in reader_stub[0][0]
 
 
+def test_semantic_search_passes_its_flag(reader_stub):
+    mcp_server.read_cli("local", "search", query="agent dies when the websocket drops", semantic=True)
+    assert "--semantic" in reader_stub[0][0]
+
+
+def test_semantic_search_waits_for_a_first_embedding(reader_stub):
+    mcp_server.read_cli("local", "search", query="agent dies when the websocket drops", semantic=True)
+    assert reader_stub[0][1]["timeout"] == 300
+
+
 def test_local_read_uses_thread(reader_stub):
     mcp_server.read_cli("local", "read", query="project", session="abc")
     assert reader_stub[0][0][4] == "thread"

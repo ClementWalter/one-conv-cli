@@ -7,7 +7,7 @@
 #     "pycryptodome==3.23.0",
 #     "mcp==2.2.0",
 #     "websockets==17.2",
-#     "numpy==2.5.4",
+#     "numpy==2.4.6",
 # ]
 #
 # [tool.uv]

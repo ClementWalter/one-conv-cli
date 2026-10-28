@@ -2,6 +2,8 @@
 
 **Visibility: public.**
 
+**Extension: not shipped** as a Claude Desktop extension: it is tooling for the author's own agent sessions and machines.
+
 Read and search your AI conversations from one CLI. Pull cloud conversations
 into a local history, or read sessions already saved by your coding tools.
 

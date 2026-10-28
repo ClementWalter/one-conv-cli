@@ -176,7 +176,23 @@ def prepare_repositories(data):
         if origin.stdout.strip() != url:
             raise BootstrapError("repository-origin")
         run(["git", "-C", str(path), "rev-parse", "--verify", "HEAD"], stage="repository-head", env=native)
+        on_default_branch(path, native)
     return native
+
+
+def on_default_branch(path, env):
+    """Put a clone left on a detached commit back on its remote's default branch; a branch is left as it is.
+
+    A spawned session pulls before working, which a detached clone cannot do. A checkout git refuses,
+    such as one over uncommitted changes, keeps the clone where it is.
+    """
+    if run(["git", "-C", str(path), "symbolic-ref", "-q", "HEAD"], stage="repository-branch", env=env, check=False).returncode == 0:
+        return
+    head = run(["git", "-C", str(path), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+               stage="repository-default", env=env, check=False).stdout.strip()
+    branch = head.removeprefix("origin/") or "main"
+    if run(["git", "-C", str(path), "checkout", "-q", branch], stage="repository-checkout", env=env, check=False).returncode == 0:
+        run(["git", "-C", str(path), "pull", "-q", "--ff-only"], stage="repository-pull", env=env, check=False)
 
 
 def _hub_settings(data):

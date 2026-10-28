@@ -23,13 +23,12 @@
 
 import json
 import time
-from types import SimpleNamespace
 
 import pytest
 
 from one_conv.control import runtime
 from one_conv.control.runtime import provision_spawner
-from one_conv.control.workers import DEFAULT_PROFILE
+from one_conv.control.workers import CloudBox
 from one_conv.live.hub import Hub
 
 SPAWNER = {"node": "cloudbox"}
@@ -61,12 +60,9 @@ class StubBoat:
 @pytest.fixture
 def manager(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "_revision", lambda: "rev-1")
-    (tmp_path / "workers.json").write_text(json.dumps({"jobs": {}, "pools": {}}))
     hub = Hub(str(tmp_path / "hub.db"))
     hub.publish("mac", [], spawn="claude", priority=10, git_user=MAC_IDENTITY)
-    return SimpleNamespace(directory=tmp_path, state_path=tmp_path / "workers.json", boat=StubBoat(),
-                           profiles={"default": DEFAULT_PROFILE},
-                           config={"public_hub_url": "https://hub.example.test", "hub": hub})
+    return CloudBox(tmp_path, {"boat": StubBoat(), "public_hub_url": "https://hub.example.test", "hub": hub})
 
 
 def test_a_missing_box_is_created(manager):
@@ -192,7 +188,7 @@ def test_a_new_mac_identity_provisions_the_box_again(manager):
 
 
 def test_a_spawner_block_needs_only_a_node():
-    runtime.check_spawner({"node": "cloudbox"}, {"default": DEFAULT_PROFILE})
+    runtime.check_spawner({"node": "cloudbox"}, {"default": {}})
 
 
 @pytest.mark.parametrize("spawner", [
@@ -204,7 +200,7 @@ def test_a_spawner_block_needs_only_a_node():
 ])
 def test_a_bad_spawner_block_is_refused(spawner):
     with pytest.raises(ValueError, match="spawner block"):
-        runtime.check_spawner(spawner, {"default": DEFAULT_PROFILE})
+        runtime.check_spawner(spawner, {"default": {}})
 
 
 def test_a_created_box_is_provisioned_at_once(manager):

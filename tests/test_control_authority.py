@@ -30,12 +30,12 @@ from starlette.requests import Request
 from starlette.testclient import TestClient
 
 from one_conv.control.cli import build_control_group
-from one_conv.control.runtime import Workers, application
+from one_conv.control.runtime import Teammates, application
 from one_conv.control.store import ControlStore
 from one_conv.live.hub import HubError
 
 ORIGIN = "https://workspace.example.test"
-MUTATIONS = ["spawn", "stop", "recheck", "stop_pool", "resume_pool", "reconcile"]
+MUTATIONS = ["spawn"]
 
 
 def bearer(token):
@@ -55,7 +55,7 @@ def dispatched(monkeypatch):
         calls.append((method, payload))
         return {"method": method, "action": payload.get("action")}
 
-    monkeypatch.setattr(Workers, "browser", browser)
+    monkeypatch.setattr(Teammates, "browser", browser)
     return calls
 
 
@@ -66,7 +66,7 @@ def app(tmp_path, dispatched):
 
 @pytest.fixture
 def client(app):
-    # No lifespan is needed: request tests must never advance provisioning jobs.
+    # No lifespan is needed: request tests never sweep the hub or wake the cloud box.
     return TestClient(app, base_url=ORIGIN)
 
 
@@ -87,10 +87,6 @@ def test_denied_staffing_does_not_dispatch(client, token, dispatched, action):
     assert dispatched == []
 
 
-def test_node_can_read_staffing_without_delegation(client, token):
-    assert client.get("/v1/workers", headers={"Authorization": "Bearer " + token}).status_code == 200
-
-
 @pytest.mark.parametrize("action", MUTATIONS)
 def test_operator_delegation_allows_each_staffing_mutation(client, app, token, action):
     app.state.store.grant_staffing("cfo")
@@ -107,11 +103,6 @@ def test_paired_human_keeps_staffing_access(client, app):
 def test_browser_cookie_does_not_authorize_node_staffing(client, app):
     client.post("/api/login", json={"token": app.state.auth.issue_pairing_token()}, headers={"Origin": ORIGIN}).raise_for_status()
     assert client.post("/v1/workers", json={"action": "spawn"}).status_code == 401
-
-
-def test_pool_minted_token_has_no_staffing_authority(client, app):
-    token = app.state.workers.manager._token({"id": "a" * 32, "node": "resident-pool"})
-    assert client.post("/v1/workers", json={"action": "spawn"}, headers={"Authorization": "Bearer " + token}).status_code == 403
 
 
 def test_staffing_payload_cannot_self_delegate(client, token):

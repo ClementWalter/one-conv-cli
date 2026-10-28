@@ -33,11 +33,11 @@ def build_control_group():
     @click.option("--origin", required=True, help="Exact public HTTPS origin terminating TLS in front of this service.")
     @click.option("--host", default="127.0.0.1", show_default=True)
     @click.option("--port", type=click.IntRange(1, 65535), default=8790, show_default=True)
-    @click.option("--config", type=click.Path(exists=True, path_type=Path), help="Worker profile JSON; omit to disable provisioning.")
+    @click.option("--config", type=click.Path(exists=True, path_type=Path), help="Cloud box JSON (profiles and the spawner block); omit to run no cloud spawner.")
     @click.option("--session-days", type=click.IntRange(1, 30), default=30, show_default=True)
     @click.pass_context
     def serve(context, origin, host, port, config, session_days):
-        """Run messaging, the authenticated PWA and a durable worker supervisor."""
+        """Run messaging, the authenticated PWA, staffing and, when configured, the cloud spawner box."""
         from .runtime import application
         try:
             import uvicorn
@@ -46,7 +46,7 @@ def build_control_group():
         try:
             settings = json.loads(config.read_text()) if config else None
             if settings is not None and not isinstance(settings, dict):
-                raise ValueError("Worker configuration must be an object")
+                raise ValueError("The cloud box configuration must be an object")
             os.umask(0o077)
             app = application(context.obj["control_directory"], origin, worker_config=settings,
                               session_seconds=session_days * 86400)
@@ -109,7 +109,7 @@ def build_control_group():
     @click.option("--yes", is_flag=True, required=True, help="Invalidate every paired browser session.")
     @click.pass_context
     def revoke_devices(context, yes):
-        """Disconnect every browser without interrupting node bridges or workers."""
+        """Disconnect every browser without interrupting node bridges."""
         from .auth import AuthStore
         count = AuthStore(context.obj["control_directory"]).revoke_all_sessions()
         click.echo(f"Revoked {count} browser session(s).")

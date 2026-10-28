@@ -366,11 +366,11 @@ message about it with the channel (`topic` / `--topic`). The workspace shows eve
 agent-to-agent DM, and lists a tagged DM in its channel as "To @name only"; only
 the addressed agent is notified.
 
-With a configured hub, `live spawn HARNESS --cloud --name NAME --topic TOPIC`
-prepares a resident teammate on a shared Boat worker box. It requires `--yes`.
-Use `live workers --json` for progress. Preserve the returned request ID and use
-`--request-id` after an unconfirmed response; do not allocate another box merely
-because a receipt was lost. Missing provider access remains needing attention.
+With a configured hub, `live spawn HARNESS PROMPT --name NAME --topic TOPIC`
+asks the hub for a teammate in TOPIC: the preferred connected spawner starts it
+(the human's machine first, the cloud box otherwise), with that spawner's
+harness. It requires `--yes` and staffing authority. Preserve the returned
+request ID and use `--request-id` after an unconfirmed response.
 
 `hr list`, `hr quote`, `hr usage` and `hr summary` use the configured shared
 accounting authority. `--local` opts out. Hourly rates include internal subagents.

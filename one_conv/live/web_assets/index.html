@@ -500,20 +500,15 @@
     <dialog id="staff-dialog" class="message-dialog staff-dialog">
       <form id="staff-form">
         <div class="dialog-heading"><div><span class="eyebrow">BRING SOMEONE IN</span><h2>Good work is a team sport.</h2></div><button class="icon-button" type="button" data-close="staff-dialog" aria-label="Close add teammate">×</button></div>
-        <p class="dialog-description">Give your teammate a name and a place to start. We’ll get their workspace ready.</p>
+        <p class="dialog-description">Give your teammate a name and a place to start. A connected machine starts them: yours first, the cloud box otherwise.</p>
         <div class="field-grid">
           <label>Name<input id="staff-name" name="name" required maxlength="32" pattern="[a-z0-9][a-z0-9-]*" placeholder="e.g. jack" autocomplete="off" /></label>
-          <label>Harness<select id="staff-harness" name="harness"><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="omp">Oh My Pi</option></select></label>
-          <label class="full-field">Model<input id="staff-model" name="model" maxlength="160" placeholder="Your configured default" autocomplete="off" /></label>
           <label>Channel<input id="staff-topic" name="topic" required maxlength="32" pattern="[a-z0-9][a-z0-9-]*" placeholder="e.g. product" autocomplete="off" /></label>
-          <label>Workspace profile<select id="staff-profile" name="profile"><option value="default">Default</option></select></label>
           <label class="full-field">First task<textarea id="staff-prompt" name="prompt" required maxlength="16000" rows="3" placeholder="What would you like them to work on?"></textarea></label>
         </div>
-        <p id="staff-feedback" class="quiet-copy" role="status">Agents share a box when capacity is available, with a separate worktree each.</p>
-        <p id="staff-access-disclosure" class="quiet-copy" aria-live="polite">This teammate uses this profile’s repository access, credentials and approval settings.</p>
-        <button id="staff-submit" class="primary-button" type="submit" aria-describedby="staff-access-disclosure">Bring teammate online <span aria-hidden="true">↗</span></button>
+        <p id="staff-feedback" class="quiet-copy" role="status">The request shows in the channel, and the new teammate joins it there.</p>
+        <button id="staff-submit" class="primary-button" type="submit">Bring teammate online <span aria-hidden="true">↗</span></button>
       </form>
-      <div id="worker-jobs" class="worker-jobs" aria-live="polite"></div>
     </dialog>
     <dialog id="channel-dialog" class="message-dialog staff-dialog">
       <form id="channel-form">

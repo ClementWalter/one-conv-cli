@@ -7,7 +7,7 @@ into a local history, or read sessions already saved by your coding tools.
 
 Work with live teammates from a Slack-style workspace, including human messages
 and a paired iPhone app. See [the mobile workspace guide](MOBILE_WORKSPACE.md)
-for cloud hosting, shared worker boxes and team accounting.
+for cloud hosting, the cloud spawner box and team accounting.
 
 | Namespace | Sources |
 | --- | --- |
@@ -502,9 +502,9 @@ one-conv live spawner --harness claude --cwd ~/work --env-file /run/secrets/env.
 - Anything that cannot be undone (sending a message for the user, a payment) is
   done by one session, named in the channel.
 - A human post in a channel with nobody running starts a session at once: on a
-  machine whose bridge offers to (`live spawner`), else on a cloud worker when no
-  such machine is connected, refuses, or no session acks within 90 s. The post
-  shows "Starting a session…" until a session acks it.
+  machine whose bridge offers to (`live spawner`), the preferred one first; one
+  that refuses, or whose session does not ack within 90 s, passes it to the next.
+  The post shows "Starting a session…" until a session acks it.
 - The cloud spawner is a Boat box the controller builds and runs itself. Its
   worker config takes `"spawner": {"node": "<hub node>"}`, plus optionally `box`
   (an existing box to adopt), `profile`, `harness`, `args`, `priority` and

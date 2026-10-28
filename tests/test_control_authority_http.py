@@ -35,11 +35,7 @@ uvicorn = pytest.importorskip("uvicorn")
 
 
 @pytest.fixture
-def workspace(tmp_path, monkeypatch):
-    from one_conv.control.workers import WorkerManager
-
-    # The actual request dispatcher queues jobs; no supervisor may contact a provider.
-    monkeypatch.setattr(WorkerManager, "run_once", lambda self: None)
+def workspace(tmp_path):
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     origin = f"http://127.0.0.1:{sock.getsockname()[1]}"
@@ -64,56 +60,35 @@ def workspace(tmp_path, monkeypatch):
 @pytest.fixture
 def spawn():
     return {"action": "spawn", "id": "a" * 32,
-            "spec": {"name": "jack", "harness": "codex", "model": None,
-                     "topic": "release", "profile": "default", "prompt": "Review the change."}}
+            "spec": {"name": "jack", "topic": "release", "prompt": "Review the change."}}
 
 
-@pytest.mark.parametrize("action", ["spawn", "stop", "recheck", "stop_pool", "resume_pool", "reconcile"])
-def test_real_http_peer_cannot_mutate_staffing(workspace, action):
+def test_real_http_peer_cannot_ask_for_a_teammate(workspace, spawn):
     _, client = workspace
     with pytest.raises(HubRefused, match=r"\(403\).*staffing authority"):
-        client.request("POST", "/v1/workers", {"action": action})
+        client.request("POST", "/v1/workers", spawn)
 
 
-def test_real_http_staffing_reads_remain_available(workspace):
-    _, client = workspace
-    assert client.request("GET", "/v1/workers")["jobs"] == []
-
-
-def test_real_http_denied_spawn_leaves_no_job(workspace, spawn):
+def test_real_http_denied_request_posts_nothing(workspace, spawn):
     app, client = workspace
     with pytest.raises(HubRefused):
         client.request("POST", "/v1/workers", spawn)
-    assert app.state.workers.manager.list()["jobs"] == []
+    assert app.state.hub.history("release") == []
 
 
-def test_real_http_operator_grant_queues_one_worker(workspace, spawn):
-    app, client = workspace
-    app.state.store.grant_staffing("cfo")
-    assert client.request("POST", "/v1/workers", spawn)["status"] == "queued"
-
-
-def test_real_http_authorized_spawn_retains_teammate_attribution(workspace, spawn):
-    app, client = workspace
-    app.state.store.grant_staffing("cfo")
-    job = client.request("POST", "/v1/workers", spawn)
-    assert "authenticated node cfo" in job["spec"]["prompt"]
-
-
-def test_real_http_delegated_node_can_stop_its_queued_job(workspace, spawn):
+def test_real_http_operator_grant_files_the_teammate_request(workspace, spawn):
     app, client = workspace
     app.state.store.grant_staffing("cfo")
     client.request("POST", "/v1/workers", spawn)
-    assert client.request("POST", "/v1/workers", {"action": "stop", "id": spawn["id"]})["status"] == "stopped"
+    assert app.state.hub.history("release")[0]["text"].startswith("New teammate @jack: A teammate on authenticated node cfo")
 
 
-def test_real_http_revoke_blocks_even_queued_job_stop(workspace, spawn):
+def test_real_http_revoked_node_cannot_ask_for_a_teammate(workspace, spawn):
     app, client = workspace
     app.state.store.grant_staffing("cfo")
-    client.request("POST", "/v1/workers", spawn)
     app.state.store.revoke_staffing("cfo")
     with pytest.raises(HubRefused, match=r"\(403\)"):
-        client.request("POST", "/v1/workers", {"action": "stop", "id": spawn["id"]})
+        client.request("POST", "/v1/workers", spawn)
 
 
 def test_real_http_replacement_token_needs_new_grant(workspace, spawn):
@@ -137,7 +112,7 @@ def test_real_http_replacement_can_receive_explicit_delegation(workspace, spawn)
     app.state.store.grant_staffing("cfo")
     client.token = app.state.store.add_node("cfo")
     app.state.store.grant_staffing("cfo")
-    assert client.request("POST", "/v1/workers", spawn)["status"] == "queued"
+    assert client.request("POST", "/v1/workers", spawn)["id"] == spawn["id"]
 
 
 def test_real_http_ordinary_peer_can_publish_native_session(workspace):

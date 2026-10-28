@@ -19,596 +19,77 @@
 # [tool.uv]
 # exclude-newer = "2026-10-27T00:00:00Z"
 # ///
-"""Durable worker jobs reserve boxes and native agents across retries and crashes."""
+"""The Boat client never repeats an unconfirmed effect, and box profiles load what the spawner box needs."""
 
 import json
 import os
 import subprocess
-import sys
-import threading
 
 import pytest
 
 from one_conv.control.workers import (
     DEFAULT_PROFILE,
     BoatCLI,
-    PreflightRefused,
+    CloudBox,
     Unconfirmed,
     WorkerError,
-    WorkerManager,
     machine_status,
     private_json,
 )
 
 
-@pytest.fixture
-def spec():
-    return {"name": "reviewer", "harness": "claude", "model": None, "topic": "release",
-            "profile": "default", "prompt": "Review the selected repository."}
-
-
-class StubBoat:
-    """An in-memory provider with explicit ambiguous acknowledgements."""
-
-    def __init__(self):
-        self.creates = 0
-        self.starts = []
-        self.health = {"status": "auth_needed", "authenticated": False, "stage": "model-probe"}
-        self.lose_create = False
-        self.lose_bootstrap = False
-        self.pools_stopped = []
-        self.pools_resumed = []
-        self.state = "running"
-
-    def credentials(self, profile):
-        return {"service_account": "private-service-account"}
-
-    def create(self, profile, pool_id):
-        self.creates += 1
-        if self.lose_create:
-            raise Unconfirmed("a private provider diagnostic")
-        return f"bx_{self.creates}"
-
-    def info(self, box):
-        return {"id": box, "state": self.state}
-
-    def bootstrap(self, box, payload):
-        self.starts.append((box, payload))
-        if self.lose_bootstrap:
-            raise Unconfirmed("a private bootstrap diagnostic")
-        return {"status": "stopped"} if payload["operation"] == "stop" else self.health
-
-    def stop_pool(self, box):
-        self.pools_stopped.append(box)
-        self.state = "stopped"
-
-    def resume_pool(self, box):
-        self.pools_resumed.append(box)
-        self.state = "running"
-
-
-@pytest.fixture
-def boat():
-    return StubBoat()
-
-
-@pytest.fixture
-def config(boat):
-    return {"boat": boat, "public_hub_url": "https://hub.example.test", "create_node_token": lambda node: "private-hub-token"}
-
-
-@pytest.fixture
-def manager(tmp_path, config):
-    return WorkerManager(tmp_path / "workers", config)
-
-
-@pytest.fixture
-def provisioned(manager, spec):
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    return manager
-
-
-def test_submit_returns_before_any_allocation(manager, spec, boat):
-    manager.submit(spec, "request-1")
-    assert boat.creates == 0
-
-
-def test_submit_is_durable(manager, spec):
-    manager.submit(spec, "request-1")
-    assert json.loads(manager.state_path.read_text())["jobs"]["request-1"]["status"] == "queued"
-
-
-def test_reusing_a_request_id_preserves_the_job(manager, spec):
-    first = manager.submit(spec, "request-1")
-    assert manager.submit(spec, "request-1") == first
-
-
-def test_reusing_a_request_id_with_other_text_is_refused(manager, spec):
-    manager.submit(spec, "request-1")
-    with pytest.raises(ValueError, match="different spec"):
-        manager.submit({**spec, "prompt": "Other task"}, "request-1")
-
-
-def test_another_request_cannot_duplicate_an_active_name(manager, spec):
-    manager.submit(spec, "request-1")
-    with pytest.raises(ValueError, match="active job"):
-        manager.submit(spec, "request-2")
-
-
-@pytest.mark.parametrize("id", ["../escape", "", "a/b", "a" * 65])
-def test_job_ids_cannot_escape_the_store(manager, spec, id):
-    with pytest.raises(ValueError, match="job id"):
-        manager.submit(spec, id)
-
-
-@pytest.mark.parametrize("change", [
-    {"name": "../escape"}, {"topic": "#Release"}, {"harness": "shell"}, {"profile": "personal"},
-    {"model": "--arbitrary-flag"}, {"model": "bad\x00model"}, {"prompt": ""}, {"prompt": "a" * 128001},
-    {"repositories": ["unrequested/private"]},
-])
-def test_untrusted_specs_fail_before_provisioning(manager, spec, change):
-    with pytest.raises(ValueError):
-        manager.submit({**spec, **change}, "request-1")
-
-
-@pytest.mark.parametrize("profile", [{"slots": 11}, {"slots": True}, {"type": "xlarge"},
-                                     {"repositories": ["org/../escape"]}, {"credential_refs": {"PATH": "op://secret"}}])
-def test_invalid_profiles_cannot_allocate(tmp_path, config, profile):
-    with pytest.raises(ValueError):
-        WorkerManager(tmp_path / "workers", {**config, "profiles": {"default": profile}})
-
-
-@pytest.mark.parametrize("args", [["--api-key", "synthetic"], ["--api-key=synthetic"]])
-def test_public_profiles_cannot_contain_native_secret_arguments(tmp_path, config, args):
-    harnesses = {**DEFAULT_PROFILE["harness_args"], "omp": args}
-    with pytest.raises(ValueError, match="private environment references"):
-        WorkerManager(tmp_path / "workers", {**config, "profiles": {"default": {"harness_args": harnesses}}})
-
-
-def test_native_authentication_failure_is_visible(provisioned):
-    assert provisioned.status("request-1")["status"] == "auth_needed"
-
-
-def test_missing_authentication_reuses_the_same_pool_on_retry(provisioned, boat):
-    provisioned.retry("request-1")
-    provisioned.run_once()
-    assert boat.creates == 1
-
-
-def test_multiple_agents_pack_into_one_pool(provisioned, spec, boat):
-    provisioned.submit({**spec, "name": "builder"}, "request-2")
-    provisioned.run_once()
-    assert boat.creates == 1
-
-
-def test_a_full_pool_allocates_another_box(tmp_path, config, spec, boat):
-    manager = WorkerManager(tmp_path / "workers", {**config, "profiles": {"default": {"slots": 1}}})
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    manager.submit({**spec, "name": "builder"}, "request-2")
-    manager.run_once()
-    assert boat.creates == 2
-
-
-@pytest.fixture
-def spawner_on_the_pool(tmp_path, config, provisioned):
-    """The box the first worker landed on is now the cloud spawner's."""
-    node = provisioned.list()["pools"][0]["node"]
-    return WorkerManager(tmp_path / "workers", {**config, "spawner": {"node": node}})
-
-
-def test_a_new_worker_never_lands_on_the_spawner_box(spawner_on_the_pool, spec, boat):
-    spawner_on_the_pool.submit({**spec, "name": "builder"}, "request-2")
-    spawner_on_the_pool.run_once()
-    assert boat.creates == 2
-
-
-def test_a_worker_bound_to_the_spawner_box_is_not_bootstrapped_again(spawner_on_the_pool, boat):
-    spawner_on_the_pool.retry("request-1")
-    spawner_on_the_pool.run_once()
-    assert len(boat.starts) == 1
-
-
-def test_a_worker_bound_to_the_spawner_box_fails_on_retry(spawner_on_the_pool):
-    spawner_on_the_pool.retry("request-1")
-    spawner_on_the_pool.run_once()
-    assert spawner_on_the_pool.status("request-1")["status"] == "failed"
-
-
-def test_lost_create_acknowledgement_becomes_unconfirmed(manager, spec, boat):
-    boat.lose_create = True
-    manager.submit(spec, "request-1")
-    assert manager.run_once()["status"] == "unconfirmed"
-
-
-def test_lost_create_acknowledgement_is_never_retried(manager, spec, boat):
-    boat.lose_create = True
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    manager.run_once()
-    assert boat.creates == 1
-
-
-@pytest.fixture
-def sibling_after_lost_create(manager, spec, boat):
-    boat.lose_create = True
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    boat.lose_create = False
-    restarted = WorkerManager(manager.directory, manager.config)
-    restarted.submit({**spec, "name": "builder"}, "request-2")
-    restarted.run_once()
-    return restarted, boat
-
-
-def test_a_sibling_cannot_create_while_an_allocation_is_unconfirmed(sibling_after_lost_create):
-    _, boat = sibling_after_lost_create
-    assert boat.creates == 1
-
-
-def test_a_sibling_has_a_recoverable_allocation_block(sibling_after_lost_create):
-    manager, _ = sibling_after_lost_create
-    job = manager.status("request-2")
-    assert (job["status"], job["phase"], job["pool_id"]) == ("unconfirmed", "allocation-blocked", None)
-
-
-def test_a_blocked_sibling_preserves_the_original_pool_reservation(sibling_after_lost_create):
-    manager, _ = sibling_after_lost_create
-    assert len(manager.list()["pools"]) == 1
-
-
-def test_rechecking_a_blocked_sibling_cannot_allocate_again(sibling_after_lost_create):
-    manager, boat = sibling_after_lost_create
-    manager.recheck("request-2")
-    manager.run_once()
-    assert boat.creates == 1
-
-
-def test_reconciled_creation_unblocks_a_sibling_on_the_same_box(sibling_after_lost_create):
-    manager, _ = sibling_after_lost_create
-    manager.reconcile("request-1", "bx_1")
-    manager.recheck("request-2")
-    manager.run_once()
-    manager.run_once()
-    assert manager.status("request-2")["box_id"] == "bx_1"
-
-
-def test_a_blocked_unstarted_sibling_can_be_cancelled(sibling_after_lost_create):
-    manager, _ = sibling_after_lost_create
-    assert manager.stop("request-2")["status"] == "stopped"
-
-
-def test_known_capacity_is_usable_while_another_creation_is_unconfirmed(tmp_path, config, spec, boat):
-    manager = WorkerManager(tmp_path / "workers", {**config, "profiles": {"default": {"slots": 1}}})
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    boat.lose_create = True
-    manager.submit({**spec, "name": "builder"}, "request-2")
-    manager.run_once()
-    boat.lose_create = False
-    manager.stop("request-1")
-    manager.submit({**spec, "name": "observer"}, "request-3")
-    manager.run_once()
-    assert manager.status("request-3")["box_id"] == "bx_1"
-
-
-@pytest.fixture
-def orphaned_allocation(manager):
-    pool = {"id": "orphan-pool", "node": "worker-orphan", "profile": "default", "slots": 4,
-            "type": "default", "status": "allocated", "box_id": None, "created": 0}
-    private_json(manager.state_path, {"jobs": {}, "pools": {pool["id"]: pool}})
-    return manager
-
-
-def test_an_orphaned_allocation_blocks_fresh_sibling_creation(orphaned_allocation, spec, boat):
-    orphaned_allocation.submit(spec, "request-1")
-    orphaned_allocation.run_once()
-    assert boat.creates == 0
-
-
-def test_an_orphan_can_be_reconciled_through_its_blocked_request(orphaned_allocation, spec, boat):
-    orphaned_allocation.submit(spec, "request-1")
-    orphaned_allocation.run_once()
-    orphaned_allocation.reconcile("request-1", "bx_inspected")
-    orphaned_allocation.run_once()
-    assert (orphaned_allocation.status("request-1")["box_id"], boat.creates) == ("bx_inspected", 0)
-
-
-def test_pre_create_setup_failure_can_be_cancelled_without_stranding_capacity(tmp_path, config, spec, boat):
-    def unavailable(node):
-        raise WorkerError("node credential creation failed")
-
-    manager = WorkerManager(tmp_path / "workers", {**config, "create_node_token": unavailable})
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    manager.stop("request-1")
-    manager.config["create_node_token"] = lambda node: "private-hub-token"
-    manager.submit({**spec, "name": "builder"}, "request-2")
-    manager.run_once()
-    assert boat.creates == 1
-
-
-def test_pre_create_cancellation_retires_only_the_unused_reservation(tmp_path, config, spec):
-    def unavailable(node):
-        raise WorkerError("node credential creation failed")
-
-    manager = WorkerManager(tmp_path / "workers", {**config, "create_node_token": unavailable})
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    manager.stop("request-1")
-    assert manager.list()["pools"][0]["status"] == "retired"
-
-
-def test_failed_pre_create_setup_retries_its_original_reservation(tmp_path, config, spec, boat):
-    def unavailable(node):
-        raise WorkerError("node credential creation failed")
-
-    manager = WorkerManager(tmp_path / "workers", {**config, "create_node_token": unavailable})
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    pool = manager.list()["pools"][0]["id"]
-    manager.config["create_node_token"] = lambda node: "private-hub-token"
-    manager.recheck("request-1")
-    manager.run_once()
-    assert (boat.creates, manager.status("request-1")["pool_id"]) == (1, pool)
-
-
-def test_preflight_refusal_after_token_failure_still_allows_safe_cancellation(tmp_path, config, spec, boat):
-    def unavailable(node):
-        raise WorkerError("node credential creation failed")
-
-    def refused(profile):
-        raise PreflightRefused("environment needs correction")
-
-    manager = WorkerManager(tmp_path / "workers", {**config, "create_node_token": unavailable})
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    manager.recheck("request-1")
-    boat.preflight = refused
-    manager.run_once()
-    manager.stop("request-1")
-    manager.config["create_node_token"] = lambda node: "private-hub-token"
-    boat.preflight = lambda profile: {}
-    manager.submit({**spec, "name": "builder"}, "request-2")
-    manager.run_once()
-    assert boat.creates == 1
-
-
-def test_ordinary_terminal_stop_cannot_restart_a_retired_reservation(tmp_path, config, spec):
-    def unavailable(node):
-        raise WorkerError("node credential creation failed")
-
-    manager = WorkerManager(tmp_path / "workers", {**config, "create_node_token": unavailable})
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    manager.stop("request-1")
-    with pytest.raises(ValueError, match="known safe setup"):
-        manager.recheck("request-1")
-
-
-def test_sibling_reconcile_cannot_bypass_an_original_owners_last_slot(tmp_path, config, spec, boat):
-    manager = WorkerManager(tmp_path / "workers", {**config, "profiles": {"default": {"slots": 1}}})
-    boat.lose_create = True
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    manager.submit({**spec, "name": "builder"}, "request-2")
-    manager.run_once()
-    with pytest.raises(ValueError, match="original allocation owner"):
-        manager.reconcile("request-2", "bx_1")
-
-
-def test_stale_sibling_reconcile_cannot_replace_a_known_box(sibling_after_lost_create):
-    manager, _ = sibling_after_lost_create
-    manager.reconcile("request-1", "bx_1")
-    with pytest.raises(ValueError, match="only an unresolved pool"):
-        manager.reconcile("request-2", "bx_different")
-
-
-def test_reconciliation_clears_the_siblings_allocation_block(sibling_after_lost_create):
-    manager, _ = sibling_after_lost_create
-    manager.reconcile("request-1", "bx_1")
-    manager.recheck("request-2")
-    manager.run_once()
-    manager.run_once()
-    assert "blocked_by_pool" not in manager.status("request-2")
-
-
-def test_unresolved_creation_is_scoped_to_its_selected_profile(tmp_path, config, spec, boat):
-    manager = WorkerManager(tmp_path / "workers", {**config, "profiles": {"default": {}, "other": {}}})
-    boat.lose_create = True
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    boat.lose_create = False
-    manager.submit({**spec, "name": "builder", "profile": "other"}, "request-2")
-    manager.run_once()
-    assert boat.creates == 2
-
-
-@pytest.fixture
-def crashed_create_boundary(manager, spec, boat, tmp_path, request):
-    boundary = request.param
-    manager.submit(spec, "request-1")
-    effect = tmp_path / "provider-create-effect"
-    script = """
-import os
-import sys
-from pathlib import Path
-from one_conv.control.workers import WorkerManager
-class CrashBoat:
-    def credentials(self, profile):
-        return {'service_account': 'private-service-account'}
-    def create(self, profile, pool):
-        if sys.argv[2] == 'after-create':
-            with Path(sys.argv[3]).open('w') as stream:
-                stream.write('bx_created')
-                stream.flush()
-                os.fsync(stream.fileno())
-        os._exit(99)
-manager = WorkerManager(Path(sys.argv[1]), {'boat': CrashBoat(), 'public_hub_url': 'https://hub.example.test',
-                       'create_node_token': lambda node: 'private-hub-token'})
-if sys.argv[2] == 'allocated':
-    manager._token = lambda pool: os._exit(99)
-manager.run_once()
-"""
-    result = subprocess.run([sys.executable, "-O", "-c", script, str(manager.directory), boundary, str(effect)],
-                            check=False, capture_output=True, text=True, timeout=10)
-    restarted = WorkerManager(manager.directory, manager.config)
-    restarted.submit({**spec, "name": "builder"}, "request-2")
-    restarted.run_once()
-    return restarted, boat, result, effect
-
-
-@pytest.mark.parametrize("crashed_create_boundary", ["allocated", "before-create", "after-create"], indirect=True)
-def test_create_boundary_crashes_cannot_allocate_for_a_sibling(crashed_create_boundary):
-    _, boat, _, _ = crashed_create_boundary
-    assert boat.creates == 0
-
-
-@pytest.mark.parametrize("crashed_create_boundary", ["allocated", "before-create", "after-create"], indirect=True)
-def test_create_boundary_crashes_leave_a_recoverable_block(crashed_create_boundary):
-    manager, _, _, _ = crashed_create_boundary
-    assert manager.status("request-2")["phase"] == "allocation-blocked"
-
-
-@pytest.mark.parametrize("crashed_create_boundary,occurred", [("allocated", False), ("before-create", False),
-                                                           ("after-create", True)], indirect=["crashed_create_boundary"])
-def test_create_boundary_crash_reaches_the_selected_effect(crashed_create_boundary, occurred):
-    _, _, result, effect = crashed_create_boundary
-    assert (result.returncode, effect.exists()) == (99, occurred)
-
-
-def test_lost_create_requires_explicit_reconciliation(manager, spec, boat):
-    boat.lose_create = True
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    with pytest.raises(ValueError, match="known safe setup"):
-        manager.retry("request-1")
-
-
-def test_reconciliation_reuses_the_selected_box(manager, spec, boat):
-    boat.lose_create = True
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    manager.reconcile("request-1", "bx_inspected")
-    manager.run_once()
-    assert manager.status("request-1")["box_id"] == "bx_inspected"
-
-
-def test_bootstrap_recheck_never_creates_a_replacement(manager, spec, boat):
-    boat.lose_bootstrap = True
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    boat.lose_bootstrap = False
-    manager.recheck("request-1")
-    manager.run_once()
-    assert boat.creates == 1
-
-
-def test_a_released_controller_claim_is_not_replayed(manager, spec, boat):
-    manager.submit(spec, "request-1")
-    manager._update("request-1", status="provisioning", phase="creating")
-    manager.run_once()
-    assert boat.creates == 0
-
-
-def test_a_released_controller_claim_is_honestly_unconfirmed(manager, spec):
-    manager.submit(spec, "request-1")
-    manager._update("request-1", status="provisioning", phase="creating")
-    manager.run_once()
-    assert manager.status("request-1")["status"] == "unconfirmed"
-
-
-def test_state_is_private(provisioned):
-    assert provisioned.state_path.stat().st_mode & 0o777 == 0o600
-
-
-def test_tokens_are_excluded_from_public_status(provisioned):
-    assert "private-hub-token" not in json.dumps(provisioned.list())
-
-
-def test_provider_diagnostics_are_excluded_from_public_status(manager, spec, boat):
-    boat.lose_create = True
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    assert "private provider diagnostic" not in json.dumps(manager.list())
-
-
-def test_untrusted_health_values_cannot_exfiltrate_into_status(manager, spec, boat):
-    boat.health = {"status": "auth_needed", "stage": "a secret credential with spaces", "authenticated": "private-provider-token"}
-    manager.submit(spec, "request-1")
-    manager.run_once()
-    assert "secret" not in json.dumps(manager.status("request-1")["health"])
-
-
-def test_unverified_capacity_is_explicit(provisioned):
-    assert provisioned.list()["pools"][0]["active_capacity"] == "unverified"
-
-
-def test_stopping_a_queued_worker_allocates_nothing(manager, spec, boat):
-    manager.submit(spec, "request-1")
-    manager.stop("request-1")
-    assert boat.creates == 0
-
-
-def test_stopping_one_worker_keeps_the_pool(provisioned):
-    provisioned.stop("request-1")
-    assert provisioned.list()["pools"][0]["status"] == "available"
-
-
-def test_stopping_a_pool_uses_its_tracked_box(provisioned, boat):
-    provisioned.stop_pool(provisioned.list()["pools"][0]["id"])
-    assert boat.pools_stopped == ["bx_1"]
-
-
-def test_stopping_a_pool_marks_its_agents_stopped(provisioned):
-    provisioned.stop_pool(provisioned.list()["pools"][0]["id"])
-    assert provisioned.status("request-1")["status"] == "stopped"
-
-
-def test_resuming_a_pool_does_not_declare_old_agents_ready(provisioned):
-    pool = provisioned.list()["pools"][0]["id"]
-    provisioned.stop_pool(pool)
-    provisioned.resume_pool(pool)
-    assert provisioned.status("request-1")["status"] == "stopped"
-
-
-def test_rechecking_after_resume_reuses_the_tracked_box(provisioned, boat):
-    pool = provisioned.list()["pools"][0]["id"]
-    provisioned.stop_pool(pool)
-    provisioned.resume_pool(pool)
-    provisioned.recheck("request-1")
-    provisioned.run_once()
-    assert boat.creates == 1
-
-
-def test_automatic_pool_stop_reuses_the_known_box(provisioned, boat):
-    boat.state = "stopped"
-    provisioned.recheck("request-1")
-    provisioned.run_once()
-    assert boat.creates == 1
-
-
-def test_automatic_pool_stop_resumes_the_known_box(provisioned, boat):
-    boat.state = "stopped"
-    provisioned.recheck("request-1")
-    provisioned.run_once()
-    assert boat.pools_resumed == ["bx_1"]
 
 
 @pytest.mark.parametrize("state", ["ready", "idle", "running"])
-def test_all_documented_running_states_reuse_the_tracked_pool(provisioned, spec, boat, state):
-    boat.state = state
-    provisioned.submit({**spec, "name": "builder"}, "request-2")
-    provisioned.run_once()
-    assert boat.creates == 1
+def test_all_documented_running_states_are_available(state):
+    assert machine_status(state) == "available"
 
 
-def test_api_archived_state_resumes_the_tracked_pool(provisioned, boat):
-    boat.state = "archived"
-    provisioned.recheck("request-1")
-    provisioned.run_once()
-    assert boat.pools_resumed == ["bx_1"]
+@pytest.fixture
+def box_config():
+    return {"boat": object(), "public_hub_url": "https://hub.example.test"}
+
+
+def test_a_box_profile_defaults_to_the_default_profile(tmp_path, box_config):
+    assert CloudBox(tmp_path, box_config).profiles["default"] == DEFAULT_PROFILE
+
+
+# What the deployed controller's config still holds from per-job cloud workers.
+RETIRED_PROFILE = {"repositories": ["ClementWalter/claudine", "ClementWalter/one-conv-cli"],
+                   "work_repository": "ClementWalter/one-conv-cli", "skills": ["brain"], "slots": 4,
+                   "environment": "oneconv-workers", "boat_agent_credentials": True, "probe_enabled": True,
+                   "revisions": {"ClementWalter/one-conv-cli": "d" * 40}}
+
+
+def test_a_profile_with_retired_worker_fields_loads(tmp_path, box_config):
+    box = CloudBox(tmp_path, {**box_config, "profiles": {"default": RETIRED_PROFILE}})
+    assert box.profiles["default"]["environment"] == "oneconv-workers"
+
+
+def test_a_profile_drops_its_pinned_revisions(tmp_path, box_config):
+    box = CloudBox(tmp_path, {**box_config, "profiles": {"default": RETIRED_PROFILE}})
+    assert "revisions" not in box.profiles["default"]
+
+
+@pytest.mark.parametrize("profile", [{"unknown": 1}, {"type": "huge"}, {"repositories": ["ClementWalter/other"]},
+                                     {"boat_agent_credentials": "yes"}, {"environment": "Bad Name"}])
+def test_an_invalid_box_profile_is_refused(tmp_path, box_config, profile):
+    with pytest.raises(ValueError):
+        CloudBox(tmp_path, {**box_config, "profiles": {"default": profile}})
+
+
+def test_a_former_worker_pools_token_is_found_by_its_node(tmp_path, box_config):
+    (tmp_path / "workers.json").write_text(json.dumps({"jobs": {}, "pools": {"p1": {"id": "p1", "node": "cloudbox"}}}))
+    assert CloudBox(tmp_path, box_config).pool_token_path("cloudbox") == tmp_path / "tokens" / "p1.json"
+
+
+def test_a_node_without_a_former_pool_has_no_pool_token(tmp_path, box_config):
+    assert CloudBox(tmp_path, box_config).pool_token_path("cloudbox") is None
+
+
+def test_an_unreadable_worker_state_has_no_pool_token(tmp_path, box_config):
+    (tmp_path / "workers.json").write_text("not json")
+    assert CloudBox(tmp_path, box_config).pool_token_path("cloudbox") is None
 
 
 @pytest.mark.parametrize("state", ["archiving", "provisioning", "error", "up", "unknown"])
@@ -657,190 +138,6 @@ def test_stop_timeout_does_not_claim_a_snapshot_is_complete(monkeypatch):
     monkeypatch.setattr("one_conv.control.workers.time.sleep", lambda duration: None)
     with pytest.raises(Unconfirmed):
         boat.stop_pool("bx_tracked")
-
-
-def test_explicit_resume_inspects_an_automatically_stopped_pool(provisioned, boat):
-    boat.state = "stopped"
-    provisioned.resume_pool(provisioned.list()["pools"][0]["id"])
-    assert boat.pools_resumed == ["bx_1"]
-
-
-def test_explicit_stop_confirms_an_already_archived_pool(provisioned, boat):
-    boat.state = "archived"
-    provisioned.stop_pool(provisioned.list()["pools"][0]["id"])
-    assert provisioned.status("request-1")["status"] == "stopped"
-
-
-@pytest.fixture
-def resumed_after_ambiguous_stop(provisioned, boat):
-    provisioned._update("request-1", status="ready", address="worker-node/claude:existing")
-
-    def stop(box):
-        raise Unconfirmed("stop outcome is unconfirmed")
-
-    boat.stop_pool = stop
-    pool = provisioned.list()["pools"][0]["id"]
-    provisioned.stop_pool(pool)
-    provisioned.resume_pool(pool)
-    return provisioned, boat
-
-
-def test_recheck_can_recover_after_an_ambiguous_stop(resumed_after_ambiguous_stop):
-    manager, _ = resumed_after_ambiguous_stop
-    assert manager.recheck("request-1")["status"] == "queued"
-
-
-def test_ambiguous_stop_recovery_never_creates_a_replacement(resumed_after_ambiguous_stop):
-    manager, boat = resumed_after_ambiguous_stop
-    manager.recheck("request-1")
-    manager.run_once()
-    assert boat.creates == 1
-
-
-def test_ambiguous_stop_recovery_preserves_the_native_claim(resumed_after_ambiguous_stop):
-    manager, boat = resumed_after_ambiguous_stop
-    manager.recheck("request-1")
-    manager.run_once()
-    assert (boat.starts[-1][0], boat.starts[-1][1]["job_id"], boat.starts[-1][1]["restart"]) == ("bx_1", "request-1", False)
-
-
-@pytest.fixture
-def crashed_pool_stop(provisioned, boat, tmp_path):
-    provisioned._update("request-1", status="ready", address="worker-node/claude:existing", health={"registered": True})
-    marker = tmp_path / "provider-stop-effect"
-    script = """
-import os
-import sys
-from pathlib import Path
-from one_conv.control.workers import WorkerManager
-class CrashBoat:
-    def info(self, box):
-        return {'id': box, 'state': 'idle'}
-    def stop_pool(self, box):
-        with Path(sys.argv[3]).open('w') as stream:
-            stream.write(box)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os._exit(99)
-WorkerManager(Path(sys.argv[1]), {'boat': CrashBoat()}).stop_pool(sys.argv[2])
-"""
-    result = subprocess.run([sys.executable, "-O", "-c", script, str(provisioned.directory),
-                             provisioned.list()["pools"][0]["id"], str(marker)], check=False,
-                            capture_output=True, text=True, timeout=10)
-    manager = WorkerManager(provisioned.directory, provisioned.config)
-    manager.run_once()
-    return manager, boat, result, marker
-
-
-def test_pool_stop_crash_reaches_the_provider_effect(crashed_pool_stop):
-    _, _, result, marker = crashed_pool_stop
-    assert (result.returncode, marker.read_text()) == (99, "bx_1")
-
-
-def test_pool_stop_crash_preserves_an_unconfirmed_job(crashed_pool_stop):
-    manager, _, _, _ = crashed_pool_stop
-    assert manager.status("request-1")["status"] == "unconfirmed"
-
-
-def test_pool_stop_crash_clears_live_health_before_the_effect(crashed_pool_stop):
-    manager, _, _, _ = crashed_pool_stop
-    assert manager.status("request-1")["health"]["registered"] is False
-
-
-def test_pool_stop_crash_does_not_allocate_a_replacement(crashed_pool_stop):
-    _, boat, _, _ = crashed_pool_stop
-    assert boat.creates == 1
-
-
-def test_pool_stop_crash_keeps_the_native_name_reserved(crashed_pool_stop, spec):
-    manager, _, _, _ = crashed_pool_stop
-    with pytest.raises(ValueError, match="active job"):
-        manager.submit(spec, "request-2")
-
-
-def test_automatic_pool_stop_invalidates_other_old_jobs(provisioned, spec, boat):
-    provisioned.submit({**spec, "name": "builder"}, "request-2")
-    provisioned.run_once()
-    boat.state = "stopped"
-    provisioned.recheck("request-1")
-    provisioned.run_once()
-    assert provisioned.status("request-2")["status"] == "stopped"
-
-
-def test_ready_worker_recheck_does_not_create_a_second_box(provisioned, boat):
-    provisioned._update("request-1", status="ready")
-    provisioned.recheck("request-1")
-    provisioned.run_once()
-    assert boat.creates == 1
-
-
-def test_ready_worker_setup_failure_keeps_its_active_reservation(provisioned, boat):
-    provisioned._update("request-1", status="ready", address="worker-node/claude:existing")
-    boat.health = {"status": "failed", "stage": "github-vault"}
-    provisioned.recheck("request-1")
-    provisioned.run_once()
-    assert provisioned.status("request-1")["status"] == "unconfirmed"
-
-
-def test_ready_worker_setup_failure_preserves_its_known_address(provisioned, boat):
-    provisioned._update("request-1", status="ready", address="worker-node/claude:existing")
-    boat.health = {"status": "failed", "stage": "github-vault"}
-    provisioned.recheck("request-1")
-    provisioned.run_once()
-    assert provisioned.status("request-1")["address"] == "worker-node/claude:existing"
-
-
-def test_an_automatically_stopped_pool_cannot_restore_an_old_address(provisioned, boat):
-    provisioned._update("request-1", status="ready", address="worker-node/claude:existing")
-    boat.state = "stopped"
-    boat.health = {"status": "failed", "stage": "github-vault"}
-    provisioned.recheck("request-1")
-    provisioned.run_once()
-    assert provisioned.status("request-1")["address"] is None
-
-
-def test_failed_preflight_does_not_free_an_existing_native_name(provisioned, spec, boat):
-    provisioned._update("request-1", status="ready", address="worker-node/claude:existing")
-
-    def refuse(profile):
-        raise PreflightRefused("unsafe environment")
-
-    boat.preflight = refuse
-    provisioned.recheck("request-1")
-    provisioned.run_once()
-    with pytest.raises(ValueError, match="active job"):
-        provisioned.submit(spec, "request-2")
-
-
-def test_ten_resident_slots_can_be_configured(tmp_path, config):
-    manager = WorkerManager(tmp_path, {**config, "profiles": {"default": {"slots": 10}}})
-    assert manager.list()["profiles"]["default"]["slots"] == 10
-
-
-def test_corrupt_state_fails_closed(manager, spec):
-    manager.state_path.write_text("{")
-    with pytest.raises(WorkerError, match="unreadable"):
-        manager.submit(spec, "request-1")
-
-
-def test_status_remains_available_during_a_slow_create(manager, spec, boat):
-    entered, release = threading.Event(), threading.Event()
-
-    def create(profile, pool):
-        entered.set()
-        release.wait(5)
-        return "bx_1"
-
-    boat.create = create
-    manager.submit(spec, "request-1")
-    thread = threading.Thread(target=manager.run_once)
-    thread.start()
-    try:
-        entered.wait(5)
-        assert manager.status("request-1")["phase"] == "creating"
-    finally:
-        release.set()
-        thread.join(5)
 
 
 def test_private_replacements_preserve_mode(tmp_path):
@@ -1028,59 +325,6 @@ def test_resume_state_ready_does_not_replace_a_terminal_ready_event(boat_resume_
     output = "\n".join(json.dumps(row) for row in boat_resume_events[:count])
     with pytest.raises(Unconfirmed):
         BoatCLI._receipt(output, "resume")
-
-
-def test_resume_stream_cannot_change_box_identity(boat_resume_events):
-    boat_resume_events[2]["id"] = "bx_other"
-    output = "\n".join(json.dumps(row) for row in boat_resume_events)
-    with pytest.raises(Unconfirmed):
-        BoatCLI._receipt(output, "resume")
-
-
-@pytest.fixture
-def agent_environment(monkeypatch):
-    boat = BoatCLI()
-    raw = {"environment": {"safeForThirdParties": False, "proxyAiCredentials": False,
-                           "effective": {"passGithub": False, "passSecrets": False,
-                                         "passSandboxCredentials": False, "passAgentsCredentials": True}}}
-    monkeypatch.setattr(boat, "_call", lambda *args, **kwargs: raw)
-    return boat, raw
-
-
-def test_dedicated_native_credentials_environment_is_verified(agent_environment):
-    boat, _ = agent_environment
-    profile = {**DEFAULT_PROFILE, "boat_agent_credentials": True, "environment": "oneconv-workers"}
-    assert boat.preflight(profile)["agent_credentials"] is True
-
-
-@pytest.mark.parametrize("field,value", [("passGithub", True), ("passSecrets", True),
-                                        ("passSandboxCredentials", True), ("passAgentsCredentials", False)])
-def test_unsafe_effective_environment_toggles_are_refused(agent_environment, field, value):
-    boat, raw = agent_environment
-    raw["environment"]["effective"][field] = value
-    profile = {**DEFAULT_PROFILE, "boat_agent_credentials": True, "environment": "oneconv-workers"}
-    with pytest.raises(WorkerError, match="pass only native agent credentials"):
-        boat.preflight(profile)
-
-
-def test_a_broad_personal_environment_cannot_pass_agent_credentials(agent_environment):
-    boat, _ = agent_environment
-    with pytest.raises(WorkerError, match="dedicated worker environment"):
-        boat.preflight({**DEFAULT_PROFILE, "boat_agent_credentials": True, "environment": "claudine"})
-
-
-@pytest.mark.parametrize("enabled,expected", [(False, True), (True, False)])
-def test_native_credentials_profiles_preserve_boat_agent_auth(monkeypatch, enabled, expected):
-    boat, commands = BoatCLI(), []
-
-    def call(args, **kwargs):
-        commands.append(args)
-        return {"id": "bx_created"}
-
-    monkeypatch.setattr(boat, "_call", call)
-    monkeypatch.setattr(boat, "preflight", lambda profile: {"agent_credentials": enabled})
-    boat.create({**DEFAULT_PROFILE, "boat_agent_credentials": enabled}, "pool-id")
-    assert ("--no-env" in commands[0]) is expected
 
 
 def test_boat_reports_a_deleted_sandbox_as_gone(monkeypatch):

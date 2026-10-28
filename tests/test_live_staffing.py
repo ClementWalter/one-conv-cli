@@ -22,22 +22,21 @@
 """From no running session to one: the hub staffs a human post at once, on a connected machine first.
 
 A human post in a channel where no session runs gets a staffing record in the same commit: a
-spawn order to a bridge that offers to start sessions, or the cloud when none is connected. A
-spawn order that is refused, or that no ack follows in time, moves to the cloud. An ack closes
-the record. The Mac's bridge starts the session in tmux; the control service submits one cloud
-worker per staffing record.
+spawn order to a bridge that offers to start sessions, or a wait for one when none is connected.
+A spawn order that is refused, or that no ack follows in time, moves to the next spawner. An ack
+closes the record. A bridge starts the session in tmux; the control service wakes the cloud box
+when a request waits for it.
 """
 
 import sqlite3
 import time
 import uuid
-from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
 
 from one_conv.control import runtime
-from one_conv.control.runtime import manage_spawner, staff_from_cloud
+from one_conv.control.runtime import manage_spawner
 from one_conv.live import bridge, hubclient, spawn, workspace
 from one_conv.live import hub as hub_module
 from one_conv.live.bridge_cli import add_bridge_commands
@@ -530,107 +529,6 @@ def test_an_announcement_is_not_staffed(hub):
     hub.send(HUMAN, {"id": "b" * 32, "from": "user", "to": "#work", "text": "FYI", "reply": "none", "mode": "push"},
              join_sender=True)
     assert staffing(hub, f"{HUMAN}:{'b' * 32}") is None
-
-
-# --- the control service submits cloud workers ---------------------------------------------------
-
-
-class StubManager:
-    """Records submitted worker specs; a spec under a known job id returns that job."""
-
-    def __init__(self):
-        self.jobs = {}
-
-    def submit(self, spec, id):
-        self.jobs.setdefault(id, {"id": id, "spec": spec})
-        return self.jobs[id]
-
-
-@pytest.fixture
-def workers():
-    return SimpleNamespace(manager=StubManager(), rate_card=lambda job: None)
-
-
-def test_the_cloud_staffing_submits_one_worker(hub, workers):
-    post(hub)
-    staff_from_cloud(hub, workers)
-    assert len(workers.manager.jobs) == 1
-
-
-def test_the_cloud_worker_joins_the_post_channel(hub, workers):
-    post(hub)
-    job, = staff_from_cloud(hub, workers)
-    assert job["spec"]["topic"] == "work"
-
-
-def test_the_cloud_worker_gets_the_ack_instructions(hub, workers):
-    key = post(hub)
-    job, = staff_from_cloud(hub, workers)
-    assert f'message_id="{key.partition(":")[2]}"' in job["spec"]["prompt"]
-
-
-def test_a_submitted_post_is_not_submitted_again(hub, workers):
-    post(hub)
-    staff_from_cloud(hub, workers)
-    assert staff_from_cloud(hub, workers) == []
-
-
-def test_the_cloud_staffing_is_marked_submitted(hub, workers):
-    key = post(hub)
-    staff_from_cloud(hub, workers)
-    assert staffing(hub, key) == ("cloud", "submitted")
-
-
-def test_without_cloud_workers_the_post_is_marked_unavailable(hub):
-    key = post(hub)
-    staff_from_cloud(hub, None)
-    assert staffing(hub, key) == ("cloud", "unavailable")
-
-
-class FailingManager:
-    def submit(self, spec, id):
-        raise ValueError("worker limit reached")
-
-
-@pytest.fixture
-def unavailable(hub):
-    """The cloud refused the request's worker once."""
-    key = post(hub)
-    staff_from_cloud(hub, SimpleNamespace(manager=FailingManager(), rate_card=lambda job: None))
-    return key
-
-
-def test_an_unavailable_request_waits_before_its_retry(hub, unavailable):
-    hub.sweep()
-    assert staffing(hub, unavailable) == ("cloud", "unavailable")
-
-
-def test_an_unavailable_request_goes_back_to_the_cloud(hub, unavailable, monkeypatch):
-    monkeypatch.setattr(hub_module, "UNAVAILABLE_RETRY_SECONDS", -1.0)
-    hub.sweep()
-    assert staffing(hub, unavailable) == ("cloud", "cloud")
-
-
-def test_an_unavailable_request_is_submitted_again(hub, unavailable, workers, monkeypatch):
-    monkeypatch.setattr(hub_module, "UNAVAILABLE_RETRY_SECONDS", -1.0)
-    hub.sweep()
-    staff_from_cloud(hub, workers)
-    assert staffing(hub, unavailable) == ("cloud", "submitted")
-
-
-def test_an_old_unavailable_request_is_not_retried(hub, unavailable, monkeypatch):
-    monkeypatch.setattr(hub_module, "UNAVAILABLE_RETRY_SECONDS", -1.0)
-    monkeypatch.setattr(hub_module, "STAFF_WINDOW_SECONDS", -1.0)
-    hub.sweep()
-    assert staffing(hub, unavailable) == ("cloud", "unavailable")
-
-
-def test_an_ack_closes_an_unavailable_request(hub, unavailable):
-    hub.publish("mac", [{"address": "claude:new"}])
-    hub.join("mac", "work", "claude:new")
-    hub.acknowledge("mac", "claude:new", unavailable.partition(":")[2])
-    hub.sweep()
-    assert staffing(hub, unavailable) == ("cloud", "done")
 
 
 # --- the control service runs the cloud spawner's box only while there is work -----------------

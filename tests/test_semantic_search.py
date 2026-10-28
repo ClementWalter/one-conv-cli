@@ -77,7 +77,7 @@ def test_normalize_lowercases_and_strips_accents():
 
 
 def test_normalize_turns_whitespace_into_spaces_and_drops_controls():
-    assert semantic._normalize("a\tb\x00c​d") == "a bcd"
+    assert semantic._normalize("a\tb\x00c\u200bd") == "a bcd"
 
 
 def test_normalize_isolates_cjk_characters():

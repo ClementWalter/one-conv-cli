@@ -1,13 +1,13 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.12"
 # dependencies = [
 #     "click==8.3.3",
 #     "curl_cffi==0.13.0",
 #     "pycryptodome==3.23.0",
 #     "mcp==2.2.0",
 #     "websockets==17.2",
-#     "numpy==2.4.6",
+#     "numpy==2.5.4",
 # ]
 #
 # [tool.uv]

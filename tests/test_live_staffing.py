@@ -220,6 +220,120 @@ def test_a_spawn_order_handed_out_after_an_ack_starts_nothing(spawner):
     assert spawn_orders(spawner)[0]["mode"] == "fyi"
 
 
+# --- one channel, one session being started ------------------------------------------------------
+
+def test_a_second_post_while_the_channel_is_being_staffed_starts_nothing(spawner):
+    post(spawner, "a")
+    key = post(spawner, "b", text="Wtf")
+    assert staffing(spawner, key) is None
+
+
+def test_a_second_post_while_the_channel_is_being_staffed_sends_one_spawn_order(spawner):
+    post(spawner, "a")
+    post(spawner, "b", text="Wtf")
+    assert len(spawn_orders(spawner)) == 1
+
+
+def test_a_post_in_another_channel_is_staffed_meanwhile(spawner):
+    post(spawner, "a")
+    assert staffing(spawner, post(spawner, "b", to="#other")) == ("mac/spawn:claude", "node")
+
+
+def test_a_stale_staffing_record_does_not_block_its_channel(spawner, monkeypatch):
+    post(spawner, "a")
+    with sqlite3.connect(spawner.path) as db:
+        db.execute("UPDATE staffing SET state = 'cloud', created = ?", (time.time() - hub_module.STAFF_WINDOW_SECONDS - 1,))
+    assert staffing(spawner, post(spawner, "b")) == ("mac/spawn:claude", "node")
+
+
+def test_a_session_that_joined_to_work_closes_the_staffing_without_an_ack(spawner):
+    key = post(spawner)
+    spawner.publish("mac", [{"address": "claude:new"}], spawn="claude")
+    spawner.join("mac", "work", "claude:new", work=True)
+    spawner.sweep()
+    assert staffing(spawner, key) == ("mac/spawn:claude", "done")
+
+
+def test_a_session_that_joined_to_work_stops_the_retries(spawner, monkeypatch):
+    post(spawner)
+    spawner.publish("mac", [{"address": "claude:new"}], spawn="claude")
+    spawner.join("mac", "work", "claude:new", work=True)
+    monkeypatch.setattr(hub_module, "SPAWN_FALLBACK_SECONDS", -1.0)
+    spawner.sweep()
+    assert len(spawn_orders(spawner)) == 1
+
+
+# --- a teammate request: one more session in a channel -------------------------------------------
+
+def teammate(hub, ident="c", topic="work", text="Defend the flat-earth side"):
+    return hub.request_teammate(HUMAN, "user", ident * 32, topic, text)
+
+
+def test_a_teammate_request_goes_to_a_spawner(spawner):
+    assert teammate(spawner)["route"] == "mac/spawn:claude"
+
+
+def test_a_teammate_request_is_staffed_even_with_a_running_member(spawner):
+    spawner.publish("mac", [{"address": "claude:one"}], spawn="claude")
+    spawner.join("mac", "work", "claude:one", work=True)
+    assert teammate(spawner)["status"] == "node"
+
+
+def test_a_teammate_request_does_not_wake_the_running_member(spawner):
+    spawner.publish("mac", [{"address": "claude:one"}], spawn="claude")
+    spawner.join("mac", "work", "claude:one", work=True)
+    teammate(spawner)
+    assert [item["mode"] for item in spawner.inbox("mac", 0) if item["to"] == "claude:one"] == ["fyi"]
+
+
+def test_a_teammate_request_is_shown_in_the_channel(spawner):
+    teammate(spawner)
+    assert [row["text"] for row in spawner.history("work")] == ["Defend the flat-earth side"]
+
+
+def test_the_teammate_spawn_order_tells_the_session_to_join_the_others(spawner):
+    teammate(spawner)
+    assert "asked for one more session in #work" in spawn_orders(spawner)[0]["text"]
+
+
+def test_the_teammate_spawn_order_carries_the_request(spawner):
+    teammate(spawner)
+    assert "Defend the flat-earth side" in spawn_orders(spawner)[0]["text"]
+
+
+def test_a_teammate_request_is_not_closed_by_a_running_member(spawner):
+    spawner.publish("mac", [{"address": "claude:one"}], spawn="claude")
+    spawner.join("mac", "work", "claude:one", work=True)
+    teammate(spawner)
+    spawner.sweep()
+    assert staffing(spawner, f"{HUMAN}:{'c' * 32}") == ("mac/spawn:claude", "node")
+
+
+def test_an_ack_closes_a_teammate_request(spawner):
+    teammate(spawner)
+    started_and_acked(spawner, f"{HUMAN}:{'c' * 32}")
+    spawner.sweep()
+    assert staffing(spawner, f"{HUMAN}:{'c' * 32}") == ("mac/spawn:claude", "done")
+
+
+def test_a_retried_teammate_request_sends_one_spawn_order(spawner):
+    teammate(spawner)
+    teammate(spawner)
+    assert len(spawn_orders(spawner)) == 1
+
+
+def test_a_teammate_request_reusing_an_id_for_other_text_is_refused(spawner):
+    teammate(spawner)
+    with pytest.raises(HubError):
+        teammate(spawner, text="Something else")
+
+
+def test_two_teammate_requests_in_one_channel_start_two_sessions(spawner):
+    teammate(spawner, "c")
+    teammate(spawner, "d", text="Defend the globe side")
+    assert len(spawn_orders(spawner)) == 2
+
+
 # --- several spawners: the preferred first, the next one when it fails --------------------------
 
 

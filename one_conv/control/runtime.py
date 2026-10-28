@@ -39,6 +39,14 @@ class Accounting:
             result["limit"] = int(result["limit"])
         return result
 
+    def teammate(self, spec, ident):
+        """Ask the hub for one more session in the spec's channel; it starts on the preferred connected spawner."""
+        from .store import NODE
+        spec = self.manager._spec(spec)
+        if not isinstance(ident, str):
+            raise ValueError("Choose a request ID")
+        return self.hub.request_teammate(NODE, "user", ident, spec["topic"], f"New teammate @{spec['name']}: {spec['prompt']}")
+
     def browser(self, method, payload):
         if method == "GET":
             return {"cards": self.rates.list(), "events": self.ledger.list_events(limit=100),
@@ -119,8 +127,10 @@ class Accounting:
 class Workers:
     """The phone queues work quickly; a durable background runner performs remote effects."""
 
-    def __init__(self, manager, rates):
+    def __init__(self, manager, rates, hub=None):
         self.manager, self.rates = manager, rates
+        # With a cloud spawner, a new teammate is a session a spawner starts, like one for a post nobody runs.
+        self.hub = hub if hub is not None and manager is not None and manager.config.get("spawner") else None
 
     def rate_card(self, job):
         """New teammates start with an unknown all-in rate instead of a fictitious free rate."""
@@ -133,6 +143,14 @@ class Workers:
         except RateError:
             log.error("Worker rate card could not be reconciled")
 
+    def teammate(self, spec, ident):
+        """Ask the hub for one more session in the spec's channel; it starts on the preferred connected spawner."""
+        from .store import NODE
+        spec = self.manager._spec(spec)
+        if not isinstance(ident, str):
+            raise ValueError("Choose a request ID")
+        return self.hub.request_teammate(NODE, "user", ident, spec["topic"], f"New teammate @{spec['name']}: {spec['prompt']}")
+
     def browser(self, method, payload):
         if method == "GET":
             _fields(payload, ())
@@ -140,6 +158,8 @@ class Workers:
         action = payload.get("action")
         if action == "spawn":
             _fields(payload, ("action", "spec", "id"))
+            if self.hub is not None:
+                return self.teammate(payload["spec"], payload["id"])
             job = self.manager.submit(payload["spec"], payload["id"])
             self.rate_card(job)
             return job
@@ -329,6 +349,18 @@ def _fingerprint(payload: dict, revision: str) -> str:
     return hashlib.sha256(json.dumps([payload, revision], sort_keys=True).encode() + helper).hexdigest()
 
 
+def _drifted(hub, node: str, record: dict) -> bool:
+    """Whether the box, publishing since it was provisioned, reports a checkout other than the provisioned one."""
+    if not record.get("revision"):
+        return False
+    seen = hub.node_seen(node)
+    if seen is None or time.time() - seen > LEASE_SECONDS or seen <= record.get("at", 0.0):
+        return False
+    revision, updated = hub.node_revision(node)
+    # A bridge too old to report its checkout is itself a drift; a report from before provisioning is not news.
+    return revision is None or (updated > record.get("at", 0.0) and revision != record["revision"])
+
+
 def provision_spawner(manager, spawner: dict, wanted: bool) -> str:
     """Keep the spawner box built from code: create it when there is none, and run the helper's
     `spawner` operation on it whenever this controller's revision, the spawner settings, or the git
@@ -365,9 +397,11 @@ def provision_spawner(manager, spawner: dict, wanted: bool) -> str:
         return "waiting"
     payload = spawner_payload(manager, spawner, git_user)
     fingerprint = _fingerprint(payload, _revision())
-    if record.get("fingerprint") == fingerprint:
+    drifted = record.get("fingerprint") == fingerprint and _drifted(manager.config["hub"], settings["node"], record)
+    if record.get("fingerprint") == fingerprint and not drifted:
         return "current"
-    if wanted or time.time() - record.get("tried", 0.0) < SPAWNER_RETRY_SECONDS:
+    # A box whose checkout left what it was provisioned at serves no request well, so drift is fixed even then.
+    if (wanted and not drifted) or time.time() - record.get("tried", 0.0) < SPAWNER_RETRY_SECONDS:
         return "waiting"
     if machine_status(state) != "available":
         return "asleep"
@@ -381,7 +415,9 @@ def provision_spawner(manager, spawner: dict, wanted: bool) -> str:
         log.error("cloud spawner box %s was not provisioned: %s at %s", box,
                   health.get("status") if isinstance(health, dict) else "no receipt", stage)
         return "failed"
-    record["fingerprint"] = fingerprint
+    record.update(fingerprint=fingerprint, revision=health.get("revision"), at=time.time())
+    if drifted:
+        log.warning("cloud spawner box %s had left its provisioned checkout; provisioned it again", box)
     # Only a failure delays the next attempt.
     record.pop("tried", None)
     private_json(record_path, record)
@@ -428,7 +464,7 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
     if worker_config is not None:
         from .workers import WorkerManager
         config = {**worker_config, "public_hub_url": public_origin, "hub": store.hub}
-        workers = Workers(WorkerManager(Path(directory) / "workers", config), accounting.rates)
+        workers = Workers(WorkerManager(Path(directory) / "workers", config), accounting.rates, store.hub)
         providers["workers"] = workers.browser
     app = cloud_application(Path(directory), public_origin, hub=store.hub, providers=providers, session_seconds=session_seconds)
 

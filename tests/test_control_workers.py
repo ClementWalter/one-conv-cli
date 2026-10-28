@@ -191,6 +191,31 @@ def test_a_full_pool_allocates_another_box(tmp_path, config, spec, boat):
     assert boat.creates == 2
 
 
+@pytest.fixture
+def spawner_on_the_pool(tmp_path, config, provisioned):
+    """The box the first worker landed on is now the cloud spawner's."""
+    node = provisioned.list()["pools"][0]["node"]
+    return WorkerManager(tmp_path / "workers", {**config, "spawner": {"node": node}})
+
+
+def test_a_new_worker_never_lands_on_the_spawner_box(spawner_on_the_pool, spec, boat):
+    spawner_on_the_pool.submit({**spec, "name": "builder"}, "request-2")
+    spawner_on_the_pool.run_once()
+    assert boat.creates == 2
+
+
+def test_a_worker_bound_to_the_spawner_box_is_not_bootstrapped_again(spawner_on_the_pool, boat):
+    spawner_on_the_pool.retry("request-1")
+    spawner_on_the_pool.run_once()
+    assert len(boat.starts) == 1
+
+
+def test_a_worker_bound_to_the_spawner_box_fails_on_retry(spawner_on_the_pool):
+    spawner_on_the_pool.retry("request-1")
+    spawner_on_the_pool.run_once()
+    assert spawner_on_the_pool.status("request-1")["status"] == "failed"
+
+
 def test_lost_create_acknowledgement_becomes_unconfirmed(manager, spec, boat):
     boat.lose_create = True
     manager.submit(spec, "request-1")

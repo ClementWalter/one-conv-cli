@@ -65,6 +65,44 @@ class SpawnError(Exception):
     """A spawn that cannot start, or a started agent that never registered."""
 
 
+def spawner_env_file() -> str | None:
+    """The env file this machine's spawner settings name, so any spawn here gets the credentials hub spawns get."""
+    try:
+        data = json.loads((live_home() / "bridge" / "spawn.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return data.get("env_file") if isinstance(data, dict) and isinstance(data.get("env_file"), str) else None
+
+
+# Claude Code versions seen opening no messaging socket: their sessions run but no message reaches them.
+DEAF = "deaf.json"
+# How long a registered Claude Code session gets to open its messaging socket.
+SOCKET_WAIT_SECONDS = 10.0
+
+
+def _deaf_path() -> Path:
+    return live_home() / "bridge" / DEAF
+
+
+def claude_version() -> str:
+    result = subprocess.run(["claude", "--version"], capture_output=True, text=True, check=False)
+    return result.stdout.strip()
+
+
+def _deaf_versions() -> list[str]:
+    try:
+        rows = json.loads(_deaf_path().read_text())
+    except (OSError, ValueError):
+        return []
+    return rows if isinstance(rows, list) else []
+
+
+def _record_deaf(version: str) -> None:
+    path = _deaf_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(sorted({*_deaf_versions(), version})))
+
+
 @dataclass
 class Spawned:
     tmux: str
@@ -121,6 +159,9 @@ def preflight(harness: str, env: dict[str, str] | None = None) -> None:
                                               env={**os.environ, **(env or {})}).returncode:
         # A logged-out Claude Code registers, then answers every prompt with "Not logged in".
         raise SpawnError("claude is not logged in on this machine")
+    if harness == "claude" and _deaf_versions() and (version := claude_version()) in _deaf_versions():
+        raise SpawnError(f"Claude Code {version} opens no messaging socket, so no message could reach its"
+                         " sessions; update Claude Code on this machine")
     if harness == "omp" and not omp.extension_path().exists():
         # Without the extension an omp session never registers, so nothing could message it.
         raise SpawnError("omp sessions register only with the live extension; run `one-conv live install --yes` first")
@@ -141,7 +182,7 @@ def start(harness: str, prompt: str, cwd: Path, model: str | None = None, extra:
     argv = command(harness, prompt, model, extra, trust_folder)
     before = {s.address for s in router.list_all(harness)}
     # A tmux server keeps the environment it started with, which may predate the credentials this process has.
-    variables = environment() if env is None else env
+    variables = environment(spawner_env_file()) if env is None else env
     credentials = [flag for key, value in variables.items() for flag in ("-e", f"{key}={value}")]
     result = subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", str(cwd), "-x", "200", "-y", "50",
                              *credentials, "--", *argv], capture_output=True, text=True, check=False)
@@ -153,10 +194,27 @@ def start(harness: str, prompt: str, cwd: Path, model: str | None = None, extra:
     _save(rows)
     spawned.address = wait_for_session(harness, cwd, before, name, wait_seconds, trust_folder,
                                        accept_bypass=BYPASS_FLAG in extra)
+    if harness == "claude" and not _socket_opened(spawned.address):
+        stop(name)
+        version = claude_version()
+        _record_deaf(version)
+        raise SpawnError(f"Claude Code {version} started {spawned.address} without a messaging socket, so no"
+                         " message could reach it; update Claude Code on this machine")
     rows = _load()
     rows[name] = spawned.to_json()
     _save(rows)
     return spawned
+
+
+def _socket_opened(address: str) -> bool:
+    """Whether the registered Claude Code session opened the socket messages are delivered through."""
+    deadline = time.monotonic() + SOCKET_WAIT_SECONDS
+    while True:
+        if any(s.address == address and s.delivery == "socket" for s in router.list_all("claude")):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
 
 
 def pane_for(address: str) -> str | None:

@@ -263,6 +263,58 @@ def test_a_session_that_joined_to_work_stops_the_retries(spawner, monkeypatch):
     assert len(spawn_orders(spawner)) == 1
 
 
+# --- a post the running session could not be handed ---------------------------------------------
+
+@pytest.fixture
+def deaf_member(hub):
+    """claude:one works in #work and is published, but its bridge cannot hand it anything."""
+    hub.publish("mac", [{"address": "claude:one"}], spawn="claude")
+    hub.join("mac", "work", "claude:one", work=True)
+    return hub
+
+
+def fail_delivery(hub, outcome):
+    for item in hub.inbox("mac", 0):
+        if item["to"] == "claude:one":
+            hub.ack("mac", item["delivery"], outcome)
+    hub.sweep()
+
+
+@pytest.mark.parametrize("outcome", ["unconfirmed", "refused"])
+def test_a_post_the_working_session_could_not_take_is_staffed(deaf_member, outcome):
+    key = post(deaf_member)
+    fail_delivery(deaf_member, outcome)
+    assert staffing(deaf_member, key) == ("mac/spawn:claude", "node")
+
+
+def test_a_post_the_working_session_took_is_not_staffed(deaf_member):
+    key = post(deaf_member)
+    fail_delivery(deaf_member, "accepted")
+    assert staffing(deaf_member, key) is None
+
+
+def test_a_post_still_on_its_way_to_the_working_session_is_not_staffed(deaf_member):
+    key = post(deaf_member)
+    deaf_member.sweep()
+    assert staffing(deaf_member, key) is None
+
+
+def test_the_session_that_could_not_take_the_post_does_not_close_its_staffing(deaf_member):
+    key = post(deaf_member)
+    fail_delivery(deaf_member, "unconfirmed")
+    deaf_member.sweep()
+    assert staffing(deaf_member, key) == ("mac/spawn:claude", "node")
+
+
+def test_a_session_joining_after_the_failed_delivery_closes_its_staffing(deaf_member):
+    key = post(deaf_member)
+    fail_delivery(deaf_member, "unconfirmed")
+    deaf_member.publish("mac", [{"address": "claude:one"}, {"address": "claude:new"}], spawn="claude")
+    deaf_member.join("mac", "work", "claude:new", work=True)
+    deaf_member.sweep()
+    assert staffing(deaf_member, key) == ("mac/spawn:claude", "done")
+
+
 # --- a teammate request: one more session in a channel -------------------------------------------
 
 def teammate(hub, ident="c", topic="work", text="Defend the flat-earth side"):

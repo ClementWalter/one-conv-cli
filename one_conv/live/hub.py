@@ -324,12 +324,22 @@ class Hub:
 
     # ── staffing: from no running session to one ─────────────────────────────────────────────────
 
-    def _running(self, db, topic: str | None, now: float) -> bool:
-        """Whether a session is running in this channel to read a human post."""
+    def _running(self, db, topic: str | None, now: float, since: float | None = None) -> bool:
+        """Whether a session is running in this channel to read a human post; with `since`, one that joined since then."""
         if not topic:
             return False
+        recent = None if since is None else {(n, a) for n, a in db.execute(
+            "SELECT node, address FROM members WHERE topic = ? AND joined >= ?", (topic, since))}
         return any(a != "user" and work and self._available(db, f"{n}/{a}", now)
-                   for n, a, work in self._members(db, topic))
+                   and (recent is None or (n, a) in recent) for n, a, work in self._members(db, topic))
+
+    @staticmethod
+    def _undelivered(db, seq: int) -> bool:
+        """Whether every session this post was to wake failed to take it, so none can be reading it."""
+        outcomes = [row[0] for row in db.execute(
+            "SELECT d.outcome FROM deliveries d JOIN posts p ON p.seq = d.post WHERE d.post = ? AND d.to_address != 'user'"
+            " AND COALESCE(d.mode, p.mode) = 'push'", (seq,))]
+        return bool(outcomes) and all(outcome in ("refused", "unconfirmed") for outcome in outcomes)
 
     def _human_post(self, db, seq: int) -> dict | None:
         row = db.execute("SELECT from_node, id, sender, topic, text, created, mode FROM posts WHERE seq = ?",
@@ -491,11 +501,12 @@ class Hub:
                 (*humans, now - STAFF_WINDOW_SECONDS)).fetchall()
             for (seq,) in rows:
                 post = self._human_post(db, seq)
-                if not self._running(db, post["topic"], now):
+                # A post no working session could be handed is as unread as one in a channel nobody runs.
+                if not self._running(db, post["topic"], now) or self._undelivered(db, seq):
                     self._staff(db, post, now)
-        for key, route, state, updated, tried in db.execute(
-                "SELECT task, route, state, updated, tried FROM staffing WHERE state IN ('node', 'cloud', 'submitted', 'unavailable')"
-                ).fetchall():
+        for key, route, state, updated, tried, created in db.execute(
+                "SELECT task, route, state, updated, tried, created FROM staffing"
+                " WHERE state IN ('node', 'cloud', 'submitted', 'unavailable')").fetchall():
             node, _, ident = key.partition(":")
             # Rows staffed before `tried` existed name their only spawner in the route.
             tried = tried.split() or ([route.partition("/")[0]] if route != "cloud" else [])
@@ -503,7 +514,7 @@ class Hub:
             seq = db.execute("SELECT seq, topic, mode FROM posts WHERE from_node = ? AND id = ?", (node, ident)).fetchone()
             acked = seq is not None and db.execute("SELECT 1 FROM post_acks WHERE post = ?", (seq[0],)).fetchone()
             # A session that joined the channel to work reads the post there, even before acking it.
-            joined = seq is not None and seq[2] == "push" and self._running(db, seq[1], now)
+            joined = seq is not None and seq[2] == "push" and self._running(db, seq[1], now, since=created)
             if seq is None or acked or joined:
                 db.execute("UPDATE staffing SET state = 'done', updated = ? WHERE task = ?", (now, key))
                 # A spawn order not yet handed out starts nothing once a session has read the post.

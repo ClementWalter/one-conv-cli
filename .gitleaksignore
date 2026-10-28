@@ -1,3 +1,5 @@
 # A variable named token assigned beside a constant: not a secret.
 4a719182cf5ad234b0ffb0522104d0e164cd4da3:one_conv/control/worker_bootstrap.py:generic-api-key:158
 6a81718656fc2f8ae462d76a6d7bc5f55cc28a7b:one_conv/control/worker_bootstrap.py:generic-api-key:158
+# The public SHA-256 of the semantic search model's tokenizer.json: a "tokenizer" key, not a secret.
+d726ec0c656e7c90c94c6ec3018d9ef198c5a7f3:one_conv/semantic.py:generic-api-key:23

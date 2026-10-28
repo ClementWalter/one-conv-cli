@@ -329,6 +329,7 @@ one-conv local read PROJECT
 one-conv local thread PROJECT
 one-conv local search TEXT
 one-conv local search 'bridge reconnect' --ranked
+one-conv local search 'agent dies when the websocket drops' --semantic
 ```
 
 `local search` matches TEXT as one exact substring, newest first. `--ranked` matches
@@ -338,6 +339,16 @@ directory (`$ONE_CONV_SEARCH_INDEX` overrides its path). Each search re-indexes
 only the sessions that changed, so the first ranked search indexes all history
 once and later ones skip parsing. Archived conversations join the index the
 first time the hub lists them for a query.
+
+`--semantic` also finds turns that share no word with TEXT. Each turn gets an
+embedding from [potion-retrieval-32M](https://huggingface.co/minishlab/potion-retrieval-32M),
+a static model run locally on the CPU with no GPU or ML framework: the CLI downloads
+it once into the state directory (about 130 MB, pinned by revision and checksum;
+`$ONE_CONV_SEMANTIC_MODEL` points to another copy). Turns rank by reciprocal rank
+fusion of their similarity to TEXT and BM25 over turns holding any word of TEXT.
+The first semantic search embeds every indexed turn, a few thousand per second;
+later ones embed only new turns. Archived conversations join when the hub lists
+them for any word of TEXT, and stay searchable once indexed.
 
 Replace `PROJECT` with a name from the listing. `local read` lists its sessions;
 `local thread` reads the newest one. Choose another with `--session ID` or

@@ -23,7 +23,7 @@ LIVE_ADDRESS = re.compile(r"(?:[a-z0-9][a-z0-9-]{0,31}/)?(?:claude|codex|omp|cur
 def read_cli(namespace: Namespace, command: str, *, query: str | None = None,
              source: str | None = None, limit: int = 30, refresh: bool = False,
              raw: bool = False, session: str | None = None, around: str | None = None,
-             context: int = 5, ranked: bool = False) -> dict:
+             context: int = 5, ranked: bool = False, semantic: bool = False) -> dict:
     """Capture JSON and diagnostics separately without sharing Click's global state."""
     if namespace not in ("cloud", "local"):
         raise ToolError("namespace must be cloud or local")
@@ -59,11 +59,13 @@ def read_cli(namespace: Namespace, command: str, *, query: str | None = None,
         args.append("--refresh")
     if ranked:
         args.append("--ranked")
+    if semantic:
+        args.append("--semantic")
     if query is not None:
         args += ["--", query]
     try:
         # A failing reader is reported from its exit code and stderr below, not raised here.
-        result = subprocess.run(args, capture_output=True, text=True, timeout=300 if refresh else 60, check=False)
+        result = subprocess.run(args, capture_output=True, text=True, timeout=300 if refresh or semantic else 60, check=False)
     except subprocess.TimeoutExpired as error:
         raise ToolError("History request timed out. Retry with a source filter or without refresh.") from error
     if result.returncode:
@@ -116,14 +118,17 @@ def create_server() -> MCPServer:
 
     @server.tool(annotations=readonly, structured_output=True)
     def search_conversations(query: str, namespace: Namespace = "cloud",
-                             source: str | None = None, limit: int = 30, ranked: bool = False) -> dict[str, Any]:
+                             source: str | None = None, limit: int = 30, ranked: bool = False,
+                             semantic: bool = False) -> dict[str, Any]:
         """Search saved message text, including every machine's archived agent sessions.
 
         By default `query` is one exact substring, newest hits first. ranked=true matches turns
         holding every word (or a word starting with it) in any order, best matches first: use it
-        for several keywords. Agent session hits carry `address`, which read_conversation accepts with `around`.
+        for several keywords. semantic=true ranks turns by meaning fused with matches on any word: use it
+        to describe what was discussed rather than its exact words. Agent session hits carry `address`,
+        which read_conversation accepts with `around`.
         """
-        return read_cli(namespace, "search", query=query, source=source, limit=limit, ranked=ranked)
+        return read_cli(namespace, "search", query=query, source=source, limit=limit, ranked=ranked, semantic=semantic)
 
     @server.tool(annotations=readonly, structured_output=True)
     def find_conversations(query: str, namespace: Namespace = "cloud",

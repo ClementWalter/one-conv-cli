@@ -44,7 +44,7 @@ READER_EXAMPLES = {
     "chats": ("--limit 10", "--json"),
     "read": ("PROJECT --json", "PROJECT --expand --limit 2"),
     "thread": ("PROJECT --no-mark-read --json", "PROJECT --around 2026-10-27T10:00:00Z --context 3"),
-    "search": ("'rate limit' --json", "'bridge reconnect' --ranked --limit 10"),
+    "search": ("'rate limit' --json", "'bridge reconnect' --ranked --limit 10", "'agent dies when the websocket drops' --semantic"),
     "find": ("QUERY --json",),
     "unread": ("--json", "--limit 10"),
     "fork": ("PROJECT", "PROJECT --nth 2 --yes"),

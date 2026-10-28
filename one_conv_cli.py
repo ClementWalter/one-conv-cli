@@ -7,6 +7,7 @@
 #     "pycryptodome==3.23.0",
 #     "mcp==2.2.0",
 #     "websockets==17.2",
+#     "numpy==2.5.4",
 # ]
 #
 # [tool.uv]
@@ -3102,6 +3103,30 @@ def _search_row(handle, ts, role, text):
 
 
 SEARCH_INDEX = "search-index.sqlite"
+# Turns are embedded and stored in batches, so an interrupted first semantic search keeps its progress.
+EMBED_BATCH = 2000
+
+
+def _semantic_model():
+    """The local embedding model, downloaded once into the state directory ($ONE_CONV_SEMANTIC_MODEL overrides it)."""
+    from one_conv import semantic
+    directory = os.environ.get("ONE_CONV_SEMANTIC_MODEL")
+    if not directory:
+        try:
+            directory = semantic.fetch(STATE_DIR / "models" / semantic.MODEL.split("/")[1] / semantic.REVISION)
+        except OSError as error:
+            raise click.ClickException(f"Could not download the semantic search model {semantic.MODEL}: {error}") from None
+    return semantic.StaticModel(directory)
+
+
+def _embed_pending(index, model, keys):
+    """Embed the turns of sessions `keys` that have none yet."""
+    pending = index.unembedded(keys)
+    if len(pending) > EMBED_BATCH:
+        log.warning("Embedding %d turns for semantic search; later searches embed only new turns.", len(pending))
+    for start in range(0, len(pending), EMBED_BATCH):
+        batch = pending[start:start + EMBED_BATCH]
+        index.embed([turn for turn, _ in batch], model.encode([text for _, text in batch]))
 
 
 def _index_identity(handle):
@@ -3114,12 +3139,13 @@ def _index_identity(handle):
     return f"{handle.source}:{handle.composer_id or handle.uuid}", repr(handle.mtime)
 
 
-def _ranked_search(needles, sessions, candidates, limit, complete_sources):
+def _ranked_search(needles, sessions, candidates, limit, complete_sources, semantic_query=None):
     """Best `limit` turns holding every needle, from the persistent index refreshed for changed sessions.
 
     Archived sessions are indexed only once the hub lists them as candidates, so a search never
     downloads the whole archive. `complete_sources`, when `sessions` lists every session of those
-    sources, drops their indexed sessions that no longer exist.
+    sources, drops their indexed sessions that no longer exist. With `semantic_query`, turns rank by
+    meaning fused with BM25 over any needle, and already indexed archived sessions stay in scope.
     """
     from one_conv.ranking import SearchIndex, snippet
     index = SearchIndex(Path(os.environ.get("ONE_CONV_SEARCH_INDEX", str(STATE_DIR / SEARCH_INDEX))))
@@ -3131,7 +3157,7 @@ def _ranked_search(needles, sessions, candidates, limit, complete_sources):
         except OSError:  # Deleted since it was listed.
             continue
         present.add(key)
-        if h.archive and h.archive["key"] not in candidates:
+        if h.archive and h.archive["key"] not in candidates and not (semantic_query and stamps.get(key) == stamp):
             continue
         if stamps.get(key) != stamp:
             try:
@@ -3144,25 +3170,36 @@ def _ranked_search(needles, sessions, candidates, limit, complete_sources):
         scope[key] = h
     if complete_sources:
         index.forget(complete_sources, present)
-    return [_search_row(scope[key], ts, role, snippet(text, needles))
-            for key, ts, role, text in index.top(needles, scope, limit)]
+    if semantic_query is None:
+        hits = index.top(needles, scope, limit)
+    else:
+        model = _semantic_model()
+        _embed_pending(index, model, scope)
+        hits = index.hybrid(needles, model.encode([semantic_query])[0], scope, limit)
+    return [_search_row(scope[key], ts, role, snippet(text, needles)) for key, ts, role, text in hits]
 
 
-@cli.command(epilog="\b\nExamples:\n  one-conv search 'rate limit' --json\n  one-conv search 'bridge reconnect' --ranked --limit 10")
+@cli.command(epilog="\b\nExamples:\n  one-conv search 'rate limit' --json\n  one-conv search 'bridge reconnect' --ranked --limit 10\n"
+                     "  one-conv search 'agent dies when the websocket drops' --semantic")
 @click.argument("text")
 @_SOURCE_OPTION
 @click.option("--project", "project_query", help="Restrict to projects matching this query (default: all).")
 @click.option("--limit", default=50, type=click.IntRange(min=1), help="Number of matches to show.")
 @click.option("--offline", is_flag=True, help="Search saved history only, without contacting online providers.")
 @click.option("--ranked", is_flag=True, help="Match turns holding every word, as a word or word prefix, in any order; best matches first.")
+@click.option("--semantic", is_flag=True, help="Rank turns by meaning, fused with matches on any word; best matches first.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
 def search(text: str, source_filter: str | None, project_query: str | None, limit: int, offline: bool,
-           ranked: bool, as_json: bool) -> None:
+           ranked: bool, semantic: bool, as_json: bool) -> None:
     """Full-text search across session transcripts, across every source.
 
     By default TEXT matches as one exact substring, newest first. --ranked
     matches turns holding every word of TEXT, each as a word or the start of
     one ("build" finds "builds"), and orders them by BM25 relevance.
+    --semantic also finds turns that share no word with TEXT: it fuses the
+    closeness in meaning of each turn to TEXT, from a small embedding model
+    run locally (downloaded once, about 130 MB), with BM25 over turns holding
+    any word of TEXT.
 
     A cheap pre-filter runs before any full parsing — a raw-bytes substring
     check for claude/codex/omp's flat JSONL files, one batched SQL LIKE query
@@ -3172,10 +3209,12 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
     --ranked reads a full-text index kept in the state directory
     ($ONE_CONV_SEARCH_INDEX overrides its path). Each search re-indexes only
     the sessions that changed since the last one, so the first ranked search
-    indexes all history once and later ones parse only what changed.
+    indexes all history once and later ones parse only what changed. The
+    first --semantic search embeds every indexed turn once in the same way.
     """
     from one_conv.ranking import words
 
+    ranked = ranked or semantic
     sources = selected_sources(source_filter, SOURCES)
     needles = words(text) if ranked else [text.lower()]
     if ranked and not needles:
@@ -3193,11 +3232,13 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
             with ThreadPoolExecutor(len(needles)) as pool:
                 listings = list(pool.map(lambda needle: {row["key"] for row in archive["client"].list_conversations(query=needle)},
                                          needles))
-            candidates = set.intersection(*listings)
+            # A semantic hit needs only one word in common with the query, or none.
+            candidates = set.union(*listings) if semantic else set.intersection(*listings)
         except ArchiveError as error:
             log.warning("%s Archived conversations were not searched.", error)
     if ranked:
-        results = _ranked_search(needles, sessions, candidates, limit, () if project_query else sources)
+        results = _ranked_search(needles, sessions, candidates, limit, () if project_query else sources,
+                                 text if semantic else None)
     else:
         results = _exact_search(needles[0], sessions, sources, candidates, limit)
     if not offline and (source_filter is None or source_filter == "chatgpt"):

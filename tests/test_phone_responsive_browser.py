@@ -54,7 +54,7 @@ def phone_width(request):
 @pytest.fixture
 def long_workspace(paired, phone_width):
     """Bounded literal labels and URLs exercise content-driven minimum sizes."""
-    page, cloud = paired
+    page, _state = paired
     page.set_viewport_size({"width": phone_width, "height": 844})
     now = time.time()
     topic = "release-" + "planning" * 7
@@ -73,10 +73,6 @@ def long_workspace(paired, phone_width):
     page.route("**/api/topics/*", lambda route: route.fulfill(json={"messages": rows}))
     page.route("**/api/devices/pair", lambda route: route.fulfill(json={"url": page.url.split("#")[0] + "#pair=" + "p" * 43,
                "expires_at": now + 600, "single_use": True, "access": "owner"}))
-    cloud["profiles"] = {"default": {"label": "RepositoryAccess" * 16}}
-    cloud["jobs"] = [{"id": "b" * 32, "status": "unconfirmed", "phase": "allocation-blocked",
-                       "blocked_by_pool": "unresolved", "spec": {"name": "reviewer-" + "r" * 23, "profile": "default"},
-                       "error": "https://example.invalid/" + "error_" * 70}]
     page.route("**/api/providers/accounting", lambda route: route.fulfill(json={
         "cards": [{"cost_center_id": "reviewer", "name": "AccountingOwner" * 12, "hourly_rate": {
             "amount": "123456789.12345678", "currency": "USD", "basis": "allocated",
@@ -117,8 +113,8 @@ def phone_screen(long_workspace, request):
         important = "#copy-invitation"
     elif request.param == "staffing":
         page.locator("#staff-team").click()
-        page.locator(".worker-job").wait_for()
-        selectors += ["#staff-dialog", ".field-grid", ".worker-job"]
+        page.locator("#staff-dialog").wait_for()
+        selectors += ["#staff-dialog", ".field-grid"]
         important = "#staff-submit"
     elif request.param == "accounting":
         page.locator("#show-costs").click()

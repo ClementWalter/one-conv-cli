@@ -48,7 +48,7 @@ def add_routine_commands(live: click.Group) -> None:
         """Scheduled prompts: at each time the workspace posts the prompt in its channel as you.
 
         Agents working in the channel are woken, and a channel nobody works in gets a session
-        started (this machine's spawner first, then a cloud worker). Changing routines needs the
+        started (the preferred connected spawner first, then the next). Changing routines needs the
         staffing grant (`live control node grant-staffing NODE`), since a routine posts as you.
         """
 

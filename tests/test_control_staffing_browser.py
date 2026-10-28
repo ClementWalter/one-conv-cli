@@ -19,7 +19,7 @@
 # [tool.uv]
 # exclude-newer = "2026-10-27T00:00:00Z"
 # ///
-"""The phone queues production worker jobs over HTTPS without paid Boat effects."""
+"""The phone asks the hub for a teammate over HTTPS; a connected spawner starts it, and costs stay editable."""
 
 import socket
 import threading
@@ -29,6 +29,7 @@ import pytest
 import uvicorn
 
 from one_conv.control.runtime import application
+from one_conv.hr import make_card
 from tests import test_control_messages as https_tests
 from tests import test_pwa_browser as phone_tests
 
@@ -36,40 +37,14 @@ tls_certificate = https_tests.tls_certificate
 browser = phone_tests.browser
 
 
-class BoatWithoutLogin:
-    """A disposable provider boundary that creates no remote resources."""
-
-    def __init__(self):
-        self.state = "ready"
-        self.created = 0
-
-    def credentials(self, _profile):
-        return {"service_account": "synthetic-private-service-account"}
-
-    def create(self, _profile, _pool):
-        self.created += 1
-        self.state = "ready"
-        return "bx_synthetic"
-
-    def info(self, _box):
-        return {"state": self.state}
-
-    def stop_pool(self, _box):
-        self.state = "archived"
-
-    def resume_pool(self, _box):
-        self.state = "ready"
-
-    def bootstrap(self, _box, payload):
-        return {"status": "stopped"} if payload["operation"] == "stop" else {"status": "auth_needed", "authenticated": False}
-
-
 @pytest.fixture
-def staffed_phone(tmp_path, tls_certificate, browser):
+def phone(tmp_path, tls_certificate, browser):
+    """A paired phone on a workspace whose Mac offers to start claude sessions."""
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     origin = f"https://127.0.0.1:{sock.getsockname()[1]}"
-    app = application(tmp_path, origin, worker_config={"boat": BoatWithoutLogin()})
+    app = application(tmp_path, origin)
+    app.state.hub.publish("mac", [], spawn="claude", priority=10)
     certificate, key = tls_certificate
     server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False, timeout_graceful_shutdown=1,
                                           ssl_certfile=str(certificate), ssl_keyfile=str(key)))
@@ -87,12 +62,6 @@ def staffed_phone(tmp_path, tls_certificate, browser):
         page.goto(origin + "/#pair=" + app.state.auth.issue_pairing_token(), wait_until="networkidle")
         page.get_by_role("button", name="Connect this device", exact=True).click()
         page.locator("#pairing").wait_for(state="hidden")
-        page.locator("#staff-team").click()
-        page.locator("#staff-name").fill("jack")
-        page.locator("#staff-topic").fill("release")
-        page.locator("#staff-prompt").fill("Review the current change.")
-        page.locator("#staff-submit").click()
-        page.locator(".worker-job").first.wait_for()
         yield page, app
     finally:
         context.close()
@@ -101,94 +70,52 @@ def staffed_phone(tmp_path, tls_certificate, browser):
         sock.close()
 
 
-def test_phone_uses_the_production_profile_mapping(staffed_phone):
-    assert staffed_phone[0].locator("#staff-profile").input_value() == "default"
-
-
-def test_default_profile_disclosure_is_linked_to_the_staffing_action(staffed_phone):
-    assert staffed_phone[0].locator("#staff-submit").get_attribute("aria-describedby") == "staff-access-disclosure"
-
-
-def test_actual_default_profile_explains_unattended_access(staffed_phone):
-    assert staffed_phone[0].locator("#staff-access-disclosure").inner_text() == "This teammate runs unattended with this profile’s repository access and credentials."
-
-
-def test_phone_staffing_is_durable_before_remote_completion(staffed_phone):
-    assert len(staffed_phone[1].state.workers.manager.list()["jobs"]) == 1
-
-
-def test_unavailable_provider_does_not_look_online(staffed_phone):
-    page, _app = staffed_phone
-    page.locator(".worker-job").filter(has_text="Provider needs attention").wait_for(timeout=10000)
-    assert page.get_by_role("button", name="Message", exact=True).count() == 0
-
-
-def test_phone_can_reopen_a_cloud_job_after_reload(staffed_phone):
-    page, _app = staffed_phone
-    # The change feed keeps a request open, so wait for the button rather than network idle.
-    page.reload()
-    page.locator("#staff-team:not([hidden])").click()
-    page.locator(".worker-job").first.wait_for()
-    assert "jack" in page.locator(".worker-job").first.inner_text()
-
-
-def test_new_worker_rate_is_unknown(staffed_phone):
-    assert staffed_phone[1].state.accounting.rates.show("jack")["hourly_rate"]["amount"] is None
-
-
-def test_phone_can_stop_a_teammate_without_deleting_its_box(staffed_phone):
-    page, app = staffed_phone
-    page.get_by_role("button", name="Stop teammate").wait_for(timeout=10000)
-    page.get_by_role("button", name="Stop teammate").click()
-    page.locator(".worker-job").filter(has_text="Stopped").wait_for()
-    assert app.state.workers.manager.list()["pools"][0]["box_id"] == "bx_synthetic"
-
-
-def test_phone_can_recheck_a_box_stopped_teammate_after_resuming_the_same_box(staffed_phone):
-    page, app = staffed_phone
-    page.get_by_role("button", name="Stop teammate", exact=True).wait_for(timeout=10000)
-    original = app.state.workers.manager.list()["jobs"][0]
-    page.get_by_role("button", name="Stop box", exact=True).click()
-    page.get_by_role("button", name="Resume box", exact=True).wait_for()
-    page.get_by_role("button", name="Resume box", exact=True).click()
-    check = page.get_by_role("button", name="Check again", exact=True)
-    check.wait_for()
-    with page.expect_response(lambda response: response.url.endswith("/api/providers/workers") and response.request.method == "POST") as response:
-        check.click()
+@pytest.fixture
+def staffed_phone(phone):
+    page, app = phone
+    page.locator("#staff-team").click()
+    page.locator("#staff-name").fill("jack")
+    page.locator("#staff-topic").fill("release")
+    page.locator("#staff-prompt").fill("Review the current change.")
+    with page.expect_response(lambda response: response.url.endswith("/api/providers/workers")) as response:
+        page.locator("#staff-submit").click()
     response.value.finished()
-    page.locator(".worker-job").filter(has_text="Provider needs attention").wait_for(timeout=10000)
-    current = app.state.workers.manager.list()["jobs"][0]
-    assert (current["id"], current["box_id"], app.state.workers.manager.boat.created) == (original["id"], "bx_synthetic", 1)
+    return page, app
 
 
-def test_individually_stopped_teammate_does_not_offer_recheck(staffed_phone):
+def test_the_phone_files_the_teammate_request_in_its_channel(staffed_phone):
+    assert [row["text"] for row in staffed_phone[1].state.hub.history("release")] == [
+        "New teammate @jack: Review the current change."]
+
+
+def test_the_phone_says_which_machine_starts_the_teammate(staffed_phone):
     page, _app = staffed_phone
-    page.get_by_role("button", name="Stop teammate", exact=True).wait_for(timeout=10000)
-    page.get_by_role("button", name="Stop teammate", exact=True).click()
-    page.locator(".worker-job").filter(has_text="Stopped").wait_for()
-    assert page.get_by_role("button", name="Check again", exact=True).count() == 0
+    page.locator("#staff-feedback").filter(has_text="Starting on mac").wait_for()
+    assert "#release" in page.locator("#staff-feedback").inner_text()
 
 
-def test_resumed_box_requires_a_worker_recheck_before_looking_online(staffed_phone, tmp_path):
-    page, _app = staffed_phone
-    page.get_by_role("button", name="Stop teammate", exact=True).wait_for(timeout=10000)
-    page.get_by_role("button", name="Stop box", exact=True).click()
-    page.get_by_role("button", name="Resume box", exact=True).wait_for()
-    page.get_by_role("button", name="Resume box", exact=True).click()
-    page.get_by_role("button", name="Check again", exact=True).wait_for()
-    page.screenshot(path=str(tmp_path / "resumed-box-recovery-390px.png"), full_page=True)
-    assert page.get_by_role("button", name="Message", exact=True).count() == 0
-    close = page.get_by_role("button", name="Close add teammate", exact=True)
-    close.scroll_into_view_if_needed()
-    page.screenshot(path=str(tmp_path / "recovery-dialog-close-390px.png"), full_page=True)
-    close.click()
+def test_the_teammate_dialog_asks_only_for_a_name_a_channel_and_a_task(phone):
+    page, _app = phone
+    page.locator("#staff-team").click()
+    assert page.locator("#staff-form input, #staff-form select, #staff-form textarea").count() == 3
+
+
+@pytest.fixture
+def costed_phone(phone):
+    """A teammate with the unknown all-in rate a new one starts with, and the costs dialog open."""
+    page, app = phone
+    app.state.accounting.rates.bind_worker(make_card(
+        "jack", "jack", aliases=["jack"], currency="USD", basis="allocated",
+        provenance="Not yet measured or allocated by the team",
+        metering_basis="Occupied work hour, including internal subagents"), "worker-test/claude:jack")
+    page.get_by_role("button", name="Team costs").click()
+    page.get_by_role("button", name="Set planning rate").wait_for()
+    return page, app
 
 
 @pytest.mark.parametrize(("entered", "expected"), [("0", "0"), ("12.50", "12.50"), ("", None)])
-def test_phone_can_set_an_explicit_planning_rate(staffed_phone, entered, expected):
-    page, app = staffed_phone
-    page.get_by_role("button", name="Close add teammate").click()
-    page.get_by_role("button", name="Team costs").click()
+def test_phone_can_set_an_explicit_planning_rate(costed_phone, entered, expected):
+    page, app = costed_phone
     page.get_by_role("button", name="Set planning rate").click()
     page.get_by_role("spinbutton", name="Hourly rate for jack").fill(entered)
     with page.expect_response("**/api/providers/accounting") as response:
@@ -197,11 +124,8 @@ def test_phone_can_set_an_explicit_planning_rate(staffed_phone, entered, expecte
     assert app.state.accounting.rates.show("jack")["hourly_rate"]["amount"] == expected
 
 
-def test_rate_edit_preserves_a_worker_registered_after_the_dialog_opened(staffed_phone):
-    page, app = staffed_phone
-    page.get_by_role("button", name="Close add teammate").click()
-    page.get_by_role("button", name="Team costs").click()
-    page.get_by_role("button", name="Set planning rate").wait_for()
+def test_rate_edit_preserves_a_worker_registered_after_the_dialog_opened(costed_phone):
+    page, app = costed_phone
     card = app.state.accounting.rates.show("jack")
     card.pop("updated_at")
     card["addresses"] = ["worker-test/codex:late"]

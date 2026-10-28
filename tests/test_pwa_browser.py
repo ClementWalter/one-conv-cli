@@ -46,7 +46,7 @@ def browser():
 
 @pytest.fixture
 def cloud_page(browser, workspace, request):
-    """The browser uses the actual app; only cloud credentials and jobs are synthetic."""
+    """The browser uses the actual app; only the workspace's answers are synthetic."""
     # API fixtures must remain visible to Playwright rather than a service worker.
     public_shell_test = request.node.name in {
         "test_service_worker_does_not_cache_private_api_responses", "test_an_offline_phone_sees_a_reconnect_page"
@@ -54,8 +54,7 @@ def cloud_page(browser, workspace, request):
     context = browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
                                   service_workers="allow" if public_shell_test else "block")
     page = context.new_page()
-    state = {"authenticated": False, "pairing": [], "jobs": [], "pools": [], "posts": [],
-             "profiles": {"default": {"label": "Project tools"}}}
+    state = {"authenticated": False, "pairing": [], "posts": []}
     page.on("pageerror", lambda error: state.setdefault("errors", []).append(str(error)))
     page.on("console", lambda event: state.setdefault("console", []).append(event.text) if event.type == "error" else None)
     page.on("requestfailed", lambda event: state.setdefault("failures", []).append(event.failure))
@@ -73,18 +72,9 @@ def cloud_page(browser, workspace, request):
         route.fulfill(json={"authenticated": True})
 
     def workers(route):
-        if route.request.method == "POST":
-            request = route.request.post_data_json
-            state["posts"].append(request)
-            if request["action"] == "spawn":
-                job = {"id": request["id"], "status": "queued", "spec": request["spec"]}
-                state["jobs"].append(job)
-            else:
-                job = next(job for job in state["jobs"] if job["id"] == request["id"])
-                job["status"] = "queued" if request["action"] in ("recheck", "reconcile") else "stopped"
-            route.fulfill(json=job)
-        else:
-            route.fulfill(json={"jobs": state["jobs"], "pools": state["pools"], "profiles": state["profiles"]})
+        request = route.request.post_data_json
+        state["posts"].append(request)
+        route.fulfill(json={"id": request["id"], "status": "node", "route": "macbook/spawn:claude"})
 
     def accounting(route):
         if route.request.method == "POST":
@@ -137,44 +127,6 @@ def test_phone_can_open_the_staffing_form(paired):
     assert page.locator("#staff-dialog").is_visible()
 
 
-def test_unknown_profile_approval_settings_use_neutral_disclosure(paired):
-    page, _state = paired
-    page.locator("#staff-team").click()
-    assert page.locator("#staff-access-disclosure").inner_text() == "This teammate uses this profile’s repository access, credentials and approval settings."
-
-
-@pytest.mark.parametrize(("harness", "args"), [("codex", ["--dangerously-bypass-approvals-and-sandbox"]),
-                                               ("claude", ["--dangerously-skip-permissions"]),
-                                               ("omp", ["--approval-mode=yolo"]), ("omp", ["--approval-mode", "yolo"])])
-def test_explicit_unattended_profile_is_disclosed_for_selected_harness(paired, harness, args):
-    page, state = paired
-    state["profiles"] = {"default": {"harness_args": {harness: args}}}
-    page.locator("#staff-team").click()
-    page.locator("#staff-profile option").filter(has_text="default").wait_for(state="attached")
-    page.locator("#staff-harness").select_option(harness)
-    page.locator("#staff-access-disclosure").filter(has_text="runs unattended").wait_for()
-    assert page.locator("#staff-access-disclosure").inner_text() == "This teammate runs unattended with this profile’s repository access and credentials."
-
-
-def test_disclosure_changes_with_the_selected_profile(paired):
-    page, state = paired
-    state["profiles"] = {"default": {"harness_args": {"codex": ["--dangerously-bypass-approvals-and-sandbox"]}},
-                         "custom": {"harness_args": {"codex": []}}}
-    page.locator("#staff-team").click()
-    page.locator("#staff-profile option").filter(has_text="custom").wait_for(state="attached")
-    page.locator("#staff-profile").select_option("custom")
-    assert "runs unattended" not in page.locator("#staff-access-disclosure").inner_text()
-
-
-def test_disclosure_changes_with_the_selected_harness(paired):
-    page, state = paired
-    state["profiles"] = {"default": {"harness_args": {"codex": ["--dangerously-bypass-approvals-and-sandbox"], "claude": []}}}
-    page.locator("#staff-team").click()
-    page.locator("#staff-access-disclosure").filter(has_text="runs unattended").wait_for()
-    page.locator("#staff-harness").select_option("claude")
-    assert "runs unattended" not in page.locator("#staff-access-disclosure").inner_text()
-
-
 @pytest.fixture
 def submitted(paired):
     page, state = paired
@@ -182,7 +134,7 @@ def submitted(paired):
     page.locator("#staff-name").fill("jack")
     page.locator("#staff-prompt").fill("Review the current implementation.")
     page.locator("#staff-submit").click()
-    page.locator(".worker-job").wait_for()
+    page.locator("#staff-feedback").filter(has_text="Starting on").wait_for()
     return page, state
 
 
@@ -194,8 +146,8 @@ def test_staffing_request_does_not_choose_a_sender(submitted):
     assert set(submitted[1]["posts"][0]) == {"action", "id", "spec"}
 
 
-def test_phone_sees_job_preparation_status(submitted):
-    assert "Getting started" in submitted[0].locator(".worker-job").inner_text()
+def test_phone_sees_which_machine_starts_the_teammate(submitted):
+    assert "Starting on macbook" in submitted[0].locator("#staff-feedback").inner_text()
 
 
 def test_unknown_rate_is_not_displayed_as_zero(paired):
@@ -314,97 +266,5 @@ def test_staffing_retry_keeps_its_id_after_a_reload(paired):
     page.locator("#staff-name").fill("jack")
     page.locator("#staff-prompt").fill("Review the implementation.")
     page.locator("#staff-submit").click()
-    page.locator(".worker-job").wait_for()
+    page.locator("#staff-feedback").filter(has_text="Starting on").wait_for()
     assert attempts[0]["id"] == attempts[1]["id"]
-
-
-@pytest.fixture
-def allocation_blocked(paired):
-    page, state = paired
-    state["jobs"] = [{"id": "blocked-job", "status": "unconfirmed", "phase": "allocation-blocked",
-                      "box_id": None, "pool_id": None, "blocked_by_pool": "unresolved-pool",
-                      "spec": {"name": "jack"}, "error": "Reconcile the earlier box creation before rechecking."}]
-    page.locator("#staff-team").click()
-    page.locator(".worker-job").filter(has_text="Waiting for box recovery").wait_for()
-    return page, state
-
-
-def test_allocation_blocked_job_can_recheck_the_existing_request(allocation_blocked):
-    page, state = allocation_blocked
-    with page.expect_response(lambda response: response.url.endswith("/api/providers/workers") and response.request.method == "POST") as response:
-        page.get_by_role("button", name="Check again", exact=True).click()
-    response.value.finished()
-    assert state["posts"] == [{"action": "recheck", "id": "blocked-job"}]
-
-
-def test_allocation_blocked_job_can_cancel_the_unstarted_request(allocation_blocked):
-    page, state = allocation_blocked
-    with page.expect_response(lambda response: response.url.endswith("/api/providers/workers") and response.request.method == "POST") as response:
-        page.get_by_role("button", name="Cancel request", exact=True).click()
-    response.value.finished()
-    assert state["posts"] == [{"action": "stop", "id": "blocked-job"}]
-
-
-def test_allocation_blocked_job_does_not_look_online(allocation_blocked):
-    assert allocation_blocked[0].get_by_role("button", name="Message", exact=True).count() == 0
-
-
-@pytest.fixture
-def orphaned_allocation(paired):
-    page, state = paired
-    state["jobs"] = [{"id": "orphaned-job", "status": "unconfirmed", "phase": "allocation-blocked",
-                      "box_id": None, "pool_id": None, "blocked_by_pool": "unresolved-pool",
-                      "spec": {"name": "jack", "profile": "default"}}]
-    state["pools"] = [{"id": "unresolved-pool", "box_id": None, "status": "unconfirmed", "profile": "default"}]
-    page.locator("#staff-team").click()
-    page.get_by_label("Reconcile box for jack", exact=True).wait_for()
-    return page, state
-
-
-def test_orphaned_allocation_can_attach_only_the_explicit_existing_box(orphaned_allocation):
-    page, state = orphaned_allocation
-    page.get_by_label("Reconcile box for jack", exact=True).fill("bx_inspected")
-    with page.expect_response(lambda response: response.url.endswith("/api/providers/workers") and response.request.method == "POST") as response:
-        page.get_by_role("button", name="Use this existing box", exact=True).click()
-    response.value.finished()
-    assert state["posts"] == [{"action": "reconcile", "id": "orphaned-job", "box_id": "bx_inspected"}]
-
-
-@pytest.mark.parametrize("owner_status", ["unconfirmed", "failed"])
-def test_blocked_sibling_cannot_reconcile_while_original_owner_is_recoverable(orphaned_allocation, owner_status):
-    page, state = orphaned_allocation
-    page.get_by_role("button", name="Close add teammate", exact=True).click()
-    state["jobs"].append({"id": "original-owner", "pool_id": "unresolved-pool", "status": owner_status,
-                          "phase": "creating", "spec": {"name": "original", "profile": "default"}})
-    page.locator("#staff-team").click()
-    page.get_by_label("Reconcile box for jack", exact=True).wait_for(state="detached")
-    assert page.get_by_label("Reconcile box for jack", exact=True).count() == 0
-
-
-@pytest.mark.parametrize(("field", "value"), [("box_id", "bx_tracked"), ("profile", "other-profile"), ("status", "retired")])
-def test_blocked_reconciliation_requires_a_matching_boxless_pool(orphaned_allocation, field, value):
-    page, state = orphaned_allocation
-    page.get_by_role("button", name="Close add teammate", exact=True).click()
-    state["pools"][0][field] = value
-    page.locator("#staff-team").click()
-    page.get_by_label("Reconcile box for jack", exact=True).wait_for(state="detached")
-    assert page.get_by_label("Reconcile box for jack", exact=True).count() == 0
-
-
-def test_boxless_reservation_has_no_box_power_action(orphaned_allocation):
-    assert orphaned_allocation[0].locator(".pool-job button").count() == 0
-
-
-def test_boxless_reservation_explains_its_unresolved_state(orphaned_allocation):
-    assert "Box creation needs checking" in orphaned_allocation[0].locator(".pool-job").inner_text()
-
-
-@pytest.mark.parametrize("pool_status", ["stopped", "unconfirmed", None])
-def test_box_stopped_job_requires_an_available_associated_pool(paired, pool_status):
-    page, state = paired
-    state["jobs"] = [{"id": "stopped-job", "status": "stopped", "phase": "pool-stopped",
-                      "pool_id": "pool", "box_id": "bx_existing", "spec": {"name": "jack"}}]
-    state["pools"] = [{"id": "pool", "status": pool_status}] if pool_status else []
-    page.locator("#staff-team").click()
-    page.locator(".worker-job").filter(has_text="Resume its box").wait_for()
-    assert page.get_by_role("button", name="Check again", exact=True).count() == 0

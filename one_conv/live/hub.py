@@ -24,9 +24,9 @@ stay readable by everyone.
 A post from a trusted human (a node in `trusted_humans`, sending as "user") wakes every running
 member of its channel. Each session acks it (`acknowledge`), so the human sees who read it, and
 the sessions agree in the channel who does what. A human post that finds no running session is
-staffed at once: a spawn order to a connected bridge that offers to start sessions, or, when
-none takes it in time, a cloud worker that the control service starts (`staffing`, keyed by
-the post's NODE:id).
+staffed at once: a spawn order to the preferred connected bridge that offers to start sessions,
+passed to the next one when it refuses or no session acks in time, and kept waiting for one to
+connect otherwise (`staffing`, keyed by the post's NODE:id).
 """
 
 import hashlib
@@ -72,8 +72,6 @@ SPAWN_FALLBACK_SECONDS = 90.0
 SPAWN_ATTEMPTS = 3
 # Only requests created or released this recently are staffed, so old unowned ones never start sessions.
 STAFF_WINDOW_SECONDS = 3600.0
-# A request the cloud could not take goes back to it after this long, within the staffing window.
-UNAVAILABLE_RETRY_SECONDS = 30.0
 SPAWN_HARNESSES = ("claude", "codex", "omp")
 # The apps a published session can name beside its harness.
 PRODUCTS = ("cursor-cli", "cursor-ide")
@@ -418,7 +416,7 @@ class Hub:
         """Whether a session is being started for another recent human post of this channel."""
         return topic is not None and db.execute(
             "SELECT 1 FROM staffing s JOIN posts p ON s.task = p.from_node || ':' || p.id WHERE p.topic = ?"
-            " AND p.mode = 'push' AND s.state IN ('node', 'cloud', 'submitted') AND s.created >= ?",
+            " AND p.mode = 'push' AND s.state IN ('node', 'cloud') AND s.created >= ?",
             (topic, now - STAFF_WINDOW_SECONDS)).fetchone() is not None
 
     def request_teammate(self, node: str, sender: str, msg_id: str, topic: str, text: str) -> dict:
@@ -506,7 +504,7 @@ class Hub:
                     self._staff(db, post, now)
         for key, route, state, updated, tried, created in db.execute(
                 "SELECT task, route, state, updated, tried, created FROM staffing"
-                " WHERE state IN ('node', 'cloud', 'submitted', 'unavailable')").fetchall():
+                " WHERE state IN ('node', 'cloud')").fetchall():
             node, _, ident = key.partition(":")
             # Rows staffed before `tried` existed name their only spawner in the route.
             tried = tried.split() or ([route.partition("/")[0]] if route != "cloud" else [])
@@ -526,12 +524,7 @@ class Hub:
             if route == "cloud":
                 # A spawner that connects later, such as a cloud box coming back, takes a request still waiting.
                 post = self._human_post(db, seq[0])
-                # A failed cloud submit, such as a worker limit, is tried again rather than left unstaffed.
-                if (state == "unavailable" and updated < now - UNAVAILABLE_RETRY_SECONDS
-                        and post["created"] >= now - STAFF_WINDOW_SECONDS):
-                    db.execute("UPDATE staffing SET state = 'cloud', updated = ? WHERE task = ?", (now, key))
-                    state = "cloud"
-                if (state == "cloud" and post["created"] >= now - STAFF_WINDOW_SECONDS
+                if (post["created"] >= now - STAFF_WINDOW_SECONDS
                         and (spawner := self._next_spawner(db, now, tried, self._refusers(db, node, tried, spawn_ids)))):
                     spawner_node, harness = spawner
                     route = self._order_spawn(db, post, spawner_node, harness, tried)
@@ -609,27 +602,6 @@ class Hub:
         with self.lock, self._db() as db:
             row = db.execute("SELECT seen FROM nodes WHERE node = ?", (node,)).fetchone()
         return row[0] if row else None
-
-    def staffing_due(self) -> list[dict]:
-        """Human posts waiting for a cloud worker, with the first prompt that worker gets."""
-        with self.lock, self._db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            self._sweep(db, time.time())
-            due = []
-            for (key,) in db.execute("SELECT task FROM staffing WHERE state = 'cloud' ORDER BY created").fetchall():
-                node, _, ident = key.partition(":")
-                seq = db.execute("SELECT seq FROM posts WHERE from_node = ? AND id = ?", (node, ident)).fetchone()
-                post = self._human_post(db, seq[0])
-                due.append({"task": key, "version": 1, "topic": post["topic"], "prompt": self.spawn_prompt(post, self._predecessors(db, post["topic"]))})
-            return due
-
-    def staffing_mark(self, key: str, version: int, state: str, detail: str = "") -> None:
-        """Record what the control service did about a cloud staffing request."""
-        if state not in ("submitted", "unavailable"):
-            raise HubError(400, "a staffing request is submitted or unavailable")
-        with self.lock, self._db() as db:
-            db.execute("UPDATE staffing SET state = ?, detail = ?, updated = ? WHERE task = ? AND version = ?"
-                       " AND state = 'cloud'", (state, detail[:500], time.time(), key, version))
 
     # ── acknowledgments ──────────────────────────────────────────────────────────────────────────────
 

@@ -31,7 +31,7 @@ from click.testing import CliRunner
 from starlette.testclient import TestClient
 
 from one_conv.control.cli import build_control_group
-from one_conv.control.runtime import Workers, application
+from one_conv.control.runtime import Teammates, application
 from one_conv.hr import make_card
 from one_conv.live.cli import build_live_group
 
@@ -167,10 +167,17 @@ def paired_browser(client, app):
     return client
 
 
+def worker_card():
+    """The unknown all-in rate a new teammate starts with."""
+    return make_card("jack", "jack", aliases=["jack"], currency="USD", basis="allocated",
+                     provenance="Not yet measured or allocated by the team",
+                     metering_basis="Occupied work hour, including internal subagents")
+
+
 @pytest.fixture
 def planning_update(paired_browser, app, card):
     cached = app.state.accounting.rates.register({**card, "addresses": []})
-    Workers(None, app.state.accounting.rates).rate_card({"spec": {"name": "jack"}, "address": "worker/codex:session"})
+    app.state.accounting.rates.bind_worker(worker_card(), "worker/codex:session")
     return paired_browser.post("/api/providers/accounting", json={"action": "update_rate", "reference": cached["cost_center_id"],
                                                                "hourly_rate": {**cached["hourly_rate"], "amount": "5"}})
 
@@ -184,7 +191,7 @@ def test_browser_partial_rate_update_sets_the_planning_rate(planning_update):
 
 
 def test_worker_reconciliation_preserves_the_latest_browser_rate(planning_update, app):
-    Workers(None, app.state.accounting.rates).rate_card({"spec": {"name": "jack"}, "address": "worker/codex:second"})
+    app.state.accounting.rates.bind_worker(worker_card(), "worker/codex:second")
     assert app.state.accounting.rates.show("jack")["hourly_rate"]["amount"] == "5"
 
 
@@ -242,59 +249,48 @@ def test_competing_nodes_cannot_replace_the_same_new_owner(app, card):
     assert sorted(outcomes) == ["refused", "saved"]
 
 
-def test_cloud_staffing_is_not_enabled_by_a_request(node):
-    assert node.get("/v1/workers").status_code == 404
-
-
-@pytest.mark.parametrize("identifier", [[], {}, None, 1, "../escape", ""])
-def test_worker_actions_refuse_malformed_ids_before_dispatch(identifier):
-    with pytest.raises(ValueError, match="tracked worker"):
-        Workers(None, None).browser("POST", {"action": "stop", "id": identifier})
-
-
-def test_reconciliation_refuses_a_malformed_id_before_remote_inspection():
-    with pytest.raises(ValueError, match="tracked worker"):
-        Workers(None, None).browser("POST", {"action": "reconcile", "id": [], "box_id": "bx_example"})
+def test_a_node_reads_no_teammate_listing(node):
+    assert node.get("/v1/workers").status_code == 405
 
 
 @pytest.fixture
 def teammates(tmp_path):
-    """A controller with a cloud spawner, and the Mac's bridge offering to start claude sessions."""
-    from one_conv.control.workers import WorkerManager
+    """The hub, with the Mac's bridge offering to start claude sessions."""
     from one_conv.live.hub import Hub
     hub = Hub(str(tmp_path / "hub.db"))
     hub.publish("mac", [], spawn="claude", priority=10)
-    manager = WorkerManager(tmp_path / "workers", {"spawner": {"node": "cloudbox"}, "create_node_token": lambda node: "t"})
-    return SimpleNamespace(hub=hub, manager=manager, workers=Workers(manager, None, hub))
+    return SimpleNamespace(hub=hub, teammates=Teammates(hub))
 
 
-TEAMMATE = {"name": "jack", "harness": "codex", "model": None, "topic": "debate", "profile": "default",
-            "prompt": "Join and defend one of the theses"}
+TEAMMATE = {"name": "jack", "topic": "debate", "prompt": "Join and defend one of the theses"}
 
 
-def test_with_a_spawner_a_new_teammate_is_started_by_a_spawner(teammates):
-    result = teammates.workers.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": TEAMMATE})
+def test_a_new_teammate_is_started_by_a_spawner(teammates):
+    result = teammates.teammates.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": TEAMMATE})
     assert result["route"] == "mac/spawn:claude"
 
 
-def test_with_a_spawner_a_new_teammate_answers_with_its_request_id(teammates):
-    result = teammates.workers.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": TEAMMATE})
+def test_a_new_teammate_answers_with_its_request_id(teammates):
+    result = teammates.teammates.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": TEAMMATE})
     assert result["id"] == "e" * 32
 
 
-def test_with_a_spawner_a_new_teammate_runs_no_cloud_worker(teammates):
-    teammates.workers.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": TEAMMATE})
-    assert teammates.manager.list()["jobs"] == []
-
-
-def test_with_a_spawner_the_teammate_request_is_posted_in_its_channel(teammates):
-    teammates.workers.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": TEAMMATE})
+def test_the_teammate_request_is_posted_in_its_channel(teammates):
+    teammates.teammates.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": TEAMMATE})
     assert [row["text"] for row in teammates.hub.history("debate")] == ["New teammate @jack: Join and defend one of the theses"]
 
 
-def test_with_a_spawner_a_malformed_teammate_is_refused(teammates):
+@pytest.mark.parametrize("spec", [{**TEAMMATE, "topic": "Bad Topic"}, {**TEAMMATE, "name": "Jack!"},
+                                  {**TEAMMATE, "prompt": " "}, {**TEAMMATE, "harness": "codex"}, "jack"])
+def test_a_malformed_teammate_is_refused(teammates, spec):
     with pytest.raises(ValueError):
-        teammates.workers.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": {**TEAMMATE, "topic": "Bad Topic"}})
+        teammates.teammates.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": spec})
+
+
+@pytest.mark.parametrize("action", ["stop", "recheck", "stop_pool", "resume_pool", "reconcile"])
+def test_only_spawn_is_a_teammate_action(teammates, action):
+    with pytest.raises(ValueError):
+        teammates.teammates.browser("POST", {"action": action, "id": "e" * 32})
 
 
 def test_pairing_cli_writes_a_private_link(tmp_path):
@@ -317,27 +313,32 @@ def test_node_cli_refuses_the_human_mailbox_identity(tmp_path):
 
 
 @pytest.fixture
-def cloud_spawn(monkeypatch):
+def teammate_spawn(monkeypatch):
     from one_conv.control import client
     calls = []
 
-    def submit(spec, ident):
+    def request_teammate(spec, ident):
         calls.append({"spec": spec, "id": ident})
-        return {"id": ident, "status": "queued", "spec": spec}
+        return {"id": ident, "status": "node", "route": "mac/spawn:claude"}
 
-    monkeypatch.setattr(client, "submit", submit)
-    result = CliRunner().invoke(build_live_group([]), ["spawn", "codex", "Review the change.", "--cloud",
+    monkeypatch.setattr(client, "request_teammate", request_teammate)
+    result = CliRunner().invoke(build_live_group([]), ["spawn", "claude", "Review the change.",
                                                       "--name", "jack", "--topic", "release", "--yes", "--json"])
     return calls, result
 
 
-def test_cloud_spawn_does_not_start_a_local_process(cloud_spawn):
-    assert len(cloud_spawn[0]) == 1
+def test_a_topic_spawn_does_not_start_a_local_process(teammate_spawn):
+    assert len(teammate_spawn[0]) == 1
 
 
-def test_cloud_spawn_preserves_the_requested_task(cloud_spawn):
-    assert cloud_spawn[0][0]["spec"]["prompt"] == "Review the change."
+def test_a_topic_spawn_preserves_the_requested_task(teammate_spawn):
+    assert teammate_spawn[0][0]["spec"] == {"name": "jack", "topic": "release", "prompt": "Review the change."}
 
 
-def test_cloud_spawn_returns_its_durable_request_id(cloud_spawn):
-    assert cloud_spawn[0][0]["id"] in cloud_spawn[1].output
+def test_a_topic_spawn_returns_its_durable_request_id(teammate_spawn):
+    assert teammate_spawn[0][0]["id"] in teammate_spawn[1].output
+
+
+def test_a_topic_spawn_needs_a_name():
+    result = CliRunner().invoke(build_live_group([]), ["spawn", "claude", "Review the change.", "--topic", "release", "--yes"])
+    assert result.exit_code == 2

@@ -164,10 +164,6 @@ body {
 .full-field { grid-column: 1 / -1; }
 .field-grid .optional { color: var(--muted); font-weight: 500; }
 .staff-dialog .primary-button { width: 100%; }
-.worker-jobs { display: grid; gap: 10px; margin-top: 22px; }
-.worker-job { display: flex; gap: 10px; align-items: flex-start; padding: 12px 0; border-top: 1px solid var(--line); }
-.worker-job > div { min-width: 0; flex: 1; display: grid; grid-template-columns: minmax(0, 1fr); gap: 5px; overflow-wrap: anywhere; }
-.worker-job small { color: var(--muted); font-size: 12px; }
 .job-detail { font-size: 11px; line-height: 1.4; margin: 0; overflow-wrap: anywhere; }
 .costs-content { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
 .rate-card { min-width: 0; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
@@ -1985,8 +1981,6 @@ button {
 .staff-dialog .dialog-heading h2,
 .costs-dialog .dialog-heading h2,
 .device-dialog .dialog-heading h2 { padding-right: 32px; }
-.job-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.pool-job { padding-top: 16px; border-top: 1px solid var(--border); }
 /* A send this tab started: honest states until the workspace's own copy replaces it. */
 .message-delivery.local-sending { color: var(--muted); font-style: italic; }
 .message-delivery.local-uncertain,

@@ -1,7 +1,7 @@
 # OneConv on your phone
 
 The cloud workspace combines the mobile web app, live hub, human mailbox,
-worker jobs and shared accounting. A laptop is an ordinary connected node.
+the cloud spawner box and shared accounting. A laptop is an ordinary connected node.
 The workspace continues to run when it disconnects.
 
 Open a pairing link in Safari, choose **Connect this device**, then use Safari's
@@ -109,25 +109,23 @@ one-conv live serve --install --yes   # keep the bridge running across restarts 
 
 The operator CLI writes pairing links and node credentials into new private
 files. `live control revoke-devices --yes` disconnects every browser while
-preserving worker and node connections. The service state directory contains
-SQLite databases and private worker state; keep it on persistent storage and
+preserving node connections. The service state directory contains SQLite
+databases and the spawner box's private state; keep it on persistent storage and
 back it up. The installer creates a systemd service that starts again after a
-host restart. Boat auto-stop ends processes. A stopped worker box retains files
-but is not a running teammate.
+host restart.
 
 ## Bringing in teammates
 
-Choose **+ Teammate**, then a name, harness, model, channel, repository profile
-and first task. Preparation continues after the phone closes. A lost response
-is retried under the same job ID. A provider create with an unknown outcome is
-held for reconciliation. Further requests for that profile can use an existing
-box with free slots, but wait before allocating another box. Canceling a waiting
-request does not cancel the original uncertain creation. Inspect Boat and use
-the original request's **Use this existing box** form to attach its sandbox.
+Choose **+ Teammate**, then a name, a channel and a first task. The request shows
+in the channel, and a connected machine that offers to start sessions starts the
+teammate there: your own machine first, the cloud spawner box otherwise. The
+phone says which machine took it. A lost response is retried under the same
+request ID, which the hub keeps to one teammate. The teammate runs the harness
+that machine's spawner starts (`live spawner --harness`).
 
-Ordinary node credentials can inspect jobs but cannot change staffing. The
-operator can delegate staffing to a CFO or another node using the service's
-existing control state directory:
+Ordinary node credentials cannot ask for teammates. The operator can delegate
+staffing to a CFO or another node using the service's existing control state
+directory:
 
 ```console
 one-conv live control node add cfo --output cfo.token --staffing
@@ -141,53 +139,20 @@ sharing that node key; replacing the key requires a new grant. Later,
 keeping messaging and accounting available. Revoking the node key also removes
 its grant. Paired human browsers retain their staffing authority.
 
-An explicitly delegated agent can use the same managed pool:
+An explicitly delegated agent asks the same way:
 
 ```console
-one-conv live spawn codex 'Review the current change.' --cloud --name jack --topic release --yes --json
-one-conv live workers --json
+one-conv live spawn claude 'Review the current change.' --name jack --topic release --yes --json
 ```
 
 The receipt includes the durable request ID. Use it with `--request-id` after an
-unconfirmed response. `live workers --stop ID --yes` stops one teammate while
-leaving others in its box running. The phone also offers **Stop box** and
-**Resume box**. Resumed agents must pass readiness again.
-After the box resumes, choose **Check again** on each preserved teammate to
-restart it under the same request and box. A teammate stopped individually
-stays stopped; add a new teammate to replace it.
+unconfirmed response.
 
-Profiles select GitHub repositories, pinned revisions, skills, provider
-credentials, harness approval settings and resident slots. Built-in default
-harness settings run unattended; custom profiles can change approval and
-sandbox settings. The phone describes the selected profile and harness's
-configured access before **Bring teammate online**. Each agent gets its own git
-worktree. A box shares its OS user and credentials across those agents;
-this is a personal trusted team, with no credential isolation between teammates.
-Selected skills are linked into Claude Code, Codex and Oh My Pi discovery paths.
-GitHub access comes from the cloud vault, independently of any laptop keychain.
-
-Native subscriptions require an environment that permits Boat's agent
-credentials. `--no-env` strips those logins. The subscription profile uses a
-dedicated environment that withholds personal secrets, GitHub injection and
-Boat administration credentials while allowing agent credentials. An explicit
-vault-key profile can instead use `--no-env`. Missing login, model access or
-quota leaves the job needing attention on the same box.
-
-Task dispatch waits for an authenticated model response, hub registration and
-channel membership, and a working numeric usage collector; a collector failure
-leaves the outcome needing checking rather than **Online**.
-
-For a fresh OMP worker, the native-credentials profile can import its selected
-Boat Pi Anthropic OAuth identity through OMP's official local importer. Existing
-OMP credentials and explicit provider configuration take precedence. This does
-not select another account when a provider rejects a request. Codex still needs
-a configured ChatGPT or API login, and provider spend limits remain in force.
-
-The benchmark established ten **idle** resident agents on a default 4-vCPU,
-8-GB box, plus concurrent local tool workloads. It did not establish ten active
-model turns. Profiles start with four resident slots and support up to ten.
-Active capacity remains unverified until measured with a working provider.
-See [the benchmark](BOAT_BENCHMARK.md).
+The cloud spawner box is built from code by the controller (see the README's
+`spawner` block): it clones the profile's repositories on their own branches,
+follows one-conv's main, runs a self-updating Claude Code, and sleeps when no
+session on it is busy. A profile names the box's repositories, Boat environment
+and machine type.
 
 ## Team accounting
 

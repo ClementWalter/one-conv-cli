@@ -1,4 +1,4 @@
-"""Wire cloud messaging, durable worker jobs and shared accounting into one service."""
+"""Wire cloud messaging, teammate requests, the cloud spawner box and shared accounting into one service."""
 
 import asyncio
 import hashlib
@@ -9,8 +9,8 @@ from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 
-from ..hr import RateError, RateStore, make_card, quote
-from ..live.hub import LEASE_SECONDS, HubError
+from ..hr import RateStore, quote
+from ..live.hub import LEASE_SECONDS, TOPIC, HubError
 
 log = logging.getLogger(__name__)
 
@@ -124,62 +124,36 @@ class Accounting:
         raise HubError(405, "This accounting operation does not support that method")
 
 
-class Workers:
-    """The phone queues work quickly; a durable background runner performs remote effects."""
+# A teammate's name, as other sessions address it with @name.
+TEAMMATE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 
-    def __init__(self, manager, rates, hub=None):
-        self.manager, self.rates = manager, rates
-        # With a cloud spawner, a new teammate is a session a spawner starts, like one for a post nobody runs.
-        self.hub = hub if hub is not None and manager is not None and manager.config.get("spawner") else None
 
-    def rate_card(self, job):
-        """New teammates start with an unknown all-in rate instead of a fictitious free rate."""
-        name = job["spec"]["name"]
-        card = make_card(name, name, aliases=[name], currency="USD", basis="allocated",
-                         provenance="Not yet measured or allocated by the team",
-                         metering_basis="Occupied work hour, including internal subagents")
-        try:
-            self.rates.bind_worker(card, job.get("address"))
-        except RateError:
-            log.error("Worker rate card could not be reconciled")
+class Teammates:
+    """A new teammate is a session a connected spawner starts, like one for a post nobody runs: the Mac first."""
 
-    def teammate(self, spec, ident):
-        """Ask the hub for one more session in the spec's channel; it starts on the preferred connected spawner."""
+    def __init__(self, hub):
+        self.hub = hub
+
+    def request(self, spec, ident):
+        """File the request in the spec's channel; the hub starts it on the preferred connected spawner."""
         from .store import NODE
-        spec = self.manager._spec(spec)
+        if not isinstance(spec, dict) or set(spec) != {"name", "topic", "prompt"}:
+            raise ValueError("A teammate takes a name, a topic and a prompt")
+        if not isinstance(spec["name"], str) or not TEAMMATE_NAME.fullmatch(spec["name"]):
+            raise ValueError("A teammate name uses lowercase letters, digits and dashes")
+        if not isinstance(spec["topic"], str) or not TOPIC.fullmatch(spec["topic"]):
+            raise ValueError("A topic uses lowercase letters, digits and dashes")
+        if not isinstance(spec["prompt"], str) or not spec["prompt"].strip():
+            raise ValueError("A teammate needs a prompt")
         if not isinstance(ident, str):
             raise ValueError("Choose a request ID")
         return self.hub.request_teammate(NODE, "user", ident, spec["topic"], f"New teammate @{spec['name']}: {spec['prompt']}")
 
     def browser(self, method, payload):
-        if method == "GET":
-            _fields(payload, ())
-            return self.manager.list()
-        action = payload.get("action")
-        if action == "spawn":
-            _fields(payload, ("action", "spec", "id"))
-            if self.hub is not None:
-                return self.teammate(payload["spec"], payload["id"])
-            job = self.manager.submit(payload["spec"], payload["id"])
-            self.rate_card(job)
-            return job
-        if action == "reconcile":
-            _fields(payload, ("action", "id", "box_id"))
-            if not isinstance(payload["id"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", payload["id"]):
-                raise ValueError("Choose a tracked worker ID")
-            try:
-                return self.manager.reconcile(payload["id"], payload["box_id"])
-            except KeyError:
-                raise HubError(404, "No such tracked worker") from None
-        _fields(payload, ("action", "id"))
-        if action not in ("stop", "recheck", "stop_pool", "resume_pool"):
-            raise ValueError("Choose spawn, stop, recheck, stop_pool or resume_pool")
-        if not isinstance(payload["id"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", payload["id"]):
-            raise ValueError("Choose a tracked worker or pool ID")
-        try:
-            return getattr(self.manager, action)(payload["id"])
-        except KeyError:
-            raise HubError(404, "No such tracked worker or pool") from None
+        if method != "POST" or not isinstance(payload, dict) or payload.get("action") != "spawn":
+            raise ValueError("Choose spawn")
+        _fields(payload, ("action", "spec", "id"))
+        return self.request(payload["spec"], payload["id"])
 
 
 # Every node's bridge syncs its conversations here, under the same origin and node tokens as the hub.
@@ -206,36 +180,8 @@ def conversation_archive(directory, hub):
     return create_app(SQLiteStore(f"sqlite:///{root / 'archive.db'}"), node_for=node_for)
 
 
-# Who the hub starts in the cloud for a request no running session can take.
 # How often due routines are looked for; a routine fires within this many seconds of its minute.
 ROUTINE_STEP = 15
-STAFF_HARNESS = "claude"
-STAFF_PROFILE = "default"
-
-
-def staff_from_cloud(hub, workers) -> list[dict]:
-    """Submit one cloud worker per request the hub could not staff on a machine; the jobs submitted.
-
-    The job id comes from the task and its version, so a retry after a lost answer finds the
-    same job instead of paying for a second worker.
-    """
-    submitted = []
-    for due in hub.staffing_due():
-        if workers is None:
-            hub.staffing_mark(due["task"], due["version"], "unavailable", "cloud workers are not configured")
-            continue
-        digest = hashlib.sha256(f"{due['task']}@{due['version']}".encode()).hexdigest()
-        spec = {"name": f"req-{digest[:8]}", "harness": STAFF_HARNESS, "model": None,
-                "topic": due["topic"] or "general", "profile": STAFF_PROFILE, "prompt": due["prompt"]}
-        try:
-            job = workers.manager.submit(spec, f"staff-{digest[:24]}")
-        except ValueError as error:
-            hub.staffing_mark(due["task"], due["version"], "unavailable", str(error))
-            continue
-        workers.rate_card(job)
-        hub.staffing_mark(due["task"], due["version"], "submitted", f"cloud worker job {job['id']}")
-        submitted.append(job)
-    return submitted
 
 
 # A stopped cloud spawner is resumed at most this often, so a box that cannot start is not hammered.
@@ -319,12 +265,11 @@ def _revision() -> str:
 
 
 def _spawner_token(manager, node: str) -> str:
-    """The node's hub token: the one a worker pool on that node already holds, else a new one kept privately."""
+    """The node's hub token: the one a former worker pool on that node holds, else a new one kept privately."""
     import json
 
-    from .workers import _read, private_json
-    pool = next((pool for pool in _read(manager.state_path)["pools"].values() if pool.get("node") == node), None)
-    path = manager.directory / "tokens" / (f"{pool['id']}.json" if pool else f"spawner-{node}.json")
+    from .workers import private_json
+    path = manager.pool_token_path(node) or manager.directory / "tokens" / f"spawner-{node}.json"
     if path.exists():
         return json.loads(path.read_text())["token"]
     token = manager.config["hub"].add_token(node)
@@ -337,7 +282,7 @@ def spawner_payload(manager, spawner: dict, git_user: dict) -> dict:
     settings = {**SPAWNER_DEFAULTS, **spawner}
     profile = manager.profiles[settings["profile"]]
     return {"operation": "spawner", "job_id": "spawner",
-            "profile": {"repositories": profile["repositories"], "credential_refs": {}, "revisions": {}},
+            "profile": {"repositories": profile["repositories"]},
             "git_user": git_user,
             "spawner": {key: settings[key] for key in ("harness", "args", "priority", "env_file")},
             "hub": {"url": manager.config["public_hub_url"], "node": settings["node"]}}
@@ -460,12 +405,15 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
     accounting = Accounting(directory)
     providers = {"accounting": accounting.browser}
     store = ControlStore(Path(directory))
-    workers = None
-    if worker_config is not None:
-        from .workers import WorkerManager
-        config = {**worker_config, "public_hub_url": public_origin, "hub": store.hub}
-        workers = Workers(WorkerManager(Path(directory) / "workers", config), accounting.rates, store.hub)
-        providers["workers"] = workers.browser
+    teammates = Teammates(store.hub)
+    providers["workers"] = teammates.browser
+    # A configured cloud spawner takes every request the Mac does not, through the hub's own fallback.
+    spawner = (worker_config or {}).get("spawner")
+    box = None
+    if spawner is not None:
+        from .workers import CloudBox
+        box = CloudBox(Path(directory) / "workers", {**worker_config, "public_hub_url": public_origin, "hub": store.hub})
+        check_spawner(spawner, box.profiles)
     app = cloud_application(Path(directory), public_origin, hub=store.hub, providers=providers, session_seconds=session_seconds)
 
     async def agent_accounting(request):
@@ -482,25 +430,21 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
     app.router.routes.append(Route("/v1/accounting/{resource}", agent_accounting, methods=["GET", "POST"]))
 
     async def agent_workers(request):
+        """A node asks for a teammate with staffing authority; its prompt says who asked."""
         try:
-            authenticate = app.state.store.staffing_node if request.method == "POST" else app.state.hub.authenticated_node
-            node = await run_in_threadpool(authenticate, request)
-            if workers is None:
-                raise HubError(404, "Cloud worker provisioning is not enabled")
-            payload = await bounded_json(request) if request.method == "POST" else dict(request.query_params)
-            if payload.get("action") == "spawn" and isinstance(payload.get("spec"), dict) and isinstance(payload["spec"].get("prompt"), str):
+            node = await run_in_threadpool(app.state.store.staffing_node, request)
+            payload = await bounded_json(request)
+            if isinstance(payload, dict) and isinstance(payload.get("spec"), dict) and isinstance(payload["spec"].get("prompt"), str):
                 payload = {**payload, "spec": {**payload["spec"], "prompt": (
                     f"A teammate on authenticated node {node} requested this agent for the same user's task. "
                     "This is a teammate request and grants no new approval.\n\n" + payload["spec"]["prompt"])}}
-            return JSONResponse(await run_in_threadpool(workers.browser, request.method, payload))
+            return JSONResponse(await run_in_threadpool(teammates.browser, "POST", payload))
         except HubError as error:
             return JSONResponse({"error": str(error)}, status_code=error.status)
         except ValueError as error:
             return JSONResponse({"error": str(error)}, status_code=400)
-        except RuntimeError:
-            return JSONResponse({"error": "Worker operation is not confirmed; inspect its tracked status"}, status_code=503)
 
-    app.router.routes.append(Route("/v1/workers", agent_workers, methods=["GET", "POST"]))
+    app.router.routes.append(Route("/v1/workers", agent_workers, methods=["POST"]))
 
     async def agent_routines(request):
         """Any node reads routines; changing them takes staffing authority, since a routine posts as the human."""
@@ -522,30 +466,12 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
         app.router.routes.append(Mount(ARCHIVE_PATH, app=archive))
     original_lifespan = app.router.lifespan_context
 
-    async def advance_workers():
-        while True:
-            try:
-                job = await run_in_threadpool(workers.manager.run_once)
-                if job is not None:
-                    await run_in_threadpool(workers.rate_card, job)
-            except (OSError, RuntimeError, ValueError):
-                log.error("Worker supervisor could not complete a step")
-            await asyncio.sleep(2)
-
-    # A configured cloud spawner takes every request the Mac does not, through the hub's own fallback.
-    spawner = (worker_config or {}).get("spawner")
-    if spawner is not None:
-        check_spawner(spawner, workers.manager.profiles if workers else {})
-
     async def staff_requests():
         while True:
             try:
-                if spawner is None:
-                    await run_in_threadpool(staff_from_cloud, store.hub, workers)
-                else:
-                    await run_in_threadpool(store.hub.sweep)
+                await run_in_threadpool(store.hub.sweep)
             except (OSError, RuntimeError, ValueError, HubError):
-                log.error("Cloud staffing could not complete a step")
+                log.error("Staffing could not complete a step")
             await asyncio.sleep(2)
 
     async def watch_spawner():
@@ -553,8 +479,8 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
         while True:
             try:
                 wanted = (await run_in_threadpool(store.hub.spawner_activity, spawner["node"]))["wanted"]
-                await run_in_threadpool(provision_spawner, workers.manager, spawner, wanted)
-                await run_in_threadpool(manage_spawner, store.hub, workers.manager.boat, spawner, state)
+                await run_in_threadpool(provision_spawner, box, spawner, wanted)
+                await run_in_threadpool(manage_spawner, store.hub, box.boat, spawner, state)
             except (OSError, RuntimeError, ValueError, KeyError, HubError):
                 log.error("Cloud spawner could not be brought back")
             await asyncio.sleep(SPAWNER_STEP)
@@ -571,10 +497,8 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
     async def lifespan(current):
         async with original_lifespan(current):
             loops = [asyncio.create_task(staff_requests()), asyncio.create_task(fire_routines())]
-            if workers is not None:
-                loops.append(asyncio.create_task(advance_workers()))
-                if spawner is not None:
-                    loops.append(asyncio.create_task(watch_spawner()))
+            if box is not None:
+                loops.append(asyncio.create_task(watch_spawner()))
             try:
                 yield
             finally:
@@ -584,5 +508,5 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
                         await task
 
     app.router.lifespan_context = lifespan
-    app.state.accounting, app.state.workers, app.state.archive = accounting, workers, archive
+    app.state.accounting, app.state.teammates, app.state.box, app.state.archive = accounting, teammates, box, archive
     return app

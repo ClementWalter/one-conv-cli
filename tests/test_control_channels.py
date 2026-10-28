@@ -21,6 +21,7 @@
 # ///
 """#general and the channels the workspace owner creates from the phone; no session joins any by itself."""
 
+import sqlite3
 import time
 
 import pytest
@@ -201,7 +202,9 @@ def test_a_retried_derived_channel_keeps_its_first_name(store, prompt_only):
 
 def test_a_channel_without_agents_starts_one_for_its_kickoff(store, prompt_only):
     topic = store.create_channel(prompt_only)["topic"]
-    assert [row["topic"] for row in store.hub.staffing_due()] == [topic]
+    with sqlite3.connect(store.hub.path) as db:
+        assert db.execute("SELECT p.topic FROM staffing s JOIN posts p ON s.task = p.from_node || ':' || p.id"
+                          " WHERE s.state = 'cloud'").fetchall() == [(topic,)]
 
 
 def test_the_directory_is_given_in_the_kickoff(store, prompt_only):

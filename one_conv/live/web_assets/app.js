@@ -28,7 +28,6 @@ const model = {
   searchGeneration: 0,
   authenticated: false,
   capabilities: {},
-  workers: { jobs: [], pools: [], profiles: [] },
   costs: null,
   staffing: false,
   reportReceivedAt: null,
@@ -856,9 +855,7 @@ function staffingLabel(staffing) {
   const where = String(staffing.route || "").split("/")[0];
   switch (staffing.state) {
     case "node": return "Starting a session on " + where + "…";
-    case "cloud":
-    case "submitted": return "Starting a cloud session…";
-    case "unavailable": return "No session could start";
+    case "cloud": return "Waiting for a machine to start a session…";
     default: return "";
   }
 }
@@ -1328,10 +1325,8 @@ async function disconnectDevice() {
     navigation = {};
     try { localStorage.removeItem("oneconv:navigation"); } catch (_) { /* Storage can be unavailable. */ }
     model.costs = null;
-    model.workers = { jobs: [], pools: [], profiles: [] };
     $("messages").replaceChildren();
     $("costs-content").replaceChildren();
-    $("worker-jobs").replaceChildren();
     $("message-input").value = "";
     sidebar();
     authentication(false);
@@ -1411,169 +1406,13 @@ async function shareInvitation() {
   catch (_) { /* Cancelling the share sheet leaves the invitation available. */ }
 }
 
-const jobLabels = {
-  queued: "Getting started", provisioning: "Preparing workspace", bootstrapping: "Setting up tools",
-  starting: "Starting teammate", registering: "Joining the team", ready: "Online",
-  auth_needed: "Provider needs attention", authentication_required: "Provider needs attention", failed: "Needs attention",
-  unknown: "Outcome needs checking", unconfirmed: "Outcome needs checking", stopped: "Stopped",
-  unverified: "Connection not verified",
-};
-
-function renderJobs() {
-  const container = $("worker-jobs");
-  container.replaceChildren();
-  for (const job of (model.workers.jobs || []).slice(0, 12)) {
-    const item = el("article", null, "worker-job");
-    const spec = job.spec || job;
-    const pool = (model.workers.pools || []).find((candidate) => candidate.id === job.pool_id);
-    // Resuming compute does not verify that its stopped teammate has reconnected.
-    const restartable = job.status === "stopped" && job.phase === "pool-stopped" && pool?.status === "available";
-    const allocationBlocked = job.status === "unconfirmed" && job.phase === "allocation-blocked";
-    const blockedPool = (model.workers.pools || []).find((candidate) => candidate.id === job.blocked_by_pool);
-    const blockedOwner = blockedPool && (model.workers.jobs || []).find(
-      (owner) => owner.pool_id === blockedPool.id && owner.status !== "stopped");
-    // An existing owner keeps reconciliation authority until its reservation is orphaned.
-    const orphanedAllocation = allocationBlocked && !job.box_id && blockedPool && !blockedPool.box_id && blockedPool.status !== "retired" &&
-      spec.profile && blockedPool.profile === spec.profile && !blockedOwner;
-    item.append(el("span", (spec.name || "A").slice(0, 2).toUpperCase(), "avatar codex"));
-    const text = el("div");
-    const jobPresence = presenceOf(person(job.address));
-    const online = job.status === "ready" && jobPresence.can_message;
-    text.append(el("strong", spec.name || "Teammate"), el("small", allocationBlocked ? "Waiting for box recovery" :
-      job.status === "ready" && !online ? "Offline · check the connection" :
-        job.status === "ready" && jobPresence.state === "unverified" ? "Connection unverified" : jobLabels[job.status] || job.status || "Preparing"));
-    if (job.error || job.detail) text.append(el("p", job.error || job.detail, "job-detail"));
-    if (job.status === "stopped" && job.phase === "pool-stopped") {
-      text.append(el("p", restartable ? "The box is available. Choose Check again to reconnect this teammate." :
-        "Resume its box, then choose Check again to reconnect this teammate.", "job-detail"));
-    }
-    if (allocationBlocked && !orphanedAllocation) {
-      const recovery = blockedPool?.box_id || blockedPool?.status === "retired" ? "Choose Check again to retry this request." :
-        (blockedOwner?.spec?.name ? `Recover the box from the ${blockedOwner.spec.name} request first, then choose Check again.` :
-          "Resolve the earlier box creation first, then choose Check again.");
-      text.append(el("p", recovery + " Cancelling this request leaves the earlier request unchanged.", "quiet-copy"));
-    }
-    if (["auth_needed", "authentication_required"].includes(job.status)) {
-      const help = el("p", "Check the provider’s login, model access or quota in ", "job-detail");
-      const link = el("a", "Boat’s agent settings");
-      link.href = "https://boat.dev/dashboard?tab=agents"; link.target = "_blank"; link.rel = "noopener noreferrer";
-      help.append(link, document.createTextNode(", then choose Check again. Your existing box is kept."));
-      text.append(help);
-    }
-    item.append(text);
-    if (online && job.address) {
-      const button = el("button", "Message", "secondary-button");
-      button.type = "button";
-      button.addEventListener("click", () => {
-        $("staff-dialog").close(); select("direct", pairOf(job.address));
-      });
-      item.append(button);
-    }
-    if (["ready", "unverified", "auth_needed", "failed"].includes(job.status) ||
-        (job.status === "unconfirmed" && job.box_id) || restartable || allocationBlocked) {
-      const actions = el("div", null, "job-actions");
-      if (["auth_needed", "unverified", "failed"].includes(job.status) ||
-          (job.status === "unconfirmed" && job.phase === "bootstrapping") || (job.status === "ready" && !online) ||
-          restartable || allocationBlocked) {
-        const check = el("button", "Check again", "secondary-button");
-        check.type = "button";
-        check.addEventListener("click", () => workerAction("recheck", job.id));
-        actions.append(check);
-      }
-      if (!restartable) {
-        const stop = el("button", allocationBlocked ? "Cancel request" : "Stop teammate", "secondary-button");
-        stop.type = "button";
-        stop.addEventListener("click", () => workerAction("stop", job.id));
-        actions.append(stop);
-      }
-      item.append(actions);
-    }
-    if ((job.status === "unconfirmed" && job.phase === "creating" && !job.box_id) || orphanedAllocation) {
-      const form = el("form", null, "quote-form"), label = el("label", "Existing box ID from Boat");
-      const input = document.createElement("input"); input.placeholder = "bx_…"; input.required = true;
-      input.setAttribute("aria-label", "Reconcile box for " + (spec.name || "teammate")); label.append(input);
-      const button = el("button", "Use this existing box", "secondary-button"); button.type = "submit";
-      form.append(label, button, el("p", "Check Boat before continuing. This attaches a box already created; it does not create another.", "quiet-copy"));
-      form.addEventListener("submit", async (event) => {
-        event.preventDefault(); button.disabled = true;
-        try { await post("/api/providers/workers", { action: "reconcile", id: job.id, box_id: input.value.trim() }); await refreshWorkers(); }
-        catch (error) { $("staff-feedback").textContent = error.message; button.disabled = false; }
-      });
-      item.append(form);
-    }
-    container.append(item);
-  }
-  for (const pool of model.workers.pools || []) {
-    if (pool.status === "retired") continue;
-    const item = el("article", null, "worker-job pool-job");
-    const detail = el("div");
-    detail.append(el("strong", pool.name || "Shared worker box"),
-      el("small", !pool.box_id ? "Box creation needs checking" : pool.status === "stopped" ? "Stopped · files preserved" : "Shared compute"));
-    item.append(detail);
-    if (pool.box_id) {
-      const action = pool.status === "stopped" ? "resume_pool" : "stop_pool";
-      const button = el("button", action === "resume_pool" ? "Resume box" : "Stop box", "secondary-button");
-      button.type = "button";
-      button.addEventListener("click", () => workerAction(action, pool.id));
-      item.append(button);
-    }
-    container.append(item);
-  }
-}
-
-async function workerAction(action, id) {
-  try {
-    await post("/api/providers/workers", { action, id });
-    await refreshWorkers();
-  } catch (error) { $("staff-feedback").textContent = error.message; }
-}
-
-function staffingProfiles() {
-  return Array.isArray(model.workers.profiles) ? model.workers.profiles :
-    Object.entries(model.workers.profiles || {}).map(([id, profile]) => ({ ...profile, id }));
-}
-
-function renderStaffingDisclosure() {
-  const profile = staffingProfiles().find((item) => (item.id || item.name) === $("staff-profile").value);
-  const harness = $("staff-harness").value, args = profile?.harness_args?.[harness];
-  const bypass = { claude: "--dangerously-skip-permissions", codex: "--dangerously-bypass-approvals-and-sandbox", omp: "--approval-mode=yolo" };
-  // Only explicit bypass settings establish unattended permissions for a selected harness.
-  const unattended = Array.isArray(args) && (args.includes(bypass[harness]) || (harness === "omp" &&
-    args.some((value, index) => value === "--approval-mode" && args[index + 1] === "yolo")));
-  const disclosure = unattended ? "This teammate runs unattended with this profile’s repository access and credentials." :
-    "This teammate uses this profile’s repository access, credentials and approval settings.";
-  const content = $("staff-access-disclosure");
-  if (content.textContent !== disclosure) content.textContent = disclosure;
-}
-
-async function refreshWorkers() {
-  if (!model.capabilities.workers || !model.authenticated) return;
-  try {
-    model.workers = await get("/api/providers/workers");
-    renderJobs();
-    const picker = $("staff-profile"), selected = picker.value;
-    picker.replaceChildren();
-    const profiles = staffingProfiles();
-    for (const profile of profiles) {
-      const option = el("option", profile.label || profile.name || profile.id);
-      option.value = profile.id || profile.name;
-      picker.append(option);
-    }
-    if (!picker.children.length) {
-      const option = el("option", "Default"); option.value = "default"; picker.append(option);
-    }
-    if ([...picker.options].some((option) => option.value === selected)) picker.value = selected;
-    renderStaffingDisclosure();
-  } catch (error) { $("staff-feedback").textContent = error.message; }
-}
-
 async function staffingIdentity(spec) {
   const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(spec))))]
     .map((byte) => byte.toString(16).padStart(2, "0")).join("");
   let pending;
   try { pending = JSON.parse(sessionStorage.getItem("oneconv:staffing")); } catch (_) { /* Storage can be unavailable. */ }
   if (!pending || pending.digest !== digest) pending = { digest, id: crypto.randomUUID().replaceAll("-", "") };
-  try { sessionStorage.setItem("oneconv:staffing", JSON.stringify(pending)); } catch (_) { /* The server also rejects duplicate active names. */ }
+  try { sessionStorage.setItem("oneconv:staffing", JSON.stringify(pending)); } catch (_) { /* Without it a retry is a new request. */ }
   return pending.id;
 }
 
@@ -1581,18 +1420,18 @@ async function staffTeammate(event) {
   event.preventDefault();
   if (model.staffing || !model.token) return;
   const spec = {
-    name: $("staff-name").value.trim(), harness: $("staff-harness").value,
-    model: $("staff-model").value.trim() || null, topic: $("staff-topic").value.trim().replace(/^#/, ""),
-    profile: $("staff-profile").value, prompt: $("staff-prompt").value.trim(),
+    name: $("staff-name").value.trim(), topic: $("staff-topic").value.trim().replace(/^#/, ""),
+    prompt: $("staff-prompt").value.trim(),
   };
   model.staffing = true; $("staff-submit").disabled = true;
-  $("staff-feedback").textContent = "Your teammate’s workspace is being prepared…";
+  $("staff-feedback").textContent = "Asking a connected machine to start your teammate…";
   try {
     const id = await staffingIdentity(spec);
     const data = await post("/api/providers/workers", { action: "spawn", id, spec });
     if (data.id !== id || typeof data.status !== "string") throw new Error("The request is not confirmed yet. Retry to check the same request.");
-    $("staff-feedback").textContent = "We’re on it. You can close this window; preparation continues in the cloud.";
-    await refreshWorkers();
+    const where = String(data.route || "").split("/")[0];
+    $("staff-feedback").textContent = where ? "Starting on " + where + ". You can close this window; they will join #" + spec.topic + "."
+      : "Waiting for a machine to connect. You can close this window; they will join #" + spec.topic + " once one does.";
   } catch (error) { $("staff-feedback").textContent = error.message; }
   finally { model.staffing = false; $("staff-submit").disabled = false; }
 }
@@ -2428,7 +2267,6 @@ $("device-dialog").addEventListener("cancel", clearInvitation);
 $("staff-team").addEventListener("click", () => {
   $("staff-dialog").showModal();
   if (model.view && model.view.kind === "topic") $("staff-topic").value = model.view.key;
-  refreshWorkers();
 });
 $("staff-form").addEventListener("submit", staffTeammate);
 $("new-channel").addEventListener("click", openChannelDialog);
@@ -2440,8 +2278,6 @@ $("routine-toggle").addEventListener("click", () => routineAction(model.routine 
 $("routine-delete").addEventListener("click", () => routineAction("delete"));
 $("routine-open").addEventListener("click", () => { $("routine-dialog").close(); select("topic", model.routine.topic); });
 $("channel-form").addEventListener("submit", createChannel);
-$("staff-profile").addEventListener("change", renderStaffingDisclosure);
-$("staff-harness").addEventListener("change", renderStaffingDisclosure);
 $("show-costs").addEventListener("click", showCosts);
 for (const button of document.querySelectorAll("[data-close]")) {
   button.addEventListener("click", () => {
@@ -2646,4 +2482,3 @@ setInterval(() => {
   if (!model.capabilities.changes && model.authenticated && model.view && model.refreshing !== model.generation)
     refreshView();
 }, 3000);
-setInterval(() => { if ($("staff-dialog").open) refreshWorkers(); }, 4000);

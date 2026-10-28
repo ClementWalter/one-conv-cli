@@ -6,7 +6,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-HARNESSES = ("claude", "codex", "omp", "cursor", "boat")
+HARNESSES = ("claude", "codex", "omp", "cursor")
 
 
 @dataclass(frozen=True)
@@ -83,8 +83,7 @@ def envelope(text: str, sender: LiveSession | None, origin: str = "unknown", rep
     separately; these local labels are not authenticated identities.
     `origin` labels a sender that is not an agent session: "user" for an interactive
     terminal or human workspace, "unknown" otherwise. `reply="none"` ends an exchange.
-    `reply="inline"` is for a receiver the sender reads back from (a Boat sandbox), which
-    answers in its own conversation because it cannot message this machine.
+    `reply="inline"` asks the receiver to answer in its own conversation rather than message back.
     `message_id` stays the same across retries so a receiver can drop duplicates.
     """
     text = _ENVELOPE_TAG.sub(r"&lt;\1", text)

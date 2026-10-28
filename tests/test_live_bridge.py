@@ -230,7 +230,7 @@ def test_a_session_not_live_here_is_refused(hub, box, monkeypatch):
 
 
 def test_an_adapter_that_cannot_confirm_is_unconfirmed(hub, box, monkeypatch):
-    unknown = "unconfirmed: box prompt exited 1 without Boat accepting or refusing it. Do not resend"
+    unknown = "unconfirmed: the harness neither accepted nor refused it. Do not resend"
     monkeypatch.setitem(router.ADAPTERS, "omp", SimpleNamespace(deliver=lambda s, text: unknown))
     message = post(hub)
     box.step(wait=0)
@@ -562,7 +562,6 @@ def test_a_send_to_another_machine_without_a_hub_is_refused(delivered):
 
 @pytest.mark.parametrize("target, node", [
     ("mac/claude:aaa", "mac"),
-    ("boat:sandbox/conversation", None),
     ("mac/nothing", None),
     ("Mac/claude:aaa", None),
     ("claude:aaa", None),

@@ -11,7 +11,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import boat, claude, codex, cursor, hubclient, omp, team
+from . import claude, codex, cursor, hubclient, omp, team
 from .model import LiveSession, envelope, is_session_id, live_home, parse_address
 
 try:
@@ -20,9 +20,7 @@ except ImportError:  # Windows has no flock; the rate log is then updated unlock
     fcntl = None
 
 logger = logging.getLogger(__name__)
-ADAPTERS = {"claude": claude, "codex": codex, "omp": omp, "cursor": cursor, "boat": boat}
-# Listing Boat calls a remote API per sandbox, so it runs only when Boat is asked for by name.
-ON_REQUEST = {"boat"}
+ADAPTERS = {"claude": claude, "codex": codex, "omp": omp, "cursor": cursor}
 # Two agents told to reply to each other would otherwise relay forever.
 RATE_LIMIT = 10
 RATE_WINDOW_SECONDS = 300
@@ -52,7 +50,7 @@ class LiveError(Exception):
 def list_all(harness: str | None = None) -> list[LiveSession]:
     sessions = []
     for name, adapter in ADAPTERS.items():
-        if (harness and harness != name) or (not harness and name in ON_REQUEST):
+        if harness and harness != name:
             continue
         try:
             sessions += adapter.list_sessions()
@@ -350,7 +348,7 @@ NODE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 
 
 def remote_address(target: str) -> tuple[str | None, str]:
-    """Split a remote agent or human route, keeping Boat's sandbox route local."""
+    """Split a NODE/address route to an agent or human on another machine; anything else stays local."""
     node, sep, local = target.partition("/")
     if sep and NODE_NAME.fullmatch(node) and (local == "user" or parse_address(local)[0] is not None):
         return node, local
@@ -449,11 +447,6 @@ def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, f
     if sender is not None and session.address == sender.address:
         raise LiveError(f"{session.address} is the sending session itself.")
     sender_label = sender.address if sender else origin
-    if fyi and session.harness == "boat":
-        raise LiveError("--fyi cannot reach a Boat conversation: a sandbox has no inbox on this "
-                        "machine's feed. Push it once the conversation is idle, or skip it.")
-    if session.harness == "boat" and reply == "expected":
-        reply = "inline"
     handle = team.name_for(sender.address) if sender is not None else None
     wrapped = envelope(text, sender, origin, "none" if fyi else reply, message_id, topic, handle)
     with _rate_slot(sender_label, session.address):

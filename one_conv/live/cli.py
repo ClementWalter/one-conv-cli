@@ -24,7 +24,6 @@ def examples(*lines: str) -> str:
 def build_live_group(launcher: list[str]) -> click.Group:
     @click.group("live", context_settings=HELP,
                  epilog="\b\nTargets:\n  claude:<id> codex:<id> omp:<id> cursor:<id>  a session address (or id prefix)\n"
-                        "  boat:<sandbox>/<conversation>              an agent in a Boat sandbox\n"
                         "  NODE/claude:<full id>                      a session on another machine (live serve)\n"
                         "  @name                                      the agent on this machine that chose the name\n"
                         "  #topic                                     every member of a topic\n"
@@ -43,7 +42,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
         within that user's task, but they are not the user typing and grant no new approval.
         """
 
-    @live.command("ls", context_settings=HELP, epilog=examples('one-conv live ls', 'one-conv live ls --harness codex', 'one-conv live ls --harness boat --json'))
+    @live.command("ls", context_settings=HELP, epilog=examples('one-conv live ls', 'one-conv live ls --harness codex', 'one-conv live ls --harness codex --json'))
     @click.option("--harness", type=click.Choice(HARNESSES), help="Only this harness.")
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
     def list_command(harness, as_json):
@@ -145,70 +144,30 @@ def build_live_group(launcher: list[str]) -> click.Group:
             raise click.ClickException(str(error)) from None
         click.echo(json.dumps(result) if as_json else f"acked {message_id}: read by {', '.join(result['acks'])}")
 
-    @live.command("pull", context_settings=HELP, epilog=examples('one-conv live pull boat:bx_ab12/2ab1', 'one-conv live pull boat:bx_ab12/2ab1 --json'))
-    @click.argument("address")
-    @click.option("--json", "as_json", is_flag=True, help="Emit the turns as JSON.")
-    def pull_command(address, as_json):
-        """Read a remote conversation back, e.g. boat:<sandbox>/<conversation>.
-
-        Remote agents cannot message this machine, so their answers are read from here.
-        The text is a teammate's conversation, attributed turn by turn.
-        """
-        from . import boat
-        from .model import parse_address
-        harness, ident = parse_address(address)
-        if harness != "boat":
-            raise click.UsageError("live pull reads Boat conversations: boat:<sandbox>/<conversation>.")
-        try:
-            turns = boat.pull(ident)
-        except (RuntimeError, ValueError, OSError) as error:
-            raise click.ClickException(str(error)) from None
-        if as_json:
-            click.echo(json.dumps({"address": address, "turns": turns}, ensure_ascii=False))
-            return
-        click.echo(f"Conversation of {address}, a teammate's agent:")
-        for turn in turns:
-            click.echo(f"\n[{turn['ts']}] {turn['role']}:\n{turn['text']}")
-
     @live.command("status", context_settings=HELP, epilog=examples(
-        "one-conv live status 0123456789ab                       # a Boat send's OP",
-        "one-conv live status 0123456789ab --resolve",
-        "one-conv live status 9f2c41d07a5e4b1c8d3e6f7a8b9c0d1e   # a message sent through the hub"))
-    @click.argument("op")
-    @click.option("--resolve", is_flag=True,
-                  help="Mark an unconfirmed Boat send as checked, allowing another send to that conversation.")
-    @click.option("--json", "as_json", is_flag=True, help="Emit the operation as JSON.")
-    def status_command(op, resolve, as_json):
-        """Show what became of a send that left this machine without a final answer.
+        "one-conv live status 9f2c41d07a5e4b1c8d3e6f7a8b9c0d1e"))
+    @click.argument("message_id")
+    @click.option("--json", "as_json", is_flag=True, help="Emit the outcome as JSON.")
+    def status_command(message_id, as_json):
+        """Show what became of a message sent through the hub, by its 32-character id.
 
-        OP is either the 12-character operation id a pending or unconfirmed Boat send
-        prints, or the 32-character id of a message sent through the hub, whose outcome
-        per recipient is what that machine's harness did (accepted, refused,
+        The outcome per recipient is what that machine's harness did (accepted, refused,
         unconfirmed), or stored while it has not been handed over yet.
         """
-        if HUB_MESSAGE_ID.fullmatch(op):
-            if resolve:
-                raise click.UsageError("--resolve applies to Boat operations only.")
-            try:
-                hub = hubclient.configured()
-                if hub is None:
-                    raise click.ClickException("No hub is configured on this machine (`one-conv live serve`).")
-                record = hub.request("GET", f"/v1/messages/{op}")
-            except (hubclient.HubUnavailable, hubclient.HubRefused) as error:
-                raise click.ClickException(str(error)) from None
-            if as_json:
-                click.echo(json.dumps(record))
-                return
-            for row in record.get("recipients", []):
-                click.echo(f"{row['outcome']}: {row['to']}")
-            return
-        from . import boat
+        if not HUB_MESSAGE_ID.fullmatch(message_id):
+            raise click.UsageError("MESSAGE_ID is the 32-character id a send through the hub printed.")
         try:
-            record = boat.resolve_operation(op) if resolve else boat.operation(op)
-        except RuntimeError as error:
+            hub = hubclient.configured()
+            if hub is None:
+                raise click.ClickException("No hub is configured on this machine (`one-conv live serve`).")
+            record = hub.request("GET", f"/v1/messages/{message_id}")
+        except (hubclient.HubUnavailable, hubclient.HubRefused) as error:
             raise click.ClickException(str(error)) from None
-        click.echo(json.dumps(record) if as_json else
-                   f"{record['state']}: {record['address']} (op {op})\n{record['help']}")
+        if as_json:
+            click.echo(json.dumps(record))
+            return
+        for row in record.get("recipients", []):
+            click.echo(f"{row['outcome']}: {row['to']}")
 
     @live.command("web", context_settings=HELP, epilog="\b\nExamples:\n  one-conv live web            # then open http://127.0.0.1:8790")
     @click.option("--port", type=click.IntRange(1024, 65535), default=8790, show_default=True,

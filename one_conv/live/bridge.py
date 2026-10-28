@@ -300,22 +300,18 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, on_sta
     mode, reply, topic = item.get("mode", "push"), item.get("reply", "expected"), item.get("topic")
     text = with_attachments(item["text"], item.get("attachments"), fetch)
     if mode == "fyi":
-        if harness == "boat":
-            return "refused", "an fyi cannot reach a Boat conversation: a sandbox has no feed on this machine"
         wrapped = envelope(text, sender, sender_route, "none", item.get("id"), topic, remote.get("name"))
         router._append_fyi(target, sender_route, wrapped)
         return "accepted", "stored FYI"
     # A Claude Code session waiting on a question takes the human's message as its answer.
     if harness == "claude" and ask.file_answer(session.id, sender_route, item["text"]):
         return "accepted", "answered the session's pending question"
-    if harness == "boat" and reply == "expected":
-        reply = "inline"
     wrapped = envelope(text, sender, sender_route, reply, item.get("id"), topic, remote.get("name"))
     try:
         with router._rate_slot(sender_route, target):
             try:
                 detail = router.ADAPTERS[harness].deliver(session, wrapped)
-                # Boat reports a send it could not confirm as pending/unconfirmed rather than raising.
+                # An adapter that cannot confirm a send says so in its answer rather than raising.
                 return ("unconfirmed" if detail.startswith(UNKNOWN_RESULTS) else "accepted"), detail
             except Exception as error:
                 raise _AdapterFailed(error) from error

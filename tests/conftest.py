@@ -14,7 +14,7 @@
 #     "sqlalchemy==2.1.4",
 #     "pydantic==2.12.5",
 #     "httpx==0.28.1",
-#     "numpy==2.5.4",
+#     "numpy==2.4.6",
 # ]
 #
 # [tool.uv]

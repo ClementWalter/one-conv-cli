@@ -648,7 +648,7 @@ function askOf(text) {
 }
 // Choices survive the thread being drawn again while the person is still filling the form.
 const askState = new Map();
-function askOptions(questions, agent, key) {
+function askOptions(questions, agent, key, closed = false) {
   // One fieldset per question, as in the terminal: its options as radio buttons (checkboxes when
   // several answers are allowed), each with its description, plus "Other" for a typed answer. The
   // answer goes to the asking agent as an ordinary reply, which its hook reads as `Header: answer`
@@ -702,7 +702,11 @@ function askOptions(questions, agent, key) {
   form.addEventListener("change", ready);
   form.appendChild(submit);
   ready();
-  if (state.sent) for (const control of form.elements) control.disabled = true;
+  if (state.sent || closed) for (const control of form.elements) control.disabled = true;
+  if (closed && !state.sent) {
+    submit.textContent = "Question closed";
+    form.classList.add("closed");
+  }
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     const answers = groups.map(answerOf);
@@ -892,7 +896,7 @@ function renderRows(rows, force = false) {
   list.replaceChildren();
   let lastDay = null,
     previous = null;
-  for (const row of rows) {
+  for (const [index, row] of rows.entries()) {
     const day = dayKey(row.at);
     if (day !== lastDay) {
       const divider = el("li", null, "day-divider");
@@ -965,7 +969,10 @@ function renderRows(rows, force = false) {
         });
         body.appendChild(more);
       }
-      if (ask && row.from !== "user") body.appendChild(askOptions(ask, row.from, key));
+      // The asking agent waits on its question, so any later message from it or from the human means
+      // the question was answered or dropped; its form then only shows what was asked.
+      const closed = rows.slice(index + 1).some((later) => later.from === row.from || isHuman(later.from));
+      if (ask && row.from !== "user") body.appendChild(askOptions(ask, row.from, key, closed));
     }
     fill();
     if (Array.isArray(row.attachments) && row.attachments.length) {

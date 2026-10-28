@@ -6,10 +6,12 @@ turns, registers like any open session, and can be watched with `tmux attach` wh
 """
 
 import json
+import logging
 import shlex
 import os
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -18,6 +20,7 @@ from pathlib import Path
 from . import codex, cursor, omp, router
 from .model import LiveSession, live_home
 
+logger = logging.getLogger(__name__)
 HARNESSES = ("claude", "codex", "omp", "cursor")
 # Cursor's terminal agent is the `agent` command; every other harness runs under its own name.
 BINARIES = {"cursor": "agent"}
@@ -115,6 +118,10 @@ class Spawned:
                 "attach": f"tmux attach -t {self.tmux}"}
 
 
+# The bridge's idle sweep and a spawn running on another thread both rewrite the registry.
+_registry_lock = threading.RLock()
+
+
 def _registry() -> Path:
     return live_home() / "spawned.json"
 
@@ -189,9 +196,10 @@ def start(harness: str, prompt: str, cwd: Path, model: str | None = None, extra:
     if result.returncode:
         raise SpawnError(f"tmux could not start {harness}: {result.stderr.strip() or result.returncode}")
     spawned = Spawned(name, harness, str(cwd))
-    rows = _load()
-    rows[name] = spawned.to_json()
-    _save(rows)
+    with _registry_lock:
+        rows = _load()
+        rows[name] = spawned.to_json()
+        _save(rows)
     spawned.address = wait_for_session(harness, cwd, before, name, wait_seconds, trust_folder,
                                        accept_bypass=BYPASS_FLAG in extra)
     if harness == "claude" and not _socket_opened(spawned.address):
@@ -200,9 +208,10 @@ def start(harness: str, prompt: str, cwd: Path, model: str | None = None, extra:
         _record_deaf(version)
         raise SpawnError(f"Claude Code {version} started {spawned.address} without a messaging socket, so no"
                          " message could reach it; update Claude Code on this machine")
-    rows = _load()
-    rows[name] = spawned.to_json()
-    _save(rows)
+    with _registry_lock:
+        rows = _load()
+        rows[name] = spawned.to_json()
+        _save(rows)
     return spawned
 
 
@@ -365,15 +374,51 @@ def _same_dir(session: LiveSession, resolved: str) -> bool:
 
 def listing() -> list[dict]:
     """Spawned agents whose tmux session is still running; finished ones are dropped."""
-    rows = _load()
-    alive = {name: row for name, row in rows.items() if _alive(name)}
-    if alive.keys() != rows.keys():
-        _save(alive)
+    with _registry_lock:
+        rows = _load()
+        alive = {name: row for name, row in rows.items() if _alive(name)}
+        if alive.keys() != rows.keys():
+            _save(alive)
     return list(alive.values())
+
+
+# A spawned agent idle this long is ended; a new post in its channel starts a fresh one that catches up.
+IDLE_HOURS = float(os.environ.get("ONE_CONV_SPAWN_IDLE_HOURS", "24"))
+
+
+def retire_idle(sessions: list[LiveSession], now: float | None = None, idle_hours: float = IDLE_HOURS) -> list[dict]:
+    """End spawned agents seen idle for `idle_hours`; returns the rows of those ended.
+
+    Each row keeps `active_at`, the last time its session was seen doing anything but waiting
+    for a message (busy, or waiting on the human), so a bridge restart never resets the clock.
+    """
+    now = time.time() if now is None else now
+    status = {session.address: session.status for session in sessions}
+    retired = []
+    with _registry_lock:
+        rows = _load()
+        for name, row in rows.items():
+            if status.get(row.get("address")) != "idle" or "active_at" not in row:
+                row["active_at"] = now
+            elif now - row["active_at"] >= idle_hours * 3600:
+                retired.append(name)
+        _save(rows)
+    ended = []
+    for name in retired:
+        try:
+            ended.append(stop(name))
+        except SpawnError as error:
+            logger.warning("could not end idle agent %s: %s", name, error)
+    return ended
 
 
 def stop(target: str) -> dict:
     """End a spawned agent's tmux session by tmux name or address; its harness then releases its registration."""
+    with _registry_lock:
+        return _stop(target)
+
+
+def _stop(target: str) -> dict:
     rows = _load()
     name = next((n for n, row in rows.items() if target in (n, row.get("address"))), None)
     if name is None:

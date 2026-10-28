@@ -22,7 +22,13 @@
 """A Claude Code question answered from the workspace: the hook posts it, the bridge files the reply, the hook answers."""
 
 import json
+import os
+import signal
+import subprocess
+import sys
 import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -99,8 +105,33 @@ def test_several_questions_are_answered_by_header_lines():
 
 def test_a_human_message_answers_a_pending_question(posted):
     (ask.asks_dir()).mkdir(parents=True)
-    (ask.asks_dir() / "s1.json").write_text("{}")
+    (ask.asks_dir() / "s1.json").write_text(json.dumps({"pid": os.getpid()}))
     assert ask.file_answer("s1", "workspace/user", "React")
+
+
+@pytest.fixture
+def abandoned():
+    """A pending question whose hook was killed before it could clean up."""
+    ask.asks_dir().mkdir(parents=True)
+    finished = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True, text=True)
+    (ask.asks_dir() / "s1.json").write_text(json.dumps({"pid": int(finished.stdout)}))
+
+
+def test_a_question_whose_hook_is_gone_takes_no_answer(abandoned):
+    assert not ask.file_answer("s1", "workspace/user", "React")
+
+
+def test_a_question_whose_hook_is_gone_is_cleared(abandoned):
+    ask.file_answer("s1", "workspace/user", "React")
+    assert not (ask.asks_dir() / "s1.json").exists()
+
+
+def test_a_message_to_a_session_whose_hook_is_gone_reaches_its_terminal(abandoned, monkeypatch):
+    delivered = []
+    monkeypatch.setattr(router, "list_all", lambda harness=None: [LiveSession("claude", "s1")])
+    monkeypatch.setattr(claude, "deliver", lambda session, text: delivered.append(text) or "delivered")
+    bridge.deliver_inbound(human_reply())
+    assert "React" in delivered[0]
 
 
 def test_without_a_pending_question_a_message_is_not_an_answer():
@@ -109,7 +140,7 @@ def test_without_a_pending_question_a_message_is_not_an_answer():
 
 def test_an_agent_message_never_answers_a_question():
     (ask.asks_dir()).mkdir(parents=True)
-    (ask.asks_dir() / "s1.json").write_text("{}")
+    (ask.asks_dir() / "s1.json").write_text(json.dumps({"pid": os.getpid()}))
     assert not ask.file_answer("s1", "macbook/claude:other", "React")
 
 
@@ -120,7 +151,7 @@ def waiting_session(monkeypatch):
     monkeypatch.setattr(router, "list_all", lambda harness=None: [LiveSession("claude", "s1")])
     monkeypatch.setattr(claude, "deliver", lambda session, text: delivered.append(text) or "delivered")
     ask.asks_dir().mkdir(parents=True)
-    (ask.asks_dir() / "s1.json").write_text("{}")
+    (ask.asks_dir() / "s1.json").write_text(json.dumps({"pid": os.getpid()}))
     return delivered
 
 
@@ -167,8 +198,13 @@ def test_the_hook_posts_the_question_to_the_workspace(posted):
     assert "Which framework?" in posted[0]
 
 
-def test_without_an_answer_in_time_the_terminal_asks(posted):
-    assert ask.run_hook(payload(FRAMEWORK), wait=0) == {}
+def test_without_an_answer_in_time_the_tool_is_declined(posted):
+    assert ask.run_hook(payload(FRAMEWORK), wait=0)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_the_decline_tells_the_agent_the_answer_comes_as_a_message(posted):
+    assert "later as a one-conv message" in ask.run_hook(
+        payload(FRAMEWORK), wait=0)["hookSpecificOutput"]["permissionDecisionReason"]
 
 
 def test_a_question_that_could_not_be_posted_is_left_to_the_terminal(monkeypatch):
@@ -198,6 +234,31 @@ def test_an_answer_arriving_while_the_hook_waits_is_used(posted, monkeypatch):
     result = ask.run_hook(payload(FRAMEWORK), wait=5)
     timer.join()
     assert result["hookSpecificOutput"]["updatedInput"]["answers"] == {"Which framework?": "React"}
+
+
+HOOK = """
+import json, sys
+from one_conv.live import ask
+ask._post = lambda session_id, text: True
+print(json.dumps(ask.run_hook(json.loads(sys.argv[1]), wait=60)))
+"""
+
+
+@pytest.fixture
+def interrupted():
+    """A real hook process waiting on its question, then ended the way Claude Code ends it on an interrupt."""
+    hook = subprocess.Popen([sys.executable, "-c", HOOK, json.dumps(payload(FRAMEWORK))],
+                            cwd=Path(__file__).resolve().parents[1], env=os.environ.copy())
+    deadline = time.monotonic() + 30
+    while not (ask.asks_dir() / "s1.json").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    hook.send_signal(signal.SIGTERM)
+    hook.wait(timeout=30)
+    return hook
+
+
+def test_an_interrupted_hook_leaves_no_pending_question(interrupted):
+    assert not (ask.asks_dir() / "s1.json").exists()
 
 
 # --- install -------------------------------------------------------------------------------------------

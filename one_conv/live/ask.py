@@ -5,17 +5,22 @@ question to the human as a direct message from the asking session, marked so the
 its options as buttons, then waits. While a question waits, the bridge files the human's next
 message to that session as the answer instead of typing it into the terminal. The hook answers the
 tool with it (`updatedInput.answers`), so the session carries on as if it had been picked there.
-With no hub, no answer in time, or any failure, the hook stays silent and the terminal asks as usual.
+A question still unanswered when the wait ends is declined with a note telling the agent the answer
+will come as a message, so a late answer from the workspace is never typed behind a terminal dialog.
+A question that could not be posted is left to the terminal. A pending question is only answered
+while its hook process lives: one killed mid-wait (an interrupt) lets later messages through.
 """
 
 import json
 import logging
 import os
+import signal
+import threading
 import time
 import uuid
 from pathlib import Path
 
-from .model import live_home
+from .model import live_home, pid_alive
 
 logger = logging.getLogger(__name__)
 HUMAN = "workspace/user"
@@ -24,6 +29,10 @@ MARKER = "<!-- one-conv-ask "
 # How long a question waits for the workspace before the terminal asks instead.
 WAIT_SECONDS = float(os.environ.get("ONE_CONV_ASK_SECONDS", "1800"))
 POLL_SECONDS = 1.0
+# What the agent reads when the wait ends unanswered: the answer can still arrive, as a message.
+UNANSWERED = ("The user has not answered this question yet. It stays open in their workspace, and their answer "
+              "will reach you later as a one-conv message. Do not ask it again: end your turn, or carry on only "
+              "with work that does not depend on the answer.")
 
 
 def asks_dir() -> Path:
@@ -83,10 +92,24 @@ def answers(questions: list[dict], reply: str) -> dict[str, str]:
 
 def file_answer(session_id: str, sender_route: str, text: str) -> bool:
     """The bridge's side: file a human message as the answer when this session has a question waiting."""
-    if sender_route != HUMAN or not _pending(session_id).exists():
+    if sender_route != HUMAN or not _waiting(session_id):
         return False
     _answer(session_id).write_text(json.dumps({"text": text, "at": time.time()}))
     return True
+
+
+def _waiting(session_id: str) -> bool:
+    """A question is pending and its hook still runs; a pending file left by a killed hook is removed."""
+    try:
+        pending = json.loads(_pending(session_id).read_text())
+    except FileNotFoundError:
+        return False
+    except ValueError:
+        pending = {}
+    if pid_alive(pending.get("pid")):
+        return True
+    _pending(session_id).unlink(missing_ok=True)
+    return False
 
 
 def _post(session_id: str, text: str) -> bool:
@@ -105,26 +128,38 @@ def _post(session_id: str, text: str) -> bool:
 
 
 def run_hook(payload: dict, wait: float = WAIT_SECONDS) -> dict:
-    """PreToolUse hook for AskUserQuestion: the answer from the workspace, or {} to let the terminal ask."""
+    """PreToolUse hook for AskUserQuestion: the workspace's answer, a decline once the wait ends unanswered,
+    or {} to let the terminal ask when the question could not be posted."""
     tool_input = payload.get("tool_input") or {}
     questions, session_id = tool_input.get("questions"), payload.get("session_id")
     if payload.get("tool_name") != "AskUserQuestion" or not questions or not session_id or tool_input.get("answers"):
         return {}
     asks_dir().mkdir(parents=True, exist_ok=True)
     _answer(session_id).unlink(missing_ok=True)
-    _pending(session_id).write_text(json.dumps({"id": uuid.uuid4().hex, "questions": questions}))
+    _pending(session_id).write_text(json.dumps({"id": uuid.uuid4().hex, "pid": os.getpid(), "questions": questions}))
+    # Claude Code ends the hook with SIGTERM when the turn is interrupted; exiting runs the cleanup below.
+    previous = signal.signal(signal.SIGTERM, _exit) if threading.current_thread() is threading.main_thread() else None
+    parent = os.getppid()
     try:
         if not _post(session_id, question_text(questions)):
             return {}
         deadline = time.monotonic() + wait
-        while time.monotonic() < deadline:
+        # A hook orphaned by its runner has nobody to answer to.
+        while time.monotonic() < deadline and os.getppid() == parent:
             if _answer(session_id).exists():
                 reply = json.loads(_answer(session_id).read_text())["text"]
                 return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
                                                "updatedInput": {"questions": questions,
                                                                 "answers": answers(questions, reply)}}}
             time.sleep(POLL_SECONDS)
-        return {}
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": UNANSWERED}}
     finally:
         _pending(session_id).unlink(missing_ok=True)
         _answer(session_id).unlink(missing_ok=True)
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
+
+
+def _exit(*_):
+    raise SystemExit(0)

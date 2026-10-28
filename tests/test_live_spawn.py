@@ -100,6 +100,7 @@ def test_preflight_refuses_a_logged_out_claude(monkeypatch):
 
 
 def test_start_hands_the_pane_this_processs_credentials(homes, monkeypatch):
+    monkeypatch.setattr(spawn, "_socket_opened", lambda address: True)
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "tok")
     monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: None)
     monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
@@ -149,6 +150,7 @@ def test_preflight_checks_claude_with_the_given_environment(monkeypatch):
 
 
 def test_start_hands_the_pane_the_given_environment(homes, monkeypatch):
+    monkeypatch.setattr(spawn, "_socket_opened", lambda address: True)
     monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: None)
     monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
     monkeypatch.setattr(spawn, "wait_for_session", lambda *args, **kw: "claude:x")
@@ -160,6 +162,7 @@ def test_start_hands_the_pane_the_given_environment(homes, monkeypatch):
 
 
 def test_start_checks_the_harness_with_the_given_environment(homes, monkeypatch):
+    monkeypatch.setattr(spawn, "_socket_opened", lambda address: True)
     checked = []
     monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: checked.append(env))
     monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
@@ -167,6 +170,78 @@ def test_start_checks_the_harness_with_the_given_environment(homes, monkeypatch)
     monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
     spawn.start("claude", "do it", homes, env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"})
     assert checked == [{"CLAUDE_CODE_OAUTH_TOKEN": "tok"}]
+
+
+def test_start_reads_the_spawner_env_file_by_default(homes, monkeypatch):
+    (homes / "env.sh").write_text("export CLAUDE_CODE_OAUTH_TOKEN=box-token\n")
+    (homes / "live" / "bridge").mkdir()
+    (homes / "live" / "bridge" / "spawn.json").write_text(json.dumps({"harness": "claude", "env_file": str(homes / "env.sh")}))
+    monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: None)
+    monkeypatch.setattr(spawn, "_socket_opened", lambda address: True)
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: [])
+    monkeypatch.setattr(spawn, "wait_for_session", lambda *args, **kw: "claude:x")
+    started = []
+    monkeypatch.setattr(spawn.subprocess, "run",
+                        lambda argv, **kw: started.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
+    spawn.start("claude", "do it", homes)
+    assert "CLAUDE_CODE_OAUTH_TOKEN=box-token" in started[0][:started[0].index("--")]
+
+
+@pytest.fixture
+def deaf_claude(homes, monkeypatch):
+    """Claude Code 2.1.220 registers its session but opens no messaging socket."""
+    monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: None)
+    monkeypatch.setattr(spawn, "wait_for_session", lambda *args, **kw: "claude:x")
+    monkeypatch.setattr(spawn, "SOCKET_WAIT_SECONDS", 0.0)
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: [LiveSession("claude", "x", str(homes), delivery="none")])
+    monkeypatch.setattr(spawn, "claude_version", lambda: "2.1.220 (Claude Code)")
+    stopped = []
+    monkeypatch.setattr(spawn, "stop", lambda target: stopped.append(target) or {})
+    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+    return stopped
+
+
+def test_start_refuses_a_claude_session_without_a_messaging_socket(deaf_claude, homes):
+    with pytest.raises(spawn.SpawnError, match="without a messaging socket"):
+        spawn.start("claude", "do it", homes)
+
+
+def test_start_stops_a_claude_session_without_a_messaging_socket(deaf_claude, homes):
+    with pytest.raises(spawn.SpawnError):
+        spawn.start("claude", "do it", homes)
+    assert deaf_claude[0].startswith(spawn.SESSION_PREFIX)
+
+
+def test_start_remembers_the_claude_version_without_a_messaging_socket(deaf_claude, homes):
+    with pytest.raises(spawn.SpawnError):
+        spawn.start("claude", "do it", homes)
+    assert spawn._deaf_versions() == ["2.1.220 (Claude Code)"]
+
+
+def test_start_keeps_a_claude_session_with_a_messaging_socket(homes, monkeypatch):
+    monkeypatch.setattr(spawn, "preflight", lambda harness, env=None: None)
+    monkeypatch.setattr(spawn, "wait_for_session", lambda *args, **kw: "claude:x")
+    monkeypatch.setattr(spawn.router, "list_all", lambda harness: [LiveSession("claude", "x", str(homes), delivery="socket")])
+    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+    assert spawn.start("claude", "do it", homes).address == "claude:x"
+
+
+@pytest.fixture
+def remembered_deaf(homes, monkeypatch):
+    spawn._record_deaf("2.1.220 (Claude Code)")
+    monkeypatch.setattr(spawn.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(spawn.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+
+
+def test_preflight_refuses_a_claude_version_known_to_open_no_socket(remembered_deaf, monkeypatch):
+    monkeypatch.setattr(spawn, "claude_version", lambda: "2.1.220 (Claude Code)")
+    with pytest.raises(spawn.SpawnError, match="opens no messaging socket"):
+        spawn.preflight("claude")
+
+
+def test_preflight_accepts_claude_once_it_was_updated(remembered_deaf, monkeypatch):
+    monkeypatch.setattr(spawn, "claude_version", lambda: "2.1.312 (Claude Code)")
+    assert spawn.preflight("claude") is None
 
 
 def test_preflight_needs_tmux(monkeypatch):

@@ -24,6 +24,7 @@
 import concurrent.futures
 import sqlite3
 import stat
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -254,6 +255,46 @@ def test_worker_actions_refuse_malformed_ids_before_dispatch(identifier):
 def test_reconciliation_refuses_a_malformed_id_before_remote_inspection():
     with pytest.raises(ValueError, match="tracked worker"):
         Workers(None, None).browser("POST", {"action": "reconcile", "id": [], "box_id": "bx_example"})
+
+
+@pytest.fixture
+def teammates(tmp_path):
+    """A controller with a cloud spawner, and the Mac's bridge offering to start claude sessions."""
+    from one_conv.control.workers import WorkerManager
+    from one_conv.live.hub import Hub
+    hub = Hub(str(tmp_path / "hub.db"))
+    hub.publish("mac", [], spawn="claude", priority=10)
+    manager = WorkerManager(tmp_path / "workers", {"spawner": {"node": "cloudbox"}, "create_node_token": lambda node: "t"})
+    return SimpleNamespace(hub=hub, manager=manager, workers=Workers(manager, None, hub))
+
+
+TEAMMATE = {"name": "jack", "harness": "codex", "model": None, "topic": "debate", "profile": "default",
+            "prompt": "Join and defend one of the theses"}
+
+
+def test_with_a_spawner_a_new_teammate_is_started_by_a_spawner(teammates):
+    result = teammates.workers.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": TEAMMATE})
+    assert result["route"] == "mac/spawn:claude"
+
+
+def test_with_a_spawner_a_new_teammate_answers_with_its_request_id(teammates):
+    result = teammates.workers.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": TEAMMATE})
+    assert result["id"] == "e" * 32
+
+
+def test_with_a_spawner_a_new_teammate_runs_no_cloud_worker(teammates):
+    teammates.workers.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": TEAMMATE})
+    assert teammates.manager.list()["jobs"] == []
+
+
+def test_with_a_spawner_the_teammate_request_is_posted_in_its_channel(teammates):
+    teammates.workers.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": TEAMMATE})
+    assert [row["text"] for row in teammates.hub.history("debate")] == ["New teammate @jack: Join and defend one of the theses"]
+
+
+def test_with_a_spawner_a_malformed_teammate_is_refused(teammates):
+    with pytest.raises(ValueError):
+        teammates.workers.browser("POST", {"action": "spawn", "id": "e" * 32, "spec": {**TEAMMATE, "topic": "Bad Topic"}})
 
 
 def test_pairing_cli_writes_a_private_link(tmp_path):

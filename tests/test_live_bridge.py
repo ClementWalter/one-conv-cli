@@ -257,6 +257,17 @@ def test_publishing_reports_this_machines_git_identity(hub, delivered, monkeypat
     assert hub.state.git_identity(exclude="mac") == {"name": "Ada", "email": "ada@example.test"}
 
 
+def test_publishing_reports_this_checkouts_revision(hub, delivered, monkeypatch):
+    monkeypatch.setattr(bridge, "checkout_revision", lambda: "d" * 40)
+    bridge.Bridge(hubclient.HubClient(hub.url, hub.box_token, "box"), "box",
+                  bridge.Ingress(bridge.bridge_dir() / "ingress.db")).publish()
+    assert hub.state.node_revision("box")[0] == "d" * 40
+
+
+def test_checkout_revision_is_this_repositorys_head():
+    assert len(bridge.checkout_revision()) == 40
+
+
 def test_git_identity_reads_the_global_git_config(tmp_path, monkeypatch):
     (tmp_path / "gitconfig").write_text("[user]\n\tname = Ada\n\temail = ada@example.test\n")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))

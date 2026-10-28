@@ -338,6 +338,17 @@ def git_identity() -> dict | None:
     return {"name": values[0], "email": values[1]} if all(values) else None
 
 
+def checkout_revision() -> str | None:
+    """The commit of the one-conv checkout this bridge runs from, read at each publication: sessions here run it."""
+    try:
+        result = subprocess.run(["git", "-C", str(Path(__file__).resolve().parents[2]), "rev-parse", "HEAD"],
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    revision = result.stdout.strip()
+    return revision if result.returncode == 0 and len(revision) == 40 else None
+
+
 class Bridge:
     def __init__(self, client: hubclient.HubClient, node: str, ingress: Ingress):
         self.client, self.node, self.ingress = client, node, ingress
@@ -360,6 +371,8 @@ class Bridge:
         offer = {"spawn": config["harness"], "spawn_priority": int(config.get("priority") or 0)} if config else {}
         if identity:
             offer["git_user"] = identity
+        if revision := checkout_revision():
+            offer["revision"] = revision
         try:
             count = self.client.request("PUT", "/v1/sessions", {"sessions": rows, **offer})["published"]
             self.notes = []

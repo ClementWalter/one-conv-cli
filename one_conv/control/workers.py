@@ -420,12 +420,16 @@ class WorkerManager:
         with self._locked():
             state = _read(self.state_path)
             profile = self.profiles[job["spec"]["profile"]]
+            # The spawner box's checkout follows main; a worker's pinned bootstrap would roll it back.
+            spawner = (self.config.get("spawner") or {}).get("node")
             if job.get("pool_id"):
+                if state["pools"][job["pool_id"]]["node"] == spawner:
+                    raise WorkerError("the cloud spawner's box runs no cloud workers")
                 return copy.deepcopy(state["pools"][job["pool_id"]])
             for pool in state["pools"].values():
                 occupied = sum(item.get("pool_id") == pool["id"] and item["status"] in ACTIVE
                                for item in state["jobs"].values())
-                if (pool["profile"] == job["spec"]["profile"] and pool.get("box_id")
+                if (pool["profile"] == job["spec"]["profile"] and pool.get("box_id") and pool["node"] != spawner
                         and pool["status"] in ("available", "stopped") and occupied < pool["slots"]):
                     break
             else:

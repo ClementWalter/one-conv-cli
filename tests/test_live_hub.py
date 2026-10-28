@@ -528,3 +528,21 @@ def test_a_cursor_past_any_sqlite_integer_returns_an_empty_page(topic):
     _, url, mac, box = topic
     call(url, "/v1/messages", mac, "POST", message("#release"))
     assert call(url, "/v1/topics/release/messages?after=9223372036854775808", box) == (200, {"messages": []})
+
+
+def test_a_published_checkout_revision_is_kept(tmp_path):
+    hub = Hub(str(tmp_path / "hub.db"))
+    hub.publish("box", [], revision="c" * 40)
+    assert hub.node_revision("box")[0] == "c" * 40
+
+
+def test_a_publication_without_a_revision_forgets_the_old_one(tmp_path):
+    hub = Hub(str(tmp_path / "hub.db"))
+    hub.publish("box", [], revision="c" * 40)
+    hub.publish("box", [])
+    assert hub.node_revision("box") == (None, None)
+
+
+def test_a_malformed_revision_is_refused(tmp_path):
+    with pytest.raises(HubError):
+        Hub(str(tmp_path / "hub.db")).publish("box", [], revision="main")

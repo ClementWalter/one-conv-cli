@@ -101,7 +101,6 @@ def test_running_counts_only_working_sessions(hub):
 
 def test_a_channel_with_only_watchers_starts_a_session(hub):
     hub.publish("mac", [{"address": "claude:builder"}, {"address": "claude:busy"}], spawn="claude")
-    post(hub, to="#defi-watch")
     hub.join("mac", "defi-watch", "claude:builder", work=False)
     post(hub, ident="c", to="#defi-watch")
     with sqlite3.connect(hub.path) as db:

@@ -100,6 +100,8 @@ CREATE TABLE IF NOT EXISTS spawners (node TEXT PRIMARY KEY, harness TEXT NOT NUL
 -- The git identity each node's user commits as; a cloud box commits as the human's own machine does.
 CREATE TABLE IF NOT EXISTS git_identities (node TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL,
     priority INTEGER NOT NULL, updated REAL NOT NULL);
+-- The one-conv commit each node's checkout is at, so the controller sees a cloud box drift off what it provisioned.
+CREATE TABLE IF NOT EXISTS node_revisions (node TEXT PRIMARY KEY, revision TEXT NOT NULL, updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS archived_topics (topic TEXT PRIMARY KEY, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS post_acks (post INTEGER NOT NULL, node TEXT NOT NULL, address TEXT NOT NULL, at REAL NOT NULL,
     PRIMARY KEY (post, node, address));
@@ -235,13 +237,17 @@ class Hub:
     def _seen(self, db, node: str) -> None:
         db.execute("INSERT OR REPLACE INTO nodes VALUES (?, ?)", (node, time.time()))
 
-    def publish(self, node: str, sessions, spawn: object = None, priority: object = 0, git_user: object = None) -> int:
+    def publish(self, node: str, sessions, spawn: object = None, priority: object = 0, git_user: object = None,
+                revision: object = None) -> int:
         """Replace this node's published sessions and renew its lease; a name already taken is refused.
 
         `spawn` is the harness this node's bridge starts a session with when the hub asks it to,
         or None when it starts none; spawners with a higher `priority` are asked first.
         `git_user` ({name, email}) is the identity this node's user commits as, kept after it goes offline.
+        `revision` is the commit of this node's one-conv checkout.
         """
+        if revision is not None and (not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision)):
+            raise HubError(400, "revision is a 40-hex commit, or absent")
         if git_user is not None and (not isinstance(git_user, dict) or set(git_user) != {"name", "email"}
                                      or not all(isinstance(v, str) and 0 < len(v) <= 256
                                                 and not any(ord(c) < 32 for c in v) for v in git_user.values())):
@@ -291,6 +297,10 @@ class Hub:
             if git_user is not None:
                 db.execute("INSERT OR REPLACE INTO git_identities VALUES (?, ?, ?, ?, ?)",
                            (node, git_user["name"], git_user["email"], priority, now))
+            if revision is None:
+                db.execute("DELETE FROM node_revisions WHERE node = ?", (node,))
+            else:
+                db.execute("INSERT OR REPLACE INTO node_revisions VALUES (?, ?, ?)", (node, revision, now))
             self._seen(db, node)
             # A clock read before _seen would put this node's lease in the future and count its sessions offline.
             self._sweep(db, time.time())
@@ -322,13 +332,14 @@ class Hub:
                    for n, a, work in self._members(db, topic))
 
     def _human_post(self, db, seq: int) -> dict | None:
-        row = db.execute("SELECT from_node, id, sender, topic, text, created FROM posts WHERE seq = ?",
+        row = db.execute("SELECT from_node, id, sender, topic, text, created, mode FROM posts WHERE seq = ?",
                          (seq,)).fetchone()
         if row is None:
             return None
-        node, ident, sender, topic, text, created = row
+        node, ident, sender, topic, text, created, mode = row
+        # A teammate request is filed fyi: it wakes nobody and asks for one more session, not for the running ones.
         return {"key": f"{node}:{ident}", "seq": seq, "topic": topic, "text": text, "created": created,
-                "created_by": f"{node}/{sender}"}
+                "created_by": f"{node}/{sender}", "teammate": mode == "fyi"}
 
     def _spawners(self, db, now: float, tried=()) -> list[tuple[str, str]]:
         """Connected spawners not yet tried, the preferred first."""
@@ -378,6 +389,9 @@ class Hub:
         row = db.execute("SELECT route, state FROM staffing WHERE task = ? AND version = 1", (post["key"],)).fetchone()
         if row:
             return {"route": row[0], "state": row[1]}
+        if not post["teammate"] and self._staffing_topic(db, post["topic"], now):
+            # The session already being started for this channel reads this post when it joins.
+            return {"route": "", "state": "joined"}
         spawner = self._next_spawner(db, now, [])
         if spawner is None:
             db.execute("INSERT INTO staffing (task, version, route, state, detail, created, updated)"
@@ -388,6 +402,40 @@ class Hub:
         db.execute("INSERT INTO staffing (task, version, route, state, detail, created, updated, tried)"
                    " VALUES (?, 1, ?, 'node', '', ?, ?, ?)", (post["key"], route, now, now, node))
         return {"route": route, "state": "node"}
+
+    @staticmethod
+    def _staffing_topic(db, topic: str | None, now: float) -> bool:
+        """Whether a session is being started for another recent human post of this channel."""
+        return topic is not None and db.execute(
+            "SELECT 1 FROM staffing s JOIN posts p ON s.task = p.from_node || ':' || p.id WHERE p.topic = ?"
+            " AND p.mode = 'push' AND s.state IN ('node', 'cloud', 'submitted') AND s.created >= ?",
+            (topic, now - STAFF_WINDOW_SECONDS)).fetchone() is not None
+
+    def request_teammate(self, node: str, sender: str, msg_id: str, topic: str, text: str) -> dict:
+        """File a request for one more session in a channel and start it on a spawner, like a post nobody runs.
+
+        The request is a visible fyi post: it wakes none of the sessions already there, and the session
+        started for it acks it. A retry with the same id returns the first request's staffing.
+        """
+        if not MESSAGE_ID.fullmatch(msg_id):
+            raise HubError(400, "id must be 32 lowercase hex characters, chosen by the sender")
+        if not TOPIC.fullmatch(topic):
+            raise HubError(400, "a topic is lowercase letters, digits and dashes")
+        if not text.strip() or len(text) > MAX_TEXT:
+            raise HubError(400, f"a teammate request is between 1 and {MAX_TEXT} characters")
+        target = f"#{topic}"
+        digest = hashlib.sha256(json.dumps(["teammate", target, sender, text]).encode()).hexdigest()
+        with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            existing = db.execute("SELECT seq, digest FROM posts WHERE from_node = ? AND id = ?", (node, msg_id)).fetchone()
+            if existing and existing[1] != digest:
+                raise HubError(409, "this id was already used for a different message")
+            seq = existing[0] if existing else self._insert(
+                db, node, msg_id, digest, target, sender, topic, "expected", "fyi", text,
+                [(n, a, "fyi") for n, a, _ in self._members(db, topic) if (n, a) != (node, sender)])
+            staffed = self._staff(db, self._human_post(db, seq), now)
+        return {"id": msg_id, "status": staffed["state"], "route": staffed["route"]}
 
     def _predecessors(self, db, topic: str | None, limit: int = 3) -> list[str]:
         """Agent sessions that posted in this channel, the most recent first: the work a new session takes over."""
@@ -402,6 +450,17 @@ class Hub:
         """The first prompt of a session started for a human post: take over, join, ack, sync, answer."""
         ident = post["key"].partition(":")[2]
         takeover = ""
+        if post.get("teammate"):
+            # The sessions already in the channel keep running: this one joins them rather than taking over.
+            return (f"{post['created_by']} asked for one more session in #{post['topic']}, and this session was"
+                    f" started for it.\n\nRequest:\n{post['text']}\n\n"
+                    f"1. Join #{post['topic']} with the join_topic tool (work=true): it catches you up on the channel,"
+                    " where other sessions may already be working.\n"
+                    f"2. Ack the request with the ack tool (message_id=\"{ident}\").\n"
+                    f"3. Do what it asks, talking in #{post['topic']}. Before starting a piece of work, say in the"
+                    " channel what you take, and leave anything already taken to whoever took it.\n"
+                    "4. This machine can disappear at any time: `git pull` every repository before working in it, and"
+                    " commit and push every change as soon as it is made. AGENTS.md in this folder has the details.")
         if predecessors:
             # Any agent can read any session from any machine: that is what lets this one continue the work.
             takeover = ("Sessions that worked in this channel before, the most recent first (they are not running now;"
@@ -441,9 +500,11 @@ class Hub:
             # Rows staffed before `tried` existed name their only spawner in the route.
             tried = tried.split() or ([route.partition("/")[0]] if route != "cloud" else [])
             spawn_ids = [self._spawn_id(key, tried[:i], n) for i, n in enumerate(tried)]
-            seq = db.execute("SELECT seq, topic FROM posts WHERE from_node = ? AND id = ?", (node, ident)).fetchone()
+            seq = db.execute("SELECT seq, topic, mode FROM posts WHERE from_node = ? AND id = ?", (node, ident)).fetchone()
             acked = seq is not None and db.execute("SELECT 1 FROM post_acks WHERE post = ?", (seq[0],)).fetchone()
-            if seq is None or acked:
+            # A session that joined the channel to work reads the post there, even before acking it.
+            joined = seq is not None and seq[2] == "push" and self._running(db, seq[1], now)
+            if seq is None or acked or joined:
                 db.execute("UPDATE staffing SET state = 'done', updated = ? WHERE task = ?", (now, key))
                 # A spawn order not yet handed out starts nothing once a session has read the post.
                 if spawn_ids:
@@ -525,6 +586,12 @@ class Hub:
             row = db.execute("SELECT name, email FROM git_identities WHERE node != ? ORDER BY priority DESC, updated DESC",
                              (exclude,)).fetchone()
         return {"name": row[0], "email": row[1]} if row else None
+
+    def node_revision(self, node: str) -> tuple[str | None, float | None]:
+        """The commit this node's checkout was at when it last published and when that was; (None, None) if it never said."""
+        with self.lock, self._db() as db:
+            row = db.execute("SELECT revision, updated FROM node_revisions WHERE node = ?", (node,)).fetchone()
+        return (row[0], row[1]) if row else (None, None)
 
     def node_seen(self, node: str) -> float | None:
         """When this node last published or polled, or None if it never did."""
@@ -1158,7 +1225,8 @@ def application(hub: Hub):
     async def sessions(request):
         if request.method == "PUT":
             return await handle(request, lambda node, body, _: {"published": hub.publish(
-                node, body.get("sessions"), body.get("spawn"), body.get("spawn_priority", 0), body.get("git_user"))})
+                node, body.get("sessions"), body.get("spawn"), body.get("spawn_priority", 0), body.get("git_user"),
+                body.get("revision"))})
         return await handle(request, lambda node, body, _: {"sessions": hub.directory()})
 
     async def messages(request):

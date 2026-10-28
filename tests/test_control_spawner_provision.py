@@ -209,3 +209,53 @@ def test_a_bad_spawner_block_is_refused(spawner):
 
 def test_a_created_box_is_provisioned_at_once(manager):
     assert provision_spawner(manager, dict(SPAWNER), wanted=False) == "provisioned"
+
+
+# --- a box whose checkout left what it was provisioned at ----------------------------------------
+
+PROVISIONED, OTHER = "a" * 40, "b" * 40
+
+
+@pytest.fixture
+def provisioned(manager):
+    """The box was provisioned at PROVISIONED ten seconds ago."""
+    manager.boat.health = {"status": "ready", "revision": PROVISIONED}
+    provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=False)
+    record = json.loads((manager.directory / "spawner.json").read_text())
+    record["at"] = time.time() - 10
+    (manager.directory / "spawner.json").write_text(json.dumps(record))
+    return manager
+
+
+def test_a_box_reporting_its_provisioned_checkout_is_current(provisioned):
+    provisioned.config["hub"].publish("cloudbox", [], spawn="claude", revision=PROVISIONED)
+    assert provision_spawner(provisioned, {**SPAWNER, "box": "bx_cloud"}, wanted=False) == "current"
+
+
+def test_a_box_reporting_another_checkout_is_provisioned_again(provisioned):
+    provisioned.config["hub"].publish("cloudbox", [], spawn="claude", revision=OTHER)
+    assert provision_spawner(provisioned, {**SPAWNER, "box": "bx_cloud"}, wanted=False) == "provisioned"
+
+
+def test_a_drifted_box_is_provisioned_even_while_a_request_waits(provisioned):
+    provisioned.config["hub"].publish("cloudbox", [], spawn="claude", revision=OTHER)
+    assert provision_spawner(provisioned, {**SPAWNER, "box": "bx_cloud"}, wanted=True) == "provisioned"
+
+
+def test_a_box_whose_bridge_reports_no_checkout_is_provisioned_again(provisioned):
+    provisioned.config["hub"].publish("cloudbox", [], spawn="claude")
+    assert provision_spawner(provisioned, {**SPAWNER, "box": "bx_cloud"}, wanted=False) == "provisioned"
+
+
+def test_a_report_from_before_provisioning_is_not_a_drift(manager):
+    manager.config["hub"].publish("cloudbox", [], spawn="claude", revision=OTHER)
+    manager.boat.health = {"status": "ready", "revision": PROVISIONED}
+    provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=False)
+    assert provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=False) == "current"
+
+
+def test_an_offline_box_is_not_a_drift(provisioned, monkeypatch):
+    provisioned.config["hub"].publish("cloudbox", [], spawn="claude", revision=OTHER)
+    monkeypatch.setattr(runtime.time, "time", lambda: time.monotonic() + 10**10)
+    assert runtime._drifted(provisioned.config["hub"], "cloudbox",
+                            json.loads((provisioned.directory / "spawner.json").read_text())) is False

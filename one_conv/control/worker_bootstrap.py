@@ -719,6 +719,15 @@ def install_uv():
     return Path.home() / ".local/bin/uv"
 
 
+def install_native_claude():
+    """A Claude Code native build in ~/.local/bin, first on the bridge's PATH: it updates itself, unlike the
+    image's root-owned npm build, which Boat's platform pins and the box cannot upgrade."""
+    native = Path.home() / ".local/bin/claude"
+    if not native.exists():
+        run(["claude", "install", "latest"], stage="claude-native", timeout=600)
+    return native
+
+
 def provision_spawner(data):
     """Make this box a spawner node from nothing: clones, git identity, uv, hub settings, the live
     install, spawner settings and the bridge's systemd unit. Every step is idempotent.
@@ -743,6 +752,8 @@ def provision_spawner(data):
     _hub_settings(data)
     launcher = [str(uv), "run", "--script", str(checkout / "bin/one-conv")]
     spawner = data["spawner"]
+    if spawner["harness"] == "claude":
+        install_native_claude()
     run([*launcher, "live", "install", "--harness", spawner["harness"], "--yes"], stage="live-install", env=env, timeout=300)
     workspace = Path.home() / "Documents/one-conv-workspace"
     workspace.mkdir(parents=True, exist_ok=True)

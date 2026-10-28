@@ -894,6 +894,24 @@ def test_a_spawner_installs_the_bridge_service(provisioned, spawner_payload):
     assert launched(provisioned, "serve")[-2:] == ["--install", "--yes"]
 
 
+def test_a_claude_spawner_installs_claudes_native_build(provisioned, spawner_payload):
+    bootstrap.provision_spawner(spawner_payload)
+    assert ["claude", "install", "latest"] in provisioned
+
+
+def test_a_claude_spawner_keeps_a_native_build_already_there(provisioned, spawner_payload):
+    native = Path.home() / ".local/bin/claude"
+    native.parent.mkdir(parents=True, exist_ok=True)
+    native.write_text("")
+    bootstrap.provision_spawner(spawner_payload)
+    assert ["claude", "install", "latest"] not in provisioned
+
+
+def test_a_codex_spawner_installs_no_claude(provisioned, spawner_payload):
+    bootstrap.provision_spawner({**spawner_payload, "spawner": {**spawner_payload["spawner"], "harness": "codex"}})
+    assert ["claude", "install", "latest"] not in provisioned
+
+
 def test_a_spawner_turns_lingering_on(provisioned, spawner_payload):
     bootstrap.provision_spawner(spawner_payload)
     assert any(argv[:4] == ["sudo", "-n", "loginctl", "enable-linger"] for argv in provisioned)

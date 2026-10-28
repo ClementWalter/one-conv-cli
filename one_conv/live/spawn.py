@@ -398,6 +398,10 @@ def retire_idle(sessions: list[LiveSession], now: float | None = None, idle_hour
     with _registry_lock:
         rows = _load()
         for name, row in rows.items():
+            if not row.get("address"):
+                # A spawn whose registration wait gave up still runs; its pane's process names its session.
+                row["address"] = next((s.address for s in sessions
+                                       if s.harness == row.get("harness") and owned_by_spawn(s, name)), "")
             if status.get(row.get("address")) != "idle" or "active_at" not in row:
                 row["active_at"] = now
             elif now - row["active_at"] >= idle_hours * 3600:

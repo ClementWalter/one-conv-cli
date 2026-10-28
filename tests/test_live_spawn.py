@@ -562,3 +562,11 @@ def test_an_agent_not_yet_registered_is_kept(ended):
     spawn._save({"oneconv-c": {"tmux": "oneconv-c", "address": "", "active_at": 0.0}})
     spawn.retire_idle([], now=25 * HOUR, idle_hours=24)
     assert ended == []
+
+
+def test_an_agent_whose_registration_was_missed_is_found_by_its_pane(ended, monkeypatch):
+    spawn._save({"oneconv-c": {"tmux": "oneconv-c", "harness": "claude", "address": ""}})
+    monkeypatch.setattr(spawn, "owned_by_spawn", lambda session, name: session.id == "x")
+    spawn.retire_idle([LiveSession("claude", "w", status="idle"), LiveSession("claude", "x", status="idle")],
+                      now=1000.0, idle_hours=24)
+    assert spawn._load()["oneconv-c"]["address"] == "claude:x"

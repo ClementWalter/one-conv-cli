@@ -5,9 +5,9 @@ question to the human as a direct message from the asking session, marked so the
 its options as buttons, then waits. While a question waits, the bridge files the human's next
 message to that session as the answer instead of typing it into the terminal. The hook answers the
 tool with it (`updatedInput.answers`), so the session carries on as if it had been picked there.
-A question still unanswered when the wait ends is declined with a note telling the agent the answer
-will come as a message, so a late answer from the workspace is never typed behind a terminal dialog.
-A question that could not be posted is left to the terminal. A pending question is only answered
+A question still unanswered when the wait ends goes back to the terminal, and the workspace is told
+so: a reply there would only be queued behind the terminal's dialog, not answer it.
+A question that could not be posted is left to the terminal too. A pending question is only answered
 while its hook process lives: one killed mid-wait (an interrupt) lets later messages through.
 """
 
@@ -29,10 +29,9 @@ MARKER = "<!-- one-conv-ask "
 # How long a question waits for the workspace before the terminal asks instead.
 WAIT_SECONDS = float(os.environ.get("ONE_CONV_ASK_SECONDS", "1800"))
 POLL_SECONDS = 1.0
-# What the agent reads when the wait ends unanswered: the answer can still arrive, as a message.
-UNANSWERED = ("The user has not answered this question yet. It stays open in their workspace, and their answer "
-              "will reach you later as a one-conv message. Do not ask it again: end your turn, or carry on only "
-              "with work that does not depend on the answer.")
+# What the human reads when the wait ends unanswered; it also closes the question's form in the web app.
+MOVED = ("No answer here in {minutes} min, so this question moved to my terminal. Open the session's terminal "
+         "to answer it there; a reply here will not answer it.")
 
 
 def asks_dir() -> Path:
@@ -112,14 +111,14 @@ def _waiting(session_id: str) -> bool:
     return False
 
 
-def _post(session_id: str, text: str) -> bool:
-    """Send the question to the human from the asking session, through this machine's bridge."""
+def _post(session_id: str, text: str, reply: str = "expected") -> bool:
+    """Send `text` to the human from the asking session, through this machine's bridge."""
     from . import claude, hubclient, router
     session = next((s for s in claude.list_sessions() if s.id == session_id), None)
     if session is None:
         return False
     try:
-        router.send(HUMAN, text, session, reply="expected")
+        router.send(HUMAN, text, session, reply=reply)
     except (router.LiveError, hubclient.HubRefused, hubclient.HubUnavailable, OSError) as error:
         # A question the workspace never got is left to the terminal.
         logger.warning("could not post the question to the workspace: %s", error)
@@ -128,8 +127,7 @@ def _post(session_id: str, text: str) -> bool:
 
 
 def run_hook(payload: dict, wait: float = WAIT_SECONDS) -> dict:
-    """PreToolUse hook for AskUserQuestion: the workspace's answer, a decline once the wait ends unanswered,
-    or {} to let the terminal ask when the question could not be posted."""
+    """PreToolUse hook for AskUserQuestion: the workspace's answer, or {} to let the terminal ask."""
     tool_input = payload.get("tool_input") or {}
     questions, session_id = tool_input.get("questions"), payload.get("session_id")
     if payload.get("tool_name") != "AskUserQuestion" or not questions or not session_id or tool_input.get("answers"):
@@ -152,8 +150,9 @@ def run_hook(payload: dict, wait: float = WAIT_SECONDS) -> dict:
                                                "updatedInput": {"questions": questions,
                                                                 "answers": answers(questions, reply)}}}
             time.sleep(POLL_SECONDS)
-        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                       "permissionDecisionReason": UNANSWERED}}
+        if os.getppid() == parent:
+            _post(session_id, MOVED.format(minutes=round(wait / 60)), reply="none")
+        return {}
     finally:
         _pending(session_id).unlink(missing_ok=True)
         _answer(session_id).unlink(missing_ok=True)

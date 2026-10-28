@@ -483,7 +483,7 @@ class ControlStore:
             "notice": "Stored durably; delivery acceptance does not mean the recipient has read it."}}
 
     def stop_session(self, payload, wait: float | None = None):
-        """The human ends an agent the spawner started; answers stopped, refused or pending."""
+        """The human ends a running agent; answers stopped, refused or pending."""
         if not isinstance(payload, dict) or set(payload) != {"address"} or not isinstance(payload["address"], str):
             raise HubError(400, "Provide the address of the agent to stop.")
         order = self.hub.stop(NODE, payload["address"])

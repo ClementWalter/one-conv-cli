@@ -1920,7 +1920,7 @@ async function stopAgent(address, name) {
     const result = await post("/api/sessions/stop", { address });
     toast({
       stopped: name + " stopped.",
-      refused: name + " was not stopped: only agents the Mac's spawner started can be stopped here. Close it in its terminal.",
+      refused: name + " was not stopped: its machine could not end it (Codex and Cursor chats share their app's process). Close it in its app.",
       unconfirmed: name + "'s machine could not confirm the stop. Check again in a moment.",
     }[result.status] || "Stop sent; " + name + "'s machine has not answered yet.");
   } catch (error) {

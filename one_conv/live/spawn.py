@@ -68,6 +68,10 @@ class SpawnError(Exception):
     """A spawn that cannot start, or a started agent that never registered."""
 
 
+class NotSpawned(SpawnError):
+    """No agent the spawner started matches; the session, if any, runs outside its tmux sessions."""
+
+
 def spawner_env_file() -> str | None:
     """The env file this machine's spawner settings name, so any spawn here gets the credentials hub spawns get."""
     try:
@@ -426,7 +430,7 @@ def _stop(target: str) -> dict:
     rows = _load()
     name = next((n for n, row in rows.items() if target in (n, row.get("address"))), None)
     if name is None:
-        raise SpawnError(f"no spawned agent matches {target!r}; see `one-conv live spawned`")
+        raise NotSpawned(f"no spawned agent matches {target!r}; see `one-conv live spawned`")
     result = subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True, text=True, check=False)
     # Only tmux confirming the session gone ends it; a failed kill with that confirmation means it had already ended.
     if _state(name) != "absent":

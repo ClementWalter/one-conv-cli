@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import ask, history, hubclient, router, spawn, team, tunnel, workspace
-from .model import envelope, live_home, parse_address
+from .model import envelope, live_home, parse_address, pid_alive
 
 try:
     import fcntl
@@ -133,7 +133,7 @@ def deliver_spawn(item: dict, on_started=None) -> tuple[str, str]:
 
 
 def deliver_stop(item: dict, on_stopped=None) -> tuple[str, str]:
-    """End a session the spawner started here, on the hub's order; any other session is refused."""
+    """End a session here on the hub's order: a spawned one with its tmux session, any other with its process."""
     address = str(item.get("to", "")).partition(":")[2]
     if not item.get("system"):
         # Only the hub issues stop orders; a message addressed here by anyone else ends nothing.
@@ -141,7 +141,13 @@ def deliver_stop(item: dict, on_stopped=None) -> tuple[str, str]:
     if parse_address(address)[0] is None:
         return "refused", f"{address!r} is not a session address"
     try:
-        row = spawn.stop(address)
+        detail = f"stopped tmux session {spawn.stop(address)['tmux']}"
+    except spawn.NotSpawned:
+        # A session started in a terminal or by another tool ends with its own process.
+        try:
+            detail = kill_session(address)
+        except KillError as error:
+            return "refused", str(error)
     except spawn.SpawnError as error:
         return "refused", str(error)
     if on_stopped is not None:
@@ -150,7 +156,42 @@ def deliver_stop(item: dict, on_stopped=None) -> tuple[str, str]:
             on_stopped()
         except (hubclient.HubRefused, hubclient.HubUnavailable) as error:
             logger.warning("stopped %s but could not republish: %s", address, error)
-    return "accepted", f"stopped tmux session {row['tmux']}"
+    return "accepted", detail
+
+
+class KillError(Exception):
+    """A session this machine cannot end through its process."""
+
+
+# How long a session gets to exit on SIGTERM before SIGKILL, and SIGKILL before giving up.
+KILL_GRACE_SECONDS = 5.0
+
+
+def kill_session(address: str, grace: float = KILL_GRACE_SECONDS) -> str:
+    """End a live session here through its own process: SIGTERM, then SIGKILL if it outlives `grace`.
+
+    Only a harness that registers one process per session (Claude Code, omp) has one to end;
+    a Codex thread or Cursor chat shares its process with others, so it is refused.
+    """
+    harness, _ = parse_address(address)
+    session = next((s for s in router.list_all(harness) if s.address == address), None) if harness else None
+    if session is None:
+        raise KillError(f"{address} is not live on this machine")
+    if not session.pid or session.pid in (os.getpid(), os.getppid()):
+        raise KillError(f"{harness} sessions share a process with others here; close {address} in its app")
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(session.pid, sig)
+        except ProcessLookupError:
+            return f"ended process {session.pid}"
+        except PermissionError as error:
+            raise KillError(f"cannot signal process {session.pid}: {error}") from error
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if not pid_alive(session.pid):
+                return f"ended process {session.pid}" + (" (killed)" if sig == signal.SIGKILL else "")
+            time.sleep(0.1)
+    raise KillError(f"process {session.pid} of {address} is still running after SIGKILL")
 
 
 def settings() -> dict:

@@ -106,7 +106,7 @@ def test_a_refused_stop_says_why(paired):
     page.locator("#details .stop-agent").click()
     page.locator("#details .stop-agent").click()
     page.wait_for_function("() => !document.getElementById('toast').hidden")
-    assert "only agents the Mac's spawner started" in page.locator("#toast").inner_text()
+    assert "could not end it" in page.locator("#toast").inner_text()
 
 
 def test_a_workspace_that_cannot_stop_shows_no_button(paired):

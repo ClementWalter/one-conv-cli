@@ -393,14 +393,68 @@ function rowButton(list, label, mark, active, action, count, unread = 0) {
   list.appendChild(li);
   return button;
 }
+// A right click, or a long press on a phone, opens a row's actions; `items` is [{label, danger, confirm, action}].
+function rowMenu(button, items) {
+  const open = (x, y) => {
+    const list = items().filter(Boolean);
+    if (list.length) showRowMenu(list, x, y);
+  };
+  button.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    open(event.clientX, event.clientY);
+  });
+  let timer = null;
+  const cancel = () => { clearTimeout(timer); timer = null; };
+  button.addEventListener("touchstart", (event) => {
+    const touch = event.touches[0];
+    timer = setTimeout(() => {
+      timer = null;
+      // The click that ends this press must not also open the row.
+      button.addEventListener("click", (click) => { click.preventDefault(); click.stopImmediatePropagation(); }, { once: true, capture: true });
+      open(touch.clientX, touch.clientY);
+    }, 550);
+  }, { passive: true });
+  for (const name of ["touchend", "touchmove", "touchcancel"]) button.addEventListener(name, cancel, { passive: true });
+}
+function closeRowMenu() {
+  const menu = document.getElementById("row-menu");
+  if (menu) menu.remove();
+}
+function showRowMenu(items, x, y) {
+  closeRowMenu();
+  const menu = el("div", null, "row-menu");
+  menu.id = "row-menu";
+  menu.setAttribute("role", "menu");
+  for (const item of items) {
+    const entry = el("button", item.label, "row-menu-item" + (item.danger ? " danger" : ""));
+    entry.type = "button";
+    entry.setAttribute("role", "menuitem");
+    entry.addEventListener("click", (event) => {
+      event.stopPropagation();
+      // A destructive entry asks for a second tap; a browser confirm dialog would block the page.
+      if (item.confirm && !entry.classList.contains("armed")) {
+        entry.classList.add("armed");
+        entry.textContent = item.confirm;
+        return;
+      }
+      closeRowMenu();
+      item.action();
+    });
+    menu.appendChild(entry);
+  }
+  document.body.appendChild(menu);
+  const box = menu.getBoundingClientRect();
+  menu.style.left = Math.max(8, Math.min(x, window.innerWidth - box.width - 8)) + "px";
+  menu.style.top = Math.max(8, Math.min(y, window.innerHeight - box.height - 8)) + "px";
+}
 function sidebar() {
   const topics = $("topics");
   topics.replaceChildren();
   const archived = $("archived-topics");
   archived.replaceChildren();
   // Archived channels stay reachable, folded away from the main list.
-  for (const topic of model.state.topics)
-    rowButton(
+  for (const topic of model.state.topics) {
+    const row = rowButton(
       topic.archived ? archived : topics,
       topic.topic,
       el("span", "#", "hash"),
@@ -411,6 +465,10 @@ function sidebar() {
       topic.running ?? (topic.members || []).length,
       unreadOf("#" + topic.topic, topic.unread),
     );
+    rowMenu(row, () => [
+      { label: topic.archived ? "Bring back channel" : "Archive channel", action: () => archiveChannel(topic.topic, !topic.archived) },
+    ]);
+  }
   if (!topics.children.length)
     topics.appendChild(
       el(
@@ -467,6 +525,12 @@ function sidebar() {
     presence.title = state.label;
     button.appendChild(presence);
     button.title = p.name + " · " + personContext(p) + " · " + presenceText(p) + "\n" + state.detail;
+    rowMenu(button, () => [
+      model.capabilities.stop && presenceOf(person(session.address)).can_message && {
+        label: "Kill " + p.name, danger: true, confirm: "Tap again to kill " + p.name,
+        action: () => stopAgent(session.address, p.name),
+      },
+    ]);
   }
   if (!people.children.length)
     people.appendChild(
@@ -1920,7 +1984,7 @@ async function stopAgent(address, name) {
     const result = await post("/api/sessions/stop", { address });
     toast({
       stopped: name + " stopped.",
-      refused: name + " was not stopped: only agents the Mac's spawner started can be stopped here. Close it in its terminal.",
+      refused: name + " was not stopped: its machine could not end it (Codex and Cursor chats share their app's process). Close it in its app.",
       unconfirmed: name + "'s machine could not confirm the stop. Check again in a moment.",
     }[result.status] || "Stop sent; " + name + "'s machine has not answered yet.");
   } catch (error) {
@@ -2343,11 +2407,21 @@ $("sidebar-toggle").addEventListener("click", () => {
   $("sidebar-toggle").setAttribute("aria-expanded", String(open));
 });
 $("sidebar-overlay").addEventListener("click", closeSidebar);
+// Whether the reader is at the end of the conversation, as of their last scroll.
+let pinnedToEnd = true;
 $("message-scroll").addEventListener("scroll", () => {
   const box = $("message-scroll");
+  pinnedToEnd = box.scrollHeight - box.scrollTop - box.clientHeight < 110;
   if (box.scrollHeight - box.scrollTop - box.clientHeight < 100)
     $("new-messages").hidden = true;
 });
+// The composer growing as it is typed in, or the keyboard opening, shortens the message list
+// without scrolling it: a reader at the end stays at the end.
+if (window.ResizeObserver)
+  new ResizeObserver(() => {
+    const box = $("message-scroll");
+    if (pinnedToEnd && box.scrollHeight - box.scrollTop - box.clientHeight >= 1) box.scrollTop = box.scrollHeight;
+  }).observe($("message-scroll"));
 $("new-messages").addEventListener("click", () => {
   $("message-scroll").scrollTop = $("message-scroll").scrollHeight;
   $("new-messages").hidden = true;
@@ -2374,6 +2448,10 @@ for (const emoji of ["👋", "👍", "✨", "🎉", "💡", "✅", "❤️"]) {
   });
   $("emoji-picker").appendChild(button);
 }
+document.addEventListener("click", (event) => {
+  if (!event.target.closest || !event.target.closest("#row-menu")) closeRowMenu();
+});
+window.addEventListener("blur", closeRowMenu);
 document.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
     event.preventDefault();
@@ -2381,6 +2459,7 @@ document.addEventListener("keydown", (event) => {
     $("search").select();
   }
   if (event.key === "Escape") {
+    closeRowMenu();
     closeSidebar();
     toggleDetails(false);
     $("emoji-picker").hidden = true;

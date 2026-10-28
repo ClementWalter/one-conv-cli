@@ -2170,3 +2170,28 @@ button {
     top: calc(46px + env(safe-area-inset-top));
   }
 }
+
+.row-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 180px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  display: grid;
+}
+.row-menu-item {
+  border: 0;
+  border-radius: 7px;
+  padding: 9px 12px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.row-menu-item:hover { background: var(--hover); }
+.row-menu-item.danger { color: #b3261e; }
+.row-menu-item.armed { background: #b3261e; color: white; }

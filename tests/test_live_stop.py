@@ -19,12 +19,16 @@
 # [tool.uv]
 # exclude-newer = "2026-10-27T00:00:00Z"
 # ///
-"""Stopping an agent from the web app: the controller orders the agent's bridge, which ends its tmux session.
+"""Stopping an agent from the web app: the controller orders the agent's bridge, which ends the session.
 
 The order is a system post to `stop:<address>` on the agent's machine. Only that bridge acts on
-it, only for a session its spawner started, and it never shows as a message in any conversation.
+it: a spawned session ends with its tmux session, any other with its own process. The order
+never shows as a message in any conversation.
 """
 
+import os
+import signal
+import subprocess
 import threading
 import time
 import uuid
@@ -35,8 +39,9 @@ from starlette.testclient import TestClient
 from one_conv.control import store as store_module
 from one_conv.control.server import application
 from one_conv.control.store import ControlStore
-from one_conv.live import bridge, spawn
+from one_conv.live import bridge, router, spawn
 from one_conv.live.hub import HubError
+from one_conv.live.model import LiveSession, pid_alive
 
 ORIGIN = "https://workspace.example.test"
 AGENT = "mac/claude:aaa"
@@ -167,8 +172,80 @@ def test_a_stop_not_issued_by_the_hub_is_refused(stopped):
     assert bridge.deliver_inbound(order(system=False))[0] == "refused"
 
 
-def test_a_session_the_spawner_did_not_start_is_refused(monkeypatch):
-    monkeypatch.setattr(spawn, "stop", lambda target: (_ for _ in ()).throw(spawn.SpawnError("no spawned agent")))
+def test_a_spawned_session_tmux_cannot_end_is_refused(monkeypatch):
+    monkeypatch.setattr(spawn, "stop", lambda target: (_ for _ in ()).throw(spawn.SpawnError("could not end")))
+    assert bridge.deliver_inbound(order())[0] == "refused"
+
+
+# --- a session the spawner did not start ends with its process --------------------------------------
+
+
+def orphan(command: str) -> int:
+    """Pid of a background process the test does not parent, so it is reaped as soon as it ends."""
+    return int(subprocess.run(["sh", "-c", f"{command} >/dev/null 2>&1 & echo $!"], capture_output=True,
+                              text=True, check=True).stdout)
+
+
+@pytest.fixture
+def not_spawned(monkeypatch):
+    monkeypatch.setattr(spawn, "stop", lambda target: (_ for _ in ()).throw(spawn.NotSpawned("no spawned agent")))
+
+
+def running_as(monkeypatch, pid, harness="claude"):
+    """The adapters list one live session `claude:aaa` run by `pid`."""
+    monkeypatch.setattr(router, "list_all", lambda harness_=None: [LiveSession(harness, "aaa", pid=pid)])
+
+
+@pytest.fixture
+def terminal_session(monkeypatch, not_spawned):
+    pid = orphan("sleep 60")
+    running_as(monkeypatch, pid)
+    yield pid
+    if pid_alive(pid):
+        os.kill(pid, signal.SIGKILL)
+
+
+@pytest.fixture
+def stubborn_session(monkeypatch, not_spawned):
+    """A session that ignores SIGTERM; an ignored signal stays ignored across exec."""
+    pid = orphan("(trap '' TERM; exec sleep 60)")
+    running_as(monkeypatch, pid)
+    monkeypatch.setattr(bridge, "KILL_GRACE_SECONDS", 0.5)
+    yield pid
+    if pid_alive(pid):
+        os.kill(pid, signal.SIGKILL)
+
+
+def test_a_terminal_session_is_stopped(terminal_session):
+    assert bridge.deliver_inbound(order())[0] == "accepted"
+
+
+def test_a_terminal_session_process_ends(terminal_session):
+    bridge.deliver_inbound(order())
+    assert not pid_alive(terminal_session)
+
+
+def test_a_session_ignoring_sigterm_is_killed(stubborn_session):
+    bridge.deliver_inbound(order())
+    assert not pid_alive(stubborn_session)
+
+
+def test_a_killed_session_says_so(stubborn_session):
+    assert bridge.deliver_inbound(order())[1].endswith("(killed)")
+
+
+def test_a_session_without_its_own_process_is_refused(monkeypatch, not_spawned):
+    running_as(monkeypatch, None, harness="claude")
+    assert bridge.deliver_inbound(order())[0] == "refused"
+
+
+def test_a_session_not_live_here_is_refused(monkeypatch, not_spawned):
+    monkeypatch.setattr(router, "list_all", lambda harness=None: [])
+    assert bridge.deliver_inbound(order())[0] == "refused"
+
+
+def test_the_bridge_never_signals_itself(monkeypatch, not_spawned):
+    running_as(monkeypatch, os.getpid())
     assert bridge.deliver_inbound(order())[0] == "refused"
 
 

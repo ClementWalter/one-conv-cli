@@ -49,18 +49,22 @@ def payload(*questions, session="s1"):
 def posted(monkeypatch):
     """The workspace post: records the text, and succeeds."""
     texts = []
-    monkeypatch.setattr(ask, "_post", lambda session_id, text: texts.append(text) or True)
+    monkeypatch.setattr(ask, "_post", lambda session_id, text, reply="expected": texts.append(text) or True)
     return texts
 
 
 @pytest.fixture
 def answered(monkeypatch):
-    """The human answers as soon as the question is posted."""
+    """The human answers as soon as the question is posted; returns what the hook posted."""
+    texts = []
+
     def reply(text):
-        def post(session_id, _):
+        def post(session_id, posted_text, reply="expected"):
+            texts.append(posted_text)
             ask.file_answer(session_id, "workspace/user", text)
             return True
         monkeypatch.setattr(ask, "_post", post)
+        return texts
     return reply
 
 
@@ -198,17 +202,30 @@ def test_the_hook_posts_the_question_to_the_workspace(posted):
     assert "Which framework?" in posted[0]
 
 
-def test_without_an_answer_in_time_the_tool_is_declined(posted):
-    assert ask.run_hook(payload(FRAMEWORK), wait=0)["hookSpecificOutput"]["permissionDecision"] == "deny"
+def test_without_an_answer_in_time_the_terminal_asks(posted):
+    assert ask.run_hook(payload(FRAMEWORK), wait=0) == {}
 
 
-def test_the_decline_tells_the_agent_the_answer_comes_as_a_message(posted):
-    assert "later as a one-conv message" in ask.run_hook(
-        payload(FRAMEWORK), wait=0)["hookSpecificOutput"]["permissionDecisionReason"]
+def test_without_an_answer_in_time_the_workspace_is_sent_to_the_terminal(posted):
+    ask.run_hook(payload(FRAMEWORK), wait=0)
+    assert "moved to my terminal" in posted[1]
+
+
+def test_an_answered_question_sends_no_terminal_notice(answered):
+    texts = answered("Vue")
+    ask.run_hook(payload(FRAMEWORK), wait=5)
+    assert len(texts) == 1
+
+
+def test_the_terminal_notice_expects_no_reply(monkeypatch):
+    replies = []
+    monkeypatch.setattr(ask, "_post", lambda session_id, text, reply="expected": replies.append(reply) or True)
+    ask.run_hook(payload(FRAMEWORK), wait=0)
+    assert replies == ["expected", "none"]
 
 
 def test_a_question_that_could_not_be_posted_is_left_to_the_terminal(monkeypatch):
-    monkeypatch.setattr(ask, "_post", lambda session_id, text: False)
+    monkeypatch.setattr(ask, "_post", lambda session_id, text, reply="expected": False)
     assert ask.run_hook(payload(FRAMEWORK), wait=5) == {}
 
 
@@ -239,7 +256,7 @@ def test_an_answer_arriving_while_the_hook_waits_is_used(posted, monkeypatch):
 HOOK = """
 import json, sys
 from one_conv.live import ask
-ask._post = lambda session_id, text: True
+ask._post = lambda session_id, text, reply="expected": True
 print(json.dumps(ask.run_hook(json.loads(sys.argv[1]), wait=60)))
 """
 

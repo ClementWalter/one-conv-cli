@@ -191,3 +191,38 @@ def test_a_missing_uv_is_installed_from_the_pinned_installer(worker_home, monkey
     monkeypatch.setattr(bootstrap, "run", lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
     bootstrap.install_uv()
     assert calls[0][-1] == f"https://astral.sh/uv/{bootstrap.UV_VERSION}/install.sh"
+
+
+@pytest.fixture
+def detached_clone(tmp_path):
+    """A clone of a two-commit repository, left on its first commit by an old pinned checkout."""
+    def git(*args, cwd=tmp_path):
+        return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git("init", "-q", "-b", "main", cwd=origin)
+    for message in ("first", "second"):
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", message, cwd=origin)
+    git("clone", "-q", str(origin), "clone")
+    clone = tmp_path / "clone"
+    git("checkout", "-q", "--detach", "HEAD~1", cwd=clone)
+    return clone, git
+
+
+def test_a_detached_clone_goes_back_to_its_default_branch(detached_clone):
+    clone, git = detached_clone
+    bootstrap.on_default_branch(clone, dict(os.environ))
+    assert git("symbolic-ref", "--short", "HEAD", cwd=clone) == "main"
+
+
+def test_a_detached_clone_is_brought_up_to_date(detached_clone):
+    clone, git = detached_clone
+    bootstrap.on_default_branch(clone, dict(os.environ))
+    assert git("log", "-1", "--format=%s", cwd=clone) == "second"
+
+
+def test_a_clone_on_a_branch_is_left_alone(detached_clone):
+    clone, git = detached_clone
+    git("checkout", "-q", "-b", "work", cwd=clone)
+    bootstrap.on_default_branch(clone, dict(os.environ))
+    assert git("symbolic-ref", "--short", "HEAD", cwd=clone) == "work"

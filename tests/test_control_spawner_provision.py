@@ -255,3 +255,45 @@ def test_an_offline_box_is_not_a_drift(provisioned, monkeypatch):
     monkeypatch.setattr(runtime.time, "time", lambda: time.monotonic() + 10**10)
     assert runtime._drifted(provisioned.config["hub"], "cloudbox",
                             json.loads((provisioned.directory / "spawner.json").read_text())) is False
+
+
+# --- a running box whose bridge never publishes --------------------------------------------------
+
+def up_for(manager, seconds):
+    """The box has been running for `seconds`, as the controller recorded it."""
+    record = json.loads((manager.directory / "spawner.json").read_text())
+    record["up_since"] = time.time() - seconds
+    (manager.directory / "spawner.json").write_text(json.dumps(record))
+
+
+def test_a_box_whose_bridge_stays_silent_is_provisioned_again(provisioned):
+    up_for(provisioned, runtime.SPAWNER_SILENT_SECONDS + 1)
+    assert provision_spawner(provisioned, {**SPAWNER, "box": "bx_cloud"}, wanted=False) == "provisioned"
+
+
+def test_a_silent_box_is_provisioned_even_while_a_request_waits(provisioned):
+    up_for(provisioned, runtime.SPAWNER_SILENT_SECONDS + 1)
+    assert provision_spawner(provisioned, {**SPAWNER, "box": "bx_cloud"}, wanted=True) == "provisioned"
+
+
+def test_a_box_just_started_is_given_time_to_publish(provisioned):
+    up_for(provisioned, 5)
+    assert provision_spawner(provisioned, {**SPAWNER, "box": "bx_cloud"}, wanted=True) == "current"
+
+
+def test_a_box_whose_bridge_publishes_is_not_silent(provisioned):
+    up_for(provisioned, runtime.SPAWNER_SILENT_SECONDS + 1)
+    provisioned.config["hub"].publish("cloudbox", [], spawn="claude", revision=PROVISIONED)
+    assert provision_spawner(provisioned, {**SPAWNER, "box": "bx_cloud"}, wanted=True) == "current"
+
+
+def test_a_running_box_records_when_it_started(manager):
+    provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=True)
+    assert "up_since" in json.loads((manager.directory / "spawner.json").read_text())
+
+
+def test_a_stopped_box_forgets_when_it_started(manager):
+    provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=True)
+    manager.boat.state = "stopped"
+    provision_spawner(manager, {**SPAWNER, "box": "bx_cloud"}, wanted=True)
+    assert "up_since" not in json.loads((manager.directory / "spawner.json").read_text())

@@ -121,7 +121,7 @@ def test_bad_spawner_payloads_are_refused(spawner_payload, field, value):
 
 def test_a_spawner_follows_main(provisioned, spawner_payload):
     bootstrap.provision_spawner(spawner_payload)
-    assert provisioned[:2] == [["git", "-C", str(Path.home() / "Documents/one-conv-cli"), "checkout", "-q", "main"],
+    assert provisioned[:2] == [["git", "-C", str(Path.home() / "Documents/one-conv-cli"), "checkout", "-q", "-f", "main"],
                                ["git", "-C", str(Path.home() / "Documents/one-conv-cli"), "pull", "-q", "--ff-only"]]
 
 

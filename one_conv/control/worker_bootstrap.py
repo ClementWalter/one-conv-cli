@@ -256,7 +256,8 @@ def provision_spawner(data):
     global STAGE
     env = prepare_repositories(data)
     checkout = Path.home() / "Documents/one-conv-cli"
-    run(["git", "-C", str(checkout), "checkout", "-q", "main"], stage="checkout-main", env=env)
+    # -f restores every tracked file, such as a launcher symlink a snapshot restore brought back as an old file.
+    run(["git", "-C", str(checkout), "checkout", "-q", "-f", "main"], stage="checkout-main", env=env)
     run(["git", "-C", str(checkout), "pull", "-q", "--ff-only"], stage="checkout-pull", env=env)
     revision = run(["git", "-C", str(checkout), "rev-parse", "HEAD"], stage="checkout-head", env=env).stdout.strip()
     git_user = data["git_user"]

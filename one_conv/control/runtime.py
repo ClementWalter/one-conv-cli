@@ -306,13 +306,26 @@ def _drifted(hub, node: str, record: dict) -> bool:
     return revision is None or (updated > record.get("at", 0.0) and revision != record["revision"])
 
 
+# A running box whose bridge has not published for this long is broken, not starting.
+SPAWNER_SILENT_SECONDS = 120
+
+
+def _silent(hub, node: str, record: dict, now: float) -> bool:
+    """Whether the box has run for SPAWNER_SILENT_SECONDS without its bridge publishing since."""
+    up_since = record.get("up_since")
+    if up_since is None or now - up_since < SPAWNER_SILENT_SECONDS:
+        return False
+    seen = hub.node_seen(node)
+    return seen is None or seen < max(up_since, now - LEASE_SECONDS)
+
+
 def provision_spawner(manager, spawner: dict, wanted: bool) -> str:
     """Keep the spawner box built from code: create it when there is none, and run the helper's
     `spawner` operation on it whenever this controller's revision, the spawner settings, or the git
     identity the human's machine reports change.
 
-    A sleeping box is provisioned when it next runs, and never while a request waits for it, since
-    provisioning restarts its bridge.
+    A sleeping box is provisioned when it next runs. A request waiting for it delays provisioning,
+    which restarts its bridge, unless the box drifted from its provisioned checkout or its bridge is silent.
     """
     import json
 
@@ -336,13 +349,24 @@ def provision_spawner(manager, spawner: dict, wanted: bool) -> str:
     elif record.get("box") != box:
         record = {"box": box}
     spawner["box"] = box
+    # When the box started running, so a bridge that never comes up is noticed.
+    available = machine_status(state) == "available"
+    if available != ("up_since" in record):
+        if available:
+            record["up_since"] = time.time()
+        else:
+            record.pop("up_since", None)
+        private_json(record_path, record)
     # The box commits as the human's own machine does; until one has reported its identity, nothing is set up.
     git_user = manager.config["hub"].git_identity(exclude=settings["node"])
     if git_user is None:
         return "waiting"
     payload = spawner_payload(manager, spawner, git_user)
     fingerprint = _fingerprint(payload, _revision())
-    drifted = record.get("fingerprint") == fingerprint and _drifted(manager.config["hub"], settings["node"], record)
+    # A restored box can come back with files older than its last provisioning, or a bridge that cannot start.
+    drifted = record.get("fingerprint") == fingerprint and (
+        _drifted(manager.config["hub"], settings["node"], record)
+        or _silent(manager.config["hub"], settings["node"], record, time.time()))
     if record.get("fingerprint") == fingerprint and not drifted:
         return "current"
     # A box whose checkout left what it was provisioned at serves no request well, so drift is fixed even then.
@@ -362,7 +386,8 @@ def provision_spawner(manager, spawner: dict, wanted: bool) -> str:
         return "failed"
     record.update(fingerprint=fingerprint, revision=health.get("revision"), at=time.time())
     if drifted:
-        log.warning("cloud spawner box %s had left its provisioned checkout; provisioned it again", box)
+        log.warning("cloud spawner box %s had left its provisioned checkout or its bridge was silent;"
+                    " provisioned it again", box)
     # Only a failure delays the next attempt.
     record.pop("tried", None)
     private_json(record_path, record)

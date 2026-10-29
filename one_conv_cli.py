@@ -1528,7 +1528,8 @@ def _chatgpt_authenticate(jar: dict[str, str]) -> dict | None:
         return None
     if payload.get("error"):
         # A stale token comes back with RefreshAccessTokenError and is refused by every API route.
-        log.warning("A ChatGPT session has expired; sign in again with: one-conv cloud chatgpt connect --login")
+        log.warning("A ChatGPT session has expired; sign in to chatgpt.com in Chrome again, "
+                    "or renew a one-conv login with: one-conv cloud chatgpt connect --login")
         return None
     account = payload.get("account") or {}
     session.headers["Authorization"] = f"Bearer {token}"

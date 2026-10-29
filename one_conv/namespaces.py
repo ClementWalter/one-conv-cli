@@ -246,8 +246,7 @@ def _pull(sync, name, product):
             except ProviderError as error:
                 raise click.ClickException(str(error)) from None
             if not accounts:
-                raise click.ClickException("No browser session is accessible without prompting. "
-                                           f"Run one-conv cloud {name} accounts to inspect access.")
+                raise click.ClickException("No browser session is accessible without prompting. " + _connect_hint(name))
             if len(accounts) > 1:
                 raise click.ClickException(f"Several accounts are available. Run one-conv cloud {name} accounts "
                                            "and select one with --account.")
@@ -271,6 +270,16 @@ def _pull(sync, name, product):
                          context_settings=HELP_SETTINGS)
 
 
+# The site each product signs in on; Codex cloud uses the ChatGPT account.
+SIGN_IN_SITES = {"chatgpt": "chatgpt.com", "codex": "chatgpt.com", "claude": "claude.ai", "cowork": "claude.ai"}
+
+
+def _connect_hint(name):
+    """The setup step that makes a browser session readable, in words that work from Claude too."""
+    return (f"Sign in to {SIGN_IN_SITES.get(name, 'the provider')} in Chrome, then run "
+            f"`one-conv cloud {name} connect` once and choose Always Allow in the macOS dialog.")
+
+
 def _accounts(name):
     """Expose verified selectors without serializing HTTP sessions or credentials."""
     import json
@@ -285,13 +294,13 @@ def _accounts(name):
                     for account in callback()]
         except ProviderError as error:
             raise click.ClickException(str(error)) from None
+        if not rows:
+            click.echo("No browser account is accessible without prompting. " + _connect_hint(name), err=True)
         if as_json:
             click.echo(json.dumps(rows))
-        elif rows:
+        else:
             for row in rows:
                 click.echo(f"{row['account_id']}  {row['email'] or row['organization_label'] or ''}")
-        else:
-            click.echo("No browser account is accessible without prompting. Sign in to the provider and authorize session access during setup.")
 
     return click.Command("accounts", callback=invoke,
                          params=[click.Option(["--json", "as_json"], is_flag=True, help="Emit safe account metadata as JSON.")],

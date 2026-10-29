@@ -1,0 +1,18 @@
+# Claude Desktop extension: a v* tag publishes one-conv-cli.mcpb on its GitHub release.
+name: extension
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  extension:
+    permissions:
+      contents: write
+    uses: ClementWalter/mcp-bridge/.github/workflows/extension.yml@613771d874e4b329ea6be596212f74476fe9fc48
+    with:
+      launcher: bin/one-conv
+      bridge-ref: 613771d874e4b329ea6be596212f74476fe9fc48

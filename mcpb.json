@@ -1,0 +1,32 @@
+{
+  "display_name": "One Conv",
+  "description": "Read and search your ChatGPT, Claude, Codex and Cowork conversations from Claude.",
+  "long_description": "Brings your conversation history from ChatGPT, Claude (claude.ai chats), Codex cloud and Cowork into Claude: list your conversations, read one in full, and search everything you have said or been told, across products.\n\nSetup:\n1. In Google Chrome (or Arc, Brave, Edge), sign in to the products you want to read: https://chatgpt.com, https://claude.ai.\n2. In Claude, ask: \"connect one-conv to my ChatGPT\". Claude runs the connect tool and macOS asks whether \"credential-helper\" may use the \"Chrome Safe Storage\" keychain item: type your Mac password and click Always Allow. This is how the extension reuses your browser session, once; later reads never ask again.\n3. Ask: \"pull my ChatGPT history\". Claude copies your conversations onto this Mac (100 by default, more on request), then can list, read and search them, e.g. \"what did ChatGPT tell me about my mortgage last spring?\".\n\nYour conversations stay on this Mac, in a local history that only you and Claude read; nothing is sent anywhere else. If Claude says a session expired, sign in to the product in Chrome again and ask it to pull once more.",
+  "platforms": ["darwin"],
+  "python": "3.12",
+  "build": {
+    "command": ["uv", "run", "--script", "scripts/build-credential-helper.py"],
+    "include": ["one_conv/native/dist/credential-helper"]
+  },
+  "tools": [
+    "cloud providers",
+    "cloud cached-accounts",
+    "cloud chats",
+    "cloud unread",
+    "cloud find",
+    "cloud search",
+    "cloud read",
+    "cloud chatgpt accounts",
+    "cloud chatgpt connect",
+    "cloud chatgpt pull",
+    "cloud claude accounts",
+    "cloud claude connect",
+    "cloud claude pull",
+    "cloud codex accounts",
+    "cloud codex connect",
+    "cloud codex pull",
+    "cloud cowork accounts",
+    "cloud cowork connect",
+    "cloud cowork pull"
+  ]
+}

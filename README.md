@@ -2,7 +2,11 @@
 
 **Visibility: public.**
 
-**Extension: not shipped** as a Claude Desktop extension: it is tooling for the author's own agent sessions and machines.
+**Claude Desktop extension:** download
+[one-conv-cli.mcpb](https://github.com/ClementWalter/one-conv-cli/releases/latest/download/one-conv-cli.mcpb),
+double-click it and click Install. It serves the `cloud` commands only
+(ChatGPT, Claude Chat, Codex cloud, Cowork), and ships the credential helper
+prebuilt so `connect` needs no developer tools.
 
 Read and search your AI conversations from one CLI. Pull cloud conversations
 into a local history, or read sessions already saved by your coding tools.
@@ -869,6 +873,12 @@ from root help. Their project-based behavior differs from the cloud namespace.
 [LEGACY_COMMANDS.md](LEGACY_COMMANDS.md) documents that interface, including the
 older ChatGPT sync and asset-download workflow. Use `cloud` and `local` for new
 integrations.
+
+## Privacy Policy
+
+The Claude Desktop extension built from this repository keeps your data on your
+Mac and talks only to the service it connects to. Full policy:
+<https://clementwalter.github.io/claude-extensions/privacy/>
 
 ## Tests
 

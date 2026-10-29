@@ -34,6 +34,17 @@ def helper(monkeypatch, tmp_path):
     path = tmp_path / "OneConv" / "credential-helper-v1"
     monkeypatch.setattr(native_auth.sys, "platform", "darwin")
     monkeypatch.setattr(native_auth, "helper_path", lambda: path)
+    # A developer checkout may hold a real prebuilt helper; tests opt in explicitly.
+    monkeypatch.setattr(native_auth, "PREBUILT", tmp_path / "no-prebuilt-helper")
+    return path
+
+
+@pytest.fixture
+def prebuilt(monkeypatch, tmp_path):
+    path = tmp_path / "dist" / "credential-helper"
+    path.parent.mkdir()
+    path.write_bytes(b"synthetic universal executable")
+    monkeypatch.setattr(native_auth, "PREBUILT", path)
     return path
 
 
@@ -141,3 +152,37 @@ def test_build_failure_is_sanitized(monkeypatch, helper, tmp_path):
     monkeypatch.setattr(native_auth.subprocess, "run", fail)
     with pytest.raises(native_auth.NativeAuthError, match="Could not build"):
         native_auth.ensure_helper()
+
+
+def test_prebuilt_helper_installs_without_compiling(monkeypatch, helper, prebuilt):
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command[0])
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+    monkeypatch.setattr(native_auth.subprocess, "run", run)
+    native_auth.ensure_helper()
+    assert calls == ["/usr/bin/codesign"]
+
+
+def test_prebuilt_helper_is_copied_into_place(monkeypatch, helper, prebuilt):
+    monkeypatch.setattr(native_auth.subprocess, "run", lambda c, **kw: subprocess.CompletedProcess(c, 0, b"", b""))
+    assert native_auth.ensure_helper().read_bytes() == b"synthetic universal executable"
+
+
+def test_prebuilt_helper_failing_its_signature_is_not_installed(monkeypatch, helper, prebuilt):
+    def fail(command, **kwargs):
+        raise subprocess.CalledProcessError(1, command)
+    monkeypatch.setattr(native_auth.subprocess, "run", fail)
+    with pytest.raises(native_auth.NativeAuthError, match="reinstall the extension"):
+        native_auth.ensure_helper()
+
+
+def test_universal_build_targets_both_architectures(monkeypatch, tmp_path):
+    targets = []
+    def run(command, **kwargs):
+        if "-target" in command:
+            targets.append(command[command.index("-target") + 1].split("-")[0])
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+    monkeypatch.setattr(native_auth.subprocess, "run", run)
+    native_auth.build_helper(tmp_path / "credential-helper", universal=True)
+    assert targets == ["arm64", "x86_64"]

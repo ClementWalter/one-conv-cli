@@ -349,6 +349,8 @@ explicitly; do not represent them as a connected account with no messages.
 - Reading marks threads read unless `--no-mark-read` is passed.
 - `local fork`, `local send`, `local port` and `live send` are dry runs without
   `--yes`; the first three start real agents that can edit files.
+- The Claude Desktop extension serves only the `cloud` commands listed in
+  `mcpb.json` `tools`; `local`, `live`, `hr` and `tune` need the CLI.
 
 ## Mobile workspace and managed teammates
 

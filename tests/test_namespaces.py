@@ -419,6 +419,25 @@ def test_pull_reports_inaccessible_browser_instead_of_managed_file(app, monkeypa
     assert "No browser session is accessible without prompting" in result.output
 
 
+def test_pull_without_session_names_the_connect_step(app, monkeypatch):
+    monkeypatch.delenv("ONE_CONV_SESSION_FILE", raising=False)
+    monkeypatch.setattr(app, "_claude_accounts", lambda: iter(()))
+    result = CliRunner().invoke(app.cli, ["cloud", "claude", "pull"])
+    assert "Sign in to claude.ai in Chrome, then run `one-conv cloud claude connect`" in result.output
+
+
+def test_accounts_json_stays_parseable_without_session(app, monkeypatch):
+    monkeypatch.setattr(app, "_claude_accounts", lambda: iter(()))
+    result = CliRunner().invoke(app.cli, ["cloud", "claude", "accounts", "--json"])
+    assert json.loads(result.stdout) == []
+
+
+def test_accounts_without_session_names_the_connect_step(app, monkeypatch):
+    monkeypatch.setattr(app, "_claude_accounts", lambda: iter(()))
+    result = CliRunner().invoke(app.cli, ["cloud", "claude", "accounts", "--json"])
+    assert "Sign in to claude.ai in Chrome" in result.stderr
+
+
 def test_public_process_reads_saved_claude_messages(tmp_path):
     account = tmp_path / "account"
     account.mkdir()

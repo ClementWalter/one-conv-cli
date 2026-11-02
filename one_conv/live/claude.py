@@ -68,12 +68,20 @@ def session_title(session_id: str, cwd: str) -> str:
     return custom or generated
 
 
+def headless(data: dict) -> bool:
+    """A `claude -p` run or an Agent SDK program: it ends with its task, so nobody can converse with it."""
+    return str(data.get("entrypoint") or "").startswith("sdk")
+
+
 def list_sessions() -> list[LiveSession]:
-    """One entry per session id: two processes resuming the same session are one address, the latest active."""
+    """One entry per session id: two processes resuming the same session are one address, the latest active.
+
+    Headless runs are left out: they are tasks, not sessions anyone has open.
+    """
     records: dict[str, dict] = {}
     for path in sorted((claude_home() / "sessions").glob("*.json")):
         data = _record(path)
-        if not data or not pid_alive(data.get("pid")):
+        if not data or not pid_alive(data.get("pid")) or headless(data):
             continue
         kept = records.get(data["sessionId"])
         if kept is None or (data.get("updatedAt") or 0) > (kept.get("updatedAt") or 0):

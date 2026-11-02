@@ -188,7 +188,8 @@ function freshness(seconds) {
 }
 function presenceText(p) {
   const presence = presenceOf(p);
-  const label = { idle: "Connected · idle", busy: "Busy", unverified: "Connection unverified", offline: "Offline" }[presence.state] || presence.label;
+  const label = { idle: "Connected · idle", busy: "Busy", waiting: "Waiting for you", unverified: "Connection unverified",
+    offline: "Offline" }[presence.state] || presence.label;
   return label + (validDate(presence.last_seen) ? " · " + freshness(presence.last_seen) : "");
 }
 function personContext(p) {

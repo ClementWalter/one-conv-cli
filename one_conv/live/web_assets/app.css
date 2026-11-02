@@ -746,6 +746,7 @@ button {
 }
 .row-presence.busy { background: #7a87ca; }
 .row-presence.unverified { background: #b78538; }
+.row-presence.waiting { background: #d0663f; }
 .agent-state { font-size: 10px; }
 .conversation-response { padding: 9px 24px; color: var(--muted); background: var(--hover); font-size: 11px; line-height: 1.5; }
 .message-delivery { display: block; margin-top: 6px; color: var(--muted); font-size: 10px; }

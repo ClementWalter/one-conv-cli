@@ -161,6 +161,10 @@ def _summary(result, ident):
     path = _text(spawned.get("agent_path"), 256) if isinstance(spawned, dict) else ""
     # An idle internal child can be completed but retained; only its parent can establish autonomous availability.
     state = "loaded" if kind == "idle" and isinstance(source, dict) and "subAgent" in source else {"active": "busy", "idle": "idle"}.get(kind, "loaded")
+    flags = status.get("activeFlags") if isinstance(status, dict) else None
+    # An active turn held on an approval or a question is waiting for the human, as Claude Code reports it.
+    if kind == "active" and isinstance(flags, list) and {"waitingOnApproval", "waitingOnUserInput"} & set(flags):
+        state = "waiting"
     return {"status": state,
             "title": _text(thread.get("name"), 1024) or path, "cwd": _text(thread.get("cwd"))}
 

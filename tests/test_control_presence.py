@@ -36,7 +36,7 @@ def row():
 
 
 @pytest.mark.parametrize("status,state", [("loaded", "unverified"), ("", "unverified"), ("unfamiliar", "unverified"),
-                                        ("idle", "idle"), ("busy", "busy")])
+                                        ("idle", "idle"), ("busy", "busy"), ("waiting", "waiting")])
 def test_native_status_never_proves_model_availability(row, status, state):
     assert session_presence({**row, "status": status}, NOW)["state"] == state
 

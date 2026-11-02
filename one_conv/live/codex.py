@@ -15,6 +15,9 @@ from .model import LiveSession, live_home
 
 # The locks directory also holds bookkeeping files such as `.coordination.lock`.
 THREAD_ID = codex_rpc.THREAD_ID
+# Codex's background app-server holds every loaded thread, for terminals and the app alike, and keeps it
+# after the window on it closed: a thread silent this long is nobody's current conversation.
+UNATTENDED_SECONDS = float(os.environ.get("ONE_CONV_CODEX_UNATTENDED_HOURS", "2")) * 3600
 
 
 def codex_home() -> Path:
@@ -46,6 +49,22 @@ def _cwd(thread_id: str) -> str:
             continue
         return meta.get("payload", {}).get("cwd", "")
     return ""
+
+
+def _last_written(thread_id: str) -> float | None:
+    times = []
+    for path in (codex_home() / "sessions").rglob(f"rollout-*{thread_id}.jsonl"):
+        try:
+            times.append(path.stat().st_mtime)
+        except OSError:
+            continue
+    return max(times) if times else None
+
+
+def unattended(thread_id: str, now: float | None = None) -> bool:
+    """A thread whose rollout nothing wrote for UNATTENDED_SECONDS; `codex queue` still reaches it."""
+    written = _last_written(thread_id)
+    return written is not None and (time.time() if now is None else now) - written >= UNATTENDED_SECONDS
 
 
 def stopped_threads() -> dict:
@@ -98,7 +117,7 @@ def list_sessions() -> list[LiveSession]:
         sessions[ident] = LiveSession("codex", ident, metadata["cwd"] or (previous.cwd if previous else _cwd(ident)),
                                      (previous.title if previous else names.get(ident, "")) or metadata["title"],
                                      metadata["status"], None, "codex queue")
-    return [sessions[ident] for ident in sorted(sessions)]
+    return [sessions[ident] for ident in sorted(sessions) if not unattended(ident)]
 
 
 def stored_session(thread_id: str) -> LiveSession | None:

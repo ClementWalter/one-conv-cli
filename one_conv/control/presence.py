@@ -30,6 +30,9 @@ def session_presence(row, now):
     elif status in ("idle", "busy"):
         state, label = status, "Idle" if status == "idle" else "Busy"
         detail = f"The connected bridge reports this agent is {status}. Model access and responsiveness are not verified."
+    elif status == "waiting":
+        state, label = "waiting", "Waiting for you"
+        detail = "The agent is held on a permission or a question in its own app or terminal. Answer it there."
     else:
         state, label = "unverified", "Unverified"
         detail = ("The bridge is connected. The native thread is reported loaded, but agent responsiveness is unverified. "

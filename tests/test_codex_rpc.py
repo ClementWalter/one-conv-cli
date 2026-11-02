@@ -70,6 +70,13 @@ def test_native_runtime_status_maps_conservatively(metadata, native, expected):
     assert codex_rpc._summary(metadata, THREAD)["status"] == expected
 
 
+@pytest.mark.parametrize("flags,expected", [(["waitingOnApproval"], "waiting"), (["waitingOnUserInput"], "waiting"),
+                                         ([], "busy")])
+def test_an_active_turn_held_on_the_human_is_waiting(metadata, flags, expected):
+    metadata["thread"]["status"] = {"type": "active", "activeFlags": flags}
+    assert codex_rpc._summary(metadata, THREAD)["status"] == expected
+
+
 @pytest.mark.parametrize("native,expected", [("active", "busy"), ("idle", "loaded")])
 def test_internal_child_idle_does_not_claim_autonomous_availability(metadata, native, expected):
     metadata["thread"].update(status={"type": native}, source={"subAgent": {"thread_spawn": {"agent_path": "/root/reviewer"}}})

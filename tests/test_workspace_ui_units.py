@@ -112,3 +112,7 @@ def test_missing_topic_is_still_a_valid_stable_route(evaluate_ui):
 
 def test_saved_route_rejects_non_string_identity(evaluate_ui):
     assert evaluate_ui("validView({kind:'direct',key:{}})") is False
+
+
+def test_an_agent_held_on_the_human_reads_waiting_for_you(evaluate_ui):
+    assert evaluate_ui("presenceText({session:{presence:{state:'waiting',label:'Waiting for you'}}})") == "Waiting for you"

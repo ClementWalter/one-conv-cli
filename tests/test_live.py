@@ -228,6 +228,21 @@ def test_claude_session_picks_up_a_rename_made_after_the_last_read(homes):
     assert claude.list_sessions()[0].title == "second"
 
 
+def test_claude_skips_a_headless_print_run(homes):
+    _claude_record(homes, os.getpid(), entrypoint="sdk-cli")
+    assert claude.list_sessions() == []
+
+
+def test_claude_skips_an_agent_sdk_program(homes):
+    _claude_record(homes, os.getpid(), entrypoint="sdk-ts")
+    assert claude.list_sessions() == []
+
+
+def test_claude_lists_a_terminal_session(homes):
+    _claude_record(homes, os.getpid(), entrypoint="cli")
+    assert [s.address for s in claude.list_sessions()] == ["claude:c1"]
+
+
 def test_claude_skips_exited_session(homes, dead_pid):
     _claude_record(homes, dead_pid)
     assert claude.list_sessions() == []

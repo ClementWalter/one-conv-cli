@@ -19,7 +19,8 @@
 # [tool.uv]
 # exclude-newer = "2026-10-27T00:00:00Z"
 # ///
-"""On the phone, every unread counted in the title can be found: an ended agent's unread DM stays listed."""
+"""On the phone, every unread counted in the title can be found: an ended agent's unread DM is listed under
+Ended sessions, never among the current connections."""
 
 import time
 
@@ -64,16 +65,24 @@ def workspace_ui(paired):
     return page
 
 
-def test_an_ended_agent_with_unread_messages_is_listed(workspace_ui):
-    assert workspace_ui.locator("#people button.unread").filter(has_text="@gone").count() == 1
+def test_an_ended_agent_with_unread_messages_is_listed_as_ended(workspace_ui):
+    assert workspace_ui.locator("#ended button.unread").filter(has_text="@gone").count() == 1
 
 
-def test_an_agent_gone_from_the_directory_with_unread_messages_is_listed(workspace_ui):
-    assert workspace_ui.locator("#people button.unread").filter(has_text="vanished").count() == 1
+def test_an_agent_gone_from_the_directory_with_unread_messages_is_listed_as_ended(workspace_ui):
+    assert workspace_ui.locator("#ended button.unread").filter(has_text="vanished").count() == 1
+
+
+def test_an_ended_agent_is_not_a_current_connection(workspace_ui):
+    assert workspace_ui.locator("#people button").count() == 0
+
+
+def test_the_ended_section_counts_its_sessions(workspace_ui):
+    assert workspace_ui.locator("#ended-count").inner_text() == "2"
 
 
 def test_an_ended_agent_with_nothing_unread_is_not_listed(workspace_ui):
-    assert workspace_ui.locator("#people button").filter(has_text="@quiet").count() == 0
+    assert workspace_ui.locator("#ended button").filter(has_text="@quiet").count() == 0
 
 
 def test_an_archived_channel_does_not_add_to_the_title(workspace_ui):

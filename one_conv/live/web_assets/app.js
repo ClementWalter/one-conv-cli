@@ -483,10 +483,12 @@ function sidebar() {
   $("archived-section").hidden = !archived.children.length;
   renderRoutines();
   // A conversation with a session opens from its row among the running sessions, with its unread count.
-  const people = $("people");
+  const people = $("people"), endedList = $("ended");
   people.replaceChildren();
-  // Sessions come and go: only the running ones are listed; past ones live on in their channels.
-  // An ended session stays listed while its direct messages are unread, so every unread count is reachable.
+  endedList.replaceChildren();
+  // Sessions come and go: only the running ones are current connections; past ones live on in their channels.
+  // An ended session is listed under Ended sessions while its direct messages are unread, so every unread
+  // count is reachable without passing for a connection.
   const listed = model.state.sessions.map((session) => session.address);
   const kept = (pair) => threadUnread(pair) > 0 || (model.view?.kind === "direct" && model.view.key === pair);
   const ended = model.threads.filter((thread) => thread.pair.split(" ").includes("user") && kept(thread.pair))
@@ -497,7 +499,7 @@ function sidebar() {
     const state = presenceOf(p);
     if (state.state === "offline" && !kept(pairOf(session.address))) continue;
     const button = rowButton(
-      people,
+      state.state === "offline" ? endedList : people,
       p.name,
       avatar(session.address, "tiny-avatar"),
       model.view &&
@@ -533,6 +535,8 @@ function sidebar() {
       },
     ]);
   }
+  $("ended-section").hidden = !endedList.children.length;
+  $("ended-count").textContent = endedList.children.length || "";
   if (!people.children.length)
     people.appendChild(
       el("li", "No session is running right now.", "sidebar-empty"),

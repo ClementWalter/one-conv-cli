@@ -269,6 +269,25 @@ def test_codex_lists_loaded_thread_with_name(homes):
         (f"codex:{THREAD}", "Fix tests", "/work/api")]
 
 
+def _silent_for_hours(homes, hours, thread_id=THREAD):
+    """Back-dates the thread's rollout, as a thread nobody wrote to for `hours`."""
+    for path in (homes / "codex" / "sessions").rglob(f"rollout-*{thread_id}.jsonl"):
+        then = time.time() - hours * 3600
+        os.utime(path, (then, then))
+
+
+def test_codex_hides_a_thread_silent_for_hours(homes):
+    _codex_thread(homes)
+    _silent_for_hours(homes, 3)
+    assert codex.list_sessions() == []
+
+
+def test_codex_lists_a_thread_written_recently(homes):
+    _codex_thread(homes)
+    _silent_for_hours(homes, 1)
+    assert [s.address for s in codex.list_sessions()] == [f"codex:{THREAD}"]
+
+
 def test_codex_ignores_bookkeeping_locks(homes):
     (homes / "codex" / "thread-writer-locks").mkdir()
     (homes / "codex" / "thread-writer-locks" / ".coordination.lock").touch()

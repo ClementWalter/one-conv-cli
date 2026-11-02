@@ -537,8 +537,10 @@ def test_an_announcement_is_not_staffed(hub):
 class StubBoat:
     """Records Boat calls against one sandbox in a given machine state."""
 
-    def __init__(self, state, snapshot="2026-10-26T08:00:00Z"):
-        self.state, self.snapshot, self.calls = state, snapshot, []
+    def __init__(self, state, snapshot=None):
+        # A fresh snapshot by default, an hour old whenever the suite runs.
+        fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
+        self.state, self.snapshot, self.calls = state, snapshot or fresh, []
 
     def info(self, box):
         self.calls.append(("info", box))

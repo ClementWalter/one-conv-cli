@@ -32,8 +32,8 @@ from pathlib import Path
 
 import pytest
 
-from one_conv.live import ask, bridge, claude, install, router
-from one_conv.live.model import LiveSession
+from one_conv.live import ask, bridge, claude, install, router, spawn
+from one_conv.live.model import LiveSession, envelope
 
 FRAMEWORK = {"question": "Which framework?", "header": "Framework", "multiSelect": False,
              "options": [{"label": "React", "description": "Most used"}, {"label": "Vue"}]}
@@ -310,3 +310,74 @@ def test_install_ask_hook_replaces_one_from_another_checkout(claude_home):
     ask_step().apply()
     assert [entry["matcher"] for entry in json.loads((claude_home / "settings.json").read_text())["hooks"]["PreToolUse"]] == [
         "Bash", "AskUserQuestion"]
+
+
+# --- who drives the session ----------------------------------------------------------------------------
+
+TYPED = {"type": "user", "origin": {"kind": "human"}, "promptSource": "typed",
+         "message": {"role": "user", "content": "build it"}}
+
+
+def delivered(text: str) -> dict:
+    """A message the bridge delivered through the socket, as Claude Code records it."""
+    return {"type": "user", "isMeta": True, "origin": {"kind": "peer", "from": "unknown"}, "promptSource": "system",
+            "message": {"role": "user", "content": f"Another Claude session sent a message:\n{text}"}}
+
+
+FROM_WORKSPACE = delivered(envelope("go on", None, "workspace/user"))
+FROM_AGENT = delivered(envelope("done", LiveSession("claude", "peer1", "/repo", "Peer")))
+
+
+@pytest.fixture
+def transcript(tmp_path):
+    """Writes the session's transcript from its entries; returns the hook payload pointing at it."""
+    def write(*entries):
+        path = tmp_path / "s1.jsonl"
+        path.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+        return {**payload(FRAMEWORK), "transcript_path": str(path)}
+    return write
+
+
+@pytest.fixture
+def spawned():
+    """Registers session s1 as an agent the spawner started in tmux."""
+    spawn._save({"oneconv-claude-1": {"tmux": "oneconv-claude-1", "harness": "claude", "address": "claude:s1"}})
+
+
+def test_a_session_typed_in_its_terminal_asks_there_at_once(posted, transcript):
+    assert ask.run_hook(transcript(TYPED), wait=5) == {}
+
+
+def test_a_session_typed_in_its_terminal_posts_nothing(posted, transcript):
+    ask.run_hook(transcript(TYPED), wait=0)
+    assert posted == []
+
+
+def test_a_session_last_driven_from_the_workspace_asks_the_workspace(posted, transcript):
+    ask.run_hook(transcript(TYPED, FROM_WORKSPACE), wait=0)
+    assert "Which framework?" in posted[0]
+
+
+def test_an_agent_message_leaves_the_question_in_the_terminal(posted, transcript):
+    ask.run_hook(transcript(TYPED, FROM_AGENT), wait=0)
+    assert posted == []
+
+
+def test_a_spawned_agent_launch_prompt_asks_the_workspace(posted, transcript, spawned):
+    ask.run_hook(transcript(TYPED, FROM_AGENT), wait=0)
+    assert "Which framework?" in posted[0]
+
+
+def test_a_spawned_agent_typed_into_later_asks_its_terminal(posted, transcript, spawned):
+    ask.run_hook(transcript(TYPED, FROM_WORKSPACE, TYPED), wait=0)
+    assert posted == []
+
+
+def test_a_subagent_prompt_is_not_the_human_typing(posted, transcript):
+    ask.run_hook(transcript(FROM_WORKSPACE, {**TYPED, "isSidechain": True}), wait=0)
+    assert "Which framework?" in posted[0]
+
+
+def test_a_missing_transcript_asks_the_workspace(posted, tmp_path):
+    ask.run_hook({**payload(FRAMEWORK), "transcript_path": str(tmp_path / "gone.jsonl")}, wait=0)
+    assert "Which framework?" in posted[0]

@@ -9,11 +9,15 @@ A question still unanswered when the wait ends goes back to the terminal, and th
 so: a reply there would only be queued behind the terminal's dialog, not answer it.
 A question that could not be posted is left to the terminal too. A pending question is only answered
 while its hook process lives: one killed mid-wait (an interrupt) lets later messages through.
+A session the human is driving from its terminal asks there at once: the hook routes a question to
+the workspace only when the latest human input came from it, or when no human typed in the terminal
+(a spawned agent working from teammates' messages).
 """
 
 import json
 import logging
 import os
+import re
 import signal
 import threading
 import time
@@ -32,6 +36,10 @@ POLL_SECONDS = 1.0
 # What the human reads when the wait ends unanswered; it also closes the question's form in the web app.
 MOVED = ("No answer here in {minutes} min, so this question moved to my terminal. Open the session's terminal "
          "to answer it there; a reply here will not answer it.")
+
+
+# The human sender of a delivered message, as the envelope labels it.
+_HUMAN_ENVELOPE = re.compile(r'<one-conv-message from="[^"]*" kind="human"')
 
 
 def asks_dir() -> Path:
@@ -126,11 +134,56 @@ def _post(session_id: str, text: str, reply: str = "expected") -> bool:
     return True
 
 
+def _text(entry: dict) -> str:
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, list):
+        return "\n".join(block.get("text", "") for block in content if isinstance(block, dict))
+    return content if isinstance(content, str) else ""
+
+
+def _spawned(session_id: str) -> bool:
+    from . import spawn
+    return any(row.get("address") == f"claude:{session_id}" for row in spawn._load().values())
+
+
+def driven_from_terminal(transcript_path: str | None, session_id: str) -> bool:
+    """Whether the latest human input in the session was typed in its terminal.
+
+    Claude Code labels each prompt's origin: `human` for the terminal, `peer` for a message
+    delivered through the socket, whose envelope says whether a human or an agent sent it.
+    A spawned agent's launch prompt is typed by the spawner, not by a human.
+    """
+    if not transcript_path:
+        return False
+    try:
+        lines = Path(transcript_path).read_text(errors="replace").splitlines()
+    except OSError:
+        return False
+    terminal, launch = False, _spawned(session_id)
+    for line in lines:
+        if '"origin"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        origin = entry.get("origin")
+        if entry.get("type") != "user" or entry.get("isSidechain") or not isinstance(origin, dict):
+            continue
+        if origin.get("kind") == "human":
+            terminal, launch = not launch, False
+        elif origin.get("kind") == "peer" and _HUMAN_ENVELOPE.search(_text(entry)):
+            terminal = False
+    return terminal
+
+
 def run_hook(payload: dict, wait: float = WAIT_SECONDS) -> dict:
     """PreToolUse hook for AskUserQuestion: the workspace's answer, or {} to let the terminal ask."""
     tool_input = payload.get("tool_input") or {}
     questions, session_id = tool_input.get("questions"), payload.get("session_id")
     if payload.get("tool_name") != "AskUserQuestion" or not questions or not session_id or tool_input.get("answers"):
+        return {}
+    if driven_from_terminal(payload.get("transcript_path"), session_id):
         return {}
     asks_dir().mkdir(parents=True, exist_ok=True)
     _answer(session_id).unlink(missing_ok=True)

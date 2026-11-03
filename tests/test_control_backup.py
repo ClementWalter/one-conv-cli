@@ -210,6 +210,27 @@ def test_a_restored_archive_has_a_new_generation(pulled, tmp_path, controller):
     assert restored != original
 
 
+def test_an_interrupted_restore_leaves_no_controller(pulled, tmp_path, monkeypatch):
+    monkeypatch.setattr(backup, "_sqlite_copy", lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        backup.restore(pulled, tmp_path / "restored")
+    assert not (tmp_path / "restored").exists()
+
+
+def test_a_restore_runs_again_after_an_interruption(pulled, tmp_path, monkeypatch):
+    with monkeypatch.context() as patched:
+        patched.setattr(backup, "_sqlite_copy", lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+        with pytest.raises(KeyboardInterrupt):
+            backup.restore(pulled, tmp_path / "restored")
+    assert backup.restore(pulled, tmp_path / "restored")["archive"] is True
+
+
+def test_restore_fills_an_empty_directory(pulled, tmp_path):
+    (tmp_path / "restored").mkdir()
+    backup.restore(pulled, tmp_path / "restored")
+    assert (tmp_path / "restored" / "hub.sqlite3").exists()
+
+
 def test_restore_refuses_a_directory_with_a_hub(pulled, controller):
     with pytest.raises(FileExistsError):
         backup.restore(pulled, controller)
@@ -224,6 +245,11 @@ def test_the_restore_command_reports_what_it_restored(pulled, tmp_path):
 def test_a_restored_state_is_private(pulled, tmp_path):
     backup.restore(pulled, tmp_path / "restored")
     assert (tmp_path / "restored" / "hub.sqlite3").stat().st_mode & 0o077 == 0
+
+
+def test_a_restored_archive_is_private(pulled, tmp_path):
+    backup.restore(pulled, tmp_path / "restored")
+    assert (tmp_path / "restored" / backup.ARCHIVE_DB).stat().st_mode & 0o077 == 0
 
 
 def test_the_mirror_is_private(pulled):

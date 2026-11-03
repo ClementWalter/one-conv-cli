@@ -57,7 +57,8 @@ one-conv live control restore --from ./controller-backup
 one-conv live control serve --origin https://new-origin.example --config control.json
 ```
 
-`restore` refuses a directory that already holds a hub. Node tokens keep
+`restore` refuses a non-empty directory and builds the new one in a staging
+folder renamed into place last, so an interrupted run simply runs again. Node tokens keep
 working, so each bridge only needs the new hub URL. The restored archive gets
 a new generation, so readers drop cached listings, and each machine re-uploads
 any of its sessions written after the backup.

@@ -106,6 +106,9 @@ def mirror_cursor(database: Path, table: str) -> int:
 
 def apply_page(database: Path, page: dict) -> int:
     """Write one page into the mirror in a single transaction, keeping the controller's rowids."""
+    if not database.exists():
+        # The mirror holds every node's conversations: private from its first byte.
+        os.close(os.open(database, os.O_WRONLY | os.O_CREAT, 0o600))
     with sqlite3.connect(database) as db:
         for sql in page["schema"]:
             db.execute(sql.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)

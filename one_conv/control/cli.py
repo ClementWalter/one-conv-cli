@@ -114,4 +114,22 @@ def build_control_group():
         count = AuthStore(context.obj["control_directory"]).revoke_all_sessions()
         click.echo(f"Revoked {count} browser session(s).")
 
+    @control.command("restore", epilog="\b\nExamples:\n  one-conv live control restore --from ~/controller-backup\n  one-conv live control --directory /srv/control restore --from /mnt/backup --json")
+    @click.option("--from", "source", type=click.Path(exists=True, file_okay=False, path_type=Path), required=True,
+                  help="A folder pulled by `one-conv backup-controller`: state/state-*.tar.gz and archive.db.")
+    @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+    @click.pass_context
+    def restore(context, source, as_json):
+        """Rebuild an empty controller directory from an off-box backup; start `serve` afterwards."""
+        from .backup import restore as restore_backup
+        try:
+            result = restore_backup(source, context.obj["control_directory"])
+        except (OSError, RuntimeError) as error:
+            raise click.ClickException(str(error)) from None
+        if as_json:
+            click.echo(json.dumps(result))
+        else:
+            click.echo(f"Restored {result['state']} ({result['snapshot_age_hours']} h old)"
+                       f"{' and the archive' if result['archive'] else ', no archive'} into {result['directory']}.")
+
     return control

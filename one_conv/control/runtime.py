@@ -486,6 +486,30 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
             return JSONResponse({"error": str(error)}, status_code=error.status)
 
     app.router.routes.append(Route("/v1/routines", agent_routines, methods=["GET", "POST"]))
+
+    async def agent_backup(request):
+        """The controller's state for an off-box copy; it holds every token hash, so staffing authority only."""
+        from starlette.responses import Response
+
+        from . import backup
+        try:
+            await run_in_threadpool(app.state.store.staffing_node, request)
+            if request.path_params["part"] == "state":
+                body = await run_in_threadpool(backup.state_snapshot, Path(directory))
+                return Response(body, media_type="application/gzip")
+            if request.path_params["part"] == "archive":
+                database = Path(directory) / backup.ARCHIVE_DB
+                if not database.exists():
+                    return JSONResponse({"error": "This controller keeps no archive."}, status_code=404)
+                table, after = request.query_params.get("table", ""), int(request.query_params.get("after", "0"))
+                return JSONResponse(await run_in_threadpool(backup.archive_page, database, table, after))
+            return JSONResponse({"error": "Unknown backup part."}, status_code=404)
+        except HubError as error:
+            return JSONResponse({"error": str(error)}, status_code=error.status)
+        except ValueError as error:
+            return JSONResponse({"error": str(error)}, status_code=400)
+
+    app.router.routes.append(Route("/v1/backup/{part}", agent_backup, methods=["GET"]))
     archive = conversation_archive(directory, app.state.hub)
     if archive is not None:
         app.router.routes.append(Mount(ARCHIVE_PATH, app=archive))

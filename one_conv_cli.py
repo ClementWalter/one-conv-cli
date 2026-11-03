@@ -4071,6 +4071,10 @@ from one_conv.live.prompts import build_prompts_command  # noqa: E402
 
 cli.add_command(build_prompts_command(_feed_find_threads, _feed_live_addresses))
 
+from one_conv.live.controller_backup import build_command as build_backup_command  # noqa: E402
+
+cli.add_command(build_backup_command())
+
 install_namespaces(cli, lambda: _chatgpt_accounts(), lambda: _claude_accounts(), LOGIN_PROFILES_DIR)
 
 

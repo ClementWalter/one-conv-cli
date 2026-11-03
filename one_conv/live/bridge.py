@@ -564,17 +564,13 @@ def _report(**state) -> None:
     _write_private(bridge_dir() / "state.json", {**_read(bridge_dir() / "state.json"), **state, "pid": os.getpid()})
 
 
-class PromptSync:
-    """Runs `one-conv report-prompts` in the background every PROMPT_SYNC_SECONDS, one run at a time.
+class LauncherJob:
+    """Runs a hidden `one-conv <command>` in the background every `seconds`, one run at a time."""
 
-    The launcher reads this machine's transcripts, so the prompts a human types into a running
-    session reach the hub as that human's messages (see `prompts`).
-    """
+    command, log_name = "", ""
 
-    def __init__(self, seconds: float | None = None, launcher: Path = LAUNCHER):
-        from .prompts import PROMPT_SYNC_SECONDS
-        self.seconds = PROMPT_SYNC_SECONDS if seconds is None else seconds
-        self.launcher, self.process, self.started = launcher, None, None
+    def __init__(self, seconds: float, launcher: Path = LAUNCHER):
+        self.seconds, self.launcher, self.process, self.started = seconds, launcher, None, None
 
     def poll(self, url: str, token: str, node: str) -> bool:
         """Start a run when none runs and the last one started at least the interval ago."""
@@ -586,14 +582,14 @@ class PromptSync:
             return False
         # The token travels in the environment, never in argv where other users could read it.
         env = {**os.environ, "ONE_CONV_HUB_URL": url, "ONE_CONV_HUB_TOKEN": token, "ONE_CONV_HUB_NODE": node}
-        log_path = bridge_dir() / "prompts.log"
+        log_path = bridge_dir() / self.log_name
         log_path.parent.mkdir(parents=True, exist_ok=True)
         output = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
-            self.process = subprocess.Popen([sys.executable, "-O", str(self.launcher), "report-prompts"], env=env,
+            self.process = subprocess.Popen([sys.executable, "-O", str(self.launcher), self.command], env=env,
                                             stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
         except OSError as error:
-            logger.warning("prompt sync could not start: %s", error)
+            logger.warning("%s could not start: %s", self.command, error)
             return False
         finally:
             os.close(output)
@@ -601,7 +597,7 @@ class PromptSync:
         return True
 
     def stop(self) -> None:
-        """End a running sync; positions move only on the hub's answer, so the next run redoes it."""
+        """End a running job; each writes only what the hub answered, so the next run redoes the rest."""
         if self.process is not None and self.process.poll() is None:
             self.process.terminate()
             try:
@@ -610,8 +606,33 @@ class PromptSync:
                 self.process.kill()
 
 
+class PromptSync(LauncherJob):
+    """`one-conv report-prompts` every PROMPT_SYNC_SECONDS.
+
+    The launcher reads this machine's transcripts, so the prompts a human types into a running
+    session reach the hub as that human's messages (see `prompts`).
+    """
+
+    command, log_name = "report-prompts", "prompts.log"
+
+    def __init__(self, seconds: float | None = None, launcher: Path = LAUNCHER):
+        from .prompts import PROMPT_SYNC_SECONDS
+        super().__init__(PROMPT_SYNC_SECONDS if seconds is None else seconds, launcher)
+
+
+class ControllerBackup(LauncherJob):
+    """`one-conv backup-controller` every ONE_CONV_CONTROLLER_BACKUP_MINUTES: an off-box copy of the controller."""
+
+    command, log_name = "backup-controller", "controller-backup.log"
+
+    def __init__(self, minutes: float | None = None, launcher: Path = LAUNCHER):
+        from .controller_backup import backup_minutes
+        super().__init__((backup_minutes() if minutes is None else minutes) * 60, launcher)
+
+
 def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
-          archive: "ArchiveSync | ArchiveLanes | None" = None, prompts: PromptSync | None = None) -> int:
+          archive: "ArchiveSync | ArchiveLanes | None" = None, prompts: PromptSync | None = None,
+          backups: ControllerBackup | None = None) -> int:
     """Run the bridge until SIGTERM/SIGINT or `stopping()`; returns the exit status."""
     lock_path = bridge_dir() / "serve.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -629,7 +650,7 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
     stopping = stopping or (lambda: False)
     forward = tunnel.Tunnel(tunnel.destination(hub), hub_port) if hub.startswith("ssh://") else None
     ingress, backoff = Ingress(bridge_dir() / "ingress.db"), 1.0
-    archive, prompts = archive or ArchiveLanes(), prompts or PromptSync()
+    archive, prompts, backups = archive or ArchiveLanes(), prompts or PromptSync(), backups or ControllerBackup()
     _report(hub=hub, node=node, started=time.time(), last_error=None)
     try:
         while not (stop_requested or stopping()):
@@ -654,6 +675,7 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
                     bridge.step()
                     archive.poll(url, token, node)
                     prompts.poll(url, token, node)
+                    backups.poll(url, token, node)
                     _report(last_ok=time.time(), published=len(bridge.directory), notes=bridge.notes)
             except (hubclient.HubUnavailable, tunnel.TunnelError) as error:
                 logger.warning("hub unreachable, retrying in %.0fs: %s", backoff, error)
@@ -676,5 +698,6 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
     finally:
         archive.stop()
         prompts.stop()
+        backups.stop()
         _report(stopped=time.time())
         lock.close()

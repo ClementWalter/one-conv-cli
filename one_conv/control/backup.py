@@ -10,8 +10,7 @@ A trusted node pulls two things (`/v1/backup/*`, staffing authority required):
   `change_sequence`. Pulling heads first, then revisions, then chunks keeps every head the mirror
   holds backed by rows it also holds, since an uploader writes chunks before the head.
 
-`restore` writes the newest state snapshot and the archive mirror into an empty controller
-directory.
+`restore` builds a controller directory from the newest state snapshot and the archive mirror.
 """
 
 import base64
@@ -150,33 +149,41 @@ def newest_state(source: Path) -> Path:
 
 
 def restore(source: Path, directory: Path) -> dict:
-    """Rebuild a controller directory from a pulled backup; refuses a directory that already has a hub."""
+    """Rebuild a controller directory from a pulled backup, all at once.
+
+    Everything is built in a staging folder beside the target and renamed into place last, so an
+    interrupted restore leaves no half-built controller and simply runs again.
+    """
     source, directory = Path(source), Path(directory)
-    if (directory / "hub.sqlite3").exists():
-        raise FileExistsError(f"{directory} already holds a hub; restore only into a fresh controller directory")
+    if directory.exists() and any(directory.iterdir()):
+        raise FileExistsError(f"{directory} is not empty; restore only into a fresh controller directory")
     snapshot = newest_state(source)
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    staging = directory.with_name(f".{directory.name}.restoring")
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(mode=0o700, parents=True)
     with tarfile.open(snapshot, "r:gz") as tar:
         # The data filter refuses absolute paths, links out of the tree and device files.
-        tar.extractall(directory, filter="data")
-    for path in directory.rglob("*"):
-        os.chmod(path, 0o700 if path.is_dir() else 0o600)
+        tar.extractall(staging, filter="data")
     mirror = source / "archive.db"
     restored_archive = mirror.exists()
     if restored_archive:
-        target = directory / ARCHIVE_DB
-        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target = staging / ARCHIVE_DB
+        target.parent.mkdir(parents=True, exist_ok=True)
         _sqlite_copy(mirror, target)
-        os.chmod(target, 0o600)
         with sqlite3.connect(target) as db:
             # A new generation makes every reader drop its cached listing and reconcile with this copy.
             db.execute("UPDATE archive_state_v1 SET generation = ? WHERE id = 1", (uuid.uuid4().hex,))
         db.close()
-    with sqlite3.connect(directory / "hub.sqlite3") as db:
+    for path in [staging, *staging.rglob("*")]:
+        os.chmod(path, 0o700 if path.is_dir() else 0o600)
+    with sqlite3.connect(staging / "hub.sqlite3") as db:
         check = db.execute("PRAGMA quick_check").fetchone()[0]
     db.close()
     if check != "ok":
         raise RuntimeError(f"the restored hub database failed its integrity check: {check}")
+    if directory.exists():
+        directory.rmdir()
+    staging.replace(directory)
     return {"state": snapshot.name, "archive": restored_archive, "directory": str(directory),
             "snapshot_age_hours": round((time.time() - snapshot.stat().st_mtime) / 3600, 1)}
 

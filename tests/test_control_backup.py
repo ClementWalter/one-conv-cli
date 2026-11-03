@@ -226,6 +226,10 @@ def test_a_restored_state_is_private(pulled, tmp_path):
     assert (tmp_path / "restored" / "hub.sqlite3").stat().st_mode & 0o077 == 0
 
 
+def test_the_mirror_is_private(pulled):
+    assert (pulled / "archive.db").stat().st_mode & 0o077 == 0
+
+
 def test_the_bridge_backup_is_off_at_zero_minutes(tmp_path):
     assert bridge.ControllerBackup(minutes=0, launcher=tmp_path / "launcher.py").poll("https://h", "t", "macbook") is False
 

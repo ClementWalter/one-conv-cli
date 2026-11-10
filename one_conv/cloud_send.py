@@ -64,7 +64,7 @@ def wrap(text: str, sender_address: str | None) -> str:
     from .live import router
 
     sender = router.whoami(sender_address)
-    origin = "user" if sender is None and sys.stdin.isatty() else "unknown"
+    origin = "unknown" if sender else router.origin(sys.stdin.isatty())
     return envelope(text, None if sender is None else replace(sender, cwd=""), origin, reply="inline")
 
 

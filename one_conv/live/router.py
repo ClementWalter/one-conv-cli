@@ -69,6 +69,40 @@ def _process(pid: int) -> tuple[int, str] | None:
     return int(parts[0]), Path(parts[1]).name
 
 
+def node_name() -> str | None:
+    """This machine's name on the live hub, or None when none is configured."""
+    name = os.environ.get("ONE_CONV_HUB_NODE")
+    if not name:
+        try:
+            name = json.loads((live_home() / "bridge" / "hub.json").read_text()).get("node")
+        except (OSError, ValueError, AttributeError):
+            return None
+    return name if isinstance(name, str) and NODE_NAME.fullmatch(name) else None
+
+
+def origin(interactive: bool, pid: int | None = None) -> str:
+    """The sender label when no agent session is calling: a human at a terminal, Claude Desktop, or unknown.
+
+    Claude Desktop runs extension servers as its own children, so its chats and Cowork
+    sessions are told apart from other callers but not from each other.
+    """
+    if interactive:
+        return "user"
+    current = pid or os.getpid()
+    for _ in range(32):
+        step = _process(current)
+        if step is None:
+            break
+        parent, name = step
+        if name == "Claude" or name.startswith("Claude Helper"):
+            node = node_name()
+            return f"{node}/claude-desktop" if node else "claude-desktop"
+        if parent <= 1:
+            break
+        current = parent
+    return "unknown"
+
+
 def whoami(explicit: str | None = None, meta: dict | None = None, pid: int | None = None) -> LiveSession | None:
     """The session this process acts for; None means the user at a plain terminal.
 

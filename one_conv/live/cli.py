@@ -87,7 +87,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             raise click.UsageError("Give MESSAGE or --stdin.")
         try:
             me = router.whoami(sender)
-            origin = "user" if sys.stdin.isatty() and not from_stdin else "unknown"
+            origin = router.origin(sys.stdin.isatty() and not from_stdin)
             if not yes and router.topic_of(target) is not None:
                 click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
                 click.echo(f"  topic:    #{router.topic_of(target)}")

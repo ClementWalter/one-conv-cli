@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 # claude.ai's connector callback; a client registering any other redirect is refused.
 CALLBACKS = ("https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback")
 SCOPE = "connectors"
+REGISTER = "/oauth/register"
 CLI_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 REQUEST_ID = re.compile(r"[A-Za-z0-9_-]{43}")
 # mcp-bridge stops a tool after 600 s; the relay waits a little longer for its answer.
@@ -433,11 +434,20 @@ def install(app, origin: str, directory: Path) -> ConnectorStore:
                                    for row in await run_in_threadpool(store.published)]}
         return await node_route(request, work)
 
+    from mcp.server.auth.routes import MetadataHandler, build_metadata, cors_middleware
     from pydantic import AnyHttpUrl
+    registration = ClientRegistrationOptions(enabled=True, valid_scopes=[SCOPE], default_scopes=[SCOPE])
+    revocation = RevocationOptions(enabled=True)
     routes = create_auth_routes(provider, issuer_url=AnyHttpUrl(origin),
-                                client_registration_options=ClientRegistrationOptions(
-                                    enabled=True, valid_scopes=[SCOPE], default_scopes=[SCOPE]),
-                                revocation_options=RevocationOptions(enabled=True))
+                                client_registration_options=registration, revocation_options=revocation)
+    # Boat's port proxy answers /register itself, so registration lives at REGISTER and the
+    # metadata clients discover it from says so.
+    metadata = build_metadata(AnyHttpUrl(origin), None, registration, revocation)
+    metadata.registration_endpoint = AnyHttpUrl(origin + REGISTER)
+    routes = [Route(REGISTER, endpoint=route.endpoint, methods=list(route.methods)) if route.path == "/register"
+              else Route(route.path, endpoint=cors_middleware(MetadataHandler(metadata).handle, ["GET", "OPTIONS"]),
+                         methods=["GET", "OPTIONS"]) if route.path == "/.well-known/oauth-authorization-server"
+              else route for route in routes]
     routes += [
         Route("/.well-known/oauth-protected-resource", resource_metadata, methods=["GET"]),
         Route("/.well-known/oauth-protected-resource/mcp/{cli}", resource_metadata, methods=["GET"]),

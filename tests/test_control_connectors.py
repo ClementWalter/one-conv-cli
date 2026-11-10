@@ -59,7 +59,7 @@ def published(client, node_token):
 
 
 def register(client, redirect=CALLBACK):
-    return client.post("/register", json={"redirect_uris": [redirect], "client_name": "Claude",
+    return client.post("/oauth/register", json={"redirect_uris": [redirect], "client_name": "Claude",
                                           "token_endpoint_auth_method": "none",
                                           "grant_types": ["authorization_code", "refresh_token"],
                                           "response_types": ["code"]})
@@ -98,7 +98,11 @@ def rpc(client, token, method, params=None, cli="demo-cli"):
 
 
 def test_authorization_server_metadata_names_the_register_endpoint(client):
-    assert client.get("/.well-known/oauth-authorization-server").json()["registration_endpoint"] == ORIGIN + "/register"
+    assert client.get("/.well-known/oauth-authorization-server").json()["registration_endpoint"] == ORIGIN + "/oauth/register"
+
+
+def test_bare_register_path_is_left_to_the_proxy(client):
+    assert client.post("/register", json={}).status_code in (404, 405)
 
 
 def test_resource_metadata_names_the_cli_endpoint(client):

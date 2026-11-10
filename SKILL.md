@@ -128,15 +128,20 @@ one-conv cloud search QUERY --json
 
 ### Sending into a Claude chat
 
-`cloud claude send CONVERSATION MESSAGE --yes` posts MESSAGE as the next turn of
-a saved Claude chat, as the account that owns it, and prints Claude's reply
-(`--json` adds the message and reply IDs). CONVERSATION is an ID prefix or title
-from `chats`; the account comes from the saved conversation, so pull it first.
-The message is wrapped in the live `<one-conv-message from="...">` envelope with
-`reply="inline"`, naming the calling agent (or `--from ADDRESS`). The sender's
-working directory is left out, because the chat may belong to someone else.
+A saved Claude chat is a live address: `claude-chat:<ID prefix or title>`.
+`one-conv live send claude-chat:QUERY MESSAGE --yes` and the `send_message` MCP
+tool post MESSAGE as the chat's next turn, as the account that owns it, and
+return Claude's reply (`reply` in JSON and tool results). `cloud claude send
+QUERY MESSAGE --yes` is the same route. QUERY is an ID prefix or title from
+`cloud chats`; the account comes from the saved conversation, so pull it first.
+The message carries the live `<one-conv-message>` envelope with `reply="inline"`
+(the chat has no one-conv tools, so it answers in the conversation), and goes in
+the live message log like any other send. The sender is the calling agent,
+`--from ADDRESS`, `user` at a terminal, or `NODE/claude-desktop` from the Claude
+Desktop extension. The sender's working directory is left out, because the
+chat may belong to someone else. A chat takes no `fyi`.
 
-Without `--yes` it is a dry run that shows the target chat and the exact text.
+Without `--yes` it is a dry run that shows the target chat and the sender.
 A sent turn is the account's own: it appears in its owner's history and uses
 their usage, so send only what the user asked for, to a chat they named. On an
 error, check the chat before resending; the turn may already be posted. Pull the
@@ -144,8 +149,9 @@ account afterwards to save the exchange. Cowork, ChatGPT and Codex cloud have no
 send.
 
 ```bash
-one-conv cloud claude send 'Trip planning' 'Summarize where we stopped' --yes
-one-conv cloud claude send abcd1234 --stdin --yes --json < note.md
+one-conv live send 'claude-chat:Trip planning' 'Summarize where we stopped' --yes
+one-conv live send claude-chat:abcd1234 --stdin --yes --json < note.md
+one-conv cloud claude send abcd1234 'Summarize where we stopped' --yes
 ```
 
 Replace `QUERY`, `EMAIL` and account selectors with values from discovery.
@@ -224,8 +230,9 @@ These agents can modify files or use tools, so preserve the user's action scope.
 `claude:<id>`, `codex:<id>`, `omp:<id>` and `cursor:<id>`. `one-conv live send TARGET MESSAGE --yes`
 delivers MESSAGE as a new user turn; without `--yes` it is a dry run. TARGET is an
 address, id prefix, title/cwd substring, `@name` of an agent on this machine,
-`#topic` (every member), or `NODE/harness:<full id>` for an agent on another
-machine when `one-conv live serve` connects this one to a hub. A message from
+`#topic` (every member), `NODE/harness:<full id>` for an agent on another
+machine when `one-conv live serve` connects this one to a hub, or
+`claude-chat:<id or title>` for a saved Claude chat (see Sending into a Claude chat). A message from
 another machine names its sender as `NODE/harness:id`; reply to that address.
 `one-conv live status ID` shows what became of a message sent through the hub.
 From inside an agent, prefer the MCP tools: `send_message`, `set_name`,

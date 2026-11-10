@@ -15,11 +15,11 @@ from copy import deepcopy
 import json
 from types import SimpleNamespace
 
-import click
 import pytest
 from click.testing import CliRunner
 
 from one_conv import cloud_send
+from one_conv.live import router
 from one_conv.live.model import LiveSession
 from one_conv.providers.anthropic import AnthropicProvider, ROOT_MESSAGE_ID
 from one_conv.providers.base import (AuthenticationRequired, JsonTransport, ProviderUnavailable)
@@ -165,41 +165,99 @@ def test_saved_conversation_by_exact_title(cache):
 
 
 def test_saved_conversation_ignores_other_products(cache):
-    with pytest.raises(click.ClickException):
+    with pytest.raises(cloud_send.CloudSendError):
         cloud_send.saved_conversation("ccc", "claude-chat", cache)
 
 
 def test_saved_conversation_rejects_ambiguous_titles(cache):
-    with pytest.raises(click.ClickException, match="Several"):
+    with pytest.raises(cloud_send.CloudSendError, match="Several"):
         cloud_send.saved_conversation("trip plan", "claude-chat", cache)
 
 
-def test_envelope_names_the_sender(monkeypatch):
-    monkeypatch.setattr("one_conv.live.router.whoami", lambda _: LiveSession("claude", "abc", cwd="/Users/me/private"))
-    assert '<one-conv-message from="claude:abc"' in cloud_send.wrap("hi", None)
+SENDER = LiveSession("claude", "abc", cwd="/Users/me/private")
 
 
-def test_envelope_keeps_the_working_directory_local(monkeypatch):
-    monkeypatch.setattr("one_conv.live.router.whoami", lambda _: LiveSession("claude", "abc", cwd="/Users/me/private"))
-    assert "/Users/me/private" not in cloud_send.wrap("hi", None)
+def test_envelope_names_the_sender():
+    assert '<one-conv-message from="claude:abc"' in cloud_send.cloud_envelope("hi", SENDER, "unknown")
 
 
-def test_envelope_asks_for_an_inline_answer(monkeypatch):
-    monkeypatch.setattr("one_conv.live.router.whoami", lambda _: LiveSession("claude", "abc"))
-    assert 'reply="inline"' in cloud_send.wrap("hi", None)
+def test_envelope_keeps_the_working_directory_local():
+    assert "/Users/me/private" not in cloud_send.cloud_envelope("hi", SENDER, "unknown")
 
 
-def test_dry_run_never_contacts_the_account(cache, monkeypatch):
+def test_envelope_asks_for_an_inline_answer():
+    assert 'reply="inline"' in cloud_send.cloud_envelope("hi", SENDER, "unknown")
+
+
+def test_envelope_keeps_no_reply():
+    assert 'reply="none"' in cloud_send.cloud_envelope("hi", SENDER, "unknown", reply="none")
+
+
+def test_envelope_without_agent_names_the_origin():
+    assert '<one-conv-message from="macbook/claude-desktop"' in cloud_send.cloud_envelope("hi", None, "macbook/claude-desktop")
+
+
+def test_deliver_without_registered_accounts_fails(cache, monkeypatch):
     monkeypatch.setattr(cloud_send, "cache_root", lambda: cache)
+    monkeypatch.setattr(cloud_send, "_accounts", None)
+    with pytest.raises(cloud_send.CloudSendError, match="unavailable"):
+        cloud_send.deliver("aaa", "hi")
+
+
+@pytest.fixture
+def delivered(cache, monkeypatch, tmp_path):
+    """Route live sends to a stub chat, recording the posted text."""
+    monkeypatch.setattr(cloud_send, "cache_root", lambda: cache)
+    monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
+    (tmp_path / "live").mkdir()
+    posted = []
+
+    def deliver(query, wrapped, accounts=None):
+        posted.append((query, wrapped))
+        return {"to": "claude-chat:" + CHAT, "title": "Trip planning", "account": "Personal", "account_id": "acct",
+                "chat_message_id": "sent-1", "reply_id": "reply-1", "stop_reason": "end_turn", "reply": "pong",
+                "url": "https://claude.ai/chat/" + CHAT}
+    monkeypatch.setattr(cloud_send, "deliver", deliver)
+    return posted
+
+
+def test_live_send_routes_a_chat_address(delivered):
+    router.send("claude-chat:aaa", "hello", SENDER)
+    assert delivered[0][0] == "aaa"
+
+
+def test_live_send_wraps_the_chat_message(delivered):
+    router.send("claude-chat:aaa", "hello", SENDER, message_id="f" * 32)
+    assert 'id="ffffffffffffffffffffffffffffffff"' in delivered[0][1]
+
+
+def test_live_send_returns_the_chat_reply(delivered):
+    assert router.send("claude-chat:aaa", "hello", SENDER)["reply"] == "pong"
+
+
+def test_live_send_signs_with_the_sender(delivered):
+    assert router.send("claude-chat:aaa", "hello", None, "macbook/claude-desktop")["from"] == "macbook/claude-desktop"
+
+
+def test_live_send_refuses_fyi_to_a_chat(delivered):
+    with pytest.raises(router.LiveError, match="no feed"):
+        router.send("claude-chat:aaa", "hello", SENDER, fyi=True)
+
+
+def test_dry_run_never_posts(cache, monkeypatch, delivered):
     monkeypatch.setattr("one_conv.live.router.whoami", lambda _: None)
-    contacted = []
-    command = cloud_send.send_command("claude", "claude-chat")
-    CliRunner().invoke(command, ["aaa", "hello"], obj={"claude_accounts": lambda: contacted.append(1) or iter(())})
-    assert contacted == []
+    CliRunner().invoke(cloud_send.send_command("claude", "claude-chat"), ["aaa", "hello"])
+    assert delivered == []
 
 
 def test_dry_run_shows_the_target_chat(cache, monkeypatch):
     monkeypatch.setattr(cloud_send, "cache_root", lambda: cache)
     monkeypatch.setattr("one_conv.live.router.whoami", lambda _: None)
-    result = CliRunner().invoke(cloud_send.send_command("claude", "claude-chat"), ["aaa", "hello"], obj={})
-    assert "to:      Trip planning  (Personal)" in result.output
+    result = CliRunner().invoke(cloud_send.send_command("claude", "claude-chat"), ["aaa", "hello"])
+    assert "Trip planning  (Personal)" in result.output
+
+
+def test_send_with_yes_prints_the_reply(cache, monkeypatch, delivered):
+    monkeypatch.setattr("one_conv.live.router.whoami", lambda _: None)
+    result = CliRunner().invoke(cloud_send.send_command("claude", "claude-chat"), ["aaa", "hello", "--yes"])
+    assert result.stdout.strip() == "pong"

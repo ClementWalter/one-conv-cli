@@ -358,6 +358,12 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
             topic = team._check("topic", topic)
     except team.TeamError as error:
         raise LiveError(str(error)) from error
+    from .. import cloud_send
+    if cloud_send.is_cloud_target(target):
+        receipt = _send_cloud(target, text, sender, origin, fyi, reply, topic, message_id)
+        if topic is not None and (request := team.record(topic, message_id, receipt["from"], text)):
+            receipt["summarize"] = request
+        return _logged(receipt, text, topic, fyi, reply)
     node, local = remote_address(target)
     if node is not None:
         hub = hubclient.configured()
@@ -409,6 +415,21 @@ def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str
     return {"to": row.get("to", target), "id": message_id, "from": sender, "via": "hub", "delivery": "hub",
             "status": "stored on the hub" if row.get("status") == "stored" else row.get("status", "stored"),
             **({"summarize": receipt["summarize"]} if receipt.get("summarize") else {})}
+
+
+def _send_cloud(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
+                reply: str, topic: str | None, message_id: str) -> dict:
+    """Post into a saved Claude chat; it answers inline, so the reply comes back in the receipt."""
+    from .. import cloud_send
+    if fyi:
+        raise LiveError("A Claude chat has no feed to hold a notice; send it without fyi.")
+    wrapped = cloud_send.cloud_envelope(text, sender, origin, reply, message_id, topic)
+    try:
+        delivered = cloud_send.deliver(target[len(cloud_send.CLAUDE_CHAT):], wrapped)
+    except cloud_send.CloudSendError as error:
+        raise LiveError(str(error)) from error
+    return {**delivered, "id": message_id, "from": sender.address if sender else origin,
+            "via": "claude.ai", "delivery": "claude.ai", "status": "replied"}
 
 
 def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,

@@ -8,6 +8,7 @@ import time
 import click
 
 from . import cursor, hubclient, router, team
+from .. import cloud_send
 from . import install as installer
 from .model import HARNESSES
 
@@ -94,6 +95,13 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 click.echo(f"  members:  {', '.join(team.members(router.topic_of(target))) or 'none yet'}")
                 click.echo(f"  from:     {me.address if me else origin}")
                 return
+            if not yes and cloud_send.is_cloud_target(target):
+                row = cloud_send.saved_conversation(target[len(cloud_send.CLAUDE_CHAT):], "claude-chat")
+                click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
+                click.echo(f"  to:       {cloud_send.CLAUDE_CHAT}{row['id'][:8]}  {row['title']}")
+                click.echo(f"  delivery: claude.ai, as {row['account_label'] or row['account_id']}; the reply comes back here")
+                click.echo(f"  from:     {me.address if me else origin}")
+                return
             if not yes:
                 session = router.resolve(target, exclude=me)
                 click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
@@ -113,6 +121,8 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 click.echo(f"  {row['status']}: {row['to']}")
         else:
             click.echo(f"{receipt['status']}: {receipt['to']}")
+            if receipt.get("via") == "claude.ai":
+                click.echo(receipt["reply"])
         if receipt.get("via") == "hub" and not as_json:
             click.echo(f"  follow it with: one-conv live status {receipt['id']}")
         if receipt.get("summarize") and not as_json:

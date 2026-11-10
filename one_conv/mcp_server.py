@@ -147,11 +147,15 @@ def create_server() -> MCPServer:
         from .live import router
         return {"sessions": [session.to_json() for session in router.list_all(harness)]}
 
-    @server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=False),
+    @server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=True),
                  structured_output=True)
     def send_message(to: str, text: str, ctx: Context, fyi: bool = False,
                      expect_reply: bool = True, topic: str | None = None) -> dict[str, Any]:
         """Send text as a new user turn to `to`: an address, id prefix, title, @name or #topic.
+
+        `to` may also be a saved Claude chat, `claude-chat:<ID prefix or title>` (see the
+        cloud chats listing): the turn is posted as the account that owns the chat, which
+        answers inline, so the result carries its `reply`. A chat cannot take fyi.
 
         A #topic reaches every member except you. `topic` files a direct message under a
         topic too. Use fyi=true for acknowledgments, sign-offs and completion notices: they

@@ -2704,6 +2704,7 @@ def _print_handle_list(cwd_label: str, handles: list[SessionHandle], as_json: bo
 
 
 from one_conv.namespaces import NamespaceRoot, SourceChoice, install as install_namespaces, selected_sources
+from one_conv.cloud_send import register_accounts as _register_cloud_accounts
 
 
 @click.group(cls=NamespaceRoot, context_settings={"help_option_names": ["-h", "--help"]},
@@ -4076,6 +4077,8 @@ from one_conv.live.controller_backup import build_command as build_backup_comman
 cli.add_command(build_backup_command())
 
 install_namespaces(cli, lambda: _chatgpt_accounts(), lambda: _claude_accounts(), LOGIN_PROFILES_DIR)
+# live send and the send_message tool reach claude-chat: addresses through these logins.
+_register_cloud_accounts(lambda: _claude_accounts())
 
 
 def _tune_snapshot(out_root: Path) -> tuple[int, int]:

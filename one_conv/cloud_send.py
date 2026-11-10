@@ -1,8 +1,9 @@
-"""Post a one-conv message into a saved Claude chat as the account that owns it.
+"""Deliver one-conv messages to saved Claude chats, as the account that owns each chat.
 
-The message is wrapped in the same `<one-conv-message>` envelope live messages use,
-so the chat sees who sent it. The reply comes back in that chat, and the command
-returns it. It is a dry run unless `--yes` is given.
+A Claude chat is addressed `claude-chat:<ID prefix or title>` in `live send` and the
+`send_message` tool, next to local agent sessions; `cloud claude send` is the same
+route. The message carries the live `<one-conv-message>` envelope. The chat has no
+one-conv tools, so it answers in the conversation and the reply returns to the sender.
 """
 
 from __future__ import annotations
@@ -11,10 +12,28 @@ import json
 import os
 from pathlib import Path
 import sys
+from typing import Callable, Iterable
 
 import click
 
 from .cloud import cache_root
+
+CLAUDE_CHAT = "claude-chat:"
+# Account discovery lives in the launcher (it reads browser logins and the vault), which registers it.
+_accounts: Callable[[], Iterable[dict]] | None = None
+
+
+class CloudSendError(RuntimeError):
+    """A cloud chat could not be found or reached; the message may still have been posted."""
+
+
+def register_accounts(discover: Callable[[], Iterable[dict]]) -> None:
+    global _accounts
+    _accounts = discover
+
+
+def is_cloud_target(target: str) -> bool:
+    return target.startswith(CLAUDE_CHAT)
 
 
 def saved_conversation(query: str, source: str, root: Path | None = None) -> dict:
@@ -37,10 +56,10 @@ def saved_conversation(query: str, source: str, root: Path | None = None) -> dic
         if matches:
             break
     else:
-        raise click.ClickException(f"No saved {source} conversation matches {query!r}. Pull the account first.")
+        raise CloudSendError(f"No saved {source} conversation matches {query!r}. Pull the account first.")
     if len(matches) != 1:
         choices = "; ".join(f"{row['session'][:12]} {row['title']}" for row in matches[:10])
-        raise click.ClickException(f"Several conversations match {query!r}; use a longer ID: {choices}")
+        raise CloudSendError(f"Several conversations match {query!r}; use a longer ID: {choices}")
     return matches[0]
 
 
@@ -54,61 +73,74 @@ def local_timezone() -> str:
         return "UTC"
 
 
-def wrap(text: str, sender_address: str | None) -> str:
-    """The live envelope, asking the chat to answer inline since it has no one-conv tools.
+def cloud_envelope(text: str, sender, origin: str, reply: str = "expected",
+                   message_id: str | None = None, topic: str | None = None) -> str:
+    """The live envelope for a chat: answered inline, without the sender's working directory.
 
-    The sender's working directory stays local: the chat may belong to someone else.
+    The chat may belong to someone else, so the sender's local path stays on this machine.
     """
     from dataclasses import replace
     from .live.model import envelope
-    from .live import router
 
-    sender = router.whoami(sender_address)
-    origin = "unknown" if sender else router.origin(sys.stdin.isatty())
-    return envelope(text, None if sender is None else replace(sender, cwd=""), origin, reply="inline")
+    return envelope(text, None if sender is None else replace(sender, cwd=""), origin,
+                    "none" if reply == "none" else "inline", message_id, topic)
+
+
+def deliver(query: str, wrapped: str, accounts: Callable[[], Iterable[dict]] | None = None) -> dict:
+    """Post WRAPPED into the chat QUERY names and wait for Claude's reply."""
+    from .cloud_cli import browser_provider
+    from .providers.base import ProviderError
+
+    row = saved_conversation(query, "claude-chat")
+    discover = accounts or _accounts
+    if discover is None:
+        raise CloudSendError("Claude accounts are unavailable in this process; use the one-conv command.")
+    try:
+        provider = browser_provider("claude-chat", row["account_id"], discover)
+    except click.ClickException as error:
+        raise CloudSendError(error.message) from None
+    try:
+        sent = provider.send_message(row["id"], wrapped, timezone_name=local_timezone())
+    except ProviderError as error:
+        raise CloudSendError(f"{error}. Check the chat in the browser before resending.") from None
+    return {"to": CLAUDE_CHAT + row["id"], "title": row["title"],
+            "account": row["account_label"] or row["account_id"], "account_id": row["account_id"],
+            "chat_message_id": sent.message_id, "reply_id": sent.reply_id,
+            "stop_reason": sent.stop_reason, "reply": sent.reply,
+            "url": f"https://claude.ai/chat/{row['id']}"}
 
 
 def send_command(name: str, product: str) -> click.Command:
-    """`one-conv cloud claude send`: the account's own next turn in one of its chats."""
+    """`one-conv cloud claude send`: `live send claude-chat:CONVERSATION`, with a chat-first dry run."""
 
-    @click.pass_context
-    def invoke(context, conversation, message, from_stdin, sender, yes, as_json):
-        from .cloud_cli import browser_provider
-        from .live.router import LiveError
-        from .providers.base import ProviderError
+    def invoke(conversation, message, from_stdin, sender, yes, as_json):
+        from .live import router
 
         if from_stdin:
             message = sys.stdin.read()
         if not message or not message.strip():
             raise click.UsageError("Give MESSAGE or --stdin.")
-        row = saved_conversation(conversation, product)
         try:
-            text = wrap(message, sender)
-        except LiveError as error:
+            row = saved_conversation(conversation, product)
+            me = router.whoami(sender)
+            origin = "unknown" if me else router.origin(sys.stdin.isatty() and not from_stdin)
+            if not yes:
+                click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
+                click.echo(f"  to:      {CLAUDE_CHAT}{row['id'][:8]}  {row['title']}  ({row['account_label'] or row['account_id']})")
+                click.echo("  as:      the account itself; the chat replies to this turn")
+                click.echo("  message:")
+                text = cloud_envelope(message, me, origin)
+                click.echo("\n".join("    " + line for line in text.splitlines()))
+                return
+            receipt = router.send(CLAUDE_CHAT + row["id"], message, me, origin)
+        except (CloudSendError, router.LiveError) as error:
             raise click.ClickException(str(error)) from None
-        account = row["account_label"] or row["account_id"]
-        if not yes:
-            click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
-            click.echo(f"  to:      {row['title'] or row['id']}  ({account})")
-            click.echo(f"  as:      the account itself; the chat replies to this turn")
-            click.echo("  message:")
-            click.echo("\n".join("    " + line for line in text.splitlines()))
-            return
-        try:
-            provider = browser_provider(product, row["account_id"], context.obj["claude_accounts"])
-            sent = provider.send_message(row["id"], text, timezone_name=local_timezone())
-        except ProviderError as error:
-            raise click.ClickException(f"{error}. Check the chat in the browser before resending.") from None
-        receipt = {"conversation": row["id"], "title": row["title"], "account": account,
-                   "message_id": sent.message_id, "reply_id": sent.reply_id,
-                   "stop_reason": sent.stop_reason, "reply": sent.reply,
-                   "url": f"https://claude.ai/chat/{row['id']}"}
         if as_json:
             click.echo(json.dumps(receipt, ensure_ascii=False))
         else:
-            click.echo(f"sent: {receipt['title']} ({account})", err=True)
-            click.echo(sent.reply)
-        click.echo(f"Run one-conv cloud {name} pull --account {row['account_id']} to save it in history.", err=True)
+            click.echo(f"sent: {receipt['title']} ({receipt['account']})", err=True)
+            click.echo(receipt["reply"])
+        click.echo(f"Run one-conv cloud {name} pull --account {receipt['account_id']} to save it in history.", err=True)
 
     return click.Command(
         "send", callback=invoke,
@@ -120,7 +152,8 @@ def send_command(name: str, product: str) -> click.Command:
         help=("Post MESSAGE into a saved chat as the account that owns it, and print Claude's reply.\n\n"
               "CONVERSATION is an ID prefix or title from `chats`. The message is wrapped in a "
               "<one-conv-message> envelope naming the sender. It is the account's own turn: the chat "
-              "answers it, and the account's owner sees it in their history. Dry run without --yes."),
+              "answers it, and the account's owner sees it in their history. Same route as "
+              "`one-conv live send claude-chat:CONVERSATION`. Dry run without --yes."),
         epilog=(f"\b\nExamples:\n  one-conv cloud {name} send abcd1234 'What did we settle on?'\n"
                 f"  one-conv cloud {name} send 'Trip planning' --stdin --yes < note.md"),
         context_settings={"help_option_names": ["-h", "--help"]})

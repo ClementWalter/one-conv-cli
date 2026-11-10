@@ -149,8 +149,11 @@ class AnthropicProvider:
                     if not isinstance(block.get("content"), (list, str)) and not isinstance(block.get("text"), str):
                         raise SchemaChanged("Claude tool result has no recognized content")
                     text.append(f"[Tool result]\n{json.dumps(block.get('content', block.get('text')), ensure_ascii=False)}")
+                elif kind in ("image", "document"):
+                    # Inline pasted media has no text; the block itself stays in content_blocks.
+                    text.append(f"[{kind.capitalize()} retained in source content]")
                 else:
-                    raise SchemaChanged("Claude returned an unsupported content block")
+                    raise SchemaChanged(f"Claude returned an unsupported content block: {kind}")
             for field in ("attachments", "files"):
                 assets = item.get(field, [])
                 if not isinstance(assets, list):

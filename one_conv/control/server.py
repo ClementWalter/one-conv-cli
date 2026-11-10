@@ -68,7 +68,7 @@ def _reject_constant(_value):
     raise ValueError("nonfinite JSON")
 
 
-async def bounded_json(request):
+async def bounded_json(request, limit: int = BODY_LIMIT):
     """Bound actual streamed bytes as well as the advertised length."""
     content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
     if content_type != "application/json" or request.headers.get("content-encoding", "identity").lower() != "identity":
@@ -76,11 +76,11 @@ async def bounded_json(request):
     declared = request.headers.getlist("content-length")
     if declared and (len(declared) != 1 or not re.fullmatch(r"[0-9]{1,12}", declared[0])):
         raise HubError(400, "Content-Length must be a nonnegative byte count.")
-    if declared and int(declared[0]) > BODY_LIMIT:
+    if declared and int(declared[0]) > limit:
         raise HubError(413, "Request body is too large.")
     body = bytearray()
     async for chunk in request.stream():
-        if len(body) + len(chunk) > BODY_LIMIT:
+        if len(body) + len(chunk) > limit:
             raise HubError(413, "Request body is too large.")
         body.extend(chunk)
     try:
@@ -354,6 +354,11 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         else:
             response = await call_next(request)
         response.headers.update(SECURITY_HEADERS)
+        # A connector consent answer redirects to the client's site; only that response may submit there.
+        widened = request.scope.get("oneconv.form_action")
+        if widened:
+            response.headers["Content-Security-Policy"] = SECURITY_HEADERS["Content-Security-Policy"].replace(
+                "form-action 'self'", f"form-action 'self' {widened}")
         return response
 
     app.add_middleware(BaseHTTPMiddleware, dispatch=security)

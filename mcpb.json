@@ -133,7 +133,10 @@
     "hr ingest",
     "hr usage",
     "hr summary",
-    "hr sync"
+    "hr sync",
+    "live connectors ls",
+    "live connectors add",
+    "live connectors rm"
   ],
   "site": {
     "group": "productivity",

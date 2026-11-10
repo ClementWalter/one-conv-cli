@@ -440,6 +440,10 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
         box = CloudBox(Path(directory) / "workers", {**worker_config, "public_hub_url": public_origin, "hub": store.hub})
         check_spawner(spawner, box.profiles)
     app = cloud_application(Path(directory), public_origin, hub=store.hub, providers=providers, session_seconds=session_seconds)
+    # Remote MCP connectors (claude.ai custom connectors) for the CLIs nodes publish.
+    from .connectors import install as install_connectors
+    from .server import canonical_origin
+    install_connectors(app, canonical_origin(public_origin), Path(directory))
 
     async def agent_accounting(request):
         try:

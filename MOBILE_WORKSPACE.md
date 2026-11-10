@@ -114,6 +114,29 @@ databases and the spawner box's private state; keep it on persistent storage and
 back it up. The installer creates a systemd service that starts again after a
 host restart.
 
+## Remote connectors
+
+The workspace also serves your machine's CLIs to claude.ai, so Claude chats and
+remote Cowork sessions can use them from anywhere, as custom connectors. Each CLI
+runs on the machine that serves it, with that machine's logins and files, so a
+connector answers only while that machine's bridge is running.
+
+```console
+one-conv live connectors add deezer-cli email-cli   # mcp-bridge names (mcp-bridge list)
+one-conv live connectors ls                          # each connector's URL and state
+```
+
+In claude.ai, add a custom connector with the URL `ls` prints
+(`https://<workspace>/mcp/<cli>`). Claude registers itself and opens a consent
+page on the workspace; answering Allow needs a browser already paired with the
+workspace (open a pairing link from Devices first). Only claude.ai's callback can
+register, and each token serves the one CLI it was issued for. The tools are the
+ones the CLI's Desktop extension ships (`mcpb.json` `tools`), with the same
+read/write labels, so Claude asks before a write.
+
+The bridge publishes the chosen CLIs every minute and runs up to four calls at a
+time with `mcp-bridge call --json`; a call stops after ten minutes.
+
 ## Bringing in teammates
 
 Choose **+ Teammate**, then a name, a channel and a first task. The request shows

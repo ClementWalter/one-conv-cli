@@ -651,6 +651,8 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
     forward = tunnel.Tunnel(tunnel.destination(hub), hub_port) if hub.startswith("ssh://") else None
     ingress, backoff = Ingress(bridge_dir() / "ingress.db"), 1.0
     archive, prompts, backups = archive or ArchiveLanes(), prompts or PromptSync(), backups or ControllerBackup()
+    from .connectors import ConnectorRelay
+    relay = ConnectorRelay()
     _report(hub=hub, node=node, started=time.time(), last_error=None)
     try:
         while not (stop_requested or stopping()):
@@ -667,6 +669,7 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
                 _write_private(bridge_dir() / "hub.json", {"url": url, "node": node, "token": token,
                                                            **({"tunnel_pid": forward.process.pid} if forward else {})})
                 bridge = Bridge(client, node, ingress)
+                relay.connect(url, token, node)
                 _report(url=url, connected=time.time(), last_error=None)
                 backoff = 1.0
                 while not (stop_requested or stopping()):
@@ -696,6 +699,7 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
             backoff = min(backoff * 2, MAX_BACKOFF)
         return 0
     finally:
+        relay.stop()
         archive.stop()
         prompts.stop()
         backups.stop()

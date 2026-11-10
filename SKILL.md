@@ -236,6 +236,14 @@ These agents can modify files or use tools, so preserve the user's action scope.
 
 `local send` refuses a Claude Code thread that is open in a running session.
 
+### Remote connectors
+
+`one-conv live connectors add CLI...` makes this machine serve CLIs (mcp-bridge
+names) to claude.ai through the live hub, as custom connectors at
+`https://<hub>/mcp/<cli>` behind OAuth; `live connectors ls` prints the URLs and
+whether each machine is online, `rm` stops serving. Calls run here, through the
+bridge, so they need `live serve` running. See MOBILE_WORKSPACE.md.
+
 ### Messaging running sessions
 
 `one-conv live ls` lists running sessions with addresses such as

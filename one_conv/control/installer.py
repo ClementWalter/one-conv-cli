@@ -37,7 +37,8 @@ UNIT = "one-conv-control.service"
 REPOSITORY = "https://github.com/ClementWalter/one-conv-cli.git"
 BOAT_URL = "https://boat.dev/api/boat/cli/download?platform=linux-x64&channel=prod"
 # sqlalchemy and pydantic back the conversation archive the controller serves to every node.
-DEPENDENCIES = ("click==8.3.3", "starlette==1.8.0", "uvicorn==0.54.0", "sqlalchemy==2.1.4", "pydantic==2.12.5")
+DEPENDENCIES = ("click==8.3.3", "starlette==1.8.0", "uvicorn==0.54.0", "sqlalchemy==2.1.4", "pydantic==2.12.5",
+                "mcp==2.2.0")
 PAYLOAD_LIMIT = 256_000
 DOWNLOAD_LIMIT = 256 * 1024 * 1024
 STAGES = frozenset({

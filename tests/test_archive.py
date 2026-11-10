@@ -734,6 +734,60 @@ def test_capture_keeps_a_claude_cwd_its_project_folder_name_encodes(tmp_path, mo
     assert sync.capture(reader, relocated, "origin")["cwd"] == "/example/ancestry/worktree"
 
 
+def test_encode_path_turns_every_non_alphanumeric_character_into_a_dash(tmp_path):
+    reader = load_sync_script().load_reader()
+    assert reader._encode_path("/Drive/me@mail.com/Mon Drive/a_b") == "-Drive-me-mail-com-Mon-Drive-a-b"
+
+
+def test_capture_keeps_a_session_copied_into_a_folder_whose_name_has_spaces_and_at_signs(tmp_path, monkeypatch):
+    """A session copied into a moved project keeps only the old cwd; the new folder's name pins the listed one."""
+    sync, reader, handle = claude_handle(tmp_path, monkeypatch)
+    moved_cwd = "/Drive/me@mail.com/Mon Drive/ancestry"
+    folder = handle.path.parent.parent / "-Drive-me-mail-com-Mon-Drive-ancestry"
+    folder.mkdir()
+    copied = folder / handle.path.name
+    shutil.copy(handle.path, copied)
+    listed = dataclasses.replace(handle, path=copied, project_cwd=moved_cwd)
+    assert sync.capture(reader, listed, "origin")["cwd"] == moved_cwd
+
+
+def sync_while_written(tmp_path, monkeypatch, client, writing):
+    """One in-process sync of the Claude fixture; with `writing`, an agent appends to it mid-capture."""
+    sync, reader, handle = claude_handle(tmp_path, monkeypatch)
+    summary = reader._handle_summary
+
+    def append_then_summarize(parsed, cache):
+        with handle.path.open("a") as stream:
+            stream.write(json.dumps({"type": "user", "cwd": "/example/ancestry", "message": {"content": "more"}}) + "\n")
+        return summary(parsed, cache)
+
+    if writing:
+        monkeypatch.setattr(reader, "_handle_summary", append_then_summarize)
+    args = types.SimpleNamespace(source=["claude"], project=None, limit=0, lane="", free_older_than=None)
+    lock = tmp_path / "sync.lock"
+    lock.touch()
+    return sync.sync(reader, client, "origin", args, lock)
+
+
+def test_sync_defers_a_session_written_during_capture(tmp_path, monkeypatch, archive):
+    _, client, _url = archive
+    result, _failures = sync_while_written(tmp_path, monkeypatch, client, writing=True)
+    assert result == {"uploaded": 0, "unchanged": 0, "busy": 1}
+
+
+def test_sync_reports_no_failure_for_a_session_written_during_capture(tmp_path, monkeypatch, archive):
+    _, client, _url = archive
+    _result, failures = sync_while_written(tmp_path, monkeypatch, client, writing=True)
+    assert failures == []
+
+
+def test_sync_uploads_a_deferred_session_once_it_is_idle(tmp_path, monkeypatch, archive):
+    _, client, _url = archive
+    sync_while_written(tmp_path, monkeypatch, client, writing=True)
+    result, _failures = sync_while_written(tmp_path, monkeypatch, client, writing=False)
+    assert result == {"uploaded": 1, "unchanged": 0}
+
+
 def test_capture_refuses_a_cursor_cli_chat_whose_captured_meta_has_no_cwd(tmp_path, monkeypatch):
     from test_cursor_cli import CHAT_ID, _write_chat
     env = fixture_env(tmp_path)

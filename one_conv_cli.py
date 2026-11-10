@@ -297,9 +297,10 @@ def _session_cwd(path: Path) -> str | None:
 
 def _encode_path(cwd: str) -> str:
     """Reproduce Claude Code's lossy directory-name encoding for a cwd (every
-    `/` and `.` becomes `-`), so a candidate cwd can be checked against a real
-    project-directory name on disk."""
-    return re.sub(r"[/.]", "-", cwd)
+    character other than an ASCII letter or digit becomes `-`, so `/`, `.`,
+    `@`, spaces and `_` alike), so a candidate cwd can be checked against a
+    real project-directory name on disk."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", cwd)
 
 
 def _project_cwd(project_dir: Path) -> str:
@@ -2980,7 +2981,9 @@ def _session_author(cwd: str, first_text: str) -> str:
 
 def _export_session(handle: SessionHandle, machine: str, out_root: Path) -> Path | None:
     """Write one session file; return its path, or None when the stored copy is already current."""
-    target = out_root / machine / handle.source / _encode_path(handle.project_cwd) / f"{handle.uuid}.json"
+    # Snapshot folders keep their own fixed naming, so a re-export overwrites a session instead of duplicating it.
+    folder = re.sub(r"[/.]", "-", handle.project_cwd)
+    target = out_root / machine / handle.source / folder / f"{handle.uuid}.json"
     if target.exists():
         try:
             if json.loads(target.read_text()).get("mtime", 0) >= handle.mtime:

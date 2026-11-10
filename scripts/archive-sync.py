@@ -322,6 +322,13 @@ class EmptyConversation(ArchiveError):
     """A conversation that holds nothing yet, such as a Cursor chat opened and never used."""
 
 
+class SourceBusy(ArchiveError):
+    """A conversation whose files moved while it was captured: an agent is still writing it.
+
+    Nothing is recorded for it, so the next sync captures it again once it is idle.
+    """
+
+
 def original_records(reader, handle, paths):
     if handle.source == "cursor":
         conn = reader._cursor_connect()
@@ -383,7 +390,7 @@ def capture(reader, handle, origin):
         "originals": originals}
     changed = original_records(reader, handle, paths) != originals if handle.source == "cursor" else fingerprint(paths) != before
     if changed:
-        raise ArchiveError(f"Source changed during capture: {handle.uuid}; retry when idle")
+        raise SourceBusy(f"Source changed during capture: {handle.uuid}; retry when idle")
     require_regular(main_files(handle, paths))
     return document
 
@@ -682,6 +689,10 @@ def sync(reader, client, origin, args, lock):
             result["uploaded"] += 1
         except EmptyConversation:
             result["empty"] = result.get("empty", 0) + 1  # Nothing to archive until it is used.
+        except SourceBusy as error:
+            # A session being written is not a failure: it stays out of the warning and is retried next run.
+            result["busy"] = result.get("busy", 0) + 1
+            print(f"{handle.source}/{handle.uuid}: deferred: {error}", file=sys.stderr)
         # One unreadable or malformed conversation must not stop the others.
         except SYNC_ERRORS + (reader.click.ClickException,) as error:
             failures.append(f"{handle.source}/{handle.uuid}: {type(error).__name__}: {error}")

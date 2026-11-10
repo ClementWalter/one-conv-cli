@@ -82,6 +82,21 @@ def test_unknown_content_fails_closed(transcript):
         provider.read_conversation("chat-1")
 
 
+@pytest.mark.parametrize("kind,marker", [("image", "[Image retained in source content]"),
+                                         ("document", "[Document retained in source content]")])
+def test_inline_media_block_is_marked(transcript, kind, marker):
+    transcript["chat_messages"][0]["content"].append({"type": kind, "source": {"type": "base64"}})
+    provider = AnthropicProvider(None, "org", transport=StubTransport(transcript))
+    assert marker in provider.read_conversation("chat-1").messages[0].text
+
+
+def test_unknown_content_error_names_the_block(transcript):
+    transcript["chat_messages"][0]["content"] = [{"type": "future_schema"}]
+    provider = AnthropicProvider(None, "org", transport=StubTransport(transcript))
+    with pytest.raises(SchemaChanged, match="future_schema"):
+        provider.read_conversation("chat-1")
+
+
 def test_attachment_extracted_text_is_retained(transcript):
     transcript["chat_messages"][0]["attachments"] = [{"file_name": "note.txt", "extracted_content": "decision evidence"}]
     provider = AnthropicProvider(None, "org", transport=StubTransport(transcript))

@@ -71,8 +71,11 @@ def build_live_group(launcher: list[str]) -> click.Group:
                   help="Leave a notice for the target's `local feed` instead of waking it; no reply expected.")
     @click.option("--no-reply", is_flag=True, help="Push, but mark the message as needing no reply.")
     @click.option("--topic", help="File a direct message under this topic too.")
+    @click.option("--image", "images", multiple=True, metavar="PATH",
+                  help="Attach an image (PNG, JPEG, GIF or WebP; repeat for up to 4). A Claude chat or "
+                       "Cowork session receives the image; an agent on this machine a saved copy to read.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the delivery receipt as JSON.")
-    def send_command(target, message, from_stdin, sender, fyi, no_reply, topic, yes, as_json):
+    def send_command(target, message, from_stdin, sender, fyi, no_reply, topic, images, yes, as_json):
         """Send MESSAGE to TARGET: an address, id prefix, title, NODE/address, @name or #topic.
 
         The message arrives as a new user turn wrapped with the sender's address, name and
@@ -102,6 +105,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 click.echo(f"  to:       {cloud_send.PREFIXES[product]}{row['id'][:12]}  {row['title']}")
                 click.echo(f"  delivery: claude.ai, as {row['account_label'] or row['account_id']}; the reply comes back here")
                 click.echo(f"  from:     {me.address if me else origin}")
+                _echo_images(images)
                 return
             if not yes:
                 session = router.resolve(target, exclude=me)
@@ -109,9 +113,10 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 click.echo(f"  to:       {session.address}  {session.title or session.cwd}")
                 click.echo(f"  delivery: {'fyi (feed inbox)' if fyi else session.delivery} ({session.status or 'unknown'})")
                 click.echo(f"  from:     {me.address if me else origin}")
+                _echo_images(images)
                 return
             receipt = router.send(target, message, me, origin, fyi=fyi,
-                                  reply="none" if no_reply else "expected", topic=topic)
+                                  reply="none" if no_reply else "expected", topic=topic, images=images)
         except (router.LiveError, team.TeamError, RuntimeError, OSError) as error:
             raise click.ClickException(str(error)) from None
         if as_json:
@@ -130,6 +135,15 @@ def build_live_group(launcher: list[str]) -> click.Group:
             _print_request(receipt["summarize"])
         if receipt.get("warning") and not as_json:
             click.echo(f"warning: {receipt['warning']}", err=True)
+
+    def _echo_images(images):
+        """Check the images in a dry run too, so a bad one shows before --yes."""
+        from .. import images as attached
+        try:
+            for image in attached.load(images):
+                click.echo(f"  image:    {image.path} ({image.media_type}, {len(image.data)} bytes)")
+        except attached.ImageError as error:
+            raise click.ClickException(str(error)) from None
 
     def _me(address):
         me = router.whoami(address)

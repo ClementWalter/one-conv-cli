@@ -150,10 +150,19 @@ their usage, so send only what the user asked for, to a chat they named. On an
 error, check the chat before resending; the turn may already be posted. Pull the
 account afterwards to save the exchange. ChatGPT and Codex cloud have no send. A deleted conversation answers 404: pull the account to refresh the list.
 
+`--image PATH` (repeat, up to 4; PNG, JPEG, GIF or WebP, 10 MB each; `images` in
+`send_message`) attaches pictures. A Claude chat receives them as uploads, a
+Cowork session inline, and an agent on this machine a saved copy under
+`<live home>/attachments`, named in the text as `[Attached image N: PATH ...]`,
+the same line the bridge writes for workspace images. Images are checked before
+anything is sent. A `#topic` or an agent on another machine cannot take images:
+the hub accepts image uploads only from the workspace.
+
 ```bash
 one-conv live send 'cowork:Weekly report' 'Add last week numbers' --yes
 one-conv live send 'claude-chat:Trip planning' 'Summarize where we stopped' --yes
 one-conv live send claude-chat:abcd1234 --stdin --yes --json < note.md
+one-conv live send claude-chat:abcd1234 'What is on this receipt?' --image receipt.jpg --yes
 one-conv cloud claude send abcd1234 'Summarize where we stopped' --yes
 ```
 

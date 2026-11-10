@@ -343,13 +343,30 @@ def ack(message_id: str, address: str) -> dict:
 
 def send(target: str, text: str, sender: LiveSession | None, origin: str = "unknown",
          fyi: bool = False, reply: str = "expected", topic: str | None = None,
-         message_id: str | None = None) -> dict:
+         message_id: str | None = None, images=()) -> dict:
     """Deliver to one session, or to every member of a topic for a `#topic` target.
 
     `message_id` is chosen once and reused on retry, so a receiver can drop a duplicate.
+    `images` are file paths: a cloud conversation receives the images themselves, an agent
+    on this machine a saved copy of each, named in the text.
     """
+    from .. import cloud_send, images as attached
     message_id = message_id or uuid.uuid4().hex
     named = topic_of(target)
+    try:
+        loaded = attached.load(images)
+    except attached.ImageError as error:
+        raise LiveError(str(error)) from error
+    if loaded and named is not None:
+        raise LiveError("Images go to one address at a time, not to a #topic.")
+    if loaded and remote_address(target)[0] is not None:
+        try:
+            hub = hubclient.configured()
+        except hubclient.HubRefused as error:
+            raise LiveError(str(error)) from error
+        if hub is None or remote_address(target)[0] != hub.node:
+            raise LiveError("Images cannot reach an agent on another machine: the hub takes image uploads "
+                            "only from the workspace.")
     try:
         if named is not None:
             return _logged(_send_topic(named, text, sender, origin, fyi, reply, message_id), text, None,
@@ -358,12 +375,13 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
             topic = team._check("topic", topic)
     except team.TeamError as error:
         raise LiveError(str(error)) from error
-    from .. import cloud_send
     if cloud_send.is_cloud_target(target):
-        receipt = _send_cloud(target, text, sender, origin, fyi, reply, topic, message_id)
+        receipt = _send_cloud(target, text, sender, origin, fyi, reply, topic, message_id, loaded)
         if topic is not None and (request := team.record(topic, message_id, receipt["from"], text)):
             receipt["summarize"] = request
         return _logged(receipt, text, topic, fyi, reply)
+    if loaded:
+        text += attached.saved_lines(loaded, live_home() / "attachments")
     node, local = remote_address(target)
     if node is not None:
         hub = hubclient.configured()
@@ -418,7 +436,7 @@ def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str
 
 
 def _send_cloud(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
-                reply: str, topic: str | None, message_id: str) -> dict:
+                reply: str, topic: str | None, message_id: str, images=()) -> dict:
     """Post into a saved Claude chat or Cowork session; it answers inline, so the reply comes back in the receipt."""
     from .. import cloud_send
     if fyi:
@@ -426,7 +444,7 @@ def _send_cloud(target: str, text: str, sender: LiveSession | None, origin: str,
     wrapped = cloud_send.cloud_envelope(text, sender, origin, reply, message_id, topic)
     product, query = cloud_send.split_target(target)
     try:
-        delivered = cloud_send.deliver(product, query, wrapped)
+        delivered = cloud_send.deliver(product, query, wrapped, images=images)
     except cloud_send.CloudSendError as error:
         raise LiveError(str(error)) from error
     return {**delivered, "id": message_id, "from": sender.address if sender else origin,

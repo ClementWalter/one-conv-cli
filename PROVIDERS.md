@@ -56,7 +56,7 @@ before the core traverses the active branch. Message content blocks are `text`,
 `thinking`, `tool_use`, `tool_result`, `image` and `document`; any other type
 fails the read and names the type.
 
-`cloud claude send` is one of one-conv's two provider writes. It POSTs to
+`cloud claude send` uses two of one-conv's three provider writes (upload and completion). It POSTs to
 `/api/organizations/{org}/chat_conversations/{id}/completion` with `prompt`,
 `parent_message_uuid` (the chat's `current_leaf_message_uuid`, or the synthetic
 root for an empty chat), `timezone`, empty `attachments` and `files`, and
@@ -78,7 +78,15 @@ by sequence. Device attestation applies to tool-permission answers, not to user
 messages. Verified live on 2026-11-10 on a session created in a chat-capable
 organization (`POST /v1/code/sessions` with `environment_id`, `config`, a first
 user event and the `cowork-remote` tag). This route is allowlisted and never
-retried, like the chat completion. Codex's observed `/tasks/{id}/turns`
+retried, like the chat completion.
+
+Images: a chat turn's images are uploaded first, one multipart `file` field per
+POST to `/api/{org}/upload`, whose answer carries `file_uuid`; the completion's
+`files` lists those IDs. A Cowork user event carries them inline: `content` becomes
+`[{"type": "image", "source": {"type": "base64", "media_type", "data"}}, ...,
+{"type": "text", "text"}]`, as the web app's composer builds it. Both verified
+live on 2026-11-10 with a PNG each receiver named correctly. The upload route is
+allowlisted and never retried. Codex's observed `/tasks/{id}/turns`
 contains `turn_mapping` and `current_turn_id`; details alone omit historical turns.
 
 ## Session integration

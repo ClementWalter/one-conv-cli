@@ -150,13 +150,17 @@ def create_server() -> MCPServer:
     @server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=True),
                  structured_output=True)
     def send_message(to: str, text: str, ctx: Context, fyi: bool = False,
-                     expect_reply: bool = True, topic: str | None = None) -> dict[str, Any]:
+                     expect_reply: bool = True, topic: str | None = None,
+                     images: list[str] | None = None) -> dict[str, Any]:
         """Send text as a new user turn to `to`: an address, id prefix, title, @name or #topic.
 
         `to` may also be a saved Claude chat, `claude-chat:<ID prefix or title>`, or Cowork
         session, `cowork:<ID prefix or title>` (see the cloud chats listing): the turn is
         posted as the account that owns it, which answers inline, so the result carries its
         `reply`. These cannot take fyi.
+        `images` are up to 4 image file paths on this machine (PNG, JPEG, GIF, WebP): a
+        Claude chat or Cowork session receives the images, an agent on this machine a saved
+        copy of each named in the text. Not for a #topic or an agent on another machine.
 
         A #topic reaches every member except you. `topic` files a direct message under a
         topic too. Use fyi=true for acknowledgments, sign-offs and completion notices: they
@@ -169,7 +173,7 @@ def create_server() -> MCPServer:
         meta = dict(ctx.request_context.meta or {})
         try:
             return router.send(to, text, router.whoami(meta=meta), fyi=fyi,
-                               reply="expected" if expect_reply else "none", topic=topic)
+                               reply="expected" if expect_reply else "none", topic=topic, images=images or ())
         except (router.LiveError, team.TeamError, RuntimeError, OSError) as error:
             raise ToolError(str(error)) from error
 

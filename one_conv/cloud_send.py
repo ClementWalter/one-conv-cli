@@ -98,8 +98,9 @@ def cloud_envelope(text: str, sender, origin: str, reply: str = "expected",
                     "none" if reply == "none" else "inline", message_id, topic)
 
 
-def deliver(product: str, query: str, wrapped: str, accounts: Callable[[], Iterable[dict]] | None = None) -> dict:
-    """Post WRAPPED into the PRODUCT conversation QUERY names and wait for its reply."""
+def deliver(product: str, query: str, wrapped: str, accounts: Callable[[], Iterable[dict]] | None = None,
+            images=()) -> dict:
+    """Post WRAPPED, with any loaded IMAGES, into the PRODUCT conversation QUERY names and wait for its reply."""
     from .cloud_cli import browser_provider
     from .providers.base import ProviderError
 
@@ -114,6 +115,8 @@ def deliver(product: str, query: str, wrapped: str, accounts: Callable[[], Itera
     try:
         # Only a Claude chat dates the turn; a Cowork agent runs on its own clock.
         options = {"timezone_name": local_timezone()} if product == "claude-chat" else {}
+        if images:
+            options["images"] = tuple(images)
         sent = provider.send_message(row["id"], wrapped, **options)
     except ProviderError as error:
         if str(error).endswith("HTTP 404"):
@@ -130,7 +133,8 @@ def deliver(product: str, query: str, wrapped: str, accounts: Callable[[], Itera
 def send_command(name: str, product: str) -> click.Command:
     """`one-conv cloud claude|cowork send`: `live send PREFIX:CONVERSATION`, with a conversation-first dry run."""
 
-    def invoke(conversation, message, from_stdin, sender, yes, as_json):
+    def invoke(conversation, message, from_stdin, sender, images, yes, as_json):
+        from . import images as attached
         from .live import router
 
         if from_stdin:
@@ -148,9 +152,11 @@ def send_command(name: str, product: str) -> click.Command:
                 click.echo("  message:")
                 text = cloud_envelope(message, me, origin)
                 click.echo("\n".join("    " + line for line in text.splitlines()))
+                for image in attached.load(images):
+                    click.echo(f"  image:   {image.path} ({image.media_type}, {len(image.data)} bytes)")
                 return
-            receipt = router.send(PREFIXES[product] + row["id"], message, me, origin)
-        except (CloudSendError, router.LiveError) as error:
+            receipt = router.send(PREFIXES[product] + row["id"], message, me, origin, images=images)
+        except (CloudSendError, router.LiveError, attached.ImageError) as error:
             raise click.ClickException(str(error)) from None
         if as_json:
             click.echo(json.dumps(receipt, ensure_ascii=False))
@@ -164,6 +170,8 @@ def send_command(name: str, product: str) -> click.Command:
         params=[click.Argument(["conversation"]), click.Argument(["message"], required=False),
                 click.Option(["--stdin", "from_stdin"], is_flag=True, help="Read the message from stdin."),
                 click.Option(["--from", "sender"], help="Sender address; detected from the calling agent by default."),
+                click.Option(["--image", "images"], multiple=True, metavar="PATH",
+                             help="Attach an image (PNG, JPEG, GIF or WebP; repeat for up to 4)."),
                 click.Option(["--yes"], is_flag=True, help="Actually send. Without it, prints what would be sent."),
                 click.Option(["--json", "as_json"], is_flag=True, help="Emit the receipt and reply as JSON.")],
         help=(f"Post MESSAGE into a saved {product} conversation as the account that owns it, and print the reply.\n\n"
@@ -172,5 +180,6 @@ def send_command(name: str, product: str) -> click.Command:
               "answers it, and the account's owner sees it in their history. Same route as "
               f"`one-conv live send {PREFIXES[product]}CONVERSATION`. Dry run without --yes."),
         epilog=(f"\b\nExamples:\n  one-conv cloud {name} send abcd1234 'What did we settle on?'\n"
-                f"  one-conv cloud {name} send 'Trip planning' --stdin --yes < note.md"),
+                f"  one-conv cloud {name} send 'Trip planning' --stdin --yes < note.md\n"
+                f"  one-conv cloud {name} send abcd1234 'What is on this receipt?' --image receipt.jpg --yes"),
         context_settings={"help_option_names": ["-h", "--help"]})

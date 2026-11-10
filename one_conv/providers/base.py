@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 
 CLAUDE_COMPLETION = re.compile(r"/api/organizations/[0-9a-f-]{36}/chat_conversations/[0-9a-f-]{36}/completion")
 COWORK_EVENTS = re.compile(r"/v1/code/sessions/cse_[A-Za-z0-9]{1,64}/events")
+CLAUDE_UPLOAD = re.compile(r"/api/[0-9a-f-]{36}/upload")
 
 
 class ProviderError(RuntimeError):
@@ -135,15 +136,24 @@ class JsonTransport:
             raise ValueError("Only the ChatGPT read-only search POST is supported")
         return self._request("post", path, {"json": body})
 
-    def post_session_events(self, path, body, timeout=60):
-        """Post events to one Cowork session; only that route, never retried, like post_completion."""
-        if self.base_url != "https://claude.ai" or not COWORK_EVENTS.fullmatch(path):
-            raise ValueError("Only the Cowork session events POST is supported")
+    def post_upload(self, path, name, media_type, data, timeout=120):
+        """Upload one file for a Claude chat message; only the org upload route, never retried."""
+        if self.base_url != "https://claude.ai" or not CLAUDE_UPLOAD.fullmatch(path):
+            raise ValueError("Only the Claude upload POST is supported")
+        from curl_cffi import CurlMime
+        form = CurlMime()
+        form.addpart(name="file", content_type=media_type, filename=name, data=data)
         try:
-            response = self.session.post(self.base_url + path, json=body, timeout=timeout, allow_redirects=False)
+            response = self.session.post(self.base_url + path, multipart=form, timeout=timeout,
+                                         allow_redirects=False)
         except Exception:
             # Session libraries differ; never expose exception strings containing credentials.
             raise ProviderUnavailable(f"{self.fingerprint}: transport failed") from None
+        finally:
+            form.close()
+        return self._json_answer(response)
+
+    def _json_answer(self, response):
         status = response.status_code
         if status in (401, 403):
             raise AuthenticationRequired(f"{self.fingerprint}: authorization required")
@@ -156,6 +166,17 @@ class JsonTransport:
             return response.json()
         except (ValueError, TypeError):
             raise SchemaChanged(f"{self.fingerprint}: expected JSON") from None
+
+    def post_session_events(self, path, body, timeout=60):
+        """Post events to one Cowork session; only that route, never retried, like post_completion."""
+        if self.base_url != "https://claude.ai" or not COWORK_EVENTS.fullmatch(path):
+            raise ValueError("Only the Cowork session events POST is supported")
+        try:
+            response = self.session.post(self.base_url + path, json=body, timeout=timeout, allow_redirects=False)
+        except Exception:
+            # Session libraries differ; never expose exception strings containing credentials.
+            raise ProviderUnavailable(f"{self.fingerprint}: transport failed") from None
+        return self._json_answer(response)
 
     def post_completion(self, path, body, timeout=600):
         """Post one Claude chat message and yield its server-sent events.

@@ -199,10 +199,12 @@ class AnthropicProvider:
             active_leaf_id=leaf,
         )
 
-    def send_message(self, conversation_id: str, text: str, *, timezone_name: str = "UTC") -> SentMessage:
+    def send_message(self, conversation_id: str, text: str, *, timezone_name: str = "UTC",
+                     images=()) -> SentMessage:
         """Post TEXT as the account's next turn in a chat and wait for Claude's reply.
 
-        The turn continues the chat's active branch, as typing in the web app would.
+        The turn continues the chat's active branch, as typing in the web app would. Each
+        image is uploaded to the organization first and attached to the turn by its file ID.
         """
         identifier = _text(conversation_id, "conversation ID")
         path = f"{self._root}/{quote(identifier, safe='')}"
@@ -210,8 +212,13 @@ class AnthropicProvider:
         if payload.get("uuid") != identifier:
             raise SchemaChanged("Claude returned a different conversation")
         parent = _optional_text(payload.get("current_leaf_message_uuid"), "active leaf") or ROOT_MESSAGE_ID
+        files = []
+        for image in images:
+            uploaded = _object(self.transport.post_upload(
+                f"/api/{quote(self.organization_id, safe='')}/upload", image.name, image.media_type, image.data))
+            files.append(_text(uploaded.get("file_uuid"), "uploaded file ID"))
         body = {"prompt": _text(text, "message text"), "parent_message_uuid": parent,
-                "timezone": timezone_name, "attachments": [], "files": [], "rendering_mode": "messages"}
+                "timezone": timezone_name, "attachments": [], "files": files, "rendering_mode": "messages"}
         started = stopped = None
         reply, stop_reason = {}, None
         for event in self.transport.post_completion(path + "/completion", body):

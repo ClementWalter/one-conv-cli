@@ -212,7 +212,7 @@ def delivered(cache, monkeypatch, tmp_path):
     (tmp_path / "live").mkdir()
     posted = []
 
-    def deliver(product, query, wrapped, accounts=None):
+    def deliver(product, query, wrapped, accounts=None, images=()):
         posted.append((query, wrapped, product))
         return {"to": "claude-chat:" + CHAT, "title": "Trip planning", "account": "Personal", "account_id": "acct",
                 "chat_message_id": "sent-1", "reply_id": "reply-1", "stop_reason": "end_turn", "reply": "pong",

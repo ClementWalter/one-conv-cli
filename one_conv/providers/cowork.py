@@ -1,5 +1,6 @@
 """Read organization-scoped Cowork cloud sessions as event snapshots, and post user messages to them."""
 
+import base64
 import json
 import time
 from urllib.parse import quote
@@ -132,18 +133,24 @@ class CoworkProvider:
             raise SchemaChanged("Cowork event pagination exceeded its page budget")
         return sorted(events, key=lambda item: item[0])
 
-    def send_message(self, conversation_id, text, *, timeout=600, interval=5, sleep=time.sleep,
+    def send_message(self, conversation_id, text, *, images=(), timeout=600, interval=5, sleep=time.sleep,
                      clock=time.monotonic):
         """Post TEXT as the user's next message in a Cowork session and wait for the turn to end.
 
         The session's agent runs the turn in the cloud; its reply is the assistant text
-        between the posted event and the `result` event that closes the turn.
+        between the posted event and the `result` event that closes the turn. Images go
+        inline as base64 blocks before the text, as the web app sends them.
         """
         identifier = _text(conversation_id, "session ID")
         root = "/v1/code/sessions/" + quote(identifier, safe="")
         event_uuid = str(uuid.uuid4())
         payload = {"type": "user", "uuid": event_uuid, "session_id": identifier, "parent_tool_use_id": None,
                    "message": {"role": "user", "content": _text(text, "message text")}}
+        if images:
+            payload["message"]["content"] = [
+                *({"type": "image", "source": {"type": "base64", "media_type": image.media_type,
+                                               "data": base64.b64encode(image.data).decode()}} for image in images),
+                {"type": "text", "text": text}]
         answer = _object(self.transport.post_session_events(root + "/events", {"events": [{"payload": payload}]}))
         results = answer.get("results")
         if not isinstance(results, list) or len(results) != 1:

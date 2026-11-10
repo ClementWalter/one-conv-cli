@@ -121,6 +121,6 @@ def send_command(name: str, product: str) -> click.Command:
               "CONVERSATION is an ID prefix or title from `chats`. The message is wrapped in a "
               "<one-conv-message> envelope naming the sender. It is the account's own turn: the chat "
               "answers it, and the account's owner sees it in their history. Dry run without --yes."),
-        epilog=(f"\b\nExamples:\n  one-conv cloud {name} send e08c3c85 'What did we settle on?'\n"
-                f"  one-conv cloud {name} send 'Greek island stone house' --stdin --yes < note.md"),
+        epilog=(f"\b\nExamples:\n  one-conv cloud {name} send abcd1234 'What did we settle on?'\n"
+                f"  one-conv cloud {name} send 'Trip planning' --stdin --yes < note.md"),
         context_settings={"help_option_names": ["-h", "--help"]})

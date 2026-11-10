@@ -24,8 +24,8 @@ from one_conv.live.model import LiveSession
 from one_conv.providers.anthropic import AnthropicProvider, ROOT_MESSAGE_ID
 from one_conv.providers.base import (AuthenticationRequired, JsonTransport, ProviderUnavailable)
 
-ORG = "940672dd-fe32-4630-abe5-50fb64796523"
-CHAT = "27df5fd2-eddb-4422-9c73-75541dabb848"
+ORG = "11111111-2222-4333-8444-555555555555"
+CHAT = "66666666-7777-4888-9999-aaaaaaaaaaaa"
 COMPLETION = f"/api/organizations/{ORG}/chat_conversations/{CHAT}/completion"
 
 
@@ -144,11 +144,11 @@ def cache(tmp_path):
     def save(name, document):
         (tmp_path / "account").mkdir(exist_ok=True)
         (tmp_path / "account" / f"{name}.json").write_text(json.dumps(document))
-    save("aaa111", {"source": "claude-chat", "id": CHAT, "session": "aaa111", "title": "Greek island stone house",
-                    "account_id": "acct", "account_label": "Ariane"})
-    save("bbb222", {"source": "claude-chat", "id": "chat-2", "session": "bbb222", "title": "Greek island ferries",
-                    "account_id": "acct", "account_label": "Ariane"})
-    save("ccc333", {"source": "chatgpt", "id": "chat-3", "session": "ccc333", "title": "Stone house", "account_id": "x"})
+    save("aaa111", {"source": "claude-chat", "id": CHAT, "session": "aaa111", "title": "Trip planning",
+                    "account_id": "acct", "account_label": "Personal"})
+    save("bbb222", {"source": "claude-chat", "id": "chat-2", "session": "bbb222", "title": "Trip planning budget",
+                    "account_id": "acct", "account_label": "Personal"})
+    save("ccc333", {"source": "chatgpt", "id": "chat-3", "session": "ccc333", "title": "Trip", "account_id": "x"})
     return tmp_path
 
 
@@ -157,11 +157,11 @@ def test_saved_conversation_by_displayed_prefix(cache):
 
 
 def test_saved_conversation_by_provider_prefix(cache):
-    assert cloud_send.saved_conversation("27df5fd2", "claude-chat", cache)["session"] == "aaa111"
+    assert cloud_send.saved_conversation("66666666", "claude-chat", cache)["session"] == "aaa111"
 
 
 def test_saved_conversation_by_exact_title(cache):
-    assert cloud_send.saved_conversation("greek island stone house", "claude-chat", cache)["id"] == CHAT
+    assert cloud_send.saved_conversation("trip planning", "claude-chat", cache)["id"] == CHAT
 
 
 def test_saved_conversation_ignores_other_products(cache):
@@ -171,7 +171,7 @@ def test_saved_conversation_ignores_other_products(cache):
 
 def test_saved_conversation_rejects_ambiguous_titles(cache):
     with pytest.raises(click.ClickException, match="Several"):
-        cloud_send.saved_conversation("greek island", "claude-chat", cache)
+        cloud_send.saved_conversation("trip plan", "claude-chat", cache)
 
 
 def test_envelope_names_the_sender(monkeypatch):
@@ -202,4 +202,4 @@ def test_dry_run_shows_the_target_chat(cache, monkeypatch):
     monkeypatch.setattr(cloud_send, "cache_root", lambda: cache)
     monkeypatch.setattr("one_conv.live.router.whoami", lambda _: None)
     result = CliRunner().invoke(cloud_send.send_command("claude", "claude-chat"), ["aaa", "hello"], obj={})
-    assert "to:      Greek island stone house  (Ariane)" in result.output
+    assert "to:      Trip planning  (Personal)" in result.output

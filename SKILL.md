@@ -144,8 +144,8 @@ account afterwards to save the exchange. Cowork, ChatGPT and Codex cloud have no
 send.
 
 ```bash
-one-conv cloud claude send 'Greek island stone house' 'Summarize where we stopped' --yes
-one-conv cloud claude send e08c3c85 --stdin --yes --json < note.md
+one-conv cloud claude send 'Trip planning' 'Summarize where we stopped' --yes
+one-conv cloud claude send abcd1234 --stdin --yes --json < note.md
 ```
 
 Replace `QUERY`, `EMAIL` and account selectors with values from discovery.

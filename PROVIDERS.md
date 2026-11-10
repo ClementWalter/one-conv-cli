@@ -56,7 +56,7 @@ before the core traverses the active branch. Message content blocks are `text`,
 `thinking`, `tool_use`, `tool_result`, `image` and `document`; any other type
 fails the read and names the type.
 
-`cloud claude send` is one-conv's only provider write. It POSTs to
+`cloud claude send` is one of one-conv's two provider writes. It POSTs to
 `/api/organizations/{org}/chat_conversations/{id}/completion` with `prompt`,
 `parent_message_uuid` (the chat's `current_leaf_message_uuid`, or the synthetic
 root for an empty chat), `timezone`, empty `attachments` and `files`, and
@@ -67,7 +67,18 @@ pieces, then `message_delta`, `message_limit` and `message_stop`. Verified live
 on 2026-11-10 against a chat-capable organization; an organization whose
 capabilities lack `chat` (API-only individual orgs) answers 403. The transport
 allowlists only this route and never retries it, since a retry could post twice.
-Cowork has no send: its write route is not verified. Codex's observed `/tasks/{id}/turns`
+`cloud cowork send` POSTs `{"events": [{"payload": {"type": "user", "uuid",
+"session_id", "parent_tool_use_id": null, "message": {"role": "user",
+"content"}}}]}` to `/v1/code/sessions/{id}/events` with the ccr headers, the
+route the web app's `sendUrl` uses. The answer's `results[0].sequence_num` marks
+the posted event; the turn's reply is the `assistant` events after it, up to the
+`result` event (its `subtype`, e.g. `success`, is the stop reason). The events
+listing ignores `from_sequence_num`, so the poll pages the whole log and filters
+by sequence. Device attestation applies to tool-permission answers, not to user
+messages. Verified live on 2026-11-10 on a session created in a chat-capable
+organization (`POST /v1/code/sessions` with `environment_id`, `config`, a first
+user event and the `cowork-remote` tag). This route is allowlisted and never
+retried, like the chat completion. Codex's observed `/tasks/{id}/turns`
 contains `turn_mapping` and `current_turn_id`; details alone omit historical turns.
 
 ## Session integration

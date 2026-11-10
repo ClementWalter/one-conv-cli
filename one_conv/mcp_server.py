@@ -153,9 +153,10 @@ def create_server() -> MCPServer:
                      expect_reply: bool = True, topic: str | None = None) -> dict[str, Any]:
         """Send text as a new user turn to `to`: an address, id prefix, title, @name or #topic.
 
-        `to` may also be a saved Claude chat, `claude-chat:<ID prefix or title>` (see the
-        cloud chats listing): the turn is posted as the account that owns the chat, which
-        answers inline, so the result carries its `reply`. A chat cannot take fyi.
+        `to` may also be a saved Claude chat, `claude-chat:<ID prefix or title>`, or Cowork
+        session, `cowork:<ID prefix or title>` (see the cloud chats listing): the turn is
+        posted as the account that owns it, which answers inline, so the result carries its
+        `reply`. These cannot take fyi.
 
         A #topic reaches every member except you. `topic` files a direct message under a
         topic too. Use fyi=true for acknowledgments, sign-offs and completion notices: they

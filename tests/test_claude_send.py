@@ -201,7 +201,7 @@ def test_deliver_without_registered_accounts_fails(cache, monkeypatch):
     monkeypatch.setattr(cloud_send, "cache_root", lambda: cache)
     monkeypatch.setattr(cloud_send, "_accounts", None)
     with pytest.raises(cloud_send.CloudSendError, match="unavailable"):
-        cloud_send.deliver("aaa", "hi")
+        cloud_send.deliver("claude-chat", "aaa", "hi")
 
 
 @pytest.fixture
@@ -212,8 +212,8 @@ def delivered(cache, monkeypatch, tmp_path):
     (tmp_path / "live").mkdir()
     posted = []
 
-    def deliver(query, wrapped, accounts=None):
-        posted.append((query, wrapped))
+    def deliver(product, query, wrapped, accounts=None):
+        posted.append((query, wrapped, product))
         return {"to": "claude-chat:" + CHAT, "title": "Trip planning", "account": "Personal", "account_id": "acct",
                 "chat_message_id": "sent-1", "reply_id": "reply-1", "stop_reason": "end_turn", "reply": "pong",
                 "url": "https://claude.ai/chat/" + CHAT}
@@ -237,6 +237,11 @@ def test_live_send_returns_the_chat_reply(delivered):
 
 def test_live_send_signs_with_the_sender(delivered):
     assert router.send("claude-chat:aaa", "hello", None, "macbook/claude-desktop")["from"] == "macbook/claude-desktop"
+
+
+def test_live_send_routes_a_cowork_address(delivered):
+    router.send("cowork:aaa", "hello", SENDER)
+    assert delivered[0][2] == "cowork-cloud"
 
 
 def test_live_send_refuses_fyi_to_a_chat(delivered):

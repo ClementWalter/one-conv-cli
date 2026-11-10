@@ -1,9 +1,10 @@
-"""Deliver one-conv messages to saved Claude chats, as the account that owns each chat.
+"""Deliver one-conv messages to saved Claude chats and Cowork sessions, as the account that owns each.
 
-A Claude chat is addressed `claude-chat:<ID prefix or title>` in `live send` and the
-`send_message` tool, next to local agent sessions; `cloud claude send` is the same
-route. The message carries the live `<one-conv-message>` envelope. The chat has no
-one-conv tools, so it answers in the conversation and the reply returns to the sender.
+A Claude chat is addressed `claude-chat:<ID prefix or title>` and a Cowork session
+`cowork:<ID prefix or title>` in `live send` and the `send_message` tool, next to
+local agent sessions; `cloud claude send` and `cloud cowork send` are the same route.
+The message carries the live `<one-conv-message>` envelope. Neither can message back,
+so each answers in its own conversation and the reply returns to the sender.
 """
 
 from __future__ import annotations
@@ -19,6 +20,11 @@ import click
 from .cloud import cache_root
 
 CLAUDE_CHAT = "claude-chat:"
+COWORK = "cowork:"
+# Address prefix -> saved-history product; each product's provider implements send_message.
+PRODUCTS = {CLAUDE_CHAT: "claude-chat", COWORK: "cowork-cloud"}
+PREFIXES = {product: prefix for prefix, product in PRODUCTS.items()}
+URLS = {"claude-chat": "https://claude.ai/chat/", "cowork-cloud": "https://claude.ai/cowork/"}
 # Account discovery lives in the launcher (it reads browser logins and the vault), which registers it.
 _accounts: Callable[[], Iterable[dict]] | None = None
 
@@ -33,7 +39,13 @@ def register_accounts(discover: Callable[[], Iterable[dict]]) -> None:
 
 
 def is_cloud_target(target: str) -> bool:
-    return target.startswith(CLAUDE_CHAT)
+    return target.startswith(tuple(PRODUCTS))
+
+
+def split_target(target: str) -> tuple[str, str]:
+    """(product, query) of a cloud address such as `cowork:<ID prefix or title>`."""
+    prefix = next(prefix for prefix in PRODUCTS if target.startswith(prefix))
+    return PRODUCTS[prefix], target[len(prefix):]
 
 
 def saved_conversation(query: str, source: str, root: Path | None = None) -> dict:
@@ -86,32 +98,37 @@ def cloud_envelope(text: str, sender, origin: str, reply: str = "expected",
                     "none" if reply == "none" else "inline", message_id, topic)
 
 
-def deliver(query: str, wrapped: str, accounts: Callable[[], Iterable[dict]] | None = None) -> dict:
-    """Post WRAPPED into the chat QUERY names and wait for Claude's reply."""
+def deliver(product: str, query: str, wrapped: str, accounts: Callable[[], Iterable[dict]] | None = None) -> dict:
+    """Post WRAPPED into the PRODUCT conversation QUERY names and wait for its reply."""
     from .cloud_cli import browser_provider
     from .providers.base import ProviderError
 
-    row = saved_conversation(query, "claude-chat")
+    row = saved_conversation(query, product)
     discover = accounts or _accounts
     if discover is None:
         raise CloudSendError("Claude accounts are unavailable in this process; use the one-conv command.")
     try:
-        provider = browser_provider("claude-chat", row["account_id"], discover)
+        provider = browser_provider(product, row["account_id"], discover)
     except click.ClickException as error:
         raise CloudSendError(error.message) from None
     try:
-        sent = provider.send_message(row["id"], wrapped, timezone_name=local_timezone())
+        # Only a Claude chat dates the turn; a Cowork agent runs on its own clock.
+        options = {"timezone_name": local_timezone()} if product == "claude-chat" else {}
+        sent = provider.send_message(row["id"], wrapped, **options)
     except ProviderError as error:
-        raise CloudSendError(f"{error}. Check the chat in the browser before resending.") from None
-    return {"to": CLAUDE_CHAT + row["id"], "title": row["title"],
+        if str(error).endswith("HTTP 404"):
+            raise CloudSendError(f"{row['title'] or row['id']} no longer exists on claude.ai (deleted?); "
+                                 "pull the account to refresh the saved list.") from None
+        raise CloudSendError(f"{error}. Check the conversation in the browser before resending.") from None
+    return {"to": PREFIXES[product] + row["id"], "title": row["title"],
             "account": row["account_label"] or row["account_id"], "account_id": row["account_id"],
             "chat_message_id": sent.message_id, "reply_id": sent.reply_id,
             "stop_reason": sent.stop_reason, "reply": sent.reply,
-            "url": f"https://claude.ai/chat/{row['id']}"}
+            "url": URLS[product] + row["id"]}
 
 
 def send_command(name: str, product: str) -> click.Command:
-    """`one-conv cloud claude send`: `live send claude-chat:CONVERSATION`, with a chat-first dry run."""
+    """`one-conv cloud claude|cowork send`: `live send PREFIX:CONVERSATION`, with a conversation-first dry run."""
 
     def invoke(conversation, message, from_stdin, sender, yes, as_json):
         from .live import router
@@ -126,13 +143,13 @@ def send_command(name: str, product: str) -> click.Command:
             origin = "unknown" if me else router.origin(sys.stdin.isatty() and not from_stdin)
             if not yes:
                 click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
-                click.echo(f"  to:      {CLAUDE_CHAT}{row['id'][:8]}  {row['title']}  ({row['account_label'] or row['account_id']})")
-                click.echo("  as:      the account itself; the chat replies to this turn")
+                click.echo(f"  to:      {PREFIXES[product]}{row['id'][:12]}  {row['title']}  ({row['account_label'] or row['account_id']})")
+                click.echo("  as:      the account itself; the conversation replies to this turn")
                 click.echo("  message:")
                 text = cloud_envelope(message, me, origin)
                 click.echo("\n".join("    " + line for line in text.splitlines()))
                 return
-            receipt = router.send(CLAUDE_CHAT + row["id"], message, me, origin)
+            receipt = router.send(PREFIXES[product] + row["id"], message, me, origin)
         except (CloudSendError, router.LiveError) as error:
             raise click.ClickException(str(error)) from None
         if as_json:
@@ -149,11 +166,11 @@ def send_command(name: str, product: str) -> click.Command:
                 click.Option(["--from", "sender"], help="Sender address; detected from the calling agent by default."),
                 click.Option(["--yes"], is_flag=True, help="Actually send. Without it, prints what would be sent."),
                 click.Option(["--json", "as_json"], is_flag=True, help="Emit the receipt and reply as JSON.")],
-        help=("Post MESSAGE into a saved chat as the account that owns it, and print Claude's reply.\n\n"
+        help=(f"Post MESSAGE into a saved {product} conversation as the account that owns it, and print the reply.\n\n"
               "CONVERSATION is an ID prefix or title from `chats`. The message is wrapped in a "
-              "<one-conv-message> envelope naming the sender. It is the account's own turn: the chat "
+              "<one-conv-message> envelope naming the sender. It is the account's own turn: the conversation "
               "answers it, and the account's owner sees it in their history. Same route as "
-              "`one-conv live send claude-chat:CONVERSATION`. Dry run without --yes."),
+              f"`one-conv live send {PREFIXES[product]}CONVERSATION`. Dry run without --yes."),
         epilog=(f"\b\nExamples:\n  one-conv cloud {name} send abcd1234 'What did we settle on?'\n"
                 f"  one-conv cloud {name} send 'Trip planning' --stdin --yes < note.md"),
         context_settings={"help_option_names": ["-h", "--help"]})

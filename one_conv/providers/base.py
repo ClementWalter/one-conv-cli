@@ -10,6 +10,7 @@ import time
 from urllib.parse import urlsplit
 
 CLAUDE_COMPLETION = re.compile(r"/api/organizations/[0-9a-f-]{36}/chat_conversations/[0-9a-f-]{36}/completion")
+COWORK_EVENTS = re.compile(r"/v1/code/sessions/cse_[A-Za-z0-9]{1,64}/events")
 
 
 class ProviderError(RuntimeError):
@@ -134,10 +135,32 @@ class JsonTransport:
             raise ValueError("Only the ChatGPT read-only search POST is supported")
         return self._request("post", path, {"json": body})
 
+    def post_session_events(self, path, body, timeout=60):
+        """Post events to one Cowork session; only that route, never retried, like post_completion."""
+        if self.base_url != "https://claude.ai" or not COWORK_EVENTS.fullmatch(path):
+            raise ValueError("Only the Cowork session events POST is supported")
+        try:
+            response = self.session.post(self.base_url + path, json=body, timeout=timeout, allow_redirects=False)
+        except Exception:
+            # Session libraries differ; never expose exception strings containing credentials.
+            raise ProviderUnavailable(f"{self.fingerprint}: transport failed") from None
+        status = response.status_code
+        if status in (401, 403):
+            raise AuthenticationRequired(f"{self.fingerprint}: authorization required")
+        if status == 429:
+            raise RateLimited(f"{self.fingerprint}: retry later",
+                              retry_delay(getattr(response, "headers", {}).get("Retry-After")))
+        if status != 200:
+            raise ProviderUnavailable(f"{self.fingerprint}: HTTP {status}")
+        try:
+            return response.json()
+        except (ValueError, TypeError):
+            raise SchemaChanged(f"{self.fingerprint}: expected JSON") from None
+
     def post_completion(self, path, body, timeout=600):
         """Post one Claude chat message and yield its server-sent events.
 
-        This is the only provider write one-conv makes, so it accepts only the Claude
+        Provider writes are allowlisted one route each; this one accepts only the Claude
         completion route. It never retries: a retried POST could send the message twice.
         """
         if self.base_url != "https://claude.ai" or not CLAUDE_COMPLETION.fullmatch(path):

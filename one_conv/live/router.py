@@ -419,17 +419,18 @@ def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str
 
 def _send_cloud(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
                 reply: str, topic: str | None, message_id: str) -> dict:
-    """Post into a saved Claude chat; it answers inline, so the reply comes back in the receipt."""
+    """Post into a saved Claude chat or Cowork session; it answers inline, so the reply comes back in the receipt."""
     from .. import cloud_send
     if fyi:
-        raise LiveError("A Claude chat has no feed to hold a notice; send it without fyi.")
+        raise LiveError("A cloud conversation has no feed to hold a notice; send it without fyi.")
     wrapped = cloud_send.cloud_envelope(text, sender, origin, reply, message_id, topic)
+    product, query = cloud_send.split_target(target)
     try:
-        delivered = cloud_send.deliver(target[len(cloud_send.CLAUDE_CHAT):], wrapped)
+        delivered = cloud_send.deliver(product, query, wrapped)
     except cloud_send.CloudSendError as error:
         raise LiveError(str(error)) from error
     return {**delivered, "id": message_id, "from": sender.address if sender else origin,
-            "via": "claude.ai", "delivery": "claude.ai", "status": "replied"}
+            "via": "claude.ai", "delivery": product, "status": "replied"}
 
 
 def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,

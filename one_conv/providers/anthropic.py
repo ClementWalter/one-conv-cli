@@ -35,7 +35,7 @@ class SentMessage:
 
     conversation_id: str
     message_id: str
-    reply_id: str
+    reply_id: str | None
     reply: str
     stop_reason: str | None
 

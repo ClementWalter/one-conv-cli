@@ -1,10 +1,13 @@
-"""Read organization-scoped Cowork cloud sessions and paginated event snapshots."""
+"""Read organization-scoped Cowork cloud sessions as event snapshots, and post user messages to them."""
 
 import json
+import time
 from urllib.parse import quote
+import uuid
 
-from .anthropic import AnthropicProvider, _object, _text
-from .base import Conversation, ConversationPage, ConversationSummary, JsonTransport, Message, SchemaChanged
+from .anthropic import AnthropicProvider, SentMessage, _object, _text
+from .base import (Conversation, ConversationPage, ConversationSummary, JsonTransport, Message,
+                   ProviderUnavailable, SchemaChanged)
 
 CAPABILITIES = ("cowork:list", "cowork:read_events")
 FINGERPRINT = "cowork-session-events:2026-09-08"
@@ -94,6 +97,14 @@ class CoworkProvider:
         detail = _object(detail.get("response_shape", detail))
         if detail.get("id") != conversation_id or "cowork-remote" not in detail.get("tags", []):
             raise SchemaChanged("Cowork session identity or product mismatch")
+        events = self._events(root)
+        # Events are a snapshot, including pending tool questions, not a completed task.
+        messages = tuple(message for _, event in events if (message := _message(event)) is not None)
+        return Conversation(conversation_id, _text(detail.get("title"), "title", empty=True),
+                            messages, coverage="session_event_snapshot", complete=True)
+
+    def _events(self, root):
+        """Every event of a session as (sequence number, event), oldest first."""
         events, cursors, seen = [], set(), set()
         cursor = None
         for _ in range(100):
@@ -119,8 +130,47 @@ class CoworkProvider:
             cursor = following
         else:
             raise SchemaChanged("Cowork event pagination exceeded its page budget")
-        # Events are a snapshot, including pending tool questions, not a completed task.
-        messages = tuple(message for _, event in sorted(events, key=lambda item: item[0])
-                         if (message := _message(event)) is not None)
-        return Conversation(conversation_id, _text(detail.get("title"), "title", empty=True),
-                            messages, coverage="session_event_snapshot", complete=True)
+        return sorted(events, key=lambda item: item[0])
+
+    def send_message(self, conversation_id, text, *, timeout=600, interval=5, sleep=time.sleep,
+                     clock=time.monotonic):
+        """Post TEXT as the user's next message in a Cowork session and wait for the turn to end.
+
+        The session's agent runs the turn in the cloud; its reply is the assistant text
+        between the posted event and the `result` event that closes the turn.
+        """
+        identifier = _text(conversation_id, "session ID")
+        root = "/v1/code/sessions/" + quote(identifier, safe="")
+        event_uuid = str(uuid.uuid4())
+        payload = {"type": "user", "uuid": event_uuid, "session_id": identifier, "parent_tool_use_id": None,
+                   "message": {"role": "user", "content": _text(text, "message text")}}
+        answer = _object(self.transport.post_session_events(root + "/events", {"events": [{"payload": payload}]}))
+        results = answer.get("results")
+        if not isinstance(results, list) or len(results) != 1:
+            raise SchemaChanged("Cowork did not acknowledge exactly one event")
+        result = _object(results[0])
+        sequence = str(result.get("sequence_num", ""))
+        if not sequence.isdigit():
+            raise SchemaChanged("Cowork acknowledged the event without a sequence number")
+        posted = int(sequence)
+        deadline = clock() + timeout
+        while True:
+            reply, outcome = [], None
+            for number, event in self._events(root):
+                if number <= posted:
+                    continue
+                if event.get("event_type") == "assistant":
+                    message = _message(event)
+                    if message is not None and message.text:
+                        reply.append(message.text)
+                elif event.get("event_type") == "result":
+                    outcome = _object(event.get("payload")).get("subtype") or "result"
+                    break
+            if outcome is not None:
+                return SentMessage(conversation_id=identifier,
+                                   message_id=_text(result.get("event_id"), "event ID"),
+                                   reply_id=None, reply="\n\n".join(reply), stop_reason=outcome)
+            if clock() >= deadline:
+                raise ProviderUnavailable("Cowork's turn did not finish in time; the message is posted, "
+                                          "read the session later for the reply")
+            sleep(interval)

@@ -3,9 +3,13 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import json
 import math
+import re
 import time
 from urllib.parse import urlsplit
+
+CLAUDE_COMPLETION = re.compile(r"/api/organizations/[0-9a-f-]{36}/chat_conversations/[0-9a-f-]{36}/completion")
 
 
 class ProviderError(RuntimeError):
@@ -129,6 +133,45 @@ class JsonTransport:
         if self.base_url != "https://chatgpt.com" or path != "/backend-api/global/search":
             raise ValueError("Only the ChatGPT read-only search POST is supported")
         return self._request("post", path, {"json": body})
+
+    def post_completion(self, path, body, timeout=600):
+        """Post one Claude chat message and yield its server-sent events.
+
+        This is the only provider write one-conv makes, so it accepts only the Claude
+        completion route. It never retries: a retried POST could send the message twice.
+        """
+        if self.base_url != "https://claude.ai" or not CLAUDE_COMPLETION.fullmatch(path):
+            raise ValueError("Only the Claude chat completion POST is supported")
+        try:
+            response = self.session.post(self.base_url + path, json=body, timeout=timeout, stream=True,
+                                         allow_redirects=False, headers={"Accept": "text/event-stream"})
+        except Exception:
+            # Session libraries differ; never expose exception strings containing credentials.
+            raise ProviderUnavailable(f"{self.fingerprint}: transport failed") from None
+        try:
+            status = response.status_code
+            if status in (401, 403):
+                raise AuthenticationRequired(f"{self.fingerprint}: authorization required")
+            if status == 429:
+                raise RateLimited(f"{self.fingerprint}: retry later",
+                                  retry_delay(getattr(response, "headers", {}).get("Retry-After")))
+            if status != 200:
+                raise ProviderUnavailable(f"{self.fingerprint}: HTTP {status}")
+            for raw in response.iter_lines():
+                line = raw.decode() if isinstance(raw, bytes) else raw
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    event = json.loads(line[5:])
+                except ValueError:
+                    raise SchemaChanged(f"{self.fingerprint}: expected JSON events") from None
+                if not isinstance(event, dict):
+                    raise SchemaChanged(f"{self.fingerprint}: expected JSON event objects")
+                yield event
+        finally:
+            close = getattr(response, "close", None)
+            if close is not None:
+                close()
 
     def _request(self, method, path, arguments):
         if not path.startswith("/") or path.startswith("//") or "\\" in path:

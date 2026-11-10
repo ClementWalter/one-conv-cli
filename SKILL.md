@@ -126,6 +126,28 @@ one-conv cloud codex pull --account EMAIL --limit 10
 one-conv cloud search QUERY --json
 ```
 
+### Sending into a Claude chat
+
+`cloud claude send CONVERSATION MESSAGE --yes` posts MESSAGE as the next turn of
+a saved Claude chat, as the account that owns it, and prints Claude's reply
+(`--json` adds the message and reply IDs). CONVERSATION is an ID prefix or title
+from `chats`; the account comes from the saved conversation, so pull it first.
+The message is wrapped in the live `<one-conv-message from="...">` envelope with
+`reply="inline"`, naming the calling agent (or `--from ADDRESS`). The sender's
+working directory is left out, because the chat may belong to someone else.
+
+Without `--yes` it is a dry run that shows the target chat and the exact text.
+A sent turn is the account's own: it appears in its owner's history and uses
+their usage, so send only what the user asked for, to a chat they named. On an
+error, check the chat before resending; the turn may already be posted. Pull the
+account afterwards to save the exchange. Cowork, ChatGPT and Codex cloud have no
+send.
+
+```bash
+one-conv cloud claude send 'Greek island stone house' 'Summarize where we stopped' --yes
+one-conv cloud claude send e08c3c85 --stdin --yes --json < note.md
+```
+
 Replace `QUERY`, `EMAIL` and account selectors with values from discovery.
 Claude selectors include organization names and IDs; ambiguous names require
 the exact account ID. Claude account identity includes browser profile and

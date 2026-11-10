@@ -1,12 +1,14 @@
-"""Read Claude Chat through an explicitly supplied private web session.
+"""Read and write Claude Chat through an explicitly supplied private web session.
 
 The authenticated web interface uses an offset-paged conversation listing and
-message trees. These private routes are not a supported Anthropic API contract.
+message trees; a send posts one turn to the completion route. These private
+routes are not a supported Anthropic API contract.
 Cowork cloud uses a separate session-event adapter.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from urllib.parse import quote
 import json
 
@@ -18,12 +20,24 @@ from .base import (
     JsonTransport,
     Message,
     ProviderAccount,
+    ProviderUnavailable,
     SchemaChanged,
 )
 
 FINGERPRINT = "claude-web-chat-2026-09-08"
 CAPABILITIES = ("claude_chat:list", "claude_chat:read")
 ROOT_MESSAGE_ID = "00000000-0000-4000-8000-000000000000"
+
+
+@dataclass(frozen=True)
+class SentMessage:
+    """A turn posted into a Claude chat and the reply it received."""
+
+    conversation_id: str
+    message_id: str
+    reply_id: str
+    reply: str
+    stop_reason: str | None
 
 
 def _text(value, field: str, *, empty: bool = False) -> str:
@@ -183,4 +197,46 @@ class AnthropicProvider:
             title=_text(payload.get("name"), "conversation name", empty=True),
             messages=tuple(messages),
             active_leaf_id=leaf,
+        )
+
+    def send_message(self, conversation_id: str, text: str, *, timezone_name: str = "UTC") -> SentMessage:
+        """Post TEXT as the account's next turn in a chat and wait for Claude's reply.
+
+        The turn continues the chat's active branch, as typing in the web app would.
+        """
+        identifier = _text(conversation_id, "conversation ID")
+        path = f"{self._root}/{quote(identifier, safe='')}"
+        payload = _object(self.transport.get(path, params={"tree": "True", "rendering_mode": "messages"}))
+        if payload.get("uuid") != identifier:
+            raise SchemaChanged("Claude returned a different conversation")
+        parent = _optional_text(payload.get("current_leaf_message_uuid"), "active leaf") or ROOT_MESSAGE_ID
+        body = {"prompt": _text(text, "message text"), "parent_message_uuid": parent,
+                "timezone": timezone_name, "attachments": [], "files": [], "rendering_mode": "messages"}
+        started = stopped = None
+        reply, stop_reason = {}, None
+        for event in self.transport.post_completion(path + "/completion", body):
+            kind = event.get("type")
+            if kind == "error":
+                error = event.get("error") if isinstance(event.get("error"), dict) else {}
+                raise ProviderUnavailable(f"Claude refused the message: {error.get('type', 'error')}")
+            if kind == "message_start":
+                started = _object(event.get("message"))
+            elif kind == "content_block_delta":
+                delta = _object(event.get("delta"))
+                if delta.get("type") == "text_delta":
+                    reply[event.get("index")] = reply.get(event.get("index"), "") + _text(
+                        delta.get("text"), "reply text", empty=True)
+            elif kind == "message_delta":
+                stop_reason = _object(event.get("delta")).get("stop_reason")
+            elif kind == "message_stop":
+                stopped = True
+        if started is None or not stopped:
+            # The human turn may already be stored; only the reply is missing.
+            raise ProviderUnavailable("Claude's reply stream ended before the reply was complete")
+        return SentMessage(
+            conversation_id=identifier,
+            message_id=_text(started.get("parent_uuid"), "sent message ID"),
+            reply_id=_text(started.get("uuid"), "reply ID"),
+            reply="\n\n".join(reply[index] for index in sorted(reply, key=lambda i: (i is None, i))),
+            stop_reason=stop_reason,
         )

@@ -229,6 +229,10 @@ def install(root, browser_accounts, claude_accounts, login_profiles):
         group.add_command(_pull(sync, name, product))
         group.add_command(_accounts(name))
         group.add_command(_connect(name))
+        if name == "claude":
+            # Claude chat is the only cloud product whose send route is verified.
+            from .cloud_send import send_command
+            group.add_command(send_command(name, product))
         cloud.add_command(group)
     root.add_command(cloud)
 

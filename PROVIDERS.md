@@ -52,7 +52,22 @@ search keeps its separate GET compatibility route, not live-verified this pass.
 
 Claude's observed listing is `chat_conversations_v2` with `data` and `has_more`,
 not the earlier array response. The adapter normalizes its synthetic root UUID
-before the core traverses the active branch. Codex's observed `/tasks/{id}/turns`
+before the core traverses the active branch. Message content blocks are `text`,
+`thinking`, `tool_use`, `tool_result`, `image` and `document`; any other type
+fails the read and names the type.
+
+`cloud claude send` is one-conv's only provider write. It POSTs to
+`/api/organizations/{org}/chat_conversations/{id}/completion` with `prompt`,
+`parent_message_uuid` (the chat's `current_leaf_message_uuid`, or the synthetic
+root for an empty chat), `timezone`, empty `attachments` and `files`, and
+`rendering_mode: messages`; no Origin header is required. The response is
+server-sent events: `message_start` carries the reply `uuid` and its
+`parent_uuid` (the posted turn), `content_block_delta` carries `text_delta`
+pieces, then `message_delta`, `message_limit` and `message_stop`. Verified live
+on 2026-11-10 against a chat-capable organization; an organization whose
+capabilities lack `chat` (API-only individual orgs) answers 403. The transport
+allowlists only this route and never retries it, since a retry could post twice.
+Cowork has no send: its write route is not verified. Codex's observed `/tasks/{id}/turns`
 contains `turn_mapping` and `current_turn_id`; details alone omit historical turns.
 
 ## Session integration

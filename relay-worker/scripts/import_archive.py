@@ -45,7 +45,9 @@ class Relay:
     def post(self, path: str, body: dict) -> dict:
         data = json.dumps(body, ensure_ascii=False).encode()
         request = Request(self.url + path, data=data, method="POST",
-                          headers={"Authorization": f"Bearer {self.admin}", "Content-Type": "application/json"})
+                          headers={"Authorization": f"Bearer {self.admin}", "Content-Type": "application/json",
+                                   # Cloudflare refuses Python's default "Python-urllib" agent (error 1010).
+                                   "User-Agent": "one-conv-admin"})
         try:
             with urlopen(request, timeout=300) as response:
                 return json.loads(response.read())

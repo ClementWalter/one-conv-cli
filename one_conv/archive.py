@@ -14,6 +14,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from one_conv import USER_AGENT
+
 CHUNK_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 16 * 1024 * 1024
 FIELDS = ("turns", "turns_with_subagents", "search_text")
@@ -206,7 +208,7 @@ class ArchiveClient:
     def request(self, path, body=None, *, raw=False):
         data = encode(body) if body is not None else None
         request = Request(self.url + "/v1/" + path, data=data,
-                          headers={"Authorization": "Bearer " + self.token,
+                          headers={"Authorization": "Bearer " + self.token, "User-Agent": USER_AGENT,
                                    "Content-Type": "application/json",
                                    # Chunks already contain zlib data and do not benefit from gzip.
                                    "Accept-Encoding": "identity" if raw else "gzip"})

@@ -17,6 +17,8 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from one_conv import USER_AGENT
+
 from . import tunnel
 from .model import live_home
 
@@ -72,6 +74,7 @@ class HubClient:
         self.listener_pid = listener_pid
         # An empty ProxyHandler keeps http_proxy/https_proxy from routing the token and body elsewhere.
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+        self._opener.addheaders = [("User-Agent", USER_AGENT)]
 
     def request(self, method: str, path: str, body: dict | None = None) -> dict:
         if self.listener_pid is not None and not tunnel.listening(self.listener_pid, urlsplit(self.url).port or 0):

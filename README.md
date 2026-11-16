@@ -386,8 +386,13 @@ one-conv local thread ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03   # r
   Through `ssh://`, `live send` uses the forwarded port only while the bridge's
   own ssh process holds it; once the bridge has stopped, sends are queued instead.
 - The bridge publishes this machine's live sessions every 15 seconds and
-  long-polls for messages addressed to them, handing each to that session's own
-  harness as a local send would. A message for a session that is not live here is
+  receives messages addressed to them, handing each to that session's own
+  harness as a local send would. On the Cloudflare Worker relay messages are
+  pushed over a WebSocket (`/v1/stream`), which lets the relay sleep between
+  messages; the bridge redials a dropped one with backoff, and the relay pushes
+  again whatever is still undelivered. The self-hosted Python relay
+  (`scripts/live-hub.py`, also behind `ssh://`) has no stream, so there the
+  bridge long-polls `/v1/inbox` instead. A message for a session that is not live here is
   refused, not queued. An attached image is uploaded to the relay and saved on
   the receiving machine, whose agent gets its path.
 - While the relay is unreachable, `live send` queues the message and the bridge

@@ -91,6 +91,7 @@ def add_bridge_commands(live: click.Group) -> None:
             raise click.UsageError("A new --hub needs its own token: pass --token-stdin or ONE_CONV_HUB_TOKEN.")
         hub = _check_hub(hub)
         bridge.save_settings(hub, node, hub_port, token)
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+        # force: the CLI configured WARNING at import, which would hide the bridge's transport and delivery lines.
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", force=True)
         click.echo(f"bridge for node {node} via {hub}; stop with Ctrl-C or `one-conv live serve --stop`", err=True)
         sys.exit(bridge.serve(hub, node, token, hub_port))

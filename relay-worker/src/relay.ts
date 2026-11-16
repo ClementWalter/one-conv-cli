@@ -10,6 +10,12 @@
  * One instance serializes every request, so a long-poll inbox waits on an in-memory promise
  * that a send to its node resolves, instead of polling storage. Attachment bodies live in R2:
  * an image may reach 10 MB and a Durable Object SQLite value is capped at 2 MB.
+ *
+ * A bridge can instead hold GET /v1/stream, a hibernatable WebSocket: each pending delivery is
+ * pushed as a frame `{"messages": [delivery]}` (the /v1/inbox body with one delivery) when the
+ * socket opens and when a send creates it, and acks still go through POST /v1/acks. The object
+ * sleeps between frames: a socket is found again by its node tag, never through instance memory,
+ * and the runtime answers the bridge's "ping" with "pong" without waking it.
  */
 
 import { DurableObject } from "cloudflare:workers";
@@ -34,6 +40,11 @@ export const MAX_WAIT = 30;
 export const LEASE_SECONDS = 60;
 const PRODUCTS = ["cursor-cli", "cursor-ide"];
 const INBOX_LIMIT = 50;
+// Keepalive text frames the runtime answers itself, so a ping never wakes a hibernated object.
+export const PING = "ping";
+export const PONG = "pong";
+// Close code for a socket whose token was revoked or replaced: the bridge reads it as a 401.
+export const REVOKED = 4401;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tokens (node TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, created REAL NOT NULL);
@@ -52,6 +63,9 @@ CREATE INDEX IF NOT EXISTS pending ON deliveries (to_node, outcome, post);
 CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, node TEXT NOT NULL, media_type TEXT NOT NULL,
     size INTEGER NOT NULL, created REAL NOT NULL);
 `;
+// The columns a delivery is handed out with, by /v1/inbox and /v1/stream alike.
+const PENDING =
+  "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.reply, p.mode, p.text, p.created, p.attachments FROM deliveries d JOIN posts p ON p.seq = d.post";
 const TABLES = ["tokens", "nodes", "sessions", "deliveries", "posts", "attachments"];
 
 type Row = Record<string, SqlStorageValue>;
@@ -86,6 +100,7 @@ export class Relay extends DurableObject<Env> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec(SCHEMA);
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PING, PONG));
     const work = (handler: Work) => (request: Request, params: Record<string, string>) => this.handle(request, params, handler);
     this.routes = [
       { pattern: path("/v1/whoami"), methods: ["GET"], handle: work((node) => ({ node })) },
@@ -97,6 +112,7 @@ export class Relay extends DurableObject<Env> {
       { pattern: path("/v1/messages"), methods: ["POST"], handle: work((node, body) => this.send(node, body)) },
       { pattern: path("/v1/messages/{msg_id}"), methods: ["GET"], handle: work((node, _, __, params) => this.status(node, params.msg_id)) },
       { pattern: path("/v1/inbox"), methods: ["GET"], handle: work(async (node, _, request) => ({ messages: await this.inbox(node, waitParam(request)) })) },
+      { pattern: path("/v1/stream"), methods: ["GET"], handle: (request) => this.stream(request) },
       { pattern: path("/v1/acks"), methods: ["POST"], handle: work((node, body) => this.ack(node, pyStr(body.delivery ?? null), pyStr(body.outcome ?? null))) },
       { pattern: path("/v1/attachments"), methods: ["POST"], handle: (request) => this.upload(request) },
       { pattern: path("/v1/attachments/{ident}"), methods: ["GET"], handle: (request, params) => this.download(request, params.ident) },
@@ -113,16 +129,30 @@ export class Relay extends DurableObject<Env> {
     if (!NODE.test(node)) return { error: `node names are lowercase letters, digits and dashes: ${pyRepr(node)}` };
     const token = tokenUrlsafe();
     this.sql.exec("INSERT OR REPLACE INTO tokens VALUES (?, ?, ?)", node, await sha256(token), now());
+    // A socket opened with the replaced token must not outlive it.
+    this.closeStreams(node, "this node's token was replaced");
     return { token };
   }
 
   revoke(node: string): boolean {
-    return this.ctx.storage.transactionSync(() => {
+    const removed = this.ctx.storage.transactionSync(() => {
       const removed = this.sql.exec("DELETE FROM tokens WHERE node = ?", node).rowsWritten;
       this.sql.exec("DELETE FROM sessions WHERE node = ?", node);
       this.sql.exec("DELETE FROM nodes WHERE node = ?", node);
       return removed > 0;
     });
+    this.closeStreams(node, "unknown or revoked token");
+    return removed;
+  }
+
+  private closeStreams(node: string, reason: string): void {
+    for (const socket of this.ctx.getWebSockets(node)) {
+      try {
+        socket.close(REVOKED, reason);
+      } catch {
+        // Already closing: nothing more reaches it.
+      }
+    }
   }
 
   tokens(): { node: string; created: number }[] {
@@ -205,6 +235,59 @@ export class Relay extends DurableObject<Env> {
     } catch (error) {
       if (error instanceof HttpError) return errorResponse(error.status, error.message);
       throw error;
+    }
+  }
+
+  // --- stream: hibernatable WebSockets tagged with their node --------------------------------------
+
+  private async stream(request: Request): Promise<Response> {
+    try {
+      const node = await this.authenticated(request);
+      if ((request.headers.get("upgrade") ?? "").toLowerCase() !== "websocket") throw new HttpError(426, "GET /v1/stream is a WebSocket upgrade");
+      const [client, server] = Object.values(new WebSocketPair());
+      // The tag is how a send finds this socket again after the object hibernated.
+      this.ctx.acceptWebSocket(server, [node]);
+      server.serializeAttachment({ node });
+      this.seen(node);
+      // Every delivery still without an outcome, so nothing sent while the bridge was away is lost.
+      const rows = this.sql
+        .exec(`${PENDING} WHERE d.to_node = ? AND d.outcome IS NULL ORDER BY d.post, d.rowid`, node)
+        .toArray();
+      this.push([server], rows);
+      return new Response(null, { status: 101, webSocket: client });
+    } catch (error) {
+      if (error instanceof HttpError) return errorResponse(error.status, error.message);
+      throw error;
+    }
+  }
+
+  /** Hand deliveries to open sockets, one frame each: a frame stays far below the message size limit. */
+  private push(sockets: WebSocket[], rows: Row[]): void {
+    if (!sockets.length || !rows.length) return;
+    const taken = now();
+    for (const row of rows) {
+      this.sql.exec("UPDATE deliveries SET taken = ? WHERE delivery = ?", taken, row.delivery);
+      const frame = JSON.stringify({ messages: [handed(row)] });
+      for (const socket of sockets) {
+        try {
+          socket.send(frame);
+        } catch {
+          // A socket closing under us: its bridge gets the delivery again when it reconnects.
+        }
+      }
+    }
+  }
+
+  webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): void {
+    // The runtime answers PING itself; this covers a ping that reaches the object anyway.
+    if (message === PING) socket.send(PONG);
+  }
+
+  webSocketClose(socket: WebSocket, code: number, reason: string): void {
+    try {
+      socket.close(code === 1005 || code === 1006 ? 1000 : code, reason);
+    } catch {
+      // The runtime already completed the closing handshake.
     }
   }
 
@@ -342,10 +425,11 @@ export class Relay extends DurableObject<Env> {
           attachments ? JSON.stringify(attachments) : null,
         )
         .one().seq as number;
-      this.sql.exec("INSERT INTO deliveries (delivery, post, to_node, to_address) VALUES (?, ?, ?, ?)", randomHex(16), seq, toNode, toAddress);
-      return { receipt: this.receipt(seq, id, false), wake: toNode };
+      const delivery = randomHex(16);
+      this.sql.exec("INSERT INTO deliveries (delivery, post, to_node, to_address) VALUES (?, ?, ?, ?)", delivery, seq, toNode, toAddress);
+      return { receipt: this.receipt(seq, id, false), wake: { node: toNode, delivery } };
     });
-    if (result.wake) this.wake(result.wake);
+    if (result.wake) this.wake(result.wake.node, result.wake.delivery);
     return result.receipt;
   }
 
@@ -370,20 +454,15 @@ export class Relay extends DurableObject<Env> {
     return { id: ident, media_type: mediaType, size: body.length };
   }
 
-  private wake(node: string): void {
+  /** Wake the node's long-polls and push the new delivery to every stream it holds open, as /v1/inbox hands it to every poller. */
+  private wake(node: string, delivery: string): void {
     for (const resolve of this.waiting.get(node) ?? []) resolve();
+    this.push(this.ctx.getWebSockets(node), this.sql.exec(`${PENDING} WHERE d.delivery = ?`, delivery).toArray());
   }
 
   private pending(node: string): Row[] {
     this.seen(node);
-    const rows = this.sql
-      .exec(
-        "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.reply, p.mode, p.text, p.created, p.attachments" +
-          " FROM deliveries d JOIN posts p ON p.seq = d.post WHERE d.to_node = ? AND d.outcome IS NULL ORDER BY d.post LIMIT ?",
-        node,
-        INBOX_LIMIT,
-      )
-      .toArray();
+    const rows = this.sql.exec(`${PENDING} WHERE d.to_node = ? AND d.outcome IS NULL ORDER BY d.post LIMIT ?`, node, INBOX_LIMIT).toArray();
     const taken = now();
     for (const row of rows) this.sql.exec("UPDATE deliveries SET taken = ? WHERE delivery = ?", taken, row.delivery);
     return rows;

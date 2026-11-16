@@ -2,7 +2,8 @@
 
 Each machine runs one bridge (`one-conv live serve`) that authenticates with its own node
 token, publishes its live sessions (with the @names they chose), and long-polls for deliveries
-addressed to them.
+addressed to them. This relay serves no /v1/stream: a bridge whose upgrade it refuses long-polls
+/v1/inbox, so only the Cloudflare Worker relay (relay-worker/) pushes deliveries over a WebSocket.
 
 A message is a post, kept once under (sending node, client-generated id) with a hash of its
 payload, so a retry returns the first receipt and a different payload under the same id is a

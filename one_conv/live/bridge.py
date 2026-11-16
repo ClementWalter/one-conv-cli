@@ -2,8 +2,11 @@
 
 One bridge per machine keeps an outbound connection to the hub: it publishes the sessions
 running here, posts what `live send` left in the outbox while the hub was unreachable, and
-long-polls for deliveries addressed to sessions here, handing each to that session's own
-adapter. Nothing listens on this machine.
+receives deliveries addressed to sessions here, handing each to that session's own adapter.
+Deliveries arrive over the relay's WebSocket stream (see stream.py) when it serves one, and
+by long-polling /v1/inbox otherwise (the Python relay, an ssh-forwarded hub). A dropped stream
+is reopened with capped, jittered exponential backoff; the relay pushes again on connect every
+delivery still without an outcome. Nothing listens on this machine.
 
 Each delivery is claimed in a durable ingress log before its adapter runs, then acked with
 its outcome. A delivery seen again (a lost ack) is acked with the recorded outcome and never
@@ -19,6 +22,7 @@ import json
 import logging
 import math
 import os
+import random
 import signal
 import sqlite3
 import subprocess
@@ -30,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import hubclient, names, router, tunnel
+from .stream import InboxStream, StreamUnsupported
 from .model import envelope, live_home, parse_address
 
 try:
@@ -51,7 +56,7 @@ IDE_SYNC_MINUTES = 15.0
 # Short: a session on a machine that goes away can only be taken over up to its last sync.
 ARCHIVE_SYNC_MINUTES = 1.0
 ARCHIVE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "archive-sync.py"
-# How long one inbox long-poll waits; also how long a stop request can take to be noticed.
+# How long one inbox long-poll or stream read waits; also how long a stop request can take to be noticed.
 POLL_SECONDS = 5.0
 MAX_BACKOFF = 30.0
 
@@ -237,8 +242,10 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, fetch=
 
 
 class Bridge:
-    def __init__(self, client: hubclient.HubClient, node: str, ingress: Ingress):
+    def __init__(self, client: hubclient.HubClient, node: str, ingress: Ingress, stream: InboxStream | None = None):
         self.client, self.node, self.ingress = client, node, ingress
+        # Without a stream, deliveries come from long-polling /v1/inbox.
+        self.stream = stream
         self.directory: dict[str, dict] = {}
         self.published_at = 0.0
         self.notes: list[str] = []
@@ -302,7 +309,13 @@ class Bridge:
         if time.monotonic() - self.published_at >= PUBLISH_SECONDS:
             self.publish()
         self.drain_outbox()
-        for item in self.client.request("GET", f"/v1/inbox?wait={wait:g}").get("messages", []):
+        if self.stream is not None:
+            items = self.stream.receive(wait)
+            for item in items:
+                logger.info("delivery %s for %s arrived over the stream", item["delivery"], item.get("to"))
+        else:
+            items = self.client.request("GET", f"/v1/inbox?wait={wait:g}").get("messages", [])
+        for item in items:
             self.handle(item)
 
 
@@ -408,6 +421,7 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
     stopping = stopping or (lambda: False)
     forward = tunnel.Tunnel(tunnel.destination(hub), hub_port) if hub.startswith("ssh://") else None
     ingress, backoff = Ingress(bridge_dir() / "ingress.db"), 1.0
+    stream = None
     archive = archive or ArchiveLanes()
     _report(hub=hub, node=node, started=time.time(), last_error=None)
     try:
@@ -424,13 +438,19 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
                 # The CLI posts through the same URL; while the bridge is down it fails and queues.
                 _write_private(bridge_dir() / "hub.json", {"url": url, "node": node, "token": token,
                                                            **({"tunnel_pid": forward.process.pid} if forward else {})})
-                bridge = Bridge(client, node, ingress)
-                _report(url=url, connected=time.time(), last_error=None)
-                backoff = 1.0
+                try:
+                    stream = InboxStream.open(client)
+                    logger.info("receiving deliveries over the relay's stream")
+                except StreamUnsupported as unsupported:
+                    logger.info("%s; long-polling /v1/inbox", unsupported)
+                bridge = Bridge(client, node, ingress, stream)
+                _report(url=url, connected=time.time(), last_error=None, transport="stream" if stream else "long-poll")
                 while not (stop_requested or stopping()):
                     if forward and not forward.alive():
                         raise tunnel.TunnelError("the ssh forward closed")
                     bridge.step()
+                    # Reset only after a full step, so a stream that drops right after opening still backs off.
+                    backoff = 1.0
                     archive.poll(url, token, node)
                     _report(last_ok=time.time(), published=len(bridge.directory), notes=bridge.notes)
             except (hubclient.HubUnavailable, tunnel.TunnelError) as error:
@@ -444,9 +464,13 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
                 logger.warning("the hub refused a request, retrying in %.0fs: %s", backoff, error)
                 _report(last_error=str(error), last_error_at=time.time())
             finally:
+                if stream is not None:
+                    stream.close()
+                    stream = None
                 if forward:
                     forward.close()
-            deadline = time.monotonic() + backoff
+            # Jitter keeps bridges dropped together (a relay deploy) from redialling in lockstep.
+            deadline = time.monotonic() + backoff * random.uniform(0.5, 1.0)
             while time.monotonic() < deadline and not (stop_requested or stopping()):
                 time.sleep(0.2)
             backoff = min(backoff * 2, MAX_BACKOFF)

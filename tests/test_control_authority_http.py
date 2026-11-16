@@ -27,7 +27,6 @@ import time
 
 import pytest
 
-from one_conv.accounting.client import AccountingClient
 from one_conv.control.runtime import application
 from one_conv.live.hubclient import HubClient, HubRefused
 
@@ -127,12 +126,8 @@ def test_real_http_ordinary_peer_can_message_human(workspace):
     assert app.state.store.direct()["threads"][0]["messages"][0]["text"] == "Ready to review."
 
 
-def test_real_http_revoked_staffing_keeps_accounting_ingest(workspace):
+def test_real_http_revoked_staffing_keeps_messaging(workspace):
     app, client = workspace
     app.state.store.grant_staffing("cfo")
     app.state.store.revoke_staffing("cfo")
-    receipts = AccountingClient(client).record_many([
-        {"billing_scope": "selected-subscription", "source": "codex", "source_event_id": "answer-1",
-         "cost_center_id": "jack", "worker_id": "codex:session", "timestamp": "2026-10-16T12:00:00Z",
-         "provenance": "native numeric usage", "tokens": {"input": 100, "output": 20}}])
-    assert receipts[0]["status"] == "recorded"
+    assert client.request("PUT", "/v1/sessions", {"sessions": [{"address": "omp:worker", "status": "idle"}]})["published"] == 1

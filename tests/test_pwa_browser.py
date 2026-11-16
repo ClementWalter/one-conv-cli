@@ -63,7 +63,7 @@ def cloud_page(browser, workspace, request):
         data = {"authenticated": False, "human": None}
         if state["authenticated"]:
             data = {"authenticated": True, "csrf_token": "synthetic-csrf", "human": {"address": "user", "name": "You"},
-                    "capabilities": {"workers": True, "accounting": True}}
+                    "capabilities": {"workers": True}}
         route.fulfill(json=data)
 
     def login(route):
@@ -76,18 +76,10 @@ def cloud_page(browser, workspace, request):
         state["posts"].append(request)
         route.fulfill(json={"id": request["id"], "status": "node", "route": "macbook/spawn:claude"})
 
-    def accounting(route):
-        if route.request.method == "POST":
-            route.fulfill(json={"expected_cost": {"amount": None, "currency": "USD"}, "hourly_rate": {"basis": "allocated"}})
-        else:
-            route.fulfill(json={"cards": [{"cost_center_id": "jack", "name": "Jack", "hourly_rate": {
-                "amount": None, "currency": "USD", "basis": "allocated", "metering_basis": "Occupied work hour"}}], "events": []})
-
     page.route("**/api/session", session)
     page.route("**/api/login", login)
     page.route("**/api/logout", lambda route: route.fulfill(json={"authenticated": False}))
     page.route("**/api/providers/workers", workers)
-    page.route("**/api/providers/accounting", accounting)
     page.goto(workspace["url"] + "/#pair=synthetic-pairing-token", wait_until="networkidle")
     yield page, state
     context.close()
@@ -150,49 +142,8 @@ def test_phone_sees_which_machine_starts_the_teammate(submitted):
     assert "Starting on macbook" in submitted[0].locator("#staff-feedback").inner_text()
 
 
-def test_unknown_rate_is_not_displayed_as_zero(paired):
-    page = paired[0]
-    page.get_by_role("button", name="Team costs").click()
-    page.locator(".rate-card").wait_for()
-    assert page.locator(".rate-amount").inner_text() == "Not measured"
-
-
-def test_unknown_quote_remains_unknown_in_the_browser(paired):
-    page = paired[0]
-    page.get_by_role("button", name="Team costs").click()
-    page.get_by_role("button", name="Estimate", exact=True).click()
-    page.locator(".rate-card > .quiet-copy").last.filter(has_text="Not measured").wait_for()
-    assert "Not measured" in page.locator(".rate-card > .quiet-copy").last.inner_text()
-
-
 def test_phone_layout_has_no_horizontal_overflow(paired):
     assert paired[0].evaluate("document.documentElement.scrollWidth <= window.innerWidth")
-
-
-@pytest.fixture
-def usage_costs(paired):
-    page = paired[0]
-    page.route("**/api/providers/accounting", lambda route: route.fulfill(json={
-        "cards": [], "events": [{"cost_center_id": "jack", "model": "example-model",
-                                   "timestamp": "2026-10-16T12:00:00Z", "tokens": {"total": 400},
-                                   "cash_cost": {"amount": None}, "allocated_cost": {"amount": None},
-                                   "estimated_cost": {"amount": "0.000000001", "currency": "USD"}}],
-    }))
-    page.get_by_role("button", name="Team costs").click()
-    page.locator(".usage-row").wait_for()
-    return page.locator(".usage-row")
-
-
-def test_usage_shows_the_answer_token_count(usage_costs):
-    assert "400 tokens" in usage_costs.inner_text()
-
-
-def test_usage_keeps_unknown_cash_separate_from_estimates(usage_costs):
-    assert "Cash not reported" in usage_costs.inner_text()
-
-
-def test_a_tiny_answer_estimate_is_not_rounded_to_zero(usage_costs):
-    assert "< 0.00000001 USD estimated" in usage_costs.inner_text()
 
 
 def test_phone_staffing_form_has_no_horizontal_overflow(paired, tmp_path):

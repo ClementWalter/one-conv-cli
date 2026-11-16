@@ -13,14 +13,13 @@ into a local history, or read sessions already saved by your coding tools.
 
 Work with live teammates from a Slack-style workspace, including human messages
 and a paired iPhone app. See [the mobile workspace guide](MOBILE_WORKSPACE.md)
-for cloud hosting, the cloud spawner box and team accounting.
+for cloud hosting and the cloud spawner box.
 
 | Namespace | Sources |
 | --- | --- |
 | `cloud` | ChatGPT, Claude Chat, Codex cloud, Cowork cloud |
 | `local` | Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi, on this machine and every machine syncing to the archive |
 | `live` | Agent messaging, topics, spawning, hub and mobile workspace |
-| `hr` | Shared or local rate cards, usage evidence and expected ask costs |
 
 Cloud conversations are addressed by ID or title. Local sessions are grouped
 by the project where the agent ran.
@@ -42,149 +41,6 @@ as a skill in your agent runtime to give it the same launcher and usage guide.
 Local history readers use files on your machine. Browser-session discovery and
 login currently target macOS. Initial Keychain setup requires Apple's
 command-line developer tools to build the native credential helper.
-
-## Agent hourly rates and ask estimates
-
-`hr` stores an hourly rate for each stable agent cost center, including that
-agent's internal subagents. Display names are labels; `@aliases` and agent addresses are references;
-renaming an agent or changing its session does not change its cost center ID.
-Stored addresses are not checked against live sessions.
-
-Register a rate with its currency, source and definition of a metered hour.
-These amounts are illustrative examples, not measured provider prices:
-
-```bash
-one-conv hr register jack --name Jack --alias jack --address codex:example-session \
-  --hourly-rate 12 --currency USD --basis allocated \
-  --provenance 'Example subscription allocation' --metering-basis 'Occupied work hour including tools'
-one-conv hr register john --name John --alias john --unknown-rate --currency USD \
-  --basis quoted --provenance 'Not measured' --metering-basis 'Occupied work hour including tools'
-one-conv hr list --json
-one-conv hr show @jack --json
-one-conv hr quote jack --minutes 15 --json
-```
-
-The example Jack quote is `3.00000000 USD`, calculated as `12 × 15 / 60`.
-John's quote has `expected_cost.amount: null` and status `unknown`; an explicitly
-zero rate yields a known zero estimate. Quotes retain currency, provenance,
-metering basis and rate basis (`observed`, `allocated` or `quoted`). They are
-planning estimates, not invoices or incremental cash charges. They neither
-contact agents nor choose staffing. No currency conversion occurs. Costs round
-to eight decimal places; rate inputs allow up to 18 digits and eight decimal
-places, bounded at one billion per hour. Estimated minutes are bounded at one
-year (`525600`).
-
-Identical registration retries return the existing card. To change a card, repeat
-`register` with the same ID and `--replace`; this replaces the whole card,
-including its aliases and addresses. References cannot belong to two cost centers.
-
-With a configured live hub, HR commands use its authenticated shared authority.
-`--hub` requires that authority; `--local` explicitly selects this machine.
-An unavailable hub never silently becomes a separate local registry. Local cards
-live in `hr/rates.sqlite3` under the live state directory (`ONE_CONV_LIVE_DIR`).
-`ONE_CONV_HR_DIR` overrides the local HR directory.
-The registry starts empty; accounting does not choose staffing or seed rates.
-
-Import actual usage metadata from an explicit Codex, Claude Code or Oh My Pi
-transcript, an OpenRouter JSONL response/SSE capture, or canonical accounting
-events. For example, with an existing saved OpenRouter response:
-
-```bash
-one-conv hr ingest response.jsonl --source openrouter --cost-center jack \
-  --billing-scope router-account --worker jack-session --json
-one-conv hr usage --cost-center jack --json
-one-conv hr summary --cost-center jack --json
-one-conv hr summary --cost-center jack --since 2026-01-01T00:00:00Z \
-  --until 2026-01-01T01:00:00Z --occupied-seconds 1800 --json
-```
-
-`--source` also accepts `codex`, `claude`, `omp` and `event`; `-` reads stdin.
-Native session IDs identify workers unless `--worker` is supplied. The explicit
-`--cost-center` owns imported internal subagents too; `--parent-worker` records
-their parent when needed. `--billing-scope` is a stable billing authority/account
-label, shared across machines importing that account, never an API key.
-
-Every event keeps its reported model/provider, native token counters, timestamp,
-worker/parent, provenance and coverage. Missing metadata remains `null`. Cached
-and reasoning tokens are retained without inferring a price or entitlement
-consumption. Native token fields have source-specific cache semantics. Native
-durations whose units are unverified remain unknown; explicit canonical events
-can provide `wall_seconds`.
-
-Cash, subscription allocations, configured-price estimates and quota are separate
-fields and summary buckets. [OpenRouter's reported `usage.cost`](https://openrouter.ai/docs/cookbook/administration/usage-accounting)
-or generation `total_cost` is recorded as its account charge; upstream inference
-cost is not added again. Other provider bills and fixed subscriptions remain
-outside that account charge. OMP's calculated `usage.cost` is an estimate,
-including an explicit estimated zero; it is never treated as reported cash.
-Allocations and quota require explicit canonical event values with provenance.
-
-Summaries describe recorded events only. Unknown cash charges prevent a complete
-cash total and observed cash hourly rate. Currencies stay separate. An observed
-rate requires one owner, a half-open `[since, until)` window and positive occupied
-owner seconds inside that window; parallel subagent wall times are not summed
-into the denominator. Rate cards are not changed automatically.
-
-The SQLite ledger deduplicates by billing scope and provider request/generation
-ID, or by stable native source identity when no request ID is available. Repeated
-imports return duplicate counts. Later provider evidence can fill unknown cost,
-tokens, model or provider fields; receipts report `enriched: true` for the same
-identity. Known values and node/owner attribution cannot be overwritten. Per-field
-provenance retains the evidence that established each value. Conflicting known
-facts reject the whole batch. OpenRouter creation timestamps use whole seconds
-so completion and later generation metadata can join. Importers handle
-current Codex response records, legacy cumulative-counter snapshots, and repeated
-Claude content blocks without adding the same usage twice. Malformed records
-fail visibly. Inputs are bounded at 100000 records and 4 MiB per record.
-
-The ledger stores accounting metadata only in `usage.sqlite3`. For local mode, set
-`ONE_CONV_ACCOUNTING_DIR` or pass `--directory` on usage commands to select its
-directory; the default is the HR directory. Combine `--directory` with `--local`
-when a hub is configured. The same
-`one_conv.accounting.Ledger(directory)` helpers serve a cloud authority. SQLite
-transactions protect concurrent processes. Hub imports send canonical numeric
-events in bounded, idempotent batches; workers and parents are qualified with
-the configured node. The authority derives bearer node identity and enforces
-ownership. UI and MCP can use the same authority separately. No model API request
-or transcript scan occurs implicitly.
-
-For automatic worker metering, a worker bootstrap supplies a private ownership
-mapping. Only its explicit native history paths are scanned. Relative paths are
-resolved beside this JSON file; this is an illustrative mapping:
-
-```json
-{
-  "schema_version": 1,
-  "histories": [
-    {"source": "codex", "path": "history", "billing_scope": "native-account"}
-  ],
-  "owners": {
-    "codex:SESSION": {"cost_center_id": "jack", "worker_id": "node/codex:SESSION"}
-  }
-}
-```
-
-Each history requires `source` (`codex`, `claude` or `omp`), `path` (a directory or
-file) and a stable `billing_scope`. Owners can override `billing_scope` or provide
-`parent_worker_id`. Unmapped sessions are counted and skipped; native Codex and
-Claude children inherit their mapped parent's cost center with distinct worker
-IDs. Keep retired worker/probe mappings for late usage. No subscription quota or
-cash charge is inferred from native token counts.
-
-```bash
-one-conv hr sync --mapping workers.json --hub --json
-one-conv hr watch --mapping workers.json --hub --interval 5 --max-backoff 60 --json
-```
-
-`sync` runs once; `watch` reloads mappings and hub credentials each pass. Use
-`--iterations 1` for a bounded check or `--local` for an isolated local ledger.
-Polling defaults to five seconds; failures back off up to sixty seconds and retry
-the same identities. Each pass bounds file count, event count and scan time;
-oversized inputs fail visibly. Incomplete final writes wait for the next pass.
-Only finalized Claude responses are imported automatically. The watcher reports
-coverage and transfers canonical accounting metadata, never transcript content.
-The reusable entrypoints are `sync_mapping(mapping_path, sink)` and
-`watch_mapping(mapping_path, sink_factory, ...)` in `one_conv.accounting.watcher`.
 
 ## Connect a cloud account
 
@@ -791,77 +647,6 @@ stale data as fresh. Searches always use saved history.
 The server exposes history access, explicit refresh, and live-session
 messaging, with no arbitrary command execution. This repository contains the CLI, agent skill,
 and local MCP server. The hosted OneConv application is developed separately.
-
-## Fine-tune on your history
-
-`one-conv tune` asks whether your own agent history can teach a coding model
-how you work. It turns saved sessions into fine-tuning data, trains a LoRA
-adapter on Qwen2.5-Coder-7B, and measures it against the base model on
-sessions it never saw. Everything stays in `~/.cache/one-conv-cli/tune`
-(`ONE_CONV_TUNE_DIR`) unless you use the Modal commands.
-
-**Data.** `snapshot` exports every human-driven session through the export
-format above: user and assistant text only, secrets redacted. The dataset
-drops machine-written "user" turns (relay preambles, harness warnings, other
-sessions' messages), keeps ChatGPT voice turns as their transcription, merges
-copies of the same conversation, and takes training rows only from agentic
-coding tools (`--targets` overrides). Each training row is the conversation
-up to an agent reply plus that reply; the loss covers the reply only. The
-newest sessions are held out for testing (`--split time`).
-
-**Labels.** Every moment where you answered an agent reply is classified:
-accepted, moved on, correction you could have been spared, correction that
-brought new facts, question, or unclear. `label` uses classifier.dev (free,
-keyless, asked not to keep the text) by default, SubQ Snap or Jev with a key,
-or an LLM judge on Boundless for the uncertain ones (`--provider boundless
---uncertain-from classifier`). Accepted and moved-on replies become SFT
-targets; avoidable corrections become DPO pairs (rejected reply vs the reply
-that followed); new-fact corrections are kept for evaluation only. `annotate`
-lets you label uncertain moments yourself, and `compare` scores each labeler
-against your labels.
-
-**Looking at the data.** `review` samples labels, `mood` rates the tone of
-every reaction from calm to angry and lists the most heated sessions, and
-`view` writes a local HTML viewer of all conversations with their labels.
-
-```bash
-one-conv tune snapshot && one-conv tune label && one-conv tune mood
-one-conv tune view                                    # local viewer, never published
-one-conv tune dataset --name base --labels            # SFT rows, DPO pairs, new-fact pairs
-one-conv tune synth --rule no-comments                # optional rule data, see below
-one-conv tune train --dataset base --run first        # MLX on Apple Silicon
-one-conv tune eval --run first
-one-conv tune probe --run first --rule no-comments
-one-conv tune runs                                    # compare runs
-```
-
-**On a GPU.** `tune cloud` runs the same steps on a Modal H100 (about 20
-minutes and a few dollars per run), with vLLM for generation and TRL for
-training: `push`, `synth`, `train`, `dpo` (preference training on top of an
-SFT run), `eval`, `benchmark` (HumanEval, to catch lost general coding
-ability), `probe`, `pull`, and `nightly` to refresh everything and retrain.
-`clean --yes` deletes the Modal volume, including the uploaded sessions.
-
-**Measures.** `eval` reports perplexity on your held-out accepted replies
-(how expected they are, not what the model writes) and preference shift: how
-often training moved probability toward the reply you accepted rather than the
-one you corrected, relative to the starting model, so reply length cancels
-out. `probe` asks a rule's coding tasks after growing amounts of real
-conversation and counts violations for the base model, the base model with the
-rule in its system prompt, and the adapter, which was never told the rule.
-`synth` provides that rule's training data by regenerating replies to your own
-coding requests with the rule as a system prompt and rewriting them to obey
-it; `dataset --synth RULE` trains on them without the prompt.
-
-**What a first experiment found** (about 2,000 human sessions, Qwen2.5-Coder-7B):
-training on accepted replies cut held-out perplexity from 9.2 to 7.4 with no
-loss on HumanEval, almost all of it from the raw sessions; DPO on about 860
-avoidable corrections moved probability toward the accepted reply on 81% of
-held-out pairs; and a no-comments rule learned from synthetic data held at
-about 50% violations across 2k to 16k tokens of history, while the same rule
-in the system prompt went from 15% with no history to 80-100%. These reading
-metrics show the model's probabilities moved; they do not yet show that its
-own replies would be accepted more often.
 
 ## Command reference
 

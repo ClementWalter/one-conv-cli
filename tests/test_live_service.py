@@ -148,7 +148,7 @@ def test_unit_restarts_only_after_a_failure():
     assert "Restart=on-failure" in service.unit("/usr/bin").splitlines()
 
 
-def test_unit_leaves_spawned_tmux_sessions_running():
+def test_unit_stops_only_the_bridge_process():
     assert "KillMode=process" in service.unit("/usr/bin").splitlines()
 
 

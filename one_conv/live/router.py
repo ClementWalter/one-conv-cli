@@ -11,7 +11,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import claude, codex, cursor, hubclient, omp, team
+from . import claude, codex, cursor, hubclient, names, omp
 from .model import LiveSession, envelope, is_session_id, live_home, parse_address
 
 try:
@@ -26,11 +26,6 @@ RATE_LIMIT = 10
 RATE_WINDOW_SECONDS = 300
 # Notices sent with --fyi stay readable by `local feed` this long.
 FYI_KEEP_SECONDS = 7 * 24 * 3600
-# messages.jsonl keeps this many of the latest messages, for `live web` and later reading.
-MESSAGE_LOG = 2000
-# Agent-to-agent diagnostic copies are shortened; human conversations keep complete text.
-# The hub's own limit (hub.MAX_TEXT), so a logged message can be reported to it whole.
-MESSAGE_LOG_TEXT = 200_000
 # Clock skew tolerated on an existing notice; anything further ahead is corrupt.
 FYI_MAX_SKEW_SECONDS = 3600
 
@@ -149,8 +144,8 @@ def resolve(target: str, sessions: list[LiveSession] | None = None,
     """Match an address, id prefix, then title/cwd substring; `exclude` drops the sender first."""
     if target.startswith("@"):
         try:
-            bound = team.address_for(target)
-        except team.TeamError as error:
+            bound = names.address_for(target)
+        except names.NameRefused as error:
             raise LiveError(str(error)) from error
         if bound is None:
             raise LiveError(f"No agent is called {target}. Run `one-conv live names`.")
@@ -169,10 +164,6 @@ def resolve(target: str, sessions: list[LiveSession] | None = None,
             listing = "\n".join(f"  {s.address}  {s.title or s.cwd}" for s in matches)
             raise LiveError(f"{target!r} matches several live sessions:\n{listing}")
     if harness == "codex" and is_session_id(query):
-        if codex.ended(query):
-            # A message queued now would be recorded in the thread and answered by nobody.
-            raise LiveError(f"codex:{query} was ended with `live stop`; resume it with `codex resume {query}` "
-                            "before sending to it.")
         stored = codex.stored_session(query)
         if stored:
             return stored
@@ -274,174 +265,110 @@ def _append_fyi(target: str, sender: str, text: str) -> None:
         os.replace(partial, path)
 
 
-def topic_of(target: str) -> str | None:
-    """The topic a `#name` or `topic:name` target addresses, else None."""
-    if target.startswith("#"):
-        return target[1:]
-    if target.startswith("topic:"):
-        return target[len("topic:"):]
-    return None
-
-
-def log_message(row: dict) -> None:
-    """Append one message to <live_home>/messages.jsonl, keeping the latest MESSAGE_LOG.
-
-    The bridge calls this for messages it delivers here, so the log covers both directions.
-    """
-    path = live_home() / "messages.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = str(row.get("text", ""))
-    human = any(re.fullmatch(r"(?:[a-z0-9][a-z0-9-]{0,31}/)?user", str(row.get(field, "")))
-                for field in ("from", "to"))
-    # This log is the human inbox, so its only copy must retain the full message.
-    entry = {**row, "text": text if human else text[:MESSAGE_LOG_TEXT], "at": row.get("at") or time.time()}
-    if not human and len(text) > MESSAGE_LOG_TEXT:
-        entry["truncated"] = True
-    with (live_home() / ".messages.lock").open("a") as lock:
-        if fcntl is not None:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            lines = path.read_text().splitlines()
-        except FileNotFoundError:
-            lines = []
-        kept = [line for line in lines if line.strip()][-(MESSAGE_LOG - 1):]
-        partial = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        partial.write_text("".join(line + "\n" for line in kept) + json.dumps(entry) + "\n")
-        os.replace(partial, path)
-
-
-def _logged(receipt: dict, text: str, topic: str | None, fyi: bool, reply: str) -> dict:
-    """Record a send; harness log failures warn, while human inbox failures propagate."""
-    statuses = {row["to"]: row["status"] for row in receipt.get("deliveries", [])}
+def _hub():
     try:
-        log_message({"id": receipt.get("id"), "from": receipt.get("from"),
-                     "to": f"#{receipt['topic']}" if "deliveries" in receipt else receipt.get("to"),
-                     "topic": receipt.get("topic") or topic, "mode": "fyi" if fyi else "push",
-                     "reply": "none" if fyi else reply,
-                     "status": statuses or receipt.get("status"), "text": text})
-    except OSError as error:
-        if receipt.get("delivery") == "human workspace":
-            # The log is the human's inbox, so its failure means delivery is unconfirmed.
-            raise
-        logger.warning("sent, but could not log the message: %s", error)
-    return receipt
-
-
-def ack(message_id: str, address: str) -> dict:
-    """Record on the hub that this session read a message delivered to it; the human sees the check mark."""
-    try:
-        hub = hubclient.configured()
+        return hubclient.configured()
     except hubclient.HubRefused as error:
-        raise LiveError(str(error)) from error
-    if hub is None:
-        raise LiveError("acks are kept by a live hub, and this machine has none; just reply instead")
-    try:
-        return hub.request("POST", "/v1/acknowledgments", {"actor": address, "id": message_id})
-    except (hubclient.HubRefused, hubclient.HubUnavailable) as error:
         raise LiveError(str(error)) from error
 
 
 def send(target: str, text: str, sender: LiveSession | None, origin: str = "unknown",
-         fyi: bool = False, reply: str = "expected", topic: str | None = None,
-         message_id: str | None = None, images=()) -> dict:
-    """Deliver to one session, or to every member of a topic for a `#topic` target.
+         fyi: bool = False, reply: str = "expected", message_id: str | None = None, images=()) -> dict:
+    """Deliver to one session: here, in a cloud conversation, or on another machine through the relay.
 
     `message_id` is chosen once and reused on retry, so a receiver can drop a duplicate.
     `images` are file paths: a cloud conversation receives the images themselves, an agent
-    on this machine a saved copy of each, named in the text.
+    on this machine a saved copy of each, named in the text, and an agent on another machine
+    a copy its bridge fetches from the relay.
     """
     from .. import cloud_send, images as attached
     message_id = message_id or uuid.uuid4().hex
-    named = topic_of(target)
     try:
         loaded = attached.load(images)
     except attached.ImageError as error:
         raise LiveError(str(error)) from error
-    if loaded and named is not None:
-        raise LiveError("Images go to one address at a time, not to a #topic.")
-    if loaded and remote_address(target)[0] is not None:
-        try:
-            hub = hubclient.configured()
-        except hubclient.HubRefused as error:
-            raise LiveError(str(error)) from error
-        if hub is None or remote_address(target)[0] != hub.node:
-            raise LiveError("Images cannot reach an agent on another machine: the hub takes image uploads "
-                            "only from the workspace.")
-    try:
-        if named is not None:
-            return _logged(_send_topic(named, text, sender, origin, fyi, reply, message_id), text, None,
-                           fyi, reply)
-        if topic is not None:
-            topic = team._check("topic", topic)
-    except team.TeamError as error:
-        raise LiveError(str(error)) from error
     if cloud_send.is_cloud_target(target):
-        receipt = _send_cloud(target, text, sender, origin, fyi, reply, topic, message_id, loaded)
-        if topic is not None and (request := team.record(topic, message_id, receipt["from"], text)):
-            receipt["summarize"] = request
-        return _logged(receipt, text, topic, fyi, reply)
-    if loaded:
-        text += attached.saved_lines(loaded, live_home() / "attachments")
+        return _send_cloud(target, text, sender, origin, fyi, reply, message_id, loaded)
+    sender_label = sender.address if sender else origin
     node, local = remote_address(target)
+    if node is None and target.startswith("@") and named_elsewhere(target):
+        # A name no session here holds may belong to a session another machine published.
+        node, local = "", target
     if node is not None:
-        hub = hubclient.configured()
+        hub = _hub()
         if hub is None:
-            raise LiveError(f"{target} is on machine {node}; reaching it needs this machine's bridge "
+            raise LiveError(f"{target} is on another machine; reaching it needs this machine's bridge "
                             "(`one-conv live serve --hub ...`).")
         if node != hub.node:
-            receipt = _post_remote(hub, target, text, sender.address if sender else origin, fyi, reply, topic,
-                                   message_id)
-            return _logged(receipt, text, topic, fyi, reply)
+            return _post_remote(hub, target, text, sender_label, fyi, reply, message_id, loaded)
         target = local  # This machine's own NODE/ prefix: deliver here.
-    receipt = _send_one(target, text, sender, origin, fyi, reply, topic, message_id)
-    if topic is not None:
-        request = team.record(topic, message_id, receipt["from"], text)
-        if request:
-            receipt["summarize"] = request
-    return _logged(receipt, text, topic, fyi, reply)
+    if loaded:
+        text += attached.saved_lines(loaded, live_home() / "attachments")
+    return _send_one(target, text, sender, origin, fyi, reply, message_id)
 
 
-# A machine's name in a NODE/harness:id address, as the hub accepts it.
+def named_elsewhere(target: str) -> bool:
+    """Whether `@name` is free here while a relay is configured that may know it."""
+    try:
+        return names.address_for(target) is None and _hub() is not None
+    except names.NameRefused as error:
+        raise LiveError(str(error)) from error
+
+
+# A machine's name in a NODE/harness:id address, as the relay accepts it.
 NODE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 
 
 def remote_address(target: str) -> tuple[str | None, str]:
-    """Split a NODE/address route to an agent or human on another machine; anything else stays local."""
+    """Split a NODE/harness:id route to an agent on another machine; anything else stays local."""
     node, sep, local = target.partition("/")
-    if sep and NODE_NAME.fullmatch(node) and (local == "user" or parse_address(local)[0] is not None):
+    if sep and NODE_NAME.fullmatch(node) and parse_address(local)[0] is not None:
         return node, local
     return None, target
 
 
-def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str, topic: str | None,
-                 message_id: str) -> dict:
-    """Post a direct message to a session on another machine; the hub hands it to that machine's bridge.
+def _upload(hub, images) -> list[str]:
+    """Upload each image to the relay; the receiving bridge fetches them by id."""
+    ids = []
+    for image in images:
+        try:
+            ids.append(hub.upload(image.media_type, image.data)["id"])
+        except (hubclient.HubRefused, hubclient.HubUnavailable, KeyError, TypeError) as error:
+            raise LiveError(f"could not upload {image.path} to the relay: {error}") from error
+    return ids
 
-    The message sits in the bridge's outbox from before the request until the hub answers,
-    so a crash or an unreachable hub leaves it for the bridge to repost under the same id.
+
+def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str, message_id: str,
+                 images=()) -> dict:
+    """Post a direct message to a session on another machine; the relay hands it to that machine's bridge.
+
+    The message sits in the bridge's outbox from before the request until the relay answers,
+    so a crash or an unreachable relay leaves it for the bridge to repost under the same id.
+    Images are uploaded first: the queued message names them by id.
     """
     message = {"id": message_id, "to": target, "from": sender, "reply": "none" if fyi else reply,
-               "mode": "fyi" if fyi else "push", "text": text, **({"topic": topic} if topic else {})}
+               "mode": "fyi" if fyi else "push", "text": text}
+    if images:
+        message["attachments"] = _upload(hub, images)
     try:
         receipt = hubclient.submit(hub, message)
     except (hubclient.HubRefused, hubclient.PendingConflict) as error:
         raise LiveError(str(error)) from error
     if receipt is None:
         return {"to": target, "id": message_id, "from": sender, "via": "hub", "delivery": "hub",
-                "status": "queued for the hub: no receipt yet, the bridge will resend it under the same id"}
+                "status": "queued for the relay: no receipt yet, the bridge will resend it under the same id"}
     row = (receipt.get("recipients") or [{}])[0]
     return {"to": row.get("to", target), "id": message_id, "from": sender, "via": "hub", "delivery": "hub",
-            "status": "stored on the hub" if row.get("status") == "stored" else row.get("status", "stored"),
-            **({"summarize": receipt["summarize"]} if receipt.get("summarize") else {})}
+            "status": "stored on the relay" if row.get("status") == "stored" else row.get("status", "stored")}
 
 
 def _send_cloud(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
-                reply: str, topic: str | None, message_id: str, images=()) -> dict:
+                reply: str, message_id: str, images=()) -> dict:
     """Post into a saved Claude chat or Cowork session; it answers inline, so the reply comes back in the receipt."""
     from .. import cloud_send
     if fyi:
         raise LiveError("A cloud conversation has no feed to hold a notice; send it without fyi.")
-    wrapped = cloud_send.cloud_envelope(text, sender, origin, reply, message_id, topic)
+    wrapped = cloud_send.cloud_envelope(text, sender, origin, reply, message_id)
     product, query = cloud_send.split_target(target)
     try:
         delivered = cloud_send.deliver(product, query, wrapped, images=images)
@@ -451,78 +378,14 @@ def _send_cloud(target: str, text: str, sender: LiveSession | None, origin: str,
             "via": "claude.ai", "delivery": product, "status": "replied"}
 
 
-def _send_topic(topic: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
-                reply: str, message_id: str) -> dict:
-    """Record the message on the topic, then deliver it to each member but the sender."""
-    topic = team._check("topic", topic)
-    sender_label = sender.address if sender else origin
-    try:
-        hub = hubclient.configured()
-    except hubclient.HubRefused as error:
-        raise LiveError(str(error)) from error
-    if hub is not None:
-        return _post_topic(hub, topic, text, sender_label, "none" if fyi else reply, message_id,
-                           "fyi" if fyi else "push")
-    members = team.members(topic)
-    request = team.record(topic, message_id, sender_label, text)
-    deliveries = []
-    for member in members:
-        if member == sender_label:
-            continue
-        try:
-            deliveries.append(_send_one(member, text, sender, origin, fyi, reply, topic, message_id))
-        except (LiveError, RuntimeError, OSError, ValueError) as error:
-            # A member that cannot be reached now still finds the message when it catches up.
-            deliveries.append({"to": member, "status": f"not delivered: {error}"})
-    receipt = {"topic": topic, "id": message_id, "from": sender_label, "deliveries": deliveries}
-    if request:
-        receipt["summarize"] = request
-    return receipt
-
-
-def team_topics_of(address: str) -> list[str]:
-    return [row["topic"] for row in team.topics() if address in row.get("members", [])]
-
-
-def _post_topic(hub, topic: str, text: str, sender: str, reply: str, message_id: str,
-                mode: str = "push") -> dict:
-    """Post once; the hub records the message and fans it out to every member on every machine.
-
-    The message sits in the bridge's outbox from before the request until the hub answers,
-    so a crash or an unreachable hub leaves it for the bridge to repost under the same id.
-    A session sender joins the topic as part of the same queued send, as sending to a local
-    topic does, so replies reach it; the post waits until that join has succeeded.
-    """
-    # mode is the delivery mode (wake the receiver or not), kept apart from the reply policy.
-    message = {"id": message_id, "to": f"#{topic}", "from": sender, "topic": topic,
-               "mode": mode, "reply": reply, "text": text}
-    if ":" in sender:
-        message["join_topic"] = True
-    try:
-        receipt = hubclient.submit(hub, message)
-    except (hubclient.HubRefused, hubclient.PendingConflict) as error:
-        raise LiveError(str(error)) from error
-    if receipt is None:
-        return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
-                "deliveries": [{"to": f"#{topic}", "status": "queued for the hub: no receipt yet, the bridge "
-                                                             "will resend it under the same id"}]}
-    return {"topic": topic, "id": message_id, "from": sender, "via": "hub",
-            "deliveries": [{"to": row["to"], "status": row["status"]} for row in receipt.get("recipients", [])],
-            **({"summarize": receipt["summarize"]} if receipt.get("summarize") else {})}
-
-
 def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
-              reply: str, topic: str | None, message_id: str) -> dict:
-    if target == "user":
-        # The human workspace reads the shared log and has no harness to wake.
-        return {"to": "user", "title": "You", "cwd": "", "delivery": "human workspace",
-                "status": "stored for human", "from": sender.address if sender else origin, "id": message_id}
+              reply: str, message_id: str) -> dict:
     session = resolve(target, exclude=sender)
     if sender is not None and session.address == sender.address:
         raise LiveError(f"{session.address} is the sending session itself.")
     sender_label = sender.address if sender else origin
-    handle = team.name_for(sender.address) if sender is not None else None
-    wrapped = envelope(text, sender, origin, "none" if fyi else reply, message_id, topic, handle)
+    handle = names.name_for(sender.address) if sender is not None else None
+    wrapped = envelope(text, sender, origin, "none" if fyi else reply, message_id, handle)
     with _rate_slot(sender_label, session.address):
         if fyi:
             _append_fyi(session.address, sender_label, wrapped)

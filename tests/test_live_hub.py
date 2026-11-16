@@ -37,6 +37,7 @@ uvicorn = pytest.importorskip("uvicorn")
 pytest.importorskip("starlette")
 
 from one_conv.live.hub import MAX_BODY, Hub, application
+from relay_worker import BACKENDS, local_database
 
 
 def serve(app):
@@ -55,8 +56,13 @@ def serve(app):
     return f"http://127.0.0.1:{sock.getsockname()[1]}", stop
 
 
-@pytest.fixture
-def hub(tmp_path):
+@pytest.fixture(params=BACKENDS)
+def hub(request, tmp_path):
+    """(relay state, URL): the Python relay, or the Worker relay when ONE_CONV_TEST_RELAY_WORKER=1."""
+    if request.param == "worker":
+        state = request.getfixturevalue("relay_worker").hub()
+        yield state, state.url
+        return
     state = Hub(str(tmp_path / "hub.db"))
     url, stop = serve(application(state))
     yield state, url
@@ -178,7 +184,7 @@ def test_a_publishing_node_is_listed_online(two_nodes):
 
 def test_a_node_that_stopped_renewing_is_listed_offline(two_nodes):
     state, url, mac, _ = two_nodes
-    with sqlite3.connect(state.path) as db:
+    with sqlite3.connect(local_database(state)) as db:
         db.execute("UPDATE nodes SET seen = 0 WHERE node = 'box'")
     rows = call(url, "/v1/sessions", mac)[1]["sessions"]
     assert {s["node"]: s["online"] for s in rows} == {"box": False, "mac": True}
@@ -186,7 +192,7 @@ def test_a_node_that_stopped_renewing_is_listed_offline(two_nodes):
 
 def test_inbox_polling_cannot_keep_an_old_session_publication_online(two_nodes):
     state, url, mac, box = two_nodes
-    with sqlite3.connect(state.path) as db:
+    with sqlite3.connect(local_database(state)) as db:
         db.execute("UPDATE sessions SET updated = 0 WHERE node = 'box'")
     call(url, "/v1/inbox?wait=0", box)
     rows = call(url, "/v1/sessions", mac)[1]["sessions"]
@@ -195,7 +201,7 @@ def test_inbox_polling_cannot_keep_an_old_session_publication_online(two_nodes):
 
 def test_directory_keeps_session_publication_time_separate_from_bridge_polling(two_nodes):
     state, url, mac, box = two_nodes
-    with sqlite3.connect(state.path) as db:
+    with sqlite3.connect(local_database(state)) as db:
         db.execute("UPDATE sessions SET updated = 123 WHERE node = 'box'")
     call(url, "/v1/inbox?wait=0", box)
     rows = call(url, "/v1/sessions", mac)[1]["sessions"]

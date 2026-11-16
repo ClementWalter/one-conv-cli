@@ -48,6 +48,7 @@ import uvicorn
 
 from archive.server import create_app
 from archive.store import SQLiteStore
+from relay_worker import BACKENDS
 from one_conv.archive import (
     CHUNK_BYTES,
     ArchiveClient,
@@ -73,8 +74,18 @@ def serve(app):
     return f"http://127.0.0.1:{sock.getsockname()[1]}", stop
 
 
-@pytest.fixture
-def archive(tmp_path):
+@pytest.fixture(params=BACKENDS)
+def archive(request, tmp_path):
+    """(store, client, url) of an archive whose shared token is "test-secret".
+
+    The Worker's admin token plays the shared token's part (any origin); it has no local store.
+    """
+    if request.param == "worker":
+        worker = request.getfixturevalue("relay_worker")
+        worker.reset()
+        url = worker.url + "/archive"
+        yield None, ArchiveClient(url, "test-secret"), url
+        return
     store = SQLiteStore(f"sqlite:///{tmp_path / 'archive.db'}")
     url, stop = serve(create_app(store, "test-secret"))
     yield store, ArchiveClient(url, "test-secret"), url
@@ -82,12 +93,19 @@ def archive(tmp_path):
     store.engine.dispose()
 
 
+def local_store(store):
+    """The Python archive's store; a test that writes it directly does not apply to the Worker."""
+    if store is None:
+        pytest.skip("writes the Python archive's database directly; relay-worker/test covers the Worker side")
+    return store
+
+
 @pytest.fixture
 def large_listing(archive):
     """Repeated metadata makes HTTP compression observable over a real socket."""
     store, client, url = archive
     metadata = {"mtime": 1, "title": "A conversation in a shared project " * 100}
-    store.put("key", "revision", metadata, "", {}, None)
+    local_store(store).put("key", "revision", metadata, "", {}, None)
     return client, url, {"items": [{**metadata, "key": "key", "revision": "revision"}], "next": None}
 
 
@@ -156,7 +174,7 @@ RANGE_KEYS = ["0a", "4", "40", "7f", "8", "8a", "c", "ff", "key"]
 def ranged_archive(archive):
     store, client, _ = archive
     for key in reversed(RANGE_KEYS):
-        store.put(key, "revision", {"mtime": 1}, key, {}, None)
+        local_store(store).put(key, "revision", {"mtime": 1}, key, {}, None)
     return client
 
 
@@ -255,9 +273,10 @@ def test_native_sync_remote_only_parity_and_updates(tmp_path, archive):
         client.put(*pack(old), metadata["revision"])
     assert client.read_capture(metadata["key"], metadata["revision"]) == old
     assert path.exists()  # The test never removes native data to prove remote reads.
-    reopened = SQLiteStore(str(store.engine.url))
-    assert reopened.read_conversation(metadata["key"]) == client.read_conversation(metadata["key"])
-    reopened.engine.dispose()
+    if store is not None:  # The Worker's index is not a file to reopen.
+        reopened = SQLiteStore(str(store.engine.url))
+        assert reopened.read_conversation(metadata["key"]) == client.read_conversation(metadata["key"])
+        reopened.engine.dispose()
     assert len(client.read_capture(metadata["key"])["turns"]) == 3
 
 
@@ -1277,6 +1296,7 @@ def test_project_directories_sharing_a_cwd_list_each_thread_once(tmp_path, archi
 
 def test_one_unreadable_archived_conversation_does_not_hide_other_results(tmp_path, archive):
     store, client, url = archive
+    local_store(store)
     env = fixture_env(tmp_path)
     first = write_claude(env)
     first.with_name("session-two.jsonl").write_text(first.read_text().replace("forty-two", "forty-three"))
@@ -1295,6 +1315,7 @@ def test_one_unreadable_archived_conversation_does_not_hide_other_results(tmp_pa
 def one_broken_archived(tmp_path, archive):
     """Two Claude sessions held only in the archive, the second one's turns lost (HTTP 404)."""
     store, client, url = archive
+    local_store(store)
     env = fixture_env(tmp_path)
     first = write_claude(env)
     first.with_name("session-two.jsonl").write_text(first.read_text().replace("forty-two", "forty-three"))

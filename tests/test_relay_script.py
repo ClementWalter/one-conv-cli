@@ -23,6 +23,7 @@
 """`scripts/live-hub.py` as an operator runs it: issue tokens, then serve the relay and its archive in one process."""
 
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -36,11 +37,20 @@ import pytest
 pytest.importorskip("uvicorn")
 pytest.importorskip("sqlalchemy")
 
+from relay_worker import BACKENDS
+
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "live-hub.py"
+ADMIN_SCRIPT = Path(__file__).resolve().parents[1] / "relay-worker" / "scripts" / "relay_admin.py"
 
 
 def run(*args) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True, check=False, timeout=60)
+
+
+def run_admin(worker, *args) -> subprocess.CompletedProcess:
+    """The Worker relay's token script, as an operator runs it with the admin secret in its environment."""
+    return subprocess.run([sys.executable, str(ADMIN_SCRIPT), "--url", worker.url, *args], capture_output=True, text=True,
+                          check=False, timeout=60, env={**os.environ, "RELAY_ADMIN_TOKEN": worker.admin})
 
 
 def status(url: str, token: str | None = None) -> int:
@@ -52,9 +62,14 @@ def status(url: str, token: str | None = None) -> int:
         return error.code
 
 
-@pytest.fixture
-def relay(tmp_path):
-    """The relay script serving on a free loopback port, with a token for node `laptop`."""
+@pytest.fixture(params=BACKENDS)
+def relay(request, tmp_path):
+    """The relay serving on a free loopback port, with a token for node `laptop` issued by its operator script."""
+    if request.param == "worker":
+        worker = request.getfixturevalue("relay_worker")
+        worker.reset()
+        yield {"url": worker.url, "token": run_admin(worker, "token", "add", "laptop").stdout.strip(), "db": None}
+        return
     db = tmp_path / "relay.db"
     token = run("token", "add", "laptop", "--db", str(db)).stdout.strip()
     with socket.socket() as probe:
@@ -91,9 +106,22 @@ def test_relay_archive_answers_a_node_token(relay):
 
 
 def test_relay_keeps_its_archive_next_to_its_database(relay):
+    if relay["db"] is None:
+        pytest.skip("the Worker keeps its archive in a Durable Object and R2, not next to a file")
     status(relay["url"] + "/archive/v1/conversations", relay["token"])
     assert (relay["db"].parent / "archive.db").is_file()
 
 
 def test_revoking_an_unknown_node_fails(tmp_path):
     assert run("token", "revoke", "ghost", "--db", str(tmp_path / "relay.db")).returncode == 1
+
+
+def test_revoking_an_unknown_node_on_the_worker_fails(relay_worker):
+    assert run_admin(relay_worker, "token", "revoke", "ghost").returncode == 1
+
+
+def test_a_revoked_worker_token_is_refused(relay_worker):
+    relay_worker.reset()
+    token = run_admin(relay_worker, "token", "add", "laptop").stdout.strip()
+    run_admin(relay_worker, "token", "revoke", "laptop")
+    assert status(relay_worker.url + "/v1/whoami", token) == 401

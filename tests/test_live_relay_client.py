@@ -34,6 +34,7 @@ pytest.importorskip("starlette")
 from one_conv.live import hubclient, router
 from one_conv.live.hub import Hub, application
 from one_conv.live.model import LiveSession
+from relay_worker import BACKENDS
 
 MAC_SESSION = "claude:c1"
 BOX_SESSION = "claude:b1"
@@ -56,14 +57,15 @@ def serve(app):
     return f"http://127.0.0.1:{sock.getsockname()[1]}", stop
 
 
-@pytest.fixture
-def hub(tmp_path, monkeypatch):
+@pytest.fixture(params=BACKENDS)
+def hub(request, tmp_path, monkeypatch):
     """A relay with nodes `mac` (this machine) and `box`; box's session is named @reviewer."""
-    state = Hub(str(tmp_path / "hub.db"))
+    worker = request.param == "worker"
+    state = request.getfixturevalue("relay_worker").hub() if worker else Hub(str(tmp_path / "hub.db"))
     mac, box = state.add_token("mac"), state.add_token("box")
     state.publish("mac", [{"address": MAC_SESSION}, {"address": "claude:c2"}])
     state.publish("box", [{"address": BOX_SESSION, "name": "reviewer"}])
-    url, stop = serve(application(state))
+    url, stop = (state.url, lambda: None) if worker else serve(application(state))
     monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live"))
     monkeypatch.setenv("ONE_CONV_HUB_URL", url)
     monkeypatch.setenv("ONE_CONV_HUB_TOKEN", mac)

@@ -28,7 +28,7 @@ from sqlalchemy import event
 
 from archive.store import Conflict, SQLiteStore
 from one_conv.archive import ArchiveError
-from test_archive import archive, fixture_env, run, write_claude
+from test_archive import archive, fixture_env, local_store, run, write_claude
 
 
 @pytest.fixture
@@ -176,7 +176,7 @@ def test_watermark_and_rows_share_a_snapshot(store):
 
 def test_http_delta_returns_store_watermark(archive):
     store, client, _ = archive
-    store.put("key", "first", {"mtime": 1}, "", {}, None)
+    local_store(store).put("key", "first", {"mtime": 1}, "", {}, None)
     assert client.request("conversations?since=0") == store.list_changes()
 
 

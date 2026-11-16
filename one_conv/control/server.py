@@ -170,7 +170,7 @@ def application(store_dir: Path, public_origin: str, hub: Hub | None = None, *, 
         return JSONResponse({"authenticated": True, "csrf_token": current["csrf_token"],
                              "expires_at": current["expires_at"],
                              "human": {"address": "user", "route": HUMAN, "name": "You", "kind": "human"},
-                             "capabilities": {"workers": "workers" in provider_map, "accounting": "accounting" in provider_map,
+                             "capabilities": {"workers": "workers" in provider_map,
                                               "pairing": True, "channels": True, "changes": True,
                                               "unread": True, "acks": True, "sign_out_others": True, "stop": True,
                                               "routines": True}})

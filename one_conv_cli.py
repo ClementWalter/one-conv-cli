@@ -93,7 +93,6 @@ import os
 import re
 import shlex
 import shutil
-import socket
 import sqlite3
 import subprocess
 import sys
@@ -1988,9 +1987,6 @@ def _chatgpt_epoch(value) -> float:
         return 0.0
 
 
-_THIS_MACHINE = socket.gethostname().split(".")[0]
-
-
 def _native_projects(sources: tuple[str, ...]):
     # A machine reading only archived Claude history has no projects directory; that is not an error then.
     from one_conv.archive import configured_url
@@ -2712,9 +2708,7 @@ from one_conv.cloud_send import register_accounts as _register_cloud_accounts
              epilog="\b\nExamples:\n  one-conv cloud --help\n  one-conv local --help\n\nLegacy top-level commands remain available as compatibility aliases.")
 def cli() -> None:
     """Read conversation history from cloud products or local agent tools."""
-    # Local accounting must not trigger unrelated history exports.
-    if click.get_current_context().invoked_subcommand != "hr":
-        _archive_sync_in_background()
+    _archive_sync_in_background()
 
 
 _SOURCE_OPTION = click.option(
@@ -2946,84 +2940,6 @@ def thread(
     for index, m in enumerate(out):
         marker = ">> " if index == anchor else ""
         click.echo(f"{marker}{_local_ts(m['ts'])}  {m['role']}: {m['text']}\n")
-
-
-# --- export: text-only session snapshots for `tune` ----------------------------
-#
-# Every session, every source, as one small JSON file of user/assistant text:
-# what was said and answered, never tool output.
-
-# Token-shaped strings that tool output leaks into transcripts. Each pattern is
-# replaced by a marker so a transcript can never re-leak a credential.
-_SECRET_PATTERNS = [
-    ("slack", re.compile(r"xox[abcpes]-[A-Za-z0-9-]{20,}")),
-    ("github", re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}")),
-    ("1password", re.compile(r"ops_[A-Za-z0-9_-]{40,}")),
-    ("google", re.compile(r"ya29\.[A-Za-z0-9_-]{30,}")),
-    ("aws", re.compile(r"AKIA[0-9A-Z]{16}")),
-    ("bearer", re.compile(r"(?i)bearer\s+[A-Za-z0-9._-]{30,}")),
-    ("privkey", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----")),
-]
-
-
-def _scrub_secrets(text: str) -> str:
-    for kind, pattern in _SECRET_PATTERNS:
-        text = pattern.sub(f"[REDACTED:{kind}]", text)
-    return text
-
-
-def _session_author(cwd: str, first_text: str) -> str:
-    """Who typed the user turns: a person, or a launcher/worker prompting headlessly."""
-    if "/heartbeats/" in cwd or first_text.startswith(("Lis et applique", "Read and follow the instructions")):
-        return "system"
-    return "human"
-
-
-def _export_session(handle: SessionHandle, machine: str, out_root: Path) -> Path | None:
-    """Write one session file; return its path, or None when the stored copy is already current."""
-    # Snapshot folders keep their own fixed naming, so a re-export overwrites a session instead of duplicating it.
-    folder = re.sub(r"[/.]", "-", handle.project_cwd)
-    target = out_root / machine / handle.source / folder / f"{handle.uuid}.json"
-    if target.exists():
-        try:
-            if json.loads(target.read_text()).get("mtime", 0) >= handle.mtime:
-                return None
-        except (OSError, ValueError):
-            pass
-    turns = _handle_rendered_turns(handle, raw=False, include_subagents=False, limit=0)
-    if not turns:
-        return None
-    first_user = next((t["text"] for t in turns if t["role"] == "user"), "")
-    doc = {
-        "source": handle.source,
-        "session": handle.uuid,
-        "machine": machine,
-        "cwd": handle.project_cwd,
-        "title": _scrub_secrets(_handle_title(handle)),
-        "author": _session_author(handle.project_cwd, first_user),
-        "mtime": handle.mtime,
-        "started": turns[0]["ts"],
-        "last": turns[-1]["ts"],
-        "turns": [{"ts": t["ts"], "role": t["role"], "text": _scrub_secrets(t["text"])} for t in turns],
-    }
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(doc, ensure_ascii=False, indent=1) + "\n")
-    return target
-
-
-def _export_all(out_root: Path, machine: str, sources: tuple[str, ...], cutoff: float = 0.0) -> tuple[list[str], int]:
-    """Export every session in scope; return written relative paths and the already-current count."""
-    written, skipped = [], 0
-    for project in _iter_all_projects(sources):
-        for handle in _project_sessions(project):
-            if handle.mtime < cutoff:
-                continue
-            path = _export_session(handle, machine, out_root)
-            if path is None:
-                skipped += 1
-            else:
-                written.append(str(path.relative_to(out_root)))
-    return written, skipped
 
 
 def _sessions_for_scope(project_query: str | None, sources: tuple[str, ...]) -> list[SessionHandle]:
@@ -4084,17 +4000,6 @@ install_namespaces(cli, lambda: _chatgpt_accounts(), lambda: _claude_accounts(),
 _register_cloud_accounts(lambda: _claude_accounts())
 
 
-def _tune_snapshot(out_root: Path) -> tuple[int, int]:
-    # Corpus rows are archive copies of other sessions, so excluding them avoids training on duplicates.
-    sources = tuple(source for source in SOURCES if source != "corpus")
-    written, skipped = _export_all(out_root, _THIS_MACHINE, sources)
-    return len(written), skipped
-
-
-from one_conv.tune.cli import build_tune_group  # noqa: E402
-
-cli.add_command(build_tune_group(_tune_snapshot, lambda: []))
-
 from one_conv.live.cli import build_live_group  # noqa: E402
 
 # Hooks and extensions call back into this checkout through uv, whose script environment
@@ -4102,11 +4007,6 @@ from one_conv.live.cli import build_live_group  # noqa: E402
 _UV = shutil.which("uv")
 cli.add_command(build_live_group([_UV, "run", "--quiet", "--script", str(Path(__file__).resolve())] if _UV
                                  else [sys.executable, "-O", str(Path(__file__).resolve())]))
-
-
-from one_conv.hr_cli import build_hr_group  # noqa: E402
-
-cli.add_command(build_hr_group())
 
 
 @cli.command("mcp", epilog="\b\nExamples:\n  one-conv mcp\n  one-conv mcp --config")

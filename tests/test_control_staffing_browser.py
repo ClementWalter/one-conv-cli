@@ -19,7 +19,7 @@
 # [tool.uv]
 # exclude-newer = "2026-10-27T00:00:00Z"
 # ///
-"""The phone asks the hub for a teammate over HTTPS; a connected spawner starts it, and costs stay editable."""
+"""The phone asks the hub for a teammate over HTTPS; and a connected spawner starts it."""
 
 import socket
 import threading
@@ -29,7 +29,6 @@ import pytest
 import uvicorn
 
 from one_conv.control.runtime import application
-from one_conv.hr import make_card
 from tests import test_control_messages as https_tests
 from tests import test_pwa_browser as phone_tests
 
@@ -98,42 +97,3 @@ def test_the_teammate_dialog_asks_only_for_a_name_a_channel_and_a_task(phone):
     page, _app = phone
     page.locator("#staff-team").click()
     assert page.locator("#staff-form input, #staff-form select, #staff-form textarea").count() == 3
-
-
-@pytest.fixture
-def costed_phone(phone):
-    """A teammate with the unknown all-in rate a new one starts with, and the costs dialog open."""
-    page, app = phone
-    app.state.accounting.rates.bind_worker(make_card(
-        "jack", "jack", aliases=["jack"], currency="USD", basis="allocated",
-        provenance="Not yet measured or allocated by the team",
-        metering_basis="Occupied work hour, including internal subagents"), "worker-test/claude:jack")
-    page.get_by_role("button", name="Team costs").click()
-    page.get_by_role("button", name="Set planning rate").wait_for()
-    return page, app
-
-
-@pytest.mark.parametrize(("entered", "expected"), [("0", "0"), ("12.50", "12.50"), ("", None)])
-def test_phone_can_set_an_explicit_planning_rate(costed_phone, entered, expected):
-    page, app = costed_phone
-    page.get_by_role("button", name="Set planning rate").click()
-    page.get_by_role("spinbutton", name="Hourly rate for jack").fill(entered)
-    with page.expect_response("**/api/providers/accounting") as response:
-        page.get_by_role("button", name="Save rate", exact=True).click()
-    response.value.finished()
-    assert app.state.accounting.rates.show("jack")["hourly_rate"]["amount"] == expected
-
-
-def test_rate_edit_preserves_a_worker_registered_after_the_dialog_opened(costed_phone):
-    page, app = costed_phone
-    card = app.state.accounting.rates.show("jack")
-    card.pop("updated_at")
-    card["addresses"] = ["worker-test/codex:late"]
-    app.state.accounting.rates.register(card, replace=True)
-    page.get_by_role("button", name="Set planning rate").click()
-    page.get_by_role("spinbutton", name="Hourly rate for jack").fill("5")
-    with page.expect_response("**/api/providers/accounting") as response:
-        page.get_by_role("button", name="Save rate", exact=True).click()
-    response.value.finished()
-    saved = app.state.accounting.rates.show("jack")
-    assert (saved["addresses"], saved["hourly_rate"]["amount"]) == (["worker-test/codex:late"], "5")

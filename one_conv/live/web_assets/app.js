@@ -28,7 +28,6 @@ const model = {
   searchGeneration: 0,
   authenticated: false,
   capabilities: {},
-  costs: null,
   staffing: false,
   reportReceivedAt: null,
   // Read marks the workspace accepted from this tab, per conversation, and the saves in flight.
@@ -1315,7 +1314,6 @@ async function session() {
     $("staff-team").hidden = !model.capabilities.workers;
     $("new-channel").hidden = !model.capabilities.channels;
     $("routines-section").hidden = !model.capabilities.routines;
-    $("show-costs").hidden = !model.capabilities.accounting;
     $("logout-device").hidden = !data.authenticated;
     $("generate-invitation").hidden = !model.capabilities.pairing;
     $("sign-out-others").hidden = !model.capabilities.sign_out_others;
@@ -1400,9 +1398,7 @@ async function disconnectDevice() {
     try { sessionStorage.removeItem("oneconv:staffing"); } catch (_) { /* Some browsers disable storage. */ }
     navigation = {};
     try { localStorage.removeItem("oneconv:navigation"); } catch (_) { /* Storage can be unavailable. */ }
-    model.costs = null;
     $("messages").replaceChildren();
-    $("costs-content").replaceChildren();
     $("message-input").value = "";
     sidebar();
     authentication(false);
@@ -1677,87 +1673,6 @@ async function createChannel(event) {
   finally { model.creatingChannel = false; $("channel-submit").disabled = false; }
 }
 
-function money(value, currency = "USD") {
-  if (value === null || value === undefined || value === "") return "Not measured";
-  const amount = Number(value);
-  if (!Number.isFinite(amount)) return "Not measured";
-  if (amount > 0 && amount < 0.00000001) return "< 0.00000001 " + currency;
-  try { return new Intl.NumberFormat(undefined, { style: "currency", currency, maximumFractionDigits: 8 }).format(amount); }
-  catch (_) { return String(value) + " " + currency; }
-}
-
-async function showCosts() {
-  $("costs-dialog").showModal();
-  const content = $("costs-content"); content.replaceChildren(el("p", "Gathering your team’s accounting…", "quiet-copy"));
-  try {
-    const data = await get("/api/providers/accounting"); model.costs = data; content.replaceChildren();
-    for (const card of data.cards || []) {
-      const item = el("article", null, "rate-card"), rate = card.hourly_rate || {};
-      item.append(el("h3", card.name || card.cost_center_id),
-        el("strong", money(rate.amount, rate.currency) + (rate.amount == null ? "" : " / hour"), "rate-amount"),
-        el("span", rate.basis || "Rate not measured", "rate-basis"),
-        el("p", rate.metering_basis || "Includes internal subagents", "quiet-copy"));
-      const form = el("form", null, "quote-form"), label = el("label", "Estimate an ask");
-      const input = document.createElement("input"); input.type = "number"; input.min = "0"; input.max = "525600";
-      input.step = "any"; input.value = "15"; input.setAttribute("aria-label", "Estimated minutes for " + (card.name || card.cost_center_id));
-      label.append(input, document.createTextNode(" minutes"));
-      const button = el("button", "Estimate", "secondary-button"); button.type = "submit";
-      const result = el("p", "Planning estimate; includes their subagents.", "quiet-copy");
-      form.append(label, button);
-      form.addEventListener("submit", async (event) => {
-        event.preventDefault(); button.disabled = true;
-        try {
-          const quote = await post("/api/providers/accounting", { action: "quote", reference: card.cost_center_id, minutes: input.value });
-          result.textContent = money(quote.expected_cost.amount, quote.expected_cost.currency) + " · " + (quote.hourly_rate.basis || "estimated") + ", including subagents";
-        } catch (error) { result.textContent = error.message; }
-        finally { button.disabled = false; }
-      });
-      item.append(form, result); content.append(item);
-      const edit = el("button", "Set planning rate", "text-button"); edit.type = "button";
-      edit.addEventListener("click", () => {
-        edit.hidden = true;
-        const editor = el("form", null, "quote-form"), label = el("label", "All-in hourly rate");
-        const amount = document.createElement("input"); amount.type = "number"; amount.min = "0";
-        amount.step = "0.00000001"; amount.value = rate.amount == null ? "" : rate.amount;
-        amount.placeholder = "Unknown"; amount.setAttribute("aria-label", "Hourly rate for " + (card.name || card.cost_center_id));
-        label.append(amount, document.createTextNode(" " + (rate.currency || "USD") + " / hour"));
-        const save = el("button", "Save rate", "secondary-button"); save.type = "submit"; editor.append(label, save);
-        editor.addEventListener("submit", async (event) => {
-          event.preventDefault(); save.disabled = true;
-          try {
-            await post("/api/providers/accounting", { action: "update_rate", reference: card.cost_center_id,
-              hourly_rate: { ...rate, amount: amount.value === "" ? null : amount.value,
-                basis: "allocated", provenance: "Human planning allocation in the workspace" },
-            });
-            await showCosts();
-          } catch (error) { result.textContent = error.message; save.disabled = false; }
-        });
-        item.append(editor);
-      });
-      item.append(edit);
-    }
-    if (!(data.cards || []).length) content.append(el("p", "Your team’s hourly rates will appear here once they’re registered. Unmeasured costs stay unknown.", "cost-empty"));
-    const events = data.events || [];
-    content.append(el("h3", "Recorded usage", "details-section-label"));
-    if (!events.length) content.append(el("p", "No usage records yet. A subscription does not become a zero-dollar answer.", "quiet-copy"));
-    for (const record of events.slice(0, 30)) {
-      const item = el("article", null, "usage-row");
-      const cash = record.cash_cost || {}, allocated = record.allocated_cost || {}, estimate = record.estimated_cost || {};
-      const owner = (data.cards || []).find(card => card.cost_center_id === record.cost_center_id);
-      const name = owner?.name || record.cost_center_id || "Teammate";
-      const total = record.tokens?.total;
-      const date = new Date(record.timestamp);
-      const details = [Number.isFinite(total) ? total.toLocaleString() + " tokens" : "Token total not reported"];
-      if (Number.isFinite(date.getTime())) details.push(date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }));
-      item.append(el("strong", name + (record.model ? " · " + record.model : "")),
-        el("small", details.join(" · ")),
-        el("span", cash.amount == null ? "Cash not reported" : money(cash.amount, cash.currency) + " reported cash"));
-      if (estimate.amount != null) item.append(el("small", money(estimate.amount, estimate.currency) + " estimated"));
-      if (allocated.amount != null) item.append(el("small", money(allocated.amount, allocated.currency) + " allocated"));
-      content.append(item);
-    }
-  } catch (error) { content.replaceChildren(el("p", error.message, "quiet-copy")); }
-}
 async function send(event) {
   event.preventDefault();
   const destination = target(),
@@ -2354,7 +2269,6 @@ $("routine-toggle").addEventListener("click", () => routineAction(model.routine 
 $("routine-delete").addEventListener("click", () => routineAction("delete"));
 $("routine-open").addEventListener("click", () => { $("routine-dialog").close(); select("topic", model.routine.topic); });
 $("channel-form").addEventListener("submit", createChannel);
-$("show-costs").addEventListener("click", showCosts);
 for (const button of document.querySelectorAll("[data-close]")) {
   button.addEventListener("click", () => {
     // Discard the secret before the browser queues its asynchronous dialog-close event.

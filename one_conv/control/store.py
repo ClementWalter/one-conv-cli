@@ -241,7 +241,7 @@ class ControlStore:
             db.execute("INSERT OR REPLACE INTO staffing_grants VALUES (?, ?, ?)", (node, row[0], time.time()))
 
     def revoke_staffing(self, node: str):
-        """Revoke staffing without interrupting this credential's messaging or accounting."""
+        """Revoke staffing without interrupting this credential's messaging."""
         self._operator_node(node)
         with self.hub.lock, self.hub._db() as db:
             db.execute("BEGIN IMMEDIATE")

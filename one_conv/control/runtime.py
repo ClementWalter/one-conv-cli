@@ -1,4 +1,4 @@
-"""Wire cloud messaging, teammate requests, the cloud spawner box and shared accounting into one service."""
+"""Wire cloud messaging, teammate requests and the cloud spawner box into one service."""
 
 import asyncio
 import hashlib
@@ -9,7 +9,6 @@ from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 
-from ..hr import RateStore, quote
 from ..live.hub import LEASE_SECONDS, TOPIC, HubError
 
 log = logging.getLogger(__name__)
@@ -17,111 +16,7 @@ log = logging.getLogger(__name__)
 
 def _fields(payload, required, optional=()):
     if not isinstance(payload, dict) or set(payload) - set(required) - set(optional) or set(required) - set(payload):
-        raise ValueError("Request fields do not match this accounting operation")
-
-
-class Accounting:
-    """Nodes report their own workers; all teammates can inspect the shared accounts."""
-
-    def __init__(self, directory):
-        from ..accounting import Ledger
-        self.rates = RateStore(Path(directory) / "hr")
-        self.ledger = Ledger(Path(directory) / "accounting")
-
-    @staticmethod
-    def filters(payload, *, summary=False):
-        allowed = {"cost_center_id", "since", "until", "occupied_seconds" if summary else "limit"}
-        _fields(payload, (), allowed)
-        result = dict(payload)
-        if "limit" in result:
-            if isinstance(result["limit"], bool):
-                raise ValueError("limit must be an integer")
-            result["limit"] = int(result["limit"])
-        return result
-
-    def teammate(self, spec, ident):
-        """Ask the hub for one more session in the spec's channel; it starts on the preferred connected spawner."""
-        from .store import NODE
-        spec = self.manager._spec(spec)
-        if not isinstance(ident, str):
-            raise ValueError("Choose a request ID")
-        return self.hub.request_teammate(NODE, "user", ident, spec["topic"], f"New teammate @{spec['name']}: {spec['prompt']}")
-
-    def browser(self, method, payload):
-        if method == "GET":
-            return {"cards": self.rates.list(), "events": self.ledger.list_events(limit=100),
-                    "summary": self.ledger.summary()}
-        if payload.get("action") == "quote":
-            _fields(payload, ("action", "reference", "minutes"))
-            return quote(self.rates.show(payload["reference"]), payload["minutes"])
-        if payload.get("action") == "register":
-            _fields(payload, ("action", "card"), ("replace",))
-            if type(payload.get("replace", False)) is not bool:
-                raise ValueError("replace must be a boolean")
-            # Browser tabs may hold stale identity fields after a worker joins or is renamed.
-            if payload.get("replace", False):
-                raise ValueError("Refresh the workspace to edit this card’s planning rate; browser registration cannot replace worker identity. API clients: use update_rate.")
-            return {"card": self.rates.register(payload["card"])}
-        if payload.get("action") == "update_rate":
-            _fields(payload, ("action", "reference", "hourly_rate"))
-            return {"card": self.rates.update_rate(payload["reference"], payload["hourly_rate"])}
-        raise ValueError("Choose quote, register or update_rate")
-
-    def node(self, node, resource, method, payload):
-        from ..accounting import normalize_event
-        if resource == "rates" and method == "GET":
-            _fields(payload, ())
-            return {"rates": self.rates.list()}
-        if resource == "rates" and method == "POST":
-            _fields(payload, ("card",), ("replace",))
-            card = payload["card"]
-            if not isinstance(card, dict) or not isinstance(card.get("addresses"), list) or not card["addresses"]:
-                raise ValueError("Node rate cards require at least one own-node worker address")
-            if any(not isinstance(value, str) or not value.startswith(node + "/") for value in card["addresses"]):
-                raise HubError(403, "A node can register only its own worker addresses")
-            if type(payload.get("replace", False)) is not bool:
-                raise ValueError("replace must be a boolean")
-            def authorize(current):
-                if current and (not current["addresses"] or
-                                any(not address.startswith(node + "/") for address in current["addresses"])):
-                    raise HubError(403, "This cost center is managed by another node or the human")
-
-            return {"card": self.rates.register(card, replace=payload.get("replace", False), authorize=authorize)}
-        if resource == "quote" and method == "POST":
-            _fields(payload, ("reference", "minutes"))
-            return {"quote": quote(self.rates.show(payload["reference"]), payload["minutes"])}
-        if resource == "usage" and method == "GET":
-            return {"events": self.ledger.list_events(**self.filters(payload))}
-        if resource == "summary" and method == "GET":
-            return {"summary": self.ledger.summary(**self.filters(payload, summary=True))}
-        if resource == "events" and method == "POST":
-            _fields(payload, ("events",))
-            events = payload["events"]
-            if not isinstance(events, list) or not 1 <= len(events) <= 100:
-                raise ValueError("Send between 1 and 100 usage events per batch")
-            accepted = []
-            for raw in events:
-                event = normalize_event(raw)
-                if event.get("node_id") not in (None, node):
-                    raise HubError(403, "Usage node identity comes from the bearer token")
-                if not event["worker_id"].startswith(node + "/") or (
-                    event["parent_worker_id"] is not None and not event["parent_worker_id"].startswith(node + "/")
-                ):
-                    raise HubError(403, "A node can report only its own workers")
-                event["node_id"] = node
-                accepted.append(event)
-            with self.rates.locked_cards() as cards:
-                owners = {card["cost_center_id"]: card for card in cards}
-                for event in accepted:
-                    card = owners.get(event["cost_center_id"])
-                    nodes = {address.partition("/")[0] for address in card["addresses"]
-                             if "/" in address.partition(":")[0]} if card else set()
-                    if nodes and node not in nodes:
-                        raise HubError(403, "This cost center belongs to another node")
-                receipts = self.ledger.record_many(accepted)
-            return {"receipts": receipts, "recorded": sum(row["status"] == "recorded" for row in receipts),
-                    "duplicates": sum(row["status"] == "duplicate" for row in receipts)}
-        raise HubError(405, "This accounting operation does not support that method")
+        raise ValueError("Request fields do not match this operation")
 
 
 # A teammate's name, as other sessions address it with @name.
@@ -427,11 +322,9 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
     from .server import bounded_json
     from .store import ControlStore
 
-    accounting = Accounting(directory)
-    providers = {"accounting": accounting.browser}
     store = ControlStore(Path(directory))
     teammates = Teammates(store.hub)
-    providers["workers"] = teammates.browser
+    providers = {"workers": teammates.browser}
     # A configured cloud spawner takes every request the Mac does not, through the hub's own fallback.
     spawner = (worker_config or {}).get("spawner")
     box = None
@@ -444,19 +337,6 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
     from .connectors import install as install_connectors
     from .server import canonical_origin
     install_connectors(app, canonical_origin(public_origin), Path(directory))
-
-    async def agent_accounting(request):
-        try:
-            node = await run_in_threadpool(app.state.hub.authenticated_node, request)
-            payload = await bounded_json(request) if request.method == "POST" else dict(request.query_params)
-            result = await run_in_threadpool(accounting.node, node, request.path_params["resource"], request.method, payload)
-            return JSONResponse(result)
-        except HubError as error:
-            return JSONResponse({"error": str(error)}, status_code=error.status)
-        except ValueError as error:
-            return JSONResponse({"error": str(error)}, status_code=400)
-
-    app.router.routes.append(Route("/v1/accounting/{resource}", agent_accounting, methods=["GET", "POST"]))
 
     async def agent_workers(request):
         """A node asks for a teammate with staffing authority; its prompt says who asked."""
@@ -561,5 +441,5 @@ def application(directory, public_origin, *, worker_config=None, session_seconds
                         await task
 
     app.router.lifespan_context = lifespan
-    app.state.accounting, app.state.teammates, app.state.box, app.state.archive = accounting, teammates, box, archive
+    app.state.teammates, app.state.box, app.state.archive = teammates, box, archive
     return app

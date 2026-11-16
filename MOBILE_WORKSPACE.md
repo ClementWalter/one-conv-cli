@@ -1,7 +1,7 @@
 # OneConv on your phone
 
 The cloud workspace combines the mobile web app, live hub, human mailbox,
-the cloud spawner box and shared accounting. A laptop is an ordinary connected node.
+and the cloud spawner box. A laptop is an ordinary connected node.
 The workspace continues to run when it disconnects.
 
 Open a pairing link in Safari, choose **Connect this device**, then use Safari's
@@ -159,7 +159,7 @@ directory. To delegate an existing key instead, run
 `one-conv live control node grant-staffing cfo`. The grant covers every process
 sharing that node key; replacing the key requires a new grant. Later,
 `one-conv live control node revoke-staffing cfo` removes staffing authority while
-keeping messaging and accounting available. Revoking the node key also removes
+keeping messaging available. Revoking the node key also removes
 its grant. Paired human browsers retain their staffing authority.
 
 An explicitly delegated agent asks the same way:
@@ -176,25 +176,3 @@ The cloud spawner box is built from code by the controller (see the README's
 follows one-conv's main, runs a self-updating Claude Code, and sleeps when no
 session on it is busy. A profile names the box's repositories, Boat environment
 and machine type.
-
-## Team accounting
-
-**Team costs** shows all-in hourly planning rates and usage evidence. Internal
-subagents belong to their owning teammate's cost center. Unknown rates and
-costs remain unknown; a subscription does not become a zero-dollar answer.
-A human can set an allocation and estimate an ask before sending it.
-
-The ledger separates provider-reported cash, allocated subscription cost,
-catalog estimates, token counts and quota evidence. Collectors project selected
-metadata without uploading transcript text. Stable request identities prevent
-repeated imports from adding a second charge.
-
-Configured agents use the shared authority for `hr list`, `hr quote`, `hr usage`
-and `hr summary`. `--local` explicitly selects a separate local registry. An
-outage never silently changes shared accounting into a local registry. A CFO
-teammate can inspect evidence and choose how to staff work; OneConv imposes no
-fixed staffing or budget policy.
-
-An observed hourly rate requires an explicit window and occupied work duration.
-It is unavailable when corresponding cash evidence is incomplete. Imported
-coverage is not a claim to reproduce a provider's full invoice.

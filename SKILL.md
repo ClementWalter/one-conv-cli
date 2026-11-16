@@ -400,8 +400,8 @@ explicitly; do not represent them as a connected account with no messages.
 - `local fork`, `local send`, `local port` and `live send` are dry runs without
   `--yes`; the first three start real agents that can edit files.
 - The Claude Desktop extension serves every command listed in `mcpb.json`
-  `tools`: all of `cloud`, `local`, `live`, `hr` and `tune` except `live web` (a
-  server) and `tune annotate` (waits for keys). Writes need `confirm=true`.
+  `tools`: all of `cloud`, `local` and `live` except `live web` (a server).
+  Writes need `confirm=true`.
 
 ## Mobile workspace and managed teammates
 
@@ -430,12 +430,7 @@ asks the hub for a teammate in TOPIC: the preferred connected spawner starts it
 (the human's machine first, the cloud box otherwise), with that spawner's
 harness. It requires `--yes` and staffing authority. Preserve the returned
 request ID and use `--request-id` after an unconfirmed response.
-
-`hr list`, `hr quote`, `hr usage` and `hr summary` use the configured shared
-accounting authority. `--local` opts out. Hourly rates include internal subagents.
-Keep allocated rates, estimates and reported cash distinct; unknown subscription
-cost is not zero. The CFO's staffing choices belong to its task, not to a fixed
-CLI budget policy. See [MOBILE_WORKSPACE.md](MOBILE_WORKSPACE.md).
+See [MOBILE_WORKSPACE.md](MOBILE_WORKSPACE.md).
 
 ## First-time setup: keep conversation history
 

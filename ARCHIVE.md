@@ -41,7 +41,7 @@ pulled every hour (`ONE_CONV_CONTROLLER_BACKUP_MINUTES`; `0` turns it off) into
 `ONE_CONV_CONTROLLER_BACKUP_DIR` (default `<live_home>/controller-backup`):
 
 - `state/state-<UTC>.tar.gz`: the hub (channels, DMs, unread marks, node token
-  hashes, routines), paired browsers, accounting and worker settings, copied
+  hashes, routines), paired browsers and worker settings, copied
   with SQLite's online backup. The newest 48 are kept
   (`ONE_CONV_CONTROLLER_BACKUP_KEEP`).
 - `archive.db`: a mirror of the conversation archive. After the first full

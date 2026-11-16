@@ -67,25 +67,19 @@ def long_workspace(paired, phone_width):
     rows = [{"id": "a" * 32, "from": address, "to": "user", "text": text, "at": now}]
     state = {"at": now, "topics": [{"topic": topic, "members": [address]}], "sessions": [agent], "names": {}}
     page.route("**/api/session", lambda route: route.fulfill(json={"authenticated": True,
-               "csrf_token": "synthetic-csrf", "capabilities": {"pairing": True, "workers": True, "accounting": True}}))
+               "csrf_token": "synthetic-csrf", "capabilities": {"pairing": True, "workers": True}}))
     page.route("**/api/state", lambda route: route.fulfill(json=state))
     page.route("**/api/direct", lambda route: route.fulfill(json={"threads": [{"pair": address + " user", "messages": rows}]}))
     page.route("**/api/topics/*", lambda route: route.fulfill(json={"messages": rows}))
     page.route("**/api/devices/pair", lambda route: route.fulfill(json={"url": page.url.split("#")[0] + "#pair=" + "p" * 43,
                "expires_at": now + 600, "single_use": True, "access": "owner"}))
-    page.route("**/api/providers/accounting", lambda route: route.fulfill(json={
-        "cards": [{"cost_center_id": "reviewer", "name": "AccountingOwner" * 12, "hourly_rate": {
-            "amount": "123456789.12345678", "currency": "USD", "basis": "allocated",
-            "metering_basis": "Occupied work hour including internal subagents"}}],
-        "events": [{"cost_center_id": "reviewer", "model": "provider/" + "model" * 30,
-                    "tokens": {"total": 1200}, "cash_cost": {"amount": None}}]}))
     page.goto(page.url.split("#")[0] + "#topic=" + topic)
     page.reload(wait_until="networkidle")
     page.locator("#title").filter(has_text=topic).wait_for()
     return page, address, phone_width
 
 
-@pytest.fixture(params=["topic", "direct", "people", "device", "staffing", "accounting", "recipients"])
+@pytest.fixture(params=["topic", "direct", "people", "device", "staffing", "recipients"])
 def phone_screen(long_workspace, request):
     """Each screen is opened through its actual visible production control."""
     page, _address, _width = long_workspace
@@ -116,12 +110,6 @@ def phone_screen(long_workspace, request):
         page.locator("#staff-dialog").wait_for()
         selectors += ["#staff-dialog", ".field-grid"]
         important = "#staff-submit"
-    elif request.param == "accounting":
-        page.locator("#show-costs").click()
-        page.locator(".rate-card").wait_for()
-        page.get_by_role("button", name="Set planning rate", exact=True).click()
-        selectors += ["#costs-dialog", ".rate-card", ".quote-form", ".usage-row"]
-        important = "#costs-dialog button[type=submit]"
     elif request.param == "recipients":
         page.locator("#sidebar-toggle").click()
         page.locator("#new-message").click()

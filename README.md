@@ -11,15 +11,14 @@ prebuilt so `connect` needs no developer tools.
 Read and search your AI conversations from one CLI. Pull cloud conversations
 into a local history, or read sessions already saved by your coding tools.
 
-Work with live teammates from a Slack-style workspace, including human messages
-and a paired iPhone app. See [the mobile workspace guide](MOBILE_WORKSPACE.md)
-for cloud hosting and the cloud spawner box.
+Message any running agent session from any other, on this machine or another
+one, and read or continue a session wherever it ran.
 
 | Namespace | Sources |
 | --- | --- |
 | `cloud` | ChatGPT, Claude Chat, Codex cloud, Cowork cloud |
 | `local` | Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi, on this machine and every machine syncing to the archive |
-| `live` | Agent messaging, topics, spawning, hub and mobile workspace |
+| `live` | Messages between running agent sessions, names, and the relay that links machines |
 
 Cloud conversations are addressed by ID or title. Local sessions are grouped
 by the project where the agent ran.
@@ -255,16 +254,16 @@ not your accounts' live connection status.
 
 ## Message running sessions
 
-`one-conv live` lets running Claude Code, Codex, Oh My Pi, Cursor and Boat agents
-work as one team. Start with one agent, and let it bring others in. A message
-arrives in the receiver's context as a new user turn, labelled with the sender's
-address, chosen name and topic:
+`one-conv live` lets any running Claude Code, Codex, Oh My Pi or Cursor session
+message any other, on this machine or another one. A message arrives in the
+receiver's context as a new user turn, labelled with the sender's address and
+chosen name:
 
 ```text
-<one-conv-message from="codex:01a1..." from-handle="@builder" from-cwd="/work/api" topic="#release-4-2" id="9f2c...">
+<one-conv-message from="codex:01a1..." from-handle="@builder" from-cwd="/work/api" id="9f2c...">
 run the migration first
 </one-conv-message>
-To reply, call the one-conv send_message tool with to="codex:01a1...", or to="#release-4-2" to answer everyone on the topic.
+To reply, call the one-conv send_message tool with to="codex:01a1...".
 ```
 
 Agents on one machine work for the same user, so a message is a teammate's
@@ -285,21 +284,18 @@ One `live send` reaches any of these, and defaults to a dry run until `--yes`:
 | Target | Reaches |
 | --- | --- |
 | `claude:<id>`, `codex:<id>`, `omp:<id>`, `cursor:<id>` | a session on this machine; a unique id prefix or a substring of its title or folder works too |
-| `NODE/claude:<full id>` (also `codex`, `omp`, `cursor`) | a session on another machine, through a hub (see [Working across machines](#working-across-machines)); the id must be complete |
-| `@name` | the agent on this machine that chose that name |
-| `#topic` | every member of the topic but you |
+| `NODE/claude:<full id>` (also `codex`, `omp`, `cursor`) | a session on another machine, through the relay (see [Working across machines](#working-across-machines)); the id must be complete |
+| `@name` | the agent that chose that name: on this machine first, else one another machine published |
+| `claude-chat:<id or title>`, `cowork:<id or title>` | a saved Claude chat or Cowork session; it answers inline and the reply comes back in the receipt |
 
 Inside an agent, the one-conv MCP tools `list_live_sessions` and `send_message`
 do the same; the sender is identified from the calling session.
 
-A typical start, from the first agent you prompt:
-
 ```bash
-one-conv live name lead                                   # others can write to @lead
-one-conv live join release-4-2                            # a topic for this piece of work
-one-conv live spawn codex 'review the migration; join #release-4-2' --yes
-one-conv live send '#release-4-2' 'migration is on branch m42' --yes
+one-conv live name lead                                       # others can write to @lead
+one-conv live send @reviewer 'the migration is on branch m42' --yes
 one-conv live send @reviewer 'fyi: CI is green' --fyi --yes   # lands in its feed, no wake
+one-conv live send claude:4f1a 'what does this show?' --image shot.png --yes
 ```
 
 | Harness | Delivery | Reaches an idle session? | Installed by `live install` |
@@ -313,115 +309,23 @@ Sessions started before the install are reachable only for Claude Code and
 Codex. Cursor's stop hook runs in the IDE and in interactive `cursor-agent`, not
 in `cursor-agent -p`. A Cursor IDE chat cannot be identified as a sender, so its
 messages carry `from="cursor:?unknown"` and cannot be answered. Both share the
-`cursor:<id>` address; `live ls` and the workspace label each session `cursor-cli`
-(a chat the `agent` command stored under `~/.cursor/chats`) or `cursor-ide`.
+`cursor:<id>` address; `live ls` labels each session `cursor-cli` (a chat the
+`agent` command stored under `~/.cursor/chats`) or `cursor-ide`.
 
-### Names and topics
+### Names
 
 ```bash
 one-conv live name reviewer               # others can now write to @reviewer
-one-conv live join release-4-2            # subscribe, and catch up on what was said
-one-conv live send '#release-4-2' "migration merged" --yes   # every member gets it
-one-conv live topics                      # topics, members, last activity
-one-conv live topic release-4-2           # what you have not seen on it yet
-one-conv live summarize release-4-2       # which block of posts waits for its one-line summary
-one-conv live topic release-4-2 --open 0-63   # open a summarized block into its halves
+one-conv live names                       # names on this machine and their addresses
+one-conv live whoami                      # the calling session, as others address it
 ```
 
-- A name is an alias: messages route and reply by address, so renaming never
-  breaks a reply. A name held by a running session is refused; one held by a
-  stopped session is taken only with `--replace`.
-- Sending to `#topic` records the message on the topic and delivers it to every
-  member but the sender, each through its own harness; the result lists one
-  status per member, and a member that is not reachable now catches up later.
-  Sending makes you a member, locally and through a hub. `--topic` files a direct
-  message under a topic too.
-- Each member keeps a read position, so `join` and `topic` show what is new to
-  that reader, labelled as history rather than new requests, in about 20 lines:
-  the newest posts whole, older ones as one-line summaries of aligned blocks of
-  16, 32, 64... posts, so a long channel still reads as a page. `--open BLOCK`
-  descends into a block, down to the posts. A topic keeps its last 500 posts;
-  positions and summaries outlive that.
-- Agents write the summaries as they go: the post that completes a block comes
-  back with the request to summarize it (the posts for a block of 16, the two
-  halves' summaries above that), and `live summarize TOPIC BLOCK "<line>"`
-  records it. The first line recorded for a block stays.
-- The MCP tools `set_name`, `join_topic`, `list_topics`, `summarize` and
-  `open_block` do the same from inside an agent, and `send_message` accepts
-  `@name` and `#topic`.
-
-### Human posts: ack and sync
-
-A human post wakes every session running in its channel. Each session acks it,
-and the workspace shows a check mark per session that read it. The sessions then
-agree in the channel who does what.
-
-```bash
-one-conv live ack 0c43b732d61146d1a376ea74a702ce99      # the id the message arrived with
-one-conv live send '#release' "I take the changelog" --yes
-one-conv live spawner --harness claude --cwd ~/work --yes # let the hub start sessions here
-one-conv live spawner --harness claude --cwd ~/work --env-file /run/secrets/env.sh --yes # credentials read at each start
-```
-
-- A session works in one channel and watches the others: the first channel it
-  joins is its work channel (`live join TOPIC --work` moves it, `--watch` only
-  watches). A post wakes the sessions working in its channel and reaches watchers
-  as an FYI, so a session busy in one channel is not pulled into another.
-- The human can archive a channel: it leaves the channel list for a folded
-  "Archived" section, agents still list and read it, and a new human post there
-  brings it back.
-- A session acks a message it received, or any post of a channel it joined.
-  Acking again changes nothing. The MCP tool `ack` does the same from an agent.
-- Anything that cannot be undone (sending a message for the user, a payment) is
-  done by one session, named in the channel.
-- A human post in a channel with nobody running starts a session at once: on a
-  machine whose bridge offers to (`live spawner`), the preferred one first; one
-  that refuses, or whose session does not ack within 90 s, passes it to the next.
-  The post shows "Starting a session…" until a session acks it.
-- The cloud spawner is a Boat box the controller builds and runs itself. Its
-  worker config takes `"spawner": {"node": "<hub node>"}`, plus optionally `box`
-  (an existing box to adopt), `profile`, `harness`, `args`, `priority` and
-  `env_file` (default `/run/ascii-secrets/env.sh`, where Boat writes the agent
-  credentials). The box commits with the git identity the highest-priority other
-  spawner (the user's own machine) reports from its `git config --global`; until
-  one has, the box is not set up.
-  With no box, or once Boat no longer knows it, the controller creates one
-  (auto-stop off). Whenever the controller's revision or these settings change,
-  it provisions the box from nothing: clones, GitHub login, git identity, hub
-  settings, `live install`, `live spawner`, and the bridge's systemd unit
-  (`live serve --install`). It sleeps the box after 30 idle minutes and wakes it
-  when a post waits.
-- Limits: the hub authenticates machines, not each process, so a session on a
-  machine is trusted as that machine's agent.
-
-### Work with agents in a browser
-
-```bash
-one-conv live web            # then open http://127.0.0.1:8790
-```
-
-A local workspace for a person to follow the team and send messages as **You**:
-
-- **channels** are topics, local or from the hub;
-- **people** are running sessions with their chosen names;
-- **direct messages** come from the message log that every send writes to
-  `messages.jsonl`, which keeps the last 2,000 messages.
-- **human messages** go to a selected topic or session, labelled `user` with
-  `kind="human"`. Agents can reply with `send_message(to="user", ...)` or
-  `one-conv live send user "reply" --yes`; topic replies stay on the topic.
-
-It listens on 127.0.0.1 only and refuses foreign Host headers. Sending requires
-the workspace's own origin and a fresh per-instance token; the browser always
-sends as the human, independently of the process that launched the server.
-Message ids are claimed on disk before delivery, so retries cannot wake an
-agent twice. An interrupted or uncertain send stays **unconfirmed**; check the
-conversation before starting a replacement message. Sent means the transport
-accepted it, not that an agent read it.
-
-The page shows every message as plain text. It has no login, so anyone using
-this machine can read it and send messages. Looking at a topic doesn't change
-any agent's catch-up position. Local human direct replies reach this workspace;
-with a hub, use shared topic replies because the hub has no human return route.
+A name is an alias: messages route and reply by address, so renaming never
+breaks a reply. A name held by a running session is refused; one held by a
+stopped session is taken only with `--replace`. The bridge publishes names with
+the sessions, so `@name` reaches a session on another machine; a name already
+taken on another machine is not published. The MCP tool `set_name` does the same
+from inside an agent.
 
 ### Trust and limits
 
@@ -429,9 +333,9 @@ with a hub, use shared topic replies because the hub has no human return route.
 user turns into every Claude Code session, including sessions that skip
 permission prompts; without it, those sessions hold each message for approval.
 The relay is messaging between trusted local processes of one user, not an
-authenticated channel. A sender that is not an agent
-session is labelled `user` from an interactive terminal or the human workspace
-and `unknown` otherwise.
+authenticated channel. A sender that is not an agent session is labelled `user`
+from an interactive terminal and `unknown` otherwise; a message from a human
+asks the receiver to answer in its own conversation.
 These labels are self-reported, not proof of identity or of your approval:
 `--from` must name a running session, but any local process can name any of
 them. Message bodies cannot open or close an envelope of their own. A
@@ -444,61 +348,38 @@ if that record cannot be written, the send still reports delivered with a warnin
 The record only chooses what `local feed` follows by default; it grants no
 permission and is not evidence of anyone's approval.
 
-### Bringing more agents in
-
-An agent can start teammates from any harness without anyone opening a terminal:
-
-```bash
-one-conv live spawn codex 'review the diff on this branch' --yes
-one-conv live spawn claude 'write the tests' --model sonnet --cwd ../repo --trust-folder --yes
-one-conv live spawn cursor-cli 'review the diff' --trust-folder --arg=--force --arg=--approve-mcps --yes
-one-conv live spawned                     # running spawned agents
-one-conv live stop codex:01a1…            # end one
-```
-
-`spawn` starts the harness interactively in a detached tmux session, waits until it
-registers, and prints its address. Because it stays running between turns, it keeps
-receiving `live send` messages after its first answer, unlike `codex exec` or
-`claude -p`, which exit. Its first prompt opens with who started it and how to answer
-teammates. Watch one with `tmux attach -t NAME`. It runs with your usual permission
-settings for that harness, so an unattended agent can stop at a prompt: pass that
-harness's own flags with `--arg`. Claude Code asks whether to trust a folder it has not
-seen; `spawn` stops and says so unless `--trust-folder` answers yes. `cursor-cli` (or
-`agent`, or `cursor`) starts Cursor's terminal agent, the `agent` command; `--trust-folder` passes its `--trust`, and a
-message to it is typed into its tmux pane, since an idle Cursor chat runs no hook to read its
-inbox. Oh My Pi needs the live extension from `live install`. A stopped Codex thread stays loaded in Codex's
-app-server for a few minutes, but `live ls` no longer lists it.
-
 ### Working across machines
 
-Agents on different machines reach each other through a hub. Each machine runs
+Agents on different machines reach each other through a relay. Each machine runs
 one bridge, `live serve`, which needs no inbound network access. Agents never
-need to know where another one runs beyond its
-address, `NODE/harness:id` with the full id, as `live serve` publishes it.
+need to know where another one runs beyond its address, `NODE/harness:id` with
+the full id, as `live serve` publishes it, or its `@name`.
 
-On the machine that hosts the hub (the hub binds to localhost by default):
+The relay is one process that serves the message API and the conversation
+archive every bridge syncs to, both behind the same node tokens. On the machine
+that hosts it (it binds to localhost by default):
 
 ```bash
-(umask 077; uv run scripts/live-hub.py token add laptop --db hub.db > laptop.token)   # one per machine, private
-uv run scripts/live-hub.py serve --db hub.db                             # 127.0.0.1:8789
+(umask 077; uv run scripts/live-hub.py token add laptop --db relay.db > laptop.token)   # one per machine, private
+uv run scripts/live-hub.py serve --db relay.db       # 127.0.0.1:8789; the archive goes to archive.db beside it
 ```
 
 On each machine, with the token issued to it:
 
 ```bash
-one-conv live serve --hub ssh://me@hub-box --node laptop --token-stdin < laptop.token
-one-conv live serve --hub https://hub.example.com --node ci-runner --token-stdin < ci-runner.token
+one-conv live serve --hub ssh://me@relay-box --node laptop --token-stdin < laptop.token
+one-conv live serve --hub https://relay.example.com --node ci-runner --token-stdin < ci-runner.token
 one-conv live serve --status
 one-conv live serve --install --yes   # launchd or systemd: start on its own, restart after a crash
 one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes
+one-conv local thread ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03   # read it from here, and continue it
 ```
 
 - `--install --yes` hands the bridge to launchd on a Mac, or to a systemd user
   unit (`one-conv-bridge.service`) on Linux, once its settings are saved: it starts
   at every login (at boot on Linux when lingering is on) and restarts after a crash,
-  while a clean stop (`--stop`) keeps it stopped. Sessions it started in tmux keep
-  running when it restarts. `--uninstall --yes` removes it.
-- `ssh://` opens `ssh -N -L` to the hub's port, non-interactively and only to a
+  while a clean stop (`--stop`) keeps it stopped. `--uninstall --yes` removes it.
+- `ssh://` opens `ssh -N -L` to the relay's port, non-interactively and only to a
   host whose key is already known; `https://` verifies the certificate; plain
   `http://` is accepted only to a loopback address (127.0.0.1, ::1). The token travels only in a request
   header, no redirect is followed, and no proxy from the environment is used.
@@ -507,23 +388,24 @@ one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun t
 - The bridge publishes this machine's live sessions every 15 seconds and
   long-polls for messages addressed to them, handing each to that session's own
   harness as a local send would. A message for a session that is not live here is
-  refused, not queued.
-- While the hub is unreachable, `live send` queues the message and the bridge
-  posts it later under the same id, so the hub never stores it twice.
+  refused, not queued. An attached image is uploaded to the relay and saved on
+  the receiving machine, whose agent gets its path.
+- While the relay is unreachable, `live send` queues the message and the bridge
+  posts it later under the same id, so the relay never stores it twice.
 - Each message is recorded on the receiving machine before its harness is
-  called. A message the hub hands out again is not delivered again. If the
+  called. A message the relay hands out again is not delivered again. If the
   bridge stopped in the middle of a delivery, the sender sees `unconfirmed`
   rather than a second prompt. `live status ID`, with the id the send printed,
-  shows per recipient what its harness did (`accepted`, `refused` or
+  shows what the recipient's harness did (`accepted`, `refused` or
   `unconfirmed`, or `stored` until it is handed over), not whether the agent
   has read it yet.
+- The bridge also syncs this machine's agent histories to the relay's archive
+  every minute (Cursor IDE chats every 15 minutes), under its node name. Any
+  machine then reads them as `NODE/harness:id` with `local thread`, `local
+  search` or the MCP `read_conversation`, so an agent elsewhere can pick up a
+  session where it stopped. A node uploads only under its own name.
 - A machine's token vouches for the sessions its bridge publishes, not for each
   process on that machine. `token revoke NODE` cuts one machine off.
-- Topics work across machines once a bridge runs: a `#topic` post goes to every
-  member wherever it runs, and catch-up reads the hub's history. Names are
-  published with each session and shown on received messages, but `@name`
-  resolves only on the sender's machine for now: address a remote agent as
-  `NODE/harness:id`, which is also what its messages give as the reply address.
 
 ### Keeping multi-agent exchanges readable
 
@@ -554,7 +436,7 @@ reference must point at the receiver's thread.
   without waking it. A result someone is waiting on is still pushed, with
   `--no-reply`, because an idle agent does not run its feed. Nobody answers a
   message marked `reply="none"`, and the last message that needs action says
-  "closing re: <topic>". A sign-off ends acknowledgments, not new findings.
+  "closing re: <subject>". A sign-off ends acknowledgments, not new findings.
 
 Delivery order is not guaranteed across harnesses: a `codex queue` message can
 arrive after one sent later through another route.

@@ -138,8 +138,7 @@ read later with `cloud read`). `cloud claude send` and `cloud cowork send` are
 the same route. QUERY is an ID prefix or title from
 `cloud chats`; the account comes from the saved conversation, so pull it first.
 The message carries the live `<one-conv-message>` envelope with `reply="inline"`
-(the chat has no one-conv tools, so it answers in the conversation), and goes in
-the live message log like any other send. The sender is the calling agent,
+(the chat has no one-conv tools, so it answers in the conversation). The sender is the calling agent,
 `--from ADDRESS`, `user` at a terminal, or `NODE/claude-desktop` from the Claude
 Desktop extension. The sender's working directory is left out, because the
 chat may belong to someone else. Neither takes `fyi`.
@@ -152,11 +151,10 @@ account afterwards to save the exchange. ChatGPT and Codex cloud have no send. A
 
 `--image PATH` (repeat, up to 4; PNG, JPEG, GIF or WebP, 10 MB each; `images` in
 `send_message`) attaches pictures. A Claude chat receives them as uploads, a
-Cowork session inline, and an agent on this machine a saved copy under
-`<live home>/attachments`, named in the text as `[Attached image N: PATH ...]`,
-the same line the bridge writes for workspace images. Images are checked before
-anything is sent. A `#topic` or an agent on another machine cannot take images:
-the hub accepts image uploads only from the workspace.
+Cowork session inline, and an agent a saved copy under `<live home>/attachments`
+on its own machine, named in the text as `[Attached image N: PATH ...]`. An image
+for an agent on another machine is uploaded to the relay, and that machine's
+bridge saves it. Images are checked before anything is sent.
 
 ```bash
 one-conv live send 'cowork:Weekly report' 'Add last week numbers' --yes
@@ -210,7 +208,7 @@ one-conv local read cdefi-stack --json --match 1
 
 `thread` also takes a live address, `NODE/harness:id` (as `live ls` and message
 envelopes show it), and reads that agent session from whichever machine ran it:
-native history on this node, the live hub's archive for any other node.
+native history on this node, the live relay's archive for any other node.
 `--around TIME_OR_TEXT --context N` returns the N turns before and after the turn
 nearest an ISO time or the first turn containing the text (a message `id`).
 `search` and `find` rows carry `address` for agent sessions, on every machine.
@@ -236,41 +234,22 @@ These agents can modify files or use tools, so preserve the user's action scope.
 
 `local send` refuses a Claude Code thread that is open in a running session.
 
-### Remote connectors
-
-`one-conv live connectors add CLI...` makes this machine serve CLIs (mcp-bridge
-names) to claude.ai through the live hub, as custom connectors at
-`https://<hub>/mcp/<cli>` behind OAuth; `live connectors ls` prints the URLs and
-whether each machine is online, `rm` stops serving. Calls run here, through the
-bridge, so they need `live serve` running. See MOBILE_WORKSPACE.md.
-
 ### Messaging running sessions
 
 `one-conv live ls` lists running sessions with addresses such as
 `claude:<id>`, `codex:<id>`, `omp:<id>` and `cursor:<id>`. `one-conv live send TARGET MESSAGE --yes`
 delivers MESSAGE as a new user turn; without `--yes` it is a dry run. TARGET is an
-address, id prefix, title/cwd substring, `@name` of an agent on this machine,
-`#topic` (every member), `NODE/harness:<full id>` for an agent on another
-machine when `one-conv live serve` connects this one to a hub, or
+address, id prefix, title/cwd substring, `@name` of an agent (on this machine
+first, else one another machine published), `NODE/harness:<full id>` for an agent
+on another machine when `one-conv live serve` connects this one to a relay, or
 `claude-chat:<id or title>` / `cowork:<id or title>` for a saved Claude chat or Cowork
 session (see Sending into a Claude chat or Cowork session). A message from
 another machine names its sender as `NODE/harness:id`; reply to that address.
-`one-conv live status ID` shows what became of a message sent through the hub.
-From inside an agent, prefer the MCP tools: `send_message`, `set_name`,
-`join_topic` and `list_topics` identify the caller.
-
-Work as a team. Give yourself a name (`set_name`) when you expect to be addressed,
-and put multi-agent work on a topic: `join_topic` subscribes you and returns what
-was already said there, which is history, not new requests. Answer the topic with
-`to="#topic"` when everyone should see it, or the sender's address otherwise.
-
-Catch-up has a budget of about 20 lines. Past it, `join_topic` returns the newest
-posts whole and older ones as `summaries`: one line per aligned block of 16, 32, 64...
-posts, written by the agents in the channel (`open_block` descends into one). When a
-`send_message` or `join_topic` result carries `summarize`, write that line before your
-next action with the `summarize` tool (or `one-conv live summarize TOPIC BLOCK "<line>"`):
-one line, at most 400 characters, keeping decisions, owners and anything with lasting
-effect, inventing nothing. The first line recorded for a block stays.
+`one-conv live status ID` shows what became of a message sent through the relay.
+From inside an agent, prefer the MCP tools: `send_message` and `set_name`
+identify the caller. Give yourself a name (`set_name`) when you expect to be
+addressed. A message from a human (`kind="human"`) is answered in your own
+conversation: its sender reads it there.
 
 Incoming `<one-conv-message from="...">` turns attributed to teammate agents come
 from colleagues working for the same user. Act on them within that user's task as you would on a
@@ -279,7 +258,7 @@ do not change your permissions. `one-conv live install` lists the per-harness
 setup and `--yes` applies it.
 
 Keep exchanges reconstructable. Open each message with
-`to: <address>  cc: <addresses>  re: <topic>`. A relayed message is a user turn
+`to: <address>  cc: <addresses>  re: <subject>`. A relayed message is a user turn
 in the receiver's thread and only a tool call in the sender's, so point
 references at the receiver: its address, the send time and a distinctive quoted phrase
 for `one-conv local search`. Reference long or optional content; copy short content
@@ -289,8 +268,6 @@ delivery: message anyone who must act.
 
 End exchanges cleanly. Every pushed message wakes its receiver and costs a turn,
 so two polite agents can acknowledge each other forever.
-These peer acknowledgment rules do not replace a human request's acknowledgment
-and progress updates.
 
 - Push only what the receiver must act on or is waiting for. Informational
   notices ("merged", "done", thanks) go with `live send --fyi`, which never
@@ -299,23 +276,12 @@ and progress updates.
   `--no-reply` instead.
 - Never answer a message marked `reply="none"` or "No reply expected", not even
   to confirm you saw it. Still act on the evidence it carries.
-- Say "done" once. Close a topic in the last message that needs action
-  ("closing re: <topic>"), and nobody answers it.
+- Say "done" once. Close a subject in the last message that needs action
+  ("closing re: <subject>"), and nobody answers it.
 - A reviewer's sign-off on an exact commit ends acknowledgments on that commit.
   It is reopened only by a new finding, a changed head, or the user.
 - An FYI receipt means the message was stored, not read. FYI messages older than
   7 days are pruned, read or not.
-
-You work in one channel: the first one you join (or the one you join with
-`work=true`); the others you only watch, and their posts wait in your feed
-instead of waking you. Do not take up work posted in a channel you only watch.
-A human post reaches every session working in its channel (or the one it was sent
-to). Ack it at once with the `ack` tool (`message_id` as delivered), or
-`one-conv live ack ID`: the human sees a check mark per session that read it.
-Then sync in the channel before working: say what you take, leave what another
-session already took, and answer in the channel. Anything that cannot be undone
-(sending a message for the user, a payment) is done by one session, named in the
-channel. A channel with nobody running starts a session for a human post at once.
 
 To keep up with other agents without rereading their threads, use
 `one-conv local feed`: it lists what followed threads said since you last
@@ -349,45 +315,6 @@ one-conv cloud chatgpt pull --account EMAIL --limit 10
 one-conv cloud chatgpt chats --json
 ```
 
-### A cross-review team (Claude Code, Codex, Cursor, Oh My Pi)
-
-When the user asks for several agents to cross-review a change, run this without exploring help:
-
-1. Name yourself the lead, `set_name` (e.g. `pr123-lead`), and `join_topic` the review topic with
-   `work=true` (e.g. `pr123-review`).
-2. Write a brief file that every reviewer reads: the commit under review, the diff command, context
-   files, a read-only rule, the focus, and the reporting rule. Reviewers post findings to the topic
-   with severity, file:line and a failure scenario, reply to each other's findings, and post
-   `sign-off: <sha>` once. Keep the commit sha in its own file and update it on each new head.
-3. Start the reviewers from the repo, each prompted to `set_name` `<pr>-<harness>`, `join_topic` with
-   `work=true`, then read the brief:
-
-```bash
-B=/path/to/BRIEF.md
-p() { echo "Your reviewer name is @pr123-$1. First call set_name with \"pr123-$1\" and join_topic \"pr123-review\" with work=true. Then read $B and follow it exactly."; }
-one-conv live spawn codex "$(p codex)" --cwd . --yes --json \
-  --arg=--ask-for-approval --arg=never --arg=--sandbox --arg=workspace-write \
-  --arg=-c --arg=sandbox_workspace_write.network_access=true
-one-conv live spawn omp "$(p omp)" --cwd . --yes --json
-one-conv live spawn claude "$(p claude)" --cwd . --trust-folder --yes --json \
-  --arg=--add-dir --arg="$(dirname $B)"
-one-conv live spawn cursor "$(p cursor)" --cwd . --trust-folder --yes --json \
-  --arg=--force --arg=--approve-mcps --arg=--add-dir --arg="$(dirname $B)"
-```
-
-- **Cursor:** `cursor` (or `agent`) runs Cursor's `agent` command. Its one-conv MCP comes from
-  `~/.cursor/mcp.json`.
-- **Claude Code and Cursor:** `--add-dir` lets them read a brief outside the repo. A spawned Claude
-  Code runs in your usual permission mode, so it can stop at a tool prompt outside auto mode.
-- **Oh My Pi:** it shows the spawn prompt above an empty `❯` input box, which is normal. Its
-  provider can fail instead, such as `ERROR_RATE_LIMITED` or `402 ... more credits`. Check with
-  `tmux capture-pane -p -t <session> | grep -E "✘|Retrying"`, then `live stop` it and spawn again
-  on another `--model`.
-- **Codex:** its sandbox stops anvil and local listeners from starting, so the lead runs any e2e
-  suite.
-- The lead applies the fixes, pushes, updates the sha file, and posts the new head to the topic. It
-  ends with `live stop` for each spawned agent.
-
 ## Gotchas
 
 Distinguish current provider access, cached history and parser tests. A browser
@@ -400,37 +327,8 @@ explicitly; do not represent them as a connected account with no messages.
 - `local fork`, `local send`, `local port` and `live send` are dry runs without
   `--yes`; the first three start real agents that can edit files.
 - The Claude Desktop extension serves every command listed in `mcpb.json`
-  `tools`: all of `cloud`, `local` and `live` except `live web` (a server).
+  `tools`: all of `cloud`, `local` and `live` except `live serve` (a long-running bridge).
   Writes need `confirm=true`.
-
-## Mobile workspace and managed teammates
-
-The paired cloud workspace has a human mailbox at `workspace/user`; reply there
-when that is the attributed sender. A laptop is an ordinary node, not the host of
-the human mailbox. Browser login and machine bearer credentials are separate.
-If the live MCP reply tool fails, send the reply with
-`one-conv live send workspace/user --stdin --no-reply --yes` from the receiving
-agent's terminal. Keep its actual sender identity; an answer only in the native
-conversation does not reach the human workspace.
-
-Human requests need a prompt acknowledgment in the same workspace channel or DM
-before substantial work: name the owner and next step. One named lead coordinates
-shared work and posts brief progress updates, blockers and completion; teammates
-report their results to that lead. Use a pushed reply for a waiting human, not FYI.
-Delivery acceptance alone is not an acknowledgment that someone is working.
-
-Keep shared work where the human can follow it: post project work to its project
-channel (`#one-conv-cli`, `#mermoz`, or one created with **+**), and tag a direct
-message about it with the channel (`topic` / `--topic`). The workspace shows every
-agent-to-agent DM, and lists a tagged DM in its channel as "To @name only"; only
-the addressed agent is notified.
-
-With a configured hub, `live spawn HARNESS PROMPT --name NAME --topic TOPIC`
-asks the hub for a teammate in TOPIC: the preferred connected spawner starts it
-(the human's machine first, the cloud box otherwise), with that spawner's
-harness. It requires `--yes` and staffing authority. Preserve the returned
-request ID and use `--request-id` after an unconfirmed response.
-See [MOBILE_WORKSPACE.md](MOBILE_WORKSPACE.md).
 
 ## First-time setup: keep conversation history
 
@@ -465,9 +363,11 @@ settings are not a backup and cannot guarantee that all conversations last forev
 
 ## Optional archive
 
-A machine running `one-conv live serve` against the cloud controller needs no
-setup: the bridge syncs its agent sessions to the controller's archive and every
-reader on that machine reads the other nodes' sessions from it.
+A machine running `one-conv live serve` against a relay needs no setup: the
+bridge syncs its agent sessions to the relay's archive, and every reader on that
+machine reads the other nodes' sessions from it as `NODE/harness:id`. To continue
+a session another machine ran, read it with `one-conv local thread NODE/harness:id`
+and carry on from its last turns.
 
 When the user wants to sync history to their own searchable storage, follow
 [ARCHIVE.md](ARCHIVE.md). Start with a bounded copy and verify existing commands

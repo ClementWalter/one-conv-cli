@@ -1,0 +1,23 @@
+// one-conv relay + conversation archive: the wire API of scripts/live-hub.py on Cloudflare.
+//
+// Local:   npm ci && npx wrangler dev --local --var RELAY_ADMIN_TOKEN:<secret>
+// Deploy:  npx wrangler r2 bucket create one-conv-archive
+//          npx wrangler deploy
+//          npx wrangler secret put RELAY_ADMIN_TOKEN
+// Tokens:  RELAY_ADMIN_TOKEN=<secret> uv run scripts/relay_admin.py --url https://<worker-url> token add <node>
+// Import:  RELAY_ADMIN_TOKEN=<secret> uv run scripts/import_archive.py --url https://<worker-url> --db archive.db
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "one-conv-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "RELAY", "class_name": "Relay" },
+      { "name": "ARCHIVE_INDEX", "class_name": "ArchiveIndex" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Relay", "ArchiveIndex"] }],
+  "r2_buckets": [{ "binding": "ARCHIVE", "bucket_name": "one-conv-archive" }],
+  "observability": { "enabled": true }
+}

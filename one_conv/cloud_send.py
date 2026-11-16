@@ -86,7 +86,7 @@ def local_timezone() -> str:
 
 
 def cloud_envelope(text: str, sender, origin: str, reply: str = "expected",
-                   message_id: str | None = None, topic: str | None = None) -> str:
+                   message_id: str | None = None) -> str:
     """The live envelope for a chat: answered inline, without the sender's working directory.
 
     The chat may belong to someone else, so the sender's local path stays on this machine.
@@ -95,7 +95,7 @@ def cloud_envelope(text: str, sender, origin: str, reply: str = "expected",
     from .live.model import envelope
 
     return envelope(text, None if sender is None else replace(sender, cwd=""), origin,
-                    "none" if reply == "none" else "inline", message_id, topic)
+                    "none" if reply == "none" else "inline", message_id)
 
 
 def deliver(product: str, query: str, wrapped: str, accounts: Callable[[], Iterable[dict]] | None = None,

@@ -188,13 +188,6 @@ def test_daemon_only_live_thread_is_listed_without_lock(home, monkeypatch):
     assert codex.list_sessions()[0].id == CHILD
 
 
-def test_explicitly_stopped_thread_is_not_resurrected_by_daemon_memory(home, monkeypatch):
-    (home / "live").mkdir()
-    (home / "live/codex-stopped.json").write_text(json.dumps({CHILD: time.time()}))
-    monkeypatch.setattr(codex_rpc, "threads", lambda home: {CHILD: {"status": "busy", "title": "", "cwd": ""}})
-    assert codex.list_sessions() == []
-
-
 def test_native_context_does_not_replace_existing_user_title(home, lock, monkeypatch):
     (home / "session_index.jsonl").write_text(json.dumps({"id": THREAD, "thread_name": "User's chosen title"}) + "\n")
     monkeypatch.setattr(codex_rpc, "threads", lambda home: {THREAD: {"status": "busy", "title": "/root/reviewer", "cwd": ""}})

@@ -19,7 +19,7 @@
 # [tool.uv]
 # exclude-newer = "2026-10-27T00:00:00Z"
 # ///
-"""The live hub over real HTTP: node tokens, publishing, routing, dedup, topics and outcomes."""
+"""The live relay over real HTTP: node tokens, publishing, routing, dedup and outcomes."""
 
 import http.client
 import json
@@ -36,7 +36,7 @@ import pytest
 uvicorn = pytest.importorskip("uvicorn")
 pytest.importorskip("starlette")
 
-from one_conv.live.hub import MAX_BODY, Hub, HubError, application
+from one_conv.live.hub import MAX_BODY, Hub, application
 
 
 def serve(app):
@@ -125,24 +125,6 @@ def test_an_address_listed_twice_is_refused(two_nodes):
     assert call(url, "/v1/sessions", mac, "PUT", {"sessions": sessions})[0] == 400
 
 
-def test_a_published_git_identity_is_kept(tmp_path):
-    hub = Hub(str(tmp_path / "hub.db"))
-    hub.publish("mac", [], spawn="claude", priority=10, git_user={"name": "Ada", "email": "ada@example.test"})
-    assert hub.git_identity(exclude="box") == {"name": "Ada", "email": "ada@example.test"}
-
-
-def test_a_publication_without_identity_keeps_the_last_one(tmp_path):
-    hub = Hub(str(tmp_path / "hub.db"))
-    hub.publish("mac", [], git_user={"name": "Ada", "email": "ada@example.test"})
-    hub.publish("mac", [])
-    assert hub.git_identity(exclude="box") == {"name": "Ada", "email": "ada@example.test"}
-
-
-def test_a_bad_git_identity_is_refused(two_nodes):
-    _, url, mac, _ = two_nodes
-    assert call(url, "/v1/sessions", mac, "PUT", {"sessions": [], "git_user": {"name": "Ada"}})[0] == 400
-
-
 def test_the_directory_carries_a_published_product(two_nodes):
     _, url, mac, _ = two_nodes
     call(url, "/v1/sessions", mac, "PUT", {"sessions": [{"address": "cursor:k1", "product": "cursor-cli"}]})
@@ -162,13 +144,25 @@ def test_an_unknown_product_is_refused(two_nodes):
     assert call(url, "/v1/sessions", mac, "PUT", {"sessions": sessions})[0] == 400
 
 
-def test_a_hub_from_before_products_gains_the_column(tmp_path):
-    path = tmp_path / "old.db"
+@pytest.fixture
+def database_with_other_tables(tmp_path):
+    """A relay database that also holds tables and columns this relay never reads."""
+    path = tmp_path / "shared.db"
     with sqlite3.connect(path) as db:
-        db.execute("CREATE TABLE sessions (node TEXT NOT NULL, address TEXT NOT NULL, name TEXT, title TEXT, cwd TEXT,"
-                   " status TEXT, updated REAL NOT NULL, PRIMARY KEY (node, address))")
-        db.execute("INSERT INTO sessions VALUES ('mac', 'claude:aaa', NULL, '', '', '', 1.0)")
-    assert Hub(str(path)).directory()[0]["product"] == ""
+        db.execute("CREATE TABLE members (topic TEXT NOT NULL, node TEXT NOT NULL, address TEXT NOT NULL)")
+        db.execute("CREATE TABLE posts (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_node TEXT NOT NULL, id TEXT NOT NULL,"
+                   " digest TEXT NOT NULL, target TEXT NOT NULL, sender TEXT NOT NULL, topic TEXT, reply TEXT NOT NULL,"
+                   " mode TEXT NOT NULL DEFAULT 'push', text TEXT NOT NULL, created REAL NOT NULL, kind TEXT,"
+                   " attachments TEXT, UNIQUE (from_node, id))")
+    return path
+
+
+def test_a_database_with_other_tables_still_relays(database_with_other_tables):
+    hub = Hub(str(database_with_other_tables))
+    hub.publish("mac", [{"address": "claude:aaa"}])
+    hub.publish("box", [{"address": "claude:bbb"}])
+    hub.send("mac", message("box/claude:bbb", text="still routed"))
+    assert [m["text"] for m in hub.inbox("box", 0)] == ["still routed"]
 
 
 def test_two_unnamed_sessions_publish(two_nodes):
@@ -206,45 +200,6 @@ def test_directory_keeps_session_publication_time_separate_from_bridge_polling(t
     call(url, "/v1/inbox?wait=0", box)
     rows = call(url, "/v1/sessions", mac)[1]["sessions"]
     assert next(row for row in rows if row["node"] == "box")["published_at"] == 123
-
-
-@pytest.fixture(params=["nodes", "sessions"])
-def stale_recipient(two_nodes, request):
-    state, *_ = two_nodes
-    column = "seen" if request.param == "nodes" else "updated"
-    with sqlite3.connect(state.path) as db:
-        db.execute(f"UPDATE {request.param} SET {column} = 0 WHERE node = 'box'")
-    return two_nodes
-
-
-def test_human_online_gate_refuses_a_stale_recipient(stale_recipient):
-    state, *_ = stale_recipient
-    with pytest.raises(HubError, match="Recipient is offline"):
-        state.send("mac", message("box/claude:bbb"), require_online=True)
-
-
-def test_machine_queueing_remains_available_for_a_stale_recipient(stale_recipient):
-    state, *_ = stale_recipient
-    assert len(state.send("mac", message("box/claude:bbb"))["recipients"]) == 1
-
-
-def test_online_gate_keeps_the_original_receipt_after_the_recipient_disconnects(two_nodes):
-    state, *_ = two_nodes
-    sent = message("box/claude:bbb")
-    state.send("mac", sent, require_online=True)
-    with sqlite3.connect(state.path) as db:
-        db.execute("UPDATE sessions SET updated = 0 WHERE node = 'box'")
-    assert state.send("mac", sent, require_online=True)["duplicate"] is True
-
-
-def test_online_gate_does_not_accept_a_changed_retry_after_disconnect(two_nodes):
-    state, *_ = two_nodes
-    sent = message("box/claude:bbb")
-    state.send("mac", sent, require_online=True)
-    with sqlite3.connect(state.path) as db:
-        db.execute("UPDATE sessions SET updated = 0 WHERE node = 'box'")
-    with pytest.raises(HubError, match="different message"):
-        state.send("mac", {**sent, "text": "Different request"}, require_online=True)
 
 
 def test_a_name_used_on_another_node_is_refused(two_nodes):
@@ -386,97 +341,6 @@ def test_a_long_poll_returns_a_message_sent_while_waiting(two_nodes):
     assert len(call(url, "/v1/inbox?wait=5", box)[1]["messages"]) == 1
 
 
-@pytest.fixture
-def topic(two_nodes):
-    """#release with mac's lead and box's worker as members."""
-    state, url, mac, box = two_nodes
-    call(url, "/v1/topics/release/members/claude:aaa", mac, "PUT")
-    call(url, "/v1/topics/release/members/claude:bbb", box, "PUT")
-    return state, url, mac, box
-
-
-def test_a_topic_post_reaches_the_other_members(topic):
-    _, url, mac, box = topic
-    call(url, "/v1/messages", mac, "POST", message("#release", text="tag it"))
-    assert [m["topic"] for m in call(url, "/v1/inbox?wait=0", box)[1]["messages"]] == ["release"]
-
-
-def test_a_topic_post_reaches_every_member_under_one_id(topic):
-    state, url, mac, box = topic
-    third = state.add_token("third")
-    call(url, "/v1/sessions", third, "PUT", {"sessions": [{"address": "codex:ccc"}]})
-    call(url, "/v1/topics/release/members/codex:ccc", third, "PUT")
-    call(url, "/v1/messages", mac, "POST", message("#release"))
-    inboxes = [call(url, "/v1/inbox?wait=0", token)[1]["messages"] for token in (box, third)]
-    assert [len(messages) for messages in inboxes] == [1, 1]
-
-
-def test_a_topic_post_with_no_one_else_there_is_kept_for_later_members(two_nodes):
-    _, url, mac, box = two_nodes
-    call(url, "/v1/topics/release/members/claude:bbb", box, "PUT")
-    call(url, "/v1/messages", box, "POST", message("#release", sender="claude:bbb", text="early"))
-    call(url, "/v1/topics/release/members/claude:aaa", mac, "PUT")
-    assert [m["text"] for m in call(url, "/v1/topics/release/messages", mac)[1]["messages"]] == ["early"]
-
-
-def test_a_topic_post_skips_its_sender(topic):
-    _, url, mac, _ = topic
-    call(url, "/v1/messages", mac, "POST", message("#release"))
-    assert call(url, "/v1/inbox?wait=0", mac)[1]["messages"] == []
-
-
-def test_a_node_cannot_add_another_nodes_session_to_a_topic(topic):
-    _, url, mac, _ = topic
-    assert call(url, "/v1/topics/release/members/claude:bbb", mac, "PUT")[0] == 403
-
-
-def test_topics_list_their_members(topic):
-    _, url, mac, _ = topic
-    assert call(url, "/v1/topics", mac)[1]["topics"][0]["members"] == ["mac/claude:aaa", "box/claude:bbb"]
-
-
-def test_topic_history_holds_only_that_topic(topic):
-    _, url, mac, box = topic
-    call(url, "/v1/topics/other/members/claude:bbb", box, "PUT")
-    call(url, "/v1/messages", mac, "POST", message("#release", text="in release"))
-    call(url, "/v1/messages", mac, "POST", message("#other", text="in other"))
-    assert [m["text"] for m in call(url, "/v1/topics/release/messages", box)[1]["messages"]] == ["in release"]
-
-
-def test_topic_history_lists_a_post_once_for_all_its_recipients(topic):
-    state, url, mac, box = topic
-    third = state.add_token("third")
-    call(url, "/v1/sessions", third, "PUT", {"sessions": [{"address": "codex:ccc"}]})
-    call(url, "/v1/topics/release/members/codex:ccc", third, "PUT")
-    call(url, "/v1/messages", mac, "POST", message("#release"))
-    assert len(call(url, "/v1/topics/release/messages", box)[1]["messages"]) == 1
-
-
-def test_topic_history_after_a_cursor_returns_the_later_ones(topic):
-    _, url, mac, box = topic
-    call(url, "/v1/messages", mac, "POST", message("#release", text="first"))
-    call(url, "/v1/messages", mac, "POST", message("#release", text="second"))
-    cursor = call(url, "/v1/topics/release/messages?limit=1", box)[1]["messages"][0]["cursor"]
-    page = call(url, f"/v1/topics/release/messages?after={cursor}", box)[1]["messages"]
-    assert [m["text"] for m in page] == ["second"]
-
-
-def test_topic_history_pages_through_two_nodes_sharing_an_id(topic):
-    _, url, mac, box = topic
-    shared = uuid.uuid4().hex
-    call(url, "/v1/messages", mac, "POST", {**message("#release", text="mac"), "id": shared})
-    call(url, "/v1/messages", box, "POST", {**message("#release", sender="claude:bbb", text="box"), "id": shared})
-    call(url, "/v1/messages", mac, "POST", message("#release", text="third"))
-    seen, cursor = [], "0"
-    for _ in range(4):
-        page = call(url, f"/v1/topics/release/messages?limit=1&after={cursor}", box)[1]["messages"]
-        if not page:
-            break
-        seen.append(page[0]["text"])
-        cursor = page[0]["cursor"]
-    assert seen == ["mac", "box", "third"]
-
-
 def raw_post(url, token, body, headers):
     """Status of a POST sent with http.client, so the body can be streamed in chunks."""
     parts = urlsplit(url)
@@ -518,31 +382,8 @@ def test_a_chunked_body_growing_too_large_is_refused(two_nodes):
 
 
 @pytest.mark.parametrize("bad", [
-    {"id": "short"}, {"text": ""}, {"reply": "maybe"}, {"mode": "wake"}, {"to": "nowhere"}, {"to": "box/claude:nobody"}])
+    {"id": "short"}, {"text": ""}, {"reply": "maybe"}, {"mode": "wake"}, {"to": "nowhere"}, {"to": "box/claude:nobody"},
+    {"to": "#release"}, {"to": "@nobody"}])
 def test_a_malformed_message_is_refused(two_nodes, bad):
     _, url, mac, _ = two_nodes
     assert call(url, "/v1/messages", mac, "POST", {**message("box/claude:bbb"), **bad})[0] in (400, 404)
-
-
-def test_a_cursor_past_any_sqlite_integer_returns_an_empty_page(topic):
-    _, url, mac, box = topic
-    call(url, "/v1/messages", mac, "POST", message("#release"))
-    assert call(url, "/v1/topics/release/messages?after=9223372036854775808", box) == (200, {"messages": []})
-
-
-def test_a_published_checkout_revision_is_kept(tmp_path):
-    hub = Hub(str(tmp_path / "hub.db"))
-    hub.publish("box", [], revision="c" * 40)
-    assert hub.node_revision("box")[0] == "c" * 40
-
-
-def test_a_publication_without_a_revision_forgets_the_old_one(tmp_path):
-    hub = Hub(str(tmp_path / "hub.db"))
-    hub.publish("box", [], revision="c" * 40)
-    hub.publish("box", [])
-    assert hub.node_revision("box") == (None, None)
-
-
-def test_a_malformed_revision_is_refused(tmp_path):
-    with pytest.raises(HubError):
-        Hub(str(tmp_path / "hub.db")).publish("box", [], revision="main")

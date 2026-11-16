@@ -4,16 +4,21 @@
 # dependencies = [
 #     "starlette==1.8.0",
 #     "uvicorn==0.54.0",
+#     "sqlalchemy==2.1.4",
+#     "pydantic==2.12.5",
 # ]
 #
 # [tool.uv]
 # exclude-newer = "2026-10-27T00:00:00Z"
 # ///
-"""Run the live hub, or manage its node tokens, on the machine that hosts it.
+"""Run the live relay, or manage its node tokens, on the machine that hosts it.
 
-    live-hub.py serve --db hub.db [--host 127.0.0.1] [--port 8789]
-    live-hub.py token add NODE --db hub.db      # prints the token once; give it to that node's bridge
-    live-hub.py token revoke NODE --db hub.db
+One process serves the relay API (direct messages between machines' bridges) and the
+conversation archive every bridge syncs to, both authenticated by the same node tokens.
+
+    live-hub.py serve --db relay.db [--archive-db archive.db] [--host 127.0.0.1] [--port 8789]
+    live-hub.py token add NODE --db relay.db      # prints the token once; give it to that node's bridge
+    live-hub.py token revoke NODE --db relay.db
 """
 
 import argparse
@@ -31,9 +36,11 @@ log = logging.getLogger("live-hub")
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    serve = commands.add_parser("serve", help="Serve the hub API.")
+    serve = commands.add_parser("serve", help="Serve the relay API and the conversation archive.")
     serve.add_argument("--db", required=True, help="SQLite file holding tokens, sessions and messages.")
-    # Localhost by default: exposing the hub is a deliberate choice (TLS proxy, or ssh tunnels only).
+    serve.add_argument("--archive-db", help="SQLite file holding the conversation archive "
+                                            "[default: archive.db next to --db].")
+    # Localhost by default: exposing the relay is a deliberate choice (TLS proxy, or ssh tunnels only).
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8789)
     token = commands.add_parser("token", help="Add or revoke a node's token.")
@@ -42,7 +49,7 @@ def main() -> int:
     token.add_argument("--db", required=True)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    os.umask(0o077)  # The database holds token hashes and message text.
+    os.umask(0o077)  # The databases hold token hashes, message text and conversation history.
     hub = Hub(args.db)
     if args.command == "token":
         try:
@@ -57,7 +64,9 @@ def main() -> int:
             return 1
         return 0
     import uvicorn
-    uvicorn.run(application(hub), host=args.host, port=args.port, access_log=False)
+    archive_db = args.archive_db or str(Path(args.db).resolve().with_name("archive.db"))
+    log.info("relay on %s:%d, archive in %s", args.host, args.port, archive_db)
+    uvicorn.run(application(hub, archive_db), host=args.host, port=args.port, access_log=False)
     return 0
 
 

@@ -295,11 +295,11 @@ class ArchiveClient:
         return self.request("conversations", {"manifest": manifest, "expected": expected})
 
 
-# The live controller serves the archive under this path of the hub's own origin.
+# The live relay (scripts/live-hub.py) serves the archive under this path of its own origin.
 HUB_ARCHIVE_PATH = "/archive"
 # A hub node name; an archive origin of this form is the NODE of that node's live addresses.
 NODE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
-# A hub-derived archive is consulted on every read, so an unreachable controller must fail fast.
+# A relay-derived archive is consulted on every read, so an unreachable relay must fail fast.
 HUB_TIMEOUT = 15
 
 

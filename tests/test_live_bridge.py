@@ -111,17 +111,17 @@ def outcome(hub, message):
     ("INVALID/user", False), ("../user", False), ("mac/user/extra", False),
 ])
 def test_sender_objects_classify_only_reserved_human_addresses(address, human):
-    wrapped = envelope("Please review.", bridge.RemoteSender(address), topic="release")
+    wrapped = envelope("Please review.", bridge.RemoteSender(address))
     assert ('kind="human"' in wrapped) is human
 
 
-def test_remote_human_sender_object_replies_to_the_topic():
-    wrapped = envelope("Please review.", bridge.RemoteSender("mac/user"), topic="release")
-    assert 'to="#release"' in wrapped
+def test_remote_human_sender_object_is_answered_in_the_conversation():
+    wrapped = envelope("Please review.", bridge.RemoteSender("mac/user"))
+    assert "Answer in this conversation" in wrapped
 
 
 def test_remote_human_sender_object_has_no_invalid_direct_reply():
-    wrapped = envelope("Please review.", bridge.RemoteSender("mac/user"), topic="release")
+    wrapped = envelope("Please review.", bridge.RemoteSender("mac/user"))
     assert 'to="mac/user"' not in wrapped
 
 
@@ -145,7 +145,7 @@ def human_omp_delivery(hub, tmp_path, monkeypatch):
     node = bridge.Bridge(client, "box", bridge.Ingress(bridge.bridge_dir() / "ingress.db"))
     node.publish()
     hub.mac.post({"id": uuid.uuid4().hex, "to": "box/omp:worker-1", "from": "user",
-                  "text": "Please review the release.", "topic": "release"})
+                  "text": "Please review the release."})
     node.step(wait=0)
     path = next((tmp_path / "live" / "inbox" / "omp" / "worker-1").glob("*.json"))
     return json.loads(path.read_text())["text"]
@@ -155,8 +155,8 @@ def test_real_bridge_human_ingress_is_marked_human(human_omp_delivery):
     assert 'from="mac/user" kind="human"' in human_omp_delivery
 
 
-def test_real_bridge_human_ingress_offers_the_topic_reply(human_omp_delivery):
-    assert 'to="#release"' in human_omp_delivery
+def test_real_bridge_human_ingress_asks_for_an_answer_in_the_conversation(human_omp_delivery):
+    assert "Answer in this conversation" in human_omp_delivery
 
 
 def test_real_bridge_human_ingress_has_no_invalid_human_route(human_omp_delivery):
@@ -250,36 +250,6 @@ def test_publishing_lists_this_machines_sessions_on_the_hub(hub, box):
     assert "box/omp:worker-1" in box.directory
 
 
-def test_publishing_reports_this_machines_git_identity(hub, delivered, monkeypatch):
-    monkeypatch.setattr(bridge, "git_identity", lambda: {"name": "Ada", "email": "ada@example.test"})
-    bridge.Bridge(hubclient.HubClient(hub.url, hub.box_token, "box"), "box",
-                  bridge.Ingress(bridge.bridge_dir() / "ingress.db")).publish()
-    assert hub.state.git_identity(exclude="mac") == {"name": "Ada", "email": "ada@example.test"}
-
-
-def test_publishing_reports_this_checkouts_revision(hub, delivered, monkeypatch):
-    monkeypatch.setattr(bridge, "checkout_revision", lambda: "d" * 40)
-    bridge.Bridge(hubclient.HubClient(hub.url, hub.box_token, "box"), "box",
-                  bridge.Ingress(bridge.bridge_dir() / "ingress.db")).publish()
-    assert hub.state.node_revision("box")[0] == "d" * 40
-
-
-def test_checkout_revision_is_this_repositorys_head():
-    assert len(bridge.checkout_revision()) == 40
-
-
-def test_git_identity_reads_the_global_git_config(tmp_path, monkeypatch):
-    (tmp_path / "gitconfig").write_text("[user]\n\tname = Ada\n\temail = ada@example.test\n")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
-    assert bridge.git_identity() == {"name": "Ada", "email": "ada@example.test"}
-
-
-def test_git_identity_needs_both_name_and_email(tmp_path, monkeypatch):
-    (tmp_path / "gitconfig").write_text("[user]\n\tname = Ada\n")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
-    assert bridge.git_identity() is None
-
-
 def queued(text="queued while offline"):
     message = {"id": uuid.uuid4().hex, "to": "mac/claude:aaa", "from": "omp:worker-1", "text": text}
     hubclient.queue(message)
@@ -321,6 +291,29 @@ def test_a_send_to_another_machine_goes_through_the_hub(sending):
     assert sending.mac.request("GET", "/v1/inbox?wait=0")["messages"][0]["text"] == "hello mac"
 
 
+def test_a_send_to_a_name_another_machine_published_goes_through_the_relay(sending):
+    router.send("@lead", "hello lead", SESSION)
+    assert sending.mac.request("GET", "/v1/inbox?wait=0")["messages"][0]["to"] == "claude:aaa"
+
+
+@pytest.fixture
+def image_sent_to_mac(sending, tmp_path):
+    """A send with one PNG to a session on mac; yields the delivery mac's bridge takes."""
+    image = tmp_path / "shot.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 40)
+    router.send("mac/claude:aaa", "see this", SESSION, images=[str(image)])
+    return sending.mac.request("GET", "/v1/inbox?wait=0")["messages"][0]
+
+
+def test_an_image_sent_to_another_machine_travels_as_an_attachment(image_sent_to_mac):
+    assert image_sent_to_mac["attachments"][0]["media_type"] == "image/png"
+
+
+def test_an_image_sent_to_another_machine_is_fetchable_by_its_receiver(sending, image_sent_to_mac):
+    ident = image_sent_to_mac["attachments"][0]["id"]
+    assert sending.mac.download(f"/v1/attachments/{ident}")[0] == "image/png"
+
+
 def test_an_fyi_to_another_machine_is_posted_as_fyi(sending):
     router.send("mac/claude:aaa", "fyi", SESSION, fyi=True)
     assert sending.mac.request("GET", "/v1/inbox?wait=0")["messages"][0]["mode"] == "fyi"
@@ -334,7 +327,7 @@ def test_a_send_to_this_machines_own_prefix_is_delivered_here(sending, delivered
 def test_a_send_while_the_hub_is_down_is_queued(sending, monkeypatch):
     monkeypatch.setenv("ONE_CONV_HUB_URL", "http://127.0.0.1:9")
     receipt = router.send("mac/claude:aaa", "later", SESSION)
-    assert receipt["status"].startswith("queued for the hub")
+    assert receipt["status"].startswith("queued for the relay")
 
 
 def test_a_post_cut_off_after_the_hub_stored_it_stays_in_the_outbox(sending, monkeypatch):
@@ -386,7 +379,7 @@ def stale_forward(hub, delivered, monkeypatch):
 
 
 def test_a_send_through_a_dead_forward_is_queued(stale_forward):
-    assert router.send("mac/claude:aaa", "secret", SESSION)["status"].startswith("queued for the hub")
+    assert router.send("mac/claude:aaa", "secret", SESSION)["status"].startswith("queued for the relay")
 
 
 def test_a_send_through_a_dead_forward_never_reaches_the_port(stale_forward):
@@ -652,8 +645,9 @@ def test_another_program_on_the_port_is_not_taken_for_the_tunnel(tmp_path, monke
 
 @pytest.fixture(autouse=True)
 def short_poll(monkeypatch):
-    """A stop is noticed after the current long-poll, so keep it short here."""
+    """A stop is noticed after the current long-poll, so keep it short here; archive sync never runs."""
     monkeypatch.setattr(bridge, "POLL_SECONDS", 0.5)
+    monkeypatch.setattr(bridge, "ArchiveLanes", lambda: SimpleNamespace(poll=lambda *args: False, stop=lambda: None))
 
 def test_serve_delivers_and_acks_until_stopped(hub, delivered):
     done = threading.Event()

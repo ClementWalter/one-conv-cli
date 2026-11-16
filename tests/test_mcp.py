@@ -142,8 +142,7 @@ def test_stdio_discovers_tools(saved_history):
     result = protocol_call(saved_history, None, {})
     assert {tool.name for tool in result.tools} == {
         "list_chats", "read_conversation", "search_conversations", "find_conversations", "list_accounts",
-        "list_live_sessions", "send_message", "set_name", "join_topic", "list_topics",
-        "ack", "summarize", "open_block",
+        "list_live_sessions", "send_message", "set_name",
     }
 
 
@@ -171,7 +170,7 @@ def test_generated_config_starts_server():
         async with Client(StdioServerParameters(**config)) as client:
             return await client.list_tools()
 
-    assert len(asyncio.run(discover()).tools) == 13
+    assert len(asyncio.run(discover()).tools) == 8
 
 
 def test_stdio_send_message_names_codex_caller_from_tool_meta(tmp_path):
@@ -220,5 +219,6 @@ def call_in_process(tool, arguments):
 
 
 def test_a_refused_tool_call_tells_the_agent_why():
-    _, text = call_in_process("ack", {"message_id": "a" * 32})
-    assert text.startswith("Error executing tool ack: ")
+    # Refused whether or not the test runs inside an agent session: the name is invalid either way.
+    _, text = call_in_process("set_name", {"name": "UPPER$"})
+    assert text.startswith("Error executing tool set_name: ")

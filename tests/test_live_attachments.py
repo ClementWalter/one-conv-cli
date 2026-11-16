@@ -19,26 +19,25 @@
 # [tool.uv]
 # exclude-newer = "2026-10-27T00:00:00Z"
 # ///
-"""Images attached to a message: stored on the hub, carried by the post, fetched by the bridge, shown in the workspace."""
+"""Images attached to a message: uploaded to the relay, carried by the post, fetched by the receiving bridge."""
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
-from one_conv.control.store import ControlStore, validate_message
 from one_conv.live import bridge
-from one_conv.live.hub import ATTACHMENT_LIMIT, Hub, HubError
+from one_conv.live.hub import ATTACHMENT_LIMIT, Hub, HubError, application
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
-NODE = "workspace"
+NODE = "laptop"
 
 
 @pytest.fixture
 def hub(tmp_path):
     state = Hub(str(tmp_path / "hub.sqlite3"))
     state.add_token(NODE)
-    state.publish(NODE, [{"address": "user"}])
     state.publish("mac", [{"address": "claude:c1"}])
     state.add_token("mac")
     return state
@@ -58,7 +57,7 @@ def message(stored, **extra):
 
 
 def test_stored_image_gets_a_32_hex_id(stored):
-    assert len(stored["id"]) == 32 and int(stored["id"], 16) >= 0
+    assert re.fullmatch(r"[0-9a-f]{32}", stored["id"])
 
 
 def test_stored_image_keeps_its_type_and_size(stored):
@@ -120,53 +119,39 @@ def test_a_delivery_without_images_has_no_attachments_key(hub):
     assert "attachments" not in hub.inbox("mac", 0)[0]
 
 
-def test_channel_history_carries_the_image(hub, stored):
-    hub.join(NODE, "release", "user")
-    hub.send(NODE, message(stored, to="#release"))
-    assert hub.history("release")[0]["attachments"][0]["id"] == stored["id"]
-
-
 def test_a_retry_with_other_images_is_a_conflict(hub, stored):
     hub.send(NODE, message(stored))
     with pytest.raises(HubError, match="different message"):
         hub.send(NODE, message(stored, attachments=[]))
 
 
-# --- workspace -------------------------------------------------------------------------------------
-
-
-def test_browser_payload_may_name_attachments():
-    assert validate_message({"id": "a" * 32, "target": "#release", "text": "", "attachments": ["b" * 32]})["attachments"] == ["b" * 32]
-
-
-def test_browser_payload_needs_text_or_an_image():
-    with pytest.raises(HubError, match="attach an image"):
-        validate_message({"id": "a" * 32, "target": "#release", "text": " "})
-
-
-def test_browser_payload_attachments_must_be_ids():
-    with pytest.raises(HubError, match="uploaded image ids"):
-        validate_message({"id": "a" * 32, "target": "#release", "text": "x", "attachments": ["nope"]})
+# --- HTTP upload -------------------------------------------------------------------------------------
 
 
 @pytest.fixture
-def store(tmp_path):
-    store = ControlStore(tmp_path / "workspace")
-    store.hub.add_token("mac")
-    store.hub.publish("mac", [{"address": "claude:c1"}])
-    return store
+def client(tmp_path):
+    from starlette.testclient import TestClient
+    state = Hub(str(tmp_path / "relay.sqlite3"))
+    token = state.add_token(NODE)
+    with TestClient(application(state)) as http:
+        yield http, {"Authorization": f"Bearer {token}"}
 
 
-def test_workspace_message_shows_its_image(store):
-    image = store.store_attachment("image/png", PNG)
-    store.send({"id": "a" * 32, "target": "mac/claude:c1", "text": "", "attachments": [image["id"]]})
-    assert store.direct()["threads"][0]["messages"][0]["attachments"][0]["id"] == image["id"]
+def test_an_uploaded_image_is_served_back_by_its_id(client):
+    http, auth = client
+    ident = http.post("/v1/attachments", content=PNG, headers={**auth, "Content-Type": "image/png"}).json()["id"]
+    assert http.get(f"/v1/attachments/{ident}", headers=auth).content == PNG
 
 
-def test_workspace_channel_post_shows_its_image(store):
-    image = store.store_attachment("image/png", PNG)
-    store.send({"id": "a" * 32, "target": "#general", "text": "Look.", "attachments": [image["id"]]})
-    assert store.topic("general")["messages"][-1]["attachments"][0]["media_type"] == "image/png"
+def test_an_upload_without_a_token_is_refused(client):
+    http, _ = client
+    assert http.post("/v1/attachments", content=PNG, headers={"Content-Type": "image/png"}).status_code == 401
+
+
+def test_an_upload_that_is_not_an_image_is_refused(client):
+    http, auth = client
+    response = http.post("/v1/attachments", content=b"%PDF", headers={**auth, "Content-Type": "application/pdf"})
+    assert response.status_code == 415
 
 
 # --- bridge ------------------------------------------------------------------------------------------
@@ -208,14 +193,20 @@ def home(tmp_path, monkeypatch):
 def test_bridge_saves_an_image_under_its_live_directory(home, tmp_path):
     node = bridge.Bridge(DownloadingClient(), "mac", bridge.Ingress(tmp_path / "ingress.db"))
     path = node.fetch_attachment({"id": "a" * 32, "media_type": "image/png", "size": len(PNG)})
-    assert path == home / "attachments" / ("a" * 32 + ".png") and path.read_bytes() == PNG
+    assert path == home / "attachments" / ("a" * 32 + ".png")
+
+
+def test_bridge_saves_the_image_bytes(home, tmp_path):
+    node = bridge.Bridge(DownloadingClient(), "mac", bridge.Ingress(tmp_path / "ingress.db"))
+    path = node.fetch_attachment({"id": "a" * 32, "media_type": "image/png", "size": len(PNG)})
+    assert path.read_bytes() == PNG
 
 
 def test_bridge_fetches_each_image_once(home, tmp_path):
     client = DownloadingClient()
     node = bridge.Bridge(client, "mac", bridge.Ingress(tmp_path / "ingress.db"))
-    for _ in range(2):
-        node.fetch_attachment({"id": "a" * 32, "media_type": "image/png", "size": len(PNG)})
+    node.fetch_attachment({"id": "a" * 32, "media_type": "image/png", "size": len(PNG)})
+    node.fetch_attachment({"id": "a" * 32, "media_type": "image/png", "size": len(PNG)})
     assert client.paths == ["/v1/attachments/" + "a" * 32]
 
 

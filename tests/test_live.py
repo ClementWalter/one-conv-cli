@@ -365,66 +365,6 @@ def test_cursor_stop_hook_hands_each_message_over_once(homes):
     assert _hook() == {}
 
 
-@pytest.fixture
-def spawned_cursor(homes, monkeypatch):
-    """Chat k1 runs in a spawned tmux session; tmux records what is typed into it."""
-    from one_conv.live import spawn
-    (homes / "live" / "spawned.json").write_text(json.dumps({"oneconv-cursor-1": {"address": "cursor:k1"}}))
-    monkeypatch.setattr(spawn, "_alive", lambda name: True)
-    typed = []
-    monkeypatch.setattr(spawn, "type_into", lambda name, text: typed.append((name, text)))
-    monkeypatch.setattr(spawn, "screen", lambda name: "→ Add a follow-up")
-    _hook()
-    return typed
-
-
-@pytest.fixture
-def busy_cursor(spawned_cursor, monkeypatch):
-    """The spawned chat is mid-turn: its footer offers ctrl+c."""
-    from one_conv.live import spawn
-    monkeypatch.setattr(spawn, "screen", lambda name: f"→ Add a follow-up  {cursor.BUSY_MARK}")
-    return spawned_cursor
-
-
-@pytest.fixture
-def turn_ends_while_queueing(spawned_cursor, monkeypatch):
-    """The chat looks busy at the first look and idle at the next, as when its turn ends meanwhile."""
-    from one_conv.live import spawn
-    screens = iter([cursor.BUSY_MARK, ""])
-    monkeypatch.setattr(spawn, "screen", lambda name: next(screens))
-    return spawned_cursor
-
-
-def test_cursor_delivery_to_a_spawned_chat_types_into_its_pane(spawned_cursor):
-    cursor.deliver(cursor.list_sessions()[0], "one")
-    assert spawned_cursor == [("oneconv-cursor-1", "one")]
-
-
-def test_cursor_delivery_to_a_spawned_chat_leaves_the_inbox_empty(spawned_cursor):
-    cursor.deliver(cursor.list_sessions()[0], "one")
-    assert _hook() == {}
-
-
-def test_cursor_delivery_to_a_busy_spawned_chat_types_nothing(busy_cursor):
-    cursor.deliver(cursor.list_sessions()[0], "one")
-    assert busy_cursor == []
-
-
-def test_cursor_delivery_to_a_busy_spawned_chat_waits_for_the_stop_hook(busy_cursor):
-    cursor.deliver(cursor.list_sessions()[0], "one")
-    assert _hook() == {"followup_message": "one"}
-
-
-def test_cursor_delivery_types_when_the_turn_ends_while_queueing(turn_ends_while_queueing):
-    cursor.deliver(cursor.list_sessions()[0], "one")
-    assert turn_ends_while_queueing == [("oneconv-cursor-1", "one")]
-
-
-def test_cursor_delivery_withdraws_the_queued_copy_it_typed(turn_ends_while_queueing):
-    cursor.deliver(cursor.list_sessions()[0], "one")
-    assert _hook() == {}
-
-
 def test_cursor_stop_hook_registers_chat(homes):
     _hook()
     assert [(s.address, s.cwd) for s in cursor.list_sessions()] == [("cursor:k1", "/work/ui")]

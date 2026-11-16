@@ -1,12 +1,12 @@
-"""Client for the live hub, shared by the CLI and the per-machine bridge (`live serve`).
+"""Client for the live relay (the hub), shared by the CLI and the per-machine bridge (`live serve`).
 
-The bridge writes `<live_home>/bridge/hub.json` (mode 0600) with the hub URL it can reach
+The bridge writes `<live_home>/bridge/hub.json` (mode 0600) with the relay URL it can reach
 right now (a local ssh tunnel, or https), this machine's node name and its token.
-ONE_CONV_HUB_URL with ONE_CONV_HUB_TOKEN selects another hub; ONE_CONV_HUB_TOKEN alone
-rotates the token for the configured hub; a URL without a token is refused, so an old
-token is never sent to a new endpoint. Without any of these there is no hub and topics
-stay on this machine. The bearer token goes only to the configured URL, over a direct
-connection: a redirect is refused, and proxies from the environment are ignored.
+ONE_CONV_HUB_URL with ONE_CONV_HUB_TOKEN selects another relay; ONE_CONV_HUB_TOKEN alone
+rotates the token for the configured relay; a URL without a token is refused, so an old
+token is never sent to a new endpoint. Without any of these there is no relay and messages
+reach only sessions on this machine. The bearer token goes only to the configured URL, over
+a direct connection: a redirect is refused, and proxies from the environment are ignored.
 """
 
 import ipaddress
@@ -15,7 +15,7 @@ import os
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 from . import tunnel
 from .model import live_home
@@ -111,30 +111,23 @@ class HubClient:
         except (urllib.error.URLError, OSError) as error:
             raise HubUnavailable(f"hub at {self.url} is unreachable: {error}") from None
 
-    # Topics ---------------------------------------------------------------------------------
-
-    def join(self, topic: str, address: str, work: bool | None = None) -> dict:
-        query = "" if work is None else f"?work={int(work)}"
-        return self.request("PUT", f"/v1/topics/{quote(topic)}/members/{quote(address, safe=':')}{query}")
-
-    def leave(self, topic: str, address: str) -> dict:
-        return self.request("DELETE", f"/v1/topics/{quote(topic)}/members/{quote(address, safe=':')}")
-
-    def topics(self) -> list[dict]:
-        return self.request("GET", "/v1/topics").get("topics", [])
-
-    def history(self, topic: str, after: str | None = None, limit: int = 100, pos: int = 0) -> list[dict]:
-        query = f"?limit={limit}" + (f"&after={quote(after)}" if after else "") + (f"&pos={pos}" if pos else "")
-        return self.request("GET", f"/v1/topics/{quote(topic)}/messages{query}").get("messages", [])
-
-    def summaries(self, topic: str) -> dict:
-        return self.request("GET", f"/v1/topics/{quote(topic)}/summaries")
-
-    def summarize(self, topic: str, block: str, text: str, by: str) -> dict:
-        return self.request("PUT", f"/v1/topics/{quote(topic)}/summaries/{block}", {"text": text, "by": by})
-
-    def open_block(self, topic: str, block: str) -> dict:
-        return self.request("GET", f"/v1/topics/{quote(topic)}/summaries/{block}")
+    def upload(self, media_type: str, data: bytes) -> dict:
+        """Store one image on the relay; returns its {id, media_type, size}."""
+        if self.listener_pid is not None and not tunnel.listening(self.listener_pid, urlsplit(self.url).port or 0):
+            raise HubUnavailable("the bridge's ssh forward is not running")
+        request = urllib.request.Request(self.url + "/v1/attachments", data=data, method="POST",
+                                         headers={"Authorization": f"Bearer {self.token}", "Content-Type": media_type})
+        try:
+            with self._opener.open(request, timeout=self.timeout) as response:
+                return json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as error:
+            try:
+                message = json.loads(error.read()).get("error", "")
+            except ValueError:
+                message = error.reason
+            raise HubRefused(error.code, message) from None
+        except (urllib.error.URLError, OSError, ValueError) as error:
+            raise HubUnavailable(f"hub at {self.url} is unreachable: {error}") from None
 
     def post(self, message: dict) -> dict:
         return self.request("POST", "/v1/messages", message)
@@ -205,12 +198,6 @@ def submit(hub: HubClient, message: dict) -> dict | None:
     return detail
 
 
-def _joined(answer, topic: str, sender: str) -> bool:
-    """The hub names this topic and this sender, qualified by whichever node it was published on."""
-    return (isinstance(answer, dict) and answer.get("topic") == topic
-            and isinstance(answer.get("member"), str) and answer["member"].endswith("/" + sender))
-
-
 def _classify(error: Exception) -> str:
     # Only a 4xx is the hub's verdict on this message; a redirect or 5xx may follow a commit.
     if isinstance(error, HubRefused) and 400 <= error.status < 500 and error.status not in RETRYABLE:
@@ -219,22 +206,9 @@ def _classify(error: Exception) -> str:
 
 
 def _outcome(hub: HubClient, message: dict) -> tuple[str, object]:
-    """("sent", receipt), ("refused", error) for a definitive 4xx, or ("retry", reason).
-
-    A message flagged `join_topic` first adds its sender to the topic; that join is part of
-    the queued send, so a transient failure keeps the whole message queued and nothing is
-    posted until the sender is a member. Joining twice is harmless on the hub.
-    """
-    if message.get("join_topic"):
-        try:
-            joined = hub.join(message["topic"], message["from"])
-        except (HubUnavailable, HubRefused) as error:
-            return _classify(error), error
-        if not _joined(joined, message["topic"], message["from"]):
-            # Without proof of membership a post could reach an empty topic and be refused for good.
-            return "retry", "the hub's answer to the join does not confirm this sender's membership"
+    """("sent", receipt), ("refused", error) for a definitive 4xx, or ("retry", reason)."""
     try:
-        receipt = hub.post({key: value for key, value in message.items() if key != "join_topic"})
+        receipt = hub.post(message)
     except (HubUnavailable, HubRefused) as error:
         return _classify(error), error
     if not _receipt_for(receipt, message["id"]):

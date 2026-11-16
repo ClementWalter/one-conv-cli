@@ -11,9 +11,8 @@ delivered twice. One claimed but without an outcome (the bridge stopped mid-deli
 reported `unconfirmed` and not retried, since the agent may already have it. Outcomes say
 what the adapter did: `accepted` is not `read`.
 
-With spawn settings (`live spawner`), the bridge also starts a session here when the hub has
-a request that no running session can take: a delivery to `spawn:<harness>` carries the
-first prompt, and the new session claims the request itself.
+Beside delivery, the bridge syncs this machine's agent histories to the relay's archive, so
+any machine can read a session here as `NODE/harness:id` and continue it.
 """
 
 import json
@@ -30,8 +29,8 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ask, history, hubclient, router, spawn, team, tunnel, workspace
-from .model import envelope, live_home, parse_address, pid_alive
+from . import hubclient, names, router, tunnel
+from .model import envelope, live_home, parse_address
 
 try:
     import fcntl
@@ -52,7 +51,6 @@ IDE_SYNC_MINUTES = 15.0
 # Short: a session on a machine that goes away can only be taken over up to its last sync.
 ARCHIVE_SYNC_MINUTES = 1.0
 ARCHIVE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "archive-sync.py"
-LAUNCHER = Path(__file__).resolve().parents[2] / "one_conv_cli.py"
 # How long one inbox long-poll waits; also how long a stop request can take to be noticed.
 POLL_SECONDS = 5.0
 MAX_BACKOFF = 30.0
@@ -78,120 +76,6 @@ def _read(path: Path) -> dict:
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
-
-
-def spawn_settings() -> dict | None:
-    """How this machine starts a session for the hub ({harness, cwd, model, args, priority, env_file}),
-    or None if it starts none."""
-    data = _read(bridge_dir() / "spawn.json")
-    return data if data.get("harness") in spawn.HARNESSES and data.get("cwd") else None
-
-
-def save_spawn_settings(data: dict | None) -> None:
-    if data is None:
-        (bridge_dir() / "spawn.json").unlink(missing_ok=True)
-    else:
-        _write_private(bridge_dir() / "spawn.json", data)
-
-
-def _start_for_hub(harness: str, prompt: str, config: dict, env: dict[str, str], on_started=None) -> None:
-    """Start the session in tmux, wait for it to register, then call `on_started`; failures are only logged.
-
-    The hub moves a request whose spawned session never claims it to the cloud, so a failure
-    here never leaves the request waiting. `on_started` publishes the session at once: the hub
-    accepts a claim only from a session this node published.
-    """
-    try:
-        workspace.prepare(Path(config["cwd"]), settings().get("node", ""))
-        started = spawn.start(harness, prompt, Path(config["cwd"]), config.get("model"),
-                              tuple(config.get("args") or ()), trust_folder=True, env=env)
-        logger.info("started %s for the hub in tmux session %s", started.address, started.tmux)
-        if on_started is not None:
-            on_started()
-    except (spawn.SpawnError, OSError, hubclient.HubRefused, hubclient.HubUnavailable) as error:
-        logger.warning("could not start or publish a %s session for the hub: %s", harness, error)
-
-
-def deliver_spawn(item: dict, on_started=None) -> tuple[str, str]:
-    """Start a session for a request the hub could not give to a running one."""
-    harness = str(item.get("to", "")).partition(":")[2]
-    config = spawn_settings()
-    if config is None or config["harness"] != harness:
-        return "refused", f"this machine does not start {harness} sessions"
-    if item.get("mode") == "fyi":
-        # A session acked the post before this order was handed out.
-        return "accepted", "not started: a session already read the post"
-    try:
-        env = spawn.environment(config.get("env_file"))
-        spawn.preflight(harness, env)
-    except spawn.SpawnError as error:
-        return "refused", str(error)
-    # Registration takes up to a minute; deliveries go on meanwhile.
-    threading.Thread(target=_start_for_hub, args=(harness, item["text"], config, env, on_started),
-                     daemon=True).start()
-    return "accepted", f"starting a {harness} session in {config['cwd']}"
-
-
-def deliver_stop(item: dict, on_stopped=None) -> tuple[str, str]:
-    """End a session here on the hub's order: a spawned one with its tmux session, any other with its process."""
-    address = str(item.get("to", "")).partition(":")[2]
-    if not item.get("system"):
-        # Only the hub issues stop orders; a message addressed here by anyone else ends nothing.
-        return "refused", "a stop order must come from the hub"
-    if parse_address(address)[0] is None:
-        return "refused", f"{address!r} is not a session address"
-    try:
-        detail = f"stopped tmux session {spawn.stop(address)['tmux']}"
-    except spawn.NotSpawned:
-        # A session started in a terminal or by another tool ends with its own process.
-        try:
-            detail = kill_session(address)
-        except KillError as error:
-            return "refused", str(error)
-    except spawn.SpawnError as error:
-        return "refused", str(error)
-    if on_stopped is not None:
-        try:
-            # Republish at once so the stopped session leaves the directory before the next lease renewal.
-            on_stopped()
-        except (hubclient.HubRefused, hubclient.HubUnavailable) as error:
-            logger.warning("stopped %s but could not republish: %s", address, error)
-    return "accepted", detail
-
-
-class KillError(Exception):
-    """A session this machine cannot end through its process."""
-
-
-# How long a session gets to exit on SIGTERM before SIGKILL, and SIGKILL before giving up.
-KILL_GRACE_SECONDS = 5.0
-
-
-def kill_session(address: str, grace: float = KILL_GRACE_SECONDS) -> str:
-    """End a live session here through its own process: SIGTERM, then SIGKILL if it outlives `grace`.
-
-    Only a harness that registers one process per session (Claude Code, omp) has one to end;
-    a Codex thread or Cursor chat shares its process with others, so it is refused.
-    """
-    harness, _ = parse_address(address)
-    session = next((s for s in router.list_all(harness) if s.address == address), None) if harness else None
-    if session is None:
-        raise KillError(f"{address} is not live on this machine")
-    if not session.pid or session.pid in (os.getpid(), os.getppid()):
-        raise KillError(f"{harness} sessions share a process with others here; close {address} in its app")
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.kill(session.pid, sig)
-        except ProcessLookupError:
-            return f"ended process {session.pid}"
-        except PermissionError as error:
-            raise KillError(f"cannot signal process {session.pid}: {error}") from error
-        deadline = time.monotonic() + grace
-        while time.monotonic() < deadline:
-            if not pid_alive(session.pid):
-                return f"ended process {session.pid}" + (" (killed)" if sig == signal.SIGKILL else "")
-            time.sleep(0.1)
-    raise KillError(f"process {session.pid} of {address} is still running after SIGKILL")
 
 
 def settings() -> dict:
@@ -312,19 +196,14 @@ def with_attachments(text: str, attachments, fetch) -> str:
     return text + ("\n\n" + "\n".join(lines) if lines else "")
 
 
-def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, on_started=None,
-                    fetch=None) -> tuple[str, str]:
-    """Hand one hub delivery to the session here it is addressed to; returns (outcome, detail).
+def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, fetch=None) -> tuple[str, str]:
+    """Hand one relay delivery to the session here it is addressed to; returns (outcome, detail).
 
     Only a session listed live on this machine receives it: a stored-only Codex thread or a
     stopped one is refused rather than queued for nobody. An fyi is filed for `local feed`
     and never wakes the session. `fetch` saves an attached image locally and returns its path.
     """
     target, sender_route = str(item.get("to", "")), str(item.get("from", ""))
-    if target.startswith("spawn:"):
-        return deliver_spawn(item, on_started)
-    if target.startswith("stop:"):
-        return deliver_stop(item, on_started)
     harness, _ = parse_address(target)
     if harness is None:
         return "refused", f"{target!r} is not a session address"
@@ -335,19 +214,13 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, on_sta
     local = sender_route.partition("/")[2]
     # A sender that is not a session (the person at that node's terminal) has no return address.
     sender = RemoteSender(sender_route, remote.get("title") or "", remote.get("cwd") or "") if ":" in local else None
-    if item.get("system"):
-        # The hub's own instruction (an assignment, a release): nobody wrote it, so it has no sender.
-        sender, sender_route = None, "system"
-    mode, reply, topic = item.get("mode", "push"), item.get("reply", "expected"), item.get("topic")
+    mode, reply = item.get("mode", "push"), item.get("reply", "expected")
     text = with_attachments(item["text"], item.get("attachments"), fetch)
     if mode == "fyi":
-        wrapped = envelope(text, sender, sender_route, "none", item.get("id"), topic, remote.get("name"))
+        wrapped = envelope(text, sender, sender_route, "none", item.get("id"), remote.get("name"))
         router._append_fyi(target, sender_route, wrapped)
         return "accepted", "stored FYI"
-    # A Claude Code session waiting on a question takes the human's message as its answer.
-    if harness == "claude" and ask.file_answer(session.id, sender_route, item["text"]):
-        return "accepted", "answered the session's pending question"
-    wrapped = envelope(text, sender, sender_route, reply, item.get("id"), topic, remote.get("name"))
+    wrapped = envelope(text, sender, sender_route, reply, item.get("id"), remote.get("name"))
     try:
         with router._rate_slot(sender_route, target):
             try:
@@ -363,63 +236,27 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, on_sta
         return "refused", str(error)
 
 
-def git_identity() -> dict | None:
-    """This machine's global git identity, which cloud boxes reproduce; None unless both parts are set."""
-    values = []
-    for key in ("user.name", "user.email"):
-        try:
-            result = subprocess.run(["git", "config", "--global", key], capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            return None
-        values.append(result.stdout.strip())
-    return {"name": values[0], "email": values[1]} if all(values) else None
-
-
-def checkout_revision() -> str | None:
-    """The commit of the one-conv checkout this bridge runs from, read at each publication: sessions here run it."""
-    try:
-        result = subprocess.run(["git", "-C", str(Path(__file__).resolve().parents[2]), "rev-parse", "HEAD"],
-                                capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    revision = result.stdout.strip()
-    return revision if result.returncode == 0 and len(revision) == 40 else None
-
-
 class Bridge:
     def __init__(self, client: hubclient.HubClient, node: str, ingress: Ingress):
         self.client, self.node, self.ingress = client, node, ingress
         self.directory: dict[str, dict] = {}
         self.published_at = 0.0
         self.notes: list[str] = []
-        # A session started for the hub publishes from its spawn thread while the loop may publish too.
-        self.publishing = threading.Lock()
 
     def publish(self) -> int:
-        """Replace this node's entries in the hub directory, renewing its lease."""
-        with self.publishing:
-            return self._publish()
-
-    def _publish(self) -> int:
-        identity = git_identity()
-        rows = [{"address": s.address, "name": team.name_for(s.address), "title": s.title, "cwd": s.cwd,
+        """Replace this node's entries in the relay directory, renewing its lease."""
+        rows = [{"address": s.address, "name": names.name_for(s.address), "title": s.title, "cwd": s.cwd,
                  "status": s.status, "product": s.product} for s in router.list_all()]
-        config = spawn_settings()
-        offer = {"spawn": config["harness"], "spawn_priority": int(config.get("priority") or 0)} if config else {}
-        if identity:
-            offer["git_user"] = identity
-        if revision := checkout_revision():
-            offer["revision"] = revision
         try:
-            count = self.client.request("PUT", "/v1/sessions", {"sessions": rows, **offer})["published"]
+            count = self.client.request("PUT", "/v1/sessions", {"sessions": rows})["published"]
             self.notes = []
         except hubclient.HubRefused as error:
             if error.status != 409:
                 raise
             # A name taken on another node must not keep every session here unreachable.
             self.notes = [f"names not published: {error}"]
-            count = self.client.request("PUT", "/v1/sessions", {"sessions": [{**r, "name": None} for r in rows],
-                                                                **offer})["published"]
+            count = self.client.request("PUT", "/v1/sessions",
+                                        {"sessions": [{**r, "name": None} for r in rows]})["published"]
         self.directory = {row["address"]: row for row in self.client.request("GET", "/v1/sessions")["sessions"]}
         self.published_at = time.monotonic()
         return count
@@ -430,15 +267,6 @@ class Bridge:
         for row in result["refused"]:
             logger.warning("the hub refused queued message %s: %s", row["id"], row["error"])
         return len(result["sent"]) + len(result["refused"])
-
-    def report_history(self) -> dict | None:
-        """Report same-machine messages as history; a hub without that route must not stop delivery."""
-        try:
-            return history.report(self.client)
-        except (hubclient.HubRefused, hubclient.HubUnavailable, OSError) as error:
-            # Unanswered ids stay pending for the next step; deliveries go on regardless.
-            logger.warning("local message history was not reported: %s", error)
-            return None
 
     def fetch_attachment(self, attachment: dict) -> Path:
         """Save an attached image under this machine's live directory, once, and return its path."""
@@ -459,7 +287,7 @@ class Bridge:
         """Deliver one inbox item at most once, then ack its outcome."""
         fresh, recorded = self.ingress.claim(item)
         if fresh:
-            outcome, detail = deliver_inbound(item, self.directory, self.publish, fetch=self.fetch_attachment)
+            outcome, detail = deliver_inbound(item, self.directory, fetch=self.fetch_attachment)
             self.ingress.finish(item["delivery"], outcome, detail)
         elif recorded is None:
             outcome = "unconfirmed"
@@ -472,11 +300,8 @@ class Bridge:
     def step(self, wait: float | None = None) -> None:
         wait = POLL_SECONDS if wait is None else wait
         if time.monotonic() - self.published_at >= PUBLISH_SECONDS:
-            for row in spawn.retire_idle(router.list_all()):
-                logger.info("ended %s, idle for %g hours", row.get("address") or row["tmux"], spawn.IDLE_HOURS)
             self.publish()
         self.drain_outbox()
-        self.report_history()
         for item in self.client.request("GET", f"/v1/inbox?wait={wait:g}").get("messages", []):
             self.handle(item)
 
@@ -564,75 +389,8 @@ def _report(**state) -> None:
     _write_private(bridge_dir() / "state.json", {**_read(bridge_dir() / "state.json"), **state, "pid": os.getpid()})
 
 
-class LauncherJob:
-    """Runs a hidden `one-conv <command>` in the background every `seconds`, one run at a time."""
-
-    command, log_name = "", ""
-
-    def __init__(self, seconds: float, launcher: Path = LAUNCHER):
-        self.seconds, self.launcher, self.process, self.started = seconds, launcher, None, None
-
-    def poll(self, url: str, token: str, node: str) -> bool:
-        """Start a run when none runs and the last one started at least the interval ago."""
-        if self.seconds <= 0 or not self.launcher.is_file():
-            return False
-        if self.process is not None and self.process.poll() is None:
-            return False
-        if self.started is not None and time.monotonic() - self.started < self.seconds:
-            return False
-        # The token travels in the environment, never in argv where other users could read it.
-        env = {**os.environ, "ONE_CONV_HUB_URL": url, "ONE_CONV_HUB_TOKEN": token, "ONE_CONV_HUB_NODE": node}
-        log_path = bridge_dir() / self.log_name
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        output = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        try:
-            self.process = subprocess.Popen([sys.executable, "-O", str(self.launcher), self.command], env=env,
-                                            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
-        except OSError as error:
-            logger.warning("%s could not start: %s", self.command, error)
-            return False
-        finally:
-            os.close(output)
-        self.started = time.monotonic()
-        return True
-
-    def stop(self) -> None:
-        """End a running job; each writes only what the hub answered, so the next run redoes the rest."""
-        if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-
-
-class PromptSync(LauncherJob):
-    """`one-conv report-prompts` every PROMPT_SYNC_SECONDS.
-
-    The launcher reads this machine's transcripts, so the prompts a human types into a running
-    session reach the hub as that human's messages (see `prompts`).
-    """
-
-    command, log_name = "report-prompts", "prompts.log"
-
-    def __init__(self, seconds: float | None = None, launcher: Path = LAUNCHER):
-        from .prompts import PROMPT_SYNC_SECONDS
-        super().__init__(PROMPT_SYNC_SECONDS if seconds is None else seconds, launcher)
-
-
-class ControllerBackup(LauncherJob):
-    """`one-conv backup-controller` every ONE_CONV_CONTROLLER_BACKUP_MINUTES: an off-box copy of the controller."""
-
-    command, log_name = "backup-controller", "controller-backup.log"
-
-    def __init__(self, minutes: float | None = None, launcher: Path = LAUNCHER):
-        from .controller_backup import backup_minutes
-        super().__init__((backup_minutes() if minutes is None else minutes) * 60, launcher)
-
-
 def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
-          archive: "ArchiveSync | ArchiveLanes | None" = None, prompts: PromptSync | None = None,
-          backups: ControllerBackup | None = None) -> int:
+          archive: "ArchiveSync | ArchiveLanes | None" = None) -> int:
     """Run the bridge until SIGTERM/SIGINT or `stopping()`; returns the exit status."""
     lock_path = bridge_dir() / "serve.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -650,9 +408,7 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
     stopping = stopping or (lambda: False)
     forward = tunnel.Tunnel(tunnel.destination(hub), hub_port) if hub.startswith("ssh://") else None
     ingress, backoff = Ingress(bridge_dir() / "ingress.db"), 1.0
-    archive, prompts, backups = archive or ArchiveLanes(), prompts or PromptSync(), backups or ControllerBackup()
-    from .connectors import ConnectorRelay
-    relay = ConnectorRelay()
+    archive = archive or ArchiveLanes()
     _report(hub=hub, node=node, started=time.time(), last_error=None)
     try:
         while not (stop_requested or stopping()):
@@ -669,7 +425,6 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
                 _write_private(bridge_dir() / "hub.json", {"url": url, "node": node, "token": token,
                                                            **({"tunnel_pid": forward.process.pid} if forward else {})})
                 bridge = Bridge(client, node, ingress)
-                relay.connect(url, token, node)
                 _report(url=url, connected=time.time(), last_error=None)
                 backoff = 1.0
                 while not (stop_requested or stopping()):
@@ -677,8 +432,6 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
                         raise tunnel.TunnelError("the ssh forward closed")
                     bridge.step()
                     archive.poll(url, token, node)
-                    prompts.poll(url, token, node)
-                    backups.poll(url, token, node)
                     _report(last_ok=time.time(), published=len(bridge.directory), notes=bridge.notes)
             except (hubclient.HubUnavailable, tunnel.TunnelError) as error:
                 logger.warning("hub unreachable, retrying in %.0fs: %s", backoff, error)
@@ -699,9 +452,6 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
             backoff = min(backoff * 2, MAX_BACKOFF)
         return 0
     finally:
-        relay.stop()
         archive.stop()
-        prompts.stop()
-        backups.stop()
         _report(stopped=time.time())
         lock.close()

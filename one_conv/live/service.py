@@ -4,9 +4,8 @@ On macOS launchd owns the process: `RunAtLoad` starts it when the user logs in, 
 `KeepAlive.SuccessfulExit = false` restarts it only after a failure. On Linux a systemd
 user unit does the same with `Restart=on-failure`, and starts at boot when the user has
 lingering enabled. A clean exit, which is what `live serve --stop` causes, leaves it
-stopped. The bridge reads its hub, node and token from its saved settings, and spawned
-sessions read credentials through `live spawner --env-file`, so the service definition
-holds no secret.
+stopped. The bridge reads its relay, node and token from its saved settings, so the service
+definition holds no secret.
 """
 
 import os
@@ -19,7 +18,6 @@ from pathlib import Path
 from . import bridge
 
 LABEL = "dev.one-conv.bridge"
-# The cloud controller restarts the box's bridge by this name.
 UNIT = "one-conv-bridge.service"
 LAUNCHER = Path(__file__).resolve().parents[2] / "bin" / "one-conv"
 # Seconds launchd waits between restarts, so a bridge failing at once (a refused token) cannot spin.
@@ -47,10 +45,10 @@ def _unit_value(value: str) -> str:
 
 
 def unit(path_env: str) -> str:
-    """The systemd user unit. PATH is the installer's, so the bridge finds uv, tmux and the agent harnesses."""
+    """The systemd user unit. PATH is the installer's, so the bridge finds uv, git and the agent harnesses."""
     return "\n".join([
         "[Unit]",
-        "Description=one-conv live bridge and spawner",
+        "Description=one-conv live bridge",
         "Wants=network-online.target",
         "After=network-online.target",
         "[Service]",
@@ -60,7 +58,7 @@ def unit(path_env: str) -> str:
         f"ExecStart={_unit_value(str(LAUNCHER))} live serve",
         "Restart=on-failure",
         f"RestartSec={THROTTLE_SECONDS}",
-        # Sessions the bridge started live in tmux; restarting the bridge must leave them running.
+        # Only the bridge is signalled: it ends its own archive sync on SIGTERM, before it exits.
         "KillMode=process",
         "[Install]",
         "WantedBy=default.target",
@@ -69,7 +67,7 @@ def unit(path_env: str) -> str:
 
 
 def definition(path_env: str) -> dict:
-    """The launchd job. PATH is the installer's, so the bridge finds uv, tmux and the agent harnesses."""
+    """The launchd job. PATH is the installer's, so the bridge finds uv, git and the agent harnesses."""
     log = bridge.bridge_dir() / "serve.log"
     return {
         "Label": LABEL,
@@ -86,7 +84,7 @@ def definition(path_env: str) -> dict:
 
 def service_path(path_env: str) -> str:
     """The installer's PATH without the launcher's private uv environment, whose folder changes with
-    its dependencies and whose python would shadow the system one in spawned sessions."""
+    its dependencies and whose python would shadow the system one in the harnesses the bridge runs."""
     private = str(Path(sys.executable).parent)
     kept = []
     for entry in path_env.split(os.pathsep):
@@ -161,7 +159,7 @@ def install() -> list[str]:
 
 
 def _install_systemd(path_env: str) -> list[str]:
-    """Write the unit, enable it, and (re)start it; tmux sessions survive the restart (KillMode=process)."""
+    """Write the unit, enable it, and (re)start it."""
     target = unit_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(unit(path_env))
@@ -185,7 +183,7 @@ def uninstall() -> list[str]:
     if sys.platform == "darwin":
         _launchctl("bootout", f"{_domain()}/{LABEL}")
     else:
-        # `disable --now` stops the bridge; its tmux sessions keep running.
+        # `disable --now` stops the bridge.
         _systemctl("disable", "--now", UNIT)
     path().unlink()
     if sys.platform != "darwin":

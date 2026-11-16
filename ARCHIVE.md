@@ -1,23 +1,25 @@
 # Optional conversation archive
 
-## The live controller's archive
+## The live relay's archive
 
-The cloud controller (`one-conv live control serve`) serves an archive at
-`/archive` on its public origin, authenticated with the node tokens its hub
-issues. Every node token reads every capture; a node uploads only captures whose
-origin is its own node name.
+The live relay (`scripts/live-hub.py serve`) serves an archive at `/archive` on
+its own origin, authenticated with the node tokens it issues. Every node token
+reads every capture; a node uploads only captures whose origin is its own node
+name. It keeps the archive in `archive.db` beside the relay database
+(`--archive-db` picks another file).
 
 A machine running `one-conv live serve` needs nothing else. The bridge runs
 `scripts/archive-sync.py` in the background for Claude Code, Codex, Oh My Pi and
-Cursor history, every 5 minutes (`ONE_CONV_ARCHIVE_SYNC_MINUTES`; `0` turns it
-off), with its hub URL and node token, and uploads under its node name. Its
-output goes to `archive-sync.log` in the bridge's state directory. Readers on
-that machine use the same settings, so `local chats`, `search`, `find`, `read`
-and `thread` include every node's sessions. `ONE_CONV_ARCHIVE_URL` set to
-another archive takes precedence; set to an empty value, it turns the archive
-off.
+Cursor CLI history every minute, and for Cursor IDE chats every 15 minutes
+(`ONE_CONV_ARCHIVE_SYNC_MINUTES`; `0` turns it off), with its relay URL and node
+token, and uploads under its node name. Its output goes to `archive-sync.log` in
+the bridge's state directory. Readers on that machine use the same settings, so
+`local chats`, `search`, `find`, `read` and `thread` include every node's
+sessions. `ONE_CONV_ARCHIVE_URL` set to another archive takes precedence; set to
+an empty value, it turns the archive off.
 
-A live address names a session on every machine:
+A live address names a session on every machine, so an agent anywhere can read
+it and continue the work:
 
 ```sh
 one-conv local thread worker-1/codex:019a... --no-mark-read --json
@@ -30,38 +32,6 @@ copy is used when the native files are gone. Any other `NODE` is read from the
 archive. A bare `harness:id` names this machine. `search` and `find` JSON rows
 carry each agent session's `address`. The MCP `read_conversation` tool takes the
 address as `query`, with `around` and `context`.
-
-The controller needs `sqlalchemy` and `pydantic`, which its installer pins;
-without them it logs that the archive is disabled and serves the hub alone.
-
-## Off-box backup and restore
-
-Every bridge whose node has staffing authority keeps a copy of the controller,
-pulled every hour (`ONE_CONV_CONTROLLER_BACKUP_MINUTES`; `0` turns it off) into
-`ONE_CONV_CONTROLLER_BACKUP_DIR` (default `<live_home>/controller-backup`):
-
-- `state/state-<UTC>.tar.gz`: the hub (channels, DMs, unread marks, node token
-  hashes, routines), paired browsers and worker settings, copied
-  with SQLite's online backup. The newest 48 are kept
-  (`ONE_CONV_CONTROLLER_BACKUP_KEEP`).
-- `archive.db`: a mirror of the conversation archive. After the first full
-  pull, each run fetches only the rows added since.
-
-Other nodes get 403. The log is `controller-backup.log` in the bridge's state
-directory; `last.json` in the backup folder records the last successful run.
-
-To rebuild a lost controller, copy the backup folder to the new machine, then:
-
-```sh
-one-conv live control restore --from ./controller-backup
-one-conv live control serve --origin https://new-origin.example --config control.json
-```
-
-`restore` refuses a non-empty directory and builds the new one in a staging
-folder renamed into place last, so an interrupted run simply runs again. Node tokens keep
-working, so each bridge only needs the new hub URL. The restored archive gets
-a new generation, so readers drop cached listings, and each machine re-uploads
-any of its sessions written after the backup.
 
 ## A standalone archive
 

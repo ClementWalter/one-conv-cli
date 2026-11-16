@@ -10,7 +10,6 @@
 # ///
 """Images sent with a message: checked before sending, uploaded to chats, inline in Cowork, copied for local agents."""
 
-from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -177,15 +176,41 @@ def test_router_hands_images_to_the_cloud(cloud, png):
     assert cloud[0][0].media_type == "image/png"
 
 
-def test_router_refuses_images_to_a_topic(cloud, png):
-    with pytest.raises(router.LiveError, match="#topic"):
-        router.send("#team", "look", SENDER, images=[str(png)])
+REMOTE = "devbox/claude:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03"
 
 
-def test_router_refuses_images_to_another_machine(cloud, png, monkeypatch):
-    monkeypatch.setattr(router.hubclient, "configured", lambda: SimpleNamespace(node="macbook"))
-    with pytest.raises(router.LiveError, match="another machine"):
-        router.send("devbox/claude:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03", "look", SENDER, images=[str(png)])
+@pytest.fixture
+def relay(monkeypatch):
+    """A relay stub for node macbook: uploads get sequential ids, posted messages are recorded."""
+    uploads, posted = [], []
+
+    def upload(media_type, data):
+        uploads.append((media_type, data))
+        return {"id": f"{len(uploads):032x}", "media_type": media_type, "size": len(data)}
+
+    monkeypatch.setattr(router.hubclient, "configured", lambda: SimpleNamespace(node="macbook", upload=upload))
+    monkeypatch.setattr(router.hubclient, "submit",
+                        lambda hub, message: posted.append(message) or {"id": message["id"], "recipients": []})
+    return SimpleNamespace(uploads=uploads, posted=posted)
+
+
+def test_router_uploads_images_to_another_machine(cloud, png, relay):
+    router.send(REMOTE, "look", SENDER, images=[str(png)])
+    assert relay.uploads == [("image/png", png.read_bytes())]
+
+
+def test_router_names_uploaded_images_in_the_remote_message(cloud, png, relay):
+    router.send(REMOTE, "look", SENDER, images=[str(png)])
+    assert relay.posted[0]["attachments"] == [f"{1:032x}"]
+
+
+def test_router_reports_a_refused_upload(cloud, png, monkeypatch):
+    def refuse(media_type, data):
+        raise router.hubclient.HubRefused(415, "attach a PNG, JPEG, GIF or WebP image")
+
+    monkeypatch.setattr(router.hubclient, "configured", lambda: SimpleNamespace(node="macbook", upload=refuse))
+    with pytest.raises(router.LiveError, match="could not upload"):
+        router.send(REMOTE, "look", SENDER, images=[str(png)])
 
 
 def test_router_checks_images_before_sending(cloud, tmp_path):

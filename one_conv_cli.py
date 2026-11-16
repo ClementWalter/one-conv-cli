@@ -2301,7 +2301,7 @@ def _address_handle(address: str) -> SessionHandle:
                 newest[_record_identity(handle)] = handle
     if not newest:
         where = "this machine" if node is None or node == here else f"the archive for node {node}"
-        hint = "" if archive else " (no archive is configured: run `one-conv live serve` against the controller)"
+        hint = "" if archive else " (no archive is configured: run `one-conv live serve` against a relay)"
         raise click.ClickException(f"No conversation {address} on {where}{hint}.")
     if len({handle.uuid for handle in newest.values()}) > 1:
         choices = ", ".join(sorted({handle.uuid for handle in newest.values()})[:10])
@@ -3986,14 +3986,6 @@ _feed_command = build_feed_command(_feed_find_threads, _feed_whoami, _feed_root,
                                    _feed_inbox_path)
 _feed_command.hidden = True
 cli.add_command(_feed_command)
-
-from one_conv.live.prompts import build_prompts_command  # noqa: E402
-
-cli.add_command(build_prompts_command(_feed_find_threads, _feed_live_addresses))
-
-from one_conv.live.controller_backup import build_command as build_backup_command  # noqa: E402
-
-cli.add_command(build_backup_command())
 
 install_namespaces(cli, lambda: _chatgpt_accounts(), lambda: _claude_accounts(), LOGIN_PROFILES_DIR)
 # live send and the send_message tool reach claude-chat: addresses through these logins.

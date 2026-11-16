@@ -1,4 +1,4 @@
-"""`one-conv live serve`: run, inspect or stop this machine's bridge to a live hub."""
+"""`one-conv live serve`: run, inspect or stop this machine's bridge to a live relay."""
 
 import json
 import logging
@@ -28,9 +28,9 @@ def add_bridge_commands(live: click.Group) -> None:
                          "  one-conv live serve --status\n"
                          "  one-conv live serve --stop\n"
                          "  one-conv live serve --install --yes   # start at login, restart after a crash")
-    @click.option("--hub", help="https://HOST, http://127.0.0.1:PORT (loopback only), or ssh://[user@]HOST to tunnel to it.")
-    @click.option("--node", help="This machine's name on the hub, as its token was issued (a-z, 0-9, -).")
-    @click.option("--hub-port", type=int, help="The hub's port on an ssh host.  [default: 8789]")
+    @click.option("--hub", help="The relay: https://HOST, http://127.0.0.1:PORT (loopback only), or ssh://[user@]HOST to tunnel to it.")
+    @click.option("--node", help="This machine's name on the relay, as its token was issued (a-z, 0-9, -).")
+    @click.option("--hub-port", type=int, help="The relay's port on an ssh host.  [default: 8789]")
     @click.option("--token-stdin", is_flag=True, help="Read this node's token from stdin and remember it (mode 600).")
     @click.option("--status", "show_status", is_flag=True, help="Show whether the bridge runs, and its last state.")
     @click.option("--stop", "stop_it", is_flag=True, help="Stop the running bridge.")
@@ -41,13 +41,14 @@ def add_bridge_commands(live: click.Group) -> None:
     @click.option("--yes", is_flag=True, help="Apply --install or --uninstall; without it, only show what would change.")
     @click.option("--json", "as_json", is_flag=True, help="Emit --status as JSON.")
     def serve_command(hub, node, hub_port, token_stdin, show_status, stop_it, install_it, uninstall_it, yes, as_json):
-        """Connect this machine to a live hub, so its agents and agents elsewhere reach each other.
+        """Connect this machine to a live relay, so its agents and agents elsewhere reach each other.
 
-        The bridge publishes the sessions running here, delivers messages the hub holds for
-        them through their usual adapters, and posts what `live send` queued while the hub
-        was unreachable. No inbound network access is required. Run one per machine, in
-        the foreground, under tmux, or as a login service (--install); its token comes
-        from `live-hub.py token add`.
+        The bridge publishes the sessions running here, delivers messages the relay holds for
+        them through their usual adapters, posts what `live send` queued while the relay was
+        unreachable, and syncs this machine's agent histories to the relay's archive so any
+        machine can read and continue them as NODE/harness:id. No inbound network access is
+        required. Run one per machine, in the foreground, under tmux, or as a login service
+        (--install); its token comes from `scripts/live-hub.py token add`.
         """
         if install_it or uninstall_it:
             if not yes:
@@ -71,7 +72,7 @@ def add_bridge_commands(live: click.Group) -> None:
                        f"via {state.get('hub', '?')}")
             if state.get("last_error"):
                 click.echo(f"  last error: {state['last_error']}")
-            click.echo(f"  queued for the hub: {state['outbox']}")
+            click.echo(f"  queued for the relay: {state['outbox']}")
             click.echo(f"  starts at login: {'yes' if service.installed() else 'no (one-conv live serve --install --yes)'}")
             for note in state.get("notes") or []:
                 click.echo(f"  {note}")
@@ -93,57 +94,3 @@ def add_bridge_commands(live: click.Group) -> None:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
         click.echo(f"bridge for node {node} via {hub}; stop with Ctrl-C or `one-conv live serve --stop`", err=True)
         sys.exit(bridge.serve(hub, node, token, hub_port))
-
-    @live.command("spawner", context_settings=HELP,
-                  epilog="\b\nExamples:\n"
-                         "  one-conv live spawner --harness claude --cwd ~/work --yes\n"
-                         "  one-conv live spawner --harness claude --cwd ~/work --arg=--dangerously-skip-permissions --yes\n"
-                         "  one-conv live spawner --harness claude --cwd ~/work --priority 10 --yes   # asked before others\n"
-                         "  one-conv live spawner --harness claude --cwd ~/work --env-file /run/secrets/env.sh --yes\n"
-                         "  one-conv live spawner            # show the current settings\n"
-                         "  one-conv live spawner --off --yes")
-    @click.option("--harness", type=click.Choice(["claude", "codex", "omp"]), help="The agent this machine starts.")
-    @click.option("--cwd", type=click.Path(exists=True, file_okay=False, resolve_path=True),
-                  help="The folder sessions start in.")
-    @click.option("--model", help="The model the started sessions use; the harness default otherwise.")
-    @click.option("--arg", "args", multiple=True, help="An extra argument for the harness command (repeatable).")
-    @click.option("--priority", type=click.IntRange(-1000, 1000), default=0, show_default=True,
-                  help="Spawners with a higher priority are asked first; the next one takes over if it is offline or silent.")
-    @click.option("--env-file", type=click.Path(dir_okay=False, resolve_path=True),
-                  help="A KEY=value (or `export KEY=value`) file read at every start; its variables reach each session.")
-    @click.option("--off", is_flag=True, help="Start no sessions for the hub any more.")
-    @click.option("--yes", is_flag=True, help="Save the change; without it, only show what would be saved.")
-    @click.option("--json", "as_json", is_flag=True, help="Emit the settings as JSON.")
-    def spawner_command(harness, cwd, model, args, priority, env_file, off, yes, as_json):
-        """Let the hub start a session on this machine when a request finds none running.
-
-        The running bridge reads these settings at its next publication and offers to start
-        sessions. The hub asks the connected spawner with the highest --priority, and passes
-        the request to the next one when it is offline, refuses, or its session does not ack
-        in time. Before each start the spawner pulls its one-conv checkout and, when --cwd is
-        not a repository, writes AGENTS.md there (how to use one-conv, git pull/push rules).
-        Sessions start detached in tmux, unattended: --arg is how they get their permission
-        settings. --env-file is read at each start, so credentials written after the bridge
-        started, or rotated since, reach the session; a start is refused while it is unreadable.
-        """
-        if off:
-            change = None
-        elif harness or cwd:
-            if not (harness and cwd):
-                raise click.UsageError("Give both --harness and --cwd, or --off.")
-            change = {"harness": harness, "cwd": cwd, "model": model, "args": list(args), "priority": priority,
-                      "env_file": env_file}
-        else:
-            current = bridge.spawn_settings()
-            click.echo(json.dumps(current) if as_json else
-                       (f"starts {current['harness']} in {current['cwd']}"
-                        + (f" with {' '.join(current['args'])}" if current.get("args") else "")
-                        if current else "starts no sessions for the hub"))
-            return
-        if not yes:
-            click.echo(f"would save: {json.dumps(change)}; add --yes")
-            return
-        bridge.save_spawn_settings(change)
-        click.echo(json.dumps(change) if as_json else
-                   ("this machine starts no sessions for the hub" if change is None
-                    else f"this machine starts {harness} sessions in {cwd} when the hub asks"))

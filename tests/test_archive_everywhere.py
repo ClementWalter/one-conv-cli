@@ -19,7 +19,7 @@
 # [tool.uv]
 # exclude-newer = "2026-10-27T00:00:00Z"
 # ///
-"""Every node's agent sessions are readable by live address from every other node, through the controller."""
+"""Every node's agent sessions are readable by live address from every other node, through the relay's archive."""
 
 import json
 import os
@@ -40,8 +40,8 @@ from starlette.testclient import TestClient
 
 from one_conv import archive, mcp_server
 from one_conv.archive import ArchiveClient, ArchiveError
-from one_conv.control.runtime import application
 from one_conv.live import bridge, router
+from one_conv.live.hub import Hub, application
 
 ROOT = Path(__file__).resolve().parents[1]
 SESSION = "worker-session"
@@ -80,40 +80,41 @@ def write_hub(env: dict, url: str, node: str, token: str) -> None:
 
 
 @pytest.fixture
-def controller(tmp_path):
-    """The controller service over real HTTP on loopback, with node tokens for `worker` and `laptop`."""
+def relay(tmp_path):
+    """The relay with its archive over real HTTP on loopback, with node tokens for `worker` and `laptop`."""
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     origin = f"http://127.0.0.1:{sock.getsockname()[1]}"
-    app = application(tmp_path / "control", origin)
+    hub = Hub(str(tmp_path / "relay.db"))
+    app = application(hub, str(tmp_path / "archive.db"))
     server = uvicorn.Server(uvicorn.Config(app, log_level="error", access_log=False, timeout_graceful_shutdown=1))
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
     while not server.started:
         time.sleep(0.02)
-    yield {"origin": origin, "worker": app.state.hub.add_token("worker"), "laptop": app.state.hub.add_token("laptop")}
+    yield {"origin": origin, "worker": hub.add_token("worker"), "laptop": hub.add_token("laptop")}
     server.should_exit = True
     thread.join(timeout=5)
     sock.close()
 
 
 @pytest.fixture
-def synced(controller, tmp_path, monkeypatch):
+def synced(relay, tmp_path, monkeypatch):
     """The worker's bridge sync has uploaded its history; returns the sync's exit status."""
     env = history_env(tmp_path / "worker")
     write_session(env)
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     sync = bridge.ArchiveSync(minutes=1)
-    sync.poll(controller["origin"], controller["worker"], "worker")
+    sync.poll(relay["origin"], relay["worker"], "worker")
     return sync.process.wait(timeout=120)
 
 
 @pytest.fixture
-def laptop(controller, synced, tmp_path):
+def laptop(relay, synced, tmp_path):
     """Another machine: no native history, only the bridge settings `live serve` wrote."""
     env = {**os.environ, **history_env(tmp_path / "laptop")}
-    write_hub(env, controller["origin"], "laptop", controller["laptop"])
+    write_hub(env, relay["origin"], "laptop", relay["laptop"])
     return env
 
 
@@ -132,19 +133,19 @@ def test_bridge_sync_completes(synced):
     assert synced == 0
 
 
-def test_sync_uploads_under_the_node_name(controller, synced):
-    client = ArchiveClient(controller["origin"] + "/archive", controller["laptop"])
+def test_sync_uploads_under_the_node_name(relay, synced):
+    client = ArchiveClient(relay["origin"] + "/archive", relay["laptop"])
     assert {row["origin"] for row in client.list_conversations()} == {"worker"}
 
 
-def test_archive_refuses_an_unknown_token(controller):
+def test_archive_refuses_an_unknown_token(relay):
     with pytest.raises(ArchiveError, match="401"):
-        list(ArchiveClient(controller["origin"] + "/archive", "not-a-node-token").list_conversations())
+        list(ArchiveClient(relay["origin"] + "/archive", "not-a-node-token").list_conversations())
 
 
-def test_a_node_cannot_upload_under_another_nodes_name(controller, tmp_path):
-    env = {**os.environ, **history_env(tmp_path / "impostor"), "ONE_CONV_ARCHIVE_URL": controller["origin"] + "/archive",
-           "ONE_CONV_ARCHIVE_TOKEN": controller["worker"], "ONE_CONV_ARCHIVE_ORIGIN": "laptop"}
+def test_a_node_cannot_upload_under_another_nodes_name(relay, tmp_path):
+    env = {**os.environ, **history_env(tmp_path / "impostor"), "ONE_CONV_ARCHIVE_URL": relay["origin"] + "/archive",
+           "ONE_CONV_ARCHIVE_TOKEN": relay["worker"], "ONE_CONV_ARCHIVE_ORIGIN": "laptop"}
     write_session(env)
     result = subprocess.run([sys.executable, str(ROOT / "scripts/archive-sync.py"), "--source", "claude"], env=env,
                             text=True, capture_output=True, check=False, timeout=120)
@@ -200,9 +201,9 @@ def test_mcp_reads_a_live_address_around_a_message(laptop, monkeypatch):
     assert [turn["text"] for turn in result["data"]["turns"]] == [TEXTS[4]]
 
 
-def test_the_node_reads_its_own_address_from_native_history(controller, synced, tmp_path):
+def test_the_node_reads_its_own_address_from_native_history(relay, synced, tmp_path):
     env = {**os.environ, **history_env(tmp_path / "worker")}
-    write_hub(env, controller["origin"], "worker", controller["worker"])
+    write_hub(env, relay["origin"], "worker", relay["worker"])
     thread = read_json(env, "local", "thread", ADDRESS, "--json", "--no-mark-read")
     assert thread["turns"][0]["text"] == TEXTS[0]
 
@@ -279,25 +280,39 @@ def test_no_hub_means_no_archive():
     assert archive.configured_url() is None
 
 
-# The controller mounts the archive behind the hub's node tokens.
+# The relay mounts the archive behind its node tokens.
 
 @pytest.fixture
-def control_app(tmp_path):
-    app = application(tmp_path / "control", "https://workspace.example.test")
-    with TestClient(app, base_url="https://workspace.example.test") as client:
-        yield app, client
+def relay_app(tmp_path):
+    hub = Hub(str(tmp_path / "relay.db"))
+    with TestClient(application(hub, str(tmp_path / "archive.db"))) as client:
+        yield hub, client
 
 
-def test_controller_archive_requires_a_node_token(control_app):
-    _, client = control_app
+def test_relay_archive_requires_a_node_token(relay_app):
+    _, client = relay_app
     assert client.get("/archive/v1/conversations").status_code == 401
 
 
-def test_controller_archive_lists_for_any_node_token(control_app):
-    app, client = control_app
-    token = app.state.hub.add_token("laptop")
+def test_relay_archive_refuses_a_revoked_token(relay_app):
+    hub, client = relay_app
+    token = hub.add_token("laptop")
+    hub.revoke("laptop")
+    assert client.get("/archive/v1/conversations", headers={"Authorization": "Bearer " + token}).status_code == 401
+
+
+def test_relay_archive_lists_for_any_node_token(relay_app):
+    hub, client = relay_app
+    token = hub.add_token("laptop")
     response = client.get("/archive/v1/conversations", headers={"Authorization": "Bearer " + token})
     assert response.json() == {"items": [], "next": None}
+
+
+def test_relay_without_an_archive_serves_no_archive(tmp_path):
+    hub = Hub(str(tmp_path / "relay.db"))
+    token = hub.add_token("laptop")
+    with TestClient(application(hub)) as client:
+        assert client.get("/archive/v1/conversations", headers={"Authorization": "Bearer " + token}).status_code == 404
 
 
 # The bridge runs the sync in the background with the node's own credentials.
@@ -393,19 +408,18 @@ class StubSync:
 
 
 @pytest.fixture
-def served(controller, monkeypatch):
+def served(relay, monkeypatch):
     monkeypatch.setattr(router, "list_all", lambda harness=None: [])
-    # One short inbox poll is enough to reach the sync; the prompt mirror is another test's subject.
+    # One short inbox poll is enough to reach the sync.
     monkeypatch.setattr(bridge, "POLL_SECONDS", 0.2)
     stub = StubSync()
-    bridge.serve(controller["origin"], "laptop", controller["laptop"], stopping=lambda: bool(stub.polls),
-                 archive=stub, prompts=StubSync())
-    return controller, stub
+    bridge.serve(relay["origin"], "laptop", relay["laptop"], stopping=lambda: bool(stub.polls), archive=stub)
+    return relay, stub
 
 
 def test_bridge_serve_syncs_with_its_hub_and_node(served):
-    controller, stub = served
-    assert stub.polls[0] == (controller["origin"], controller["laptop"], "laptop")
+    relay, stub = served
+    assert stub.polls[0] == (relay["origin"], relay["laptop"], "laptop")
 
 
 def test_bridge_serve_stops_its_sync_on_exit(served):

@@ -39,8 +39,9 @@ export function message(to: string, extra: Record<string, unknown> = {}): Record
 export async function twoNodes(): Promise<{ mac: string; box: string }> {
   const mac = await mint("mac");
   const box = await mint("box");
-  await publish(mac, [{ address: "claude:aaa", name: "lead" }]);
-  await publish(box, [{ address: "claude:bbb", name: "worker" }]);
+  // Bodies are read so no response stays in flight: evicting the relay waits for those to drain.
+  await (await publish(mac, [{ address: "claude:aaa", name: "lead" }])).text();
+  await (await publish(box, [{ address: "claude:bbb", name: "worker" }])).text();
   return { mac, box };
 }
 

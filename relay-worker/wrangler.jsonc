@@ -19,5 +19,7 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Relay", "ArchiveIndex"] }],
   "r2_buckets": [{ "binding": "ARCHIVE", "bucket_name": "one-conv-archive" }],
+  // A chunk upload decompresses and hashes up to 16 MB of captures; the plan default would cut it off.
+  "limits": { "cpu_ms": 120000 },
   "observability": { "enabled": true }
 }

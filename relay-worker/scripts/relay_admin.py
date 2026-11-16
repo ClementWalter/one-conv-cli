@@ -31,7 +31,9 @@ log = logging.getLogger("relay-admin")
 def call(url: str, admin: str, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
     """(status, JSON body) of one admin request; HTTP errors are returned, not raised."""
     request = Request(url.rstrip("/") + path, method=method, data=json.dumps(body).encode() if body is not None else None,
-                      headers={"Authorization": f"Bearer {admin}", "Content-Type": "application/json"})
+                      headers={"Authorization": f"Bearer {admin}", "Content-Type": "application/json",
+                               # Cloudflare refuses Python's default "Python-urllib" agent (error 1010).
+                               "User-Agent": "one-conv-admin"})
     try:
         with urlopen(request, timeout=30) as response:
             return response.status, json.loads(response.read())

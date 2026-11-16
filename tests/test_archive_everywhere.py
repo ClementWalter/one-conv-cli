@@ -42,6 +42,7 @@ from one_conv import archive, mcp_server
 from one_conv.archive import ArchiveClient, ArchiveError
 from one_conv.live import bridge, router
 from one_conv.live.hub import Hub, application
+from relay_worker import BACKENDS
 
 ROOT = Path(__file__).resolve().parents[1]
 SESSION = "worker-session"
@@ -79,9 +80,13 @@ def write_hub(env: dict, url: str, node: str, token: str) -> None:
     path.write_text(json.dumps({"url": url, "node": node, "token": token}))
 
 
-@pytest.fixture
-def relay(tmp_path):
+@pytest.fixture(params=BACKENDS)
+def relay(request, tmp_path):
     """The relay with its archive over real HTTP on loopback, with node tokens for `worker` and `laptop`."""
+    if request.param == "worker":
+        hub = request.getfixturevalue("relay_worker").hub()
+        yield {"origin": hub.url, "worker": hub.add_token("worker"), "laptop": hub.add_token("laptop")}
+        return
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     origin = f"http://127.0.0.1:{sock.getsockname()[1]}"
@@ -282,8 +287,15 @@ def test_no_hub_means_no_archive():
 
 # The relay mounts the archive behind its node tokens.
 
-@pytest.fixture
-def relay_app(tmp_path):
+@pytest.fixture(params=BACKENDS)
+def relay_app(request, tmp_path):
+    """(relay state, HTTP client) of a relay serving its archive."""
+    if request.param == "worker":
+        import httpx
+        hub = request.getfixturevalue("relay_worker").hub()
+        with httpx.Client(base_url=hub.url) as client:
+            yield hub, client
+        return
     hub = Hub(str(tmp_path / "relay.db"))
     with TestClient(application(hub, str(tmp_path / "archive.db"))) as client:
         yield hub, client

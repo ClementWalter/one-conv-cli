@@ -42,3 +42,14 @@ def no_configured_archive(monkeypatch):
     monkeypatch.delenv("ONE_CONV_ARCHIVE_TOKEN", raising=False)
     monkeypatch.delenv("ONE_CONV_ARCHIVE_ORIGIN", raising=False)
     monkeypatch.setenv("ONE_CONV_ARCHIVE_SYNC_MINUTES", "0")
+
+
+@pytest.fixture(scope="session")
+def relay_worker():
+    """The Cloudflare Worker relay under `wrangler dev --local`, started once per test process."""
+    from relay_worker import ENABLED, WorkerProcess
+    if not ENABLED:
+        pytest.skip("set ONE_CONV_TEST_RELAY_WORKER=1 to run the relay tests against the Worker")
+    worker = WorkerProcess()
+    yield worker
+    worker.stop()

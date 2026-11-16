@@ -29,14 +29,15 @@ import pytest
 
 from one_conv.live import bridge
 from one_conv.live.hub import ATTACHMENT_LIMIT, Hub, HubError, application
+from relay_worker import BACKENDS, python_only
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
 NODE = "laptop"
 
 
-@pytest.fixture
-def hub(tmp_path):
-    state = Hub(str(tmp_path / "hub.sqlite3"))
+@pytest.fixture(params=BACKENDS)
+def hub(request, tmp_path):
+    state = request.getfixturevalue("relay_worker").hub() if request.param == "worker" else Hub(str(tmp_path / "hub.sqlite3"))
     state.add_token(NODE)
     state.publish("mac", [{"address": "claude:c1"}])
     state.add_token("mac")
@@ -74,6 +75,7 @@ def test_only_images_are_stored(hub):
 
 
 def test_an_oversized_image_is_refused(hub):
+    python_only(hub, "over HTTP an oversized body is refused before it is read, as 413 'request too large'")
     with pytest.raises(HubError, match="at most"):
         hub.store_attachment(NODE, "image/png", b"\x00" * (ATTACHMENT_LIMIT + 1))
 
@@ -128,12 +130,19 @@ def test_a_retry_with_other_images_is_a_conflict(hub, stored):
 # --- HTTP upload -------------------------------------------------------------------------------------
 
 
-@pytest.fixture
-def client(tmp_path):
+@pytest.fixture(params=BACKENDS)
+def client(request, tmp_path):
+    """An HTTP client on the relay (the Python app in process, or the Worker) and a node's auth header."""
+    import httpx
     from starlette.testclient import TestClient
-    state = Hub(str(tmp_path / "relay.sqlite3"))
+    if request.param == "worker":
+        state = request.getfixturevalue("relay_worker").hub()
+        http = httpx.Client(base_url=state.url)
+    else:
+        state = Hub(str(tmp_path / "relay.sqlite3"))
+        http = TestClient(application(state))
     token = state.add_token(NODE)
-    with TestClient(application(state)) as http:
+    with http:
         yield http, {"Authorization": f"Bearer {token}"}
 
 

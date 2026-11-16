@@ -14,7 +14,9 @@ import type { Env } from "./env";
 
 const PART = 500_000;
 export const OVERLAP = 4096;
-const IN_BATCH = 500;
+// Cloudflare's SQLite binds at most 100 parameters per statement; local workerd allows more.
+export const SQL_MAX_PARAMETERS = 100;
+const IN_BATCH = SQL_MAX_PARAMETERS;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS heads (key TEXT PRIMARY KEY, revision TEXT NOT NULL, mtime REAL NOT NULL,

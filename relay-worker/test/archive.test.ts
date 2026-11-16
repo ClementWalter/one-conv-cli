@@ -254,3 +254,12 @@ describe("search parts", () => {
     expect(searchParts("")).toEqual([["", ""]]);
   });
 });
+
+describe("missing-chunk check above the SQLite parameter limit", () => {
+  test("reports every unknown digest of a list longer than one statement can bind", async () => {
+    const token = await mint("mac");
+    const digests = Array.from({ length: 1000 }, (_, index) => index.toString(16).padStart(64, "0"));
+    const answer = await body(call("/archive/v1/chunks/missing", { method: "POST", token, body: { digests } }));
+    expect((answer as { missing: string[] }).missing.length).toBe(1000);
+  });
+});

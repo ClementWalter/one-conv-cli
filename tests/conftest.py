@@ -33,6 +33,9 @@ def isolated_session_vault(tmp_path, monkeypatch):
     monkeypatch.setenv("ONE_CONV_LIVE_DIR", str(tmp_path / "live-relay"))
     # Caches derived from history must not land in the user's state directory either.
     monkeypatch.setenv("ONE_CONV_SEARCH_INDEX", str(tmp_path / "search-index.sqlite"))
+    # agy history and config: readers and `live install` must never see the user's own.
+    monkeypatch.setenv("ONE_CONV_AGY_HOME", str(tmp_path / "agy-home"))
+    monkeypatch.setenv("ONE_CONV_AGY_CONFIG", str(tmp_path / "agy-config"))
 
 
 @pytest.fixture(autouse=True)

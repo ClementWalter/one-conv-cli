@@ -36,7 +36,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from one_conv.live import claude, codex, cursor, install, omp, router
+from one_conv.live import agy, claude, codex, cursor, install, omp, router
 from one_conv.live.cli import build_live_group
 from one_conv.live.model import LiveSession, envelope, is_session_id, parse_address
 
@@ -416,6 +416,169 @@ def test_cursor_stop_hook_without_conversation_does_nothing(homes):
     assert cursor.run_stop_hook({}) == {}
 
 
+# --- Antigravity CLI (agy) ------------------------------------------------------------------
+
+AGY_ID = "0a9e7c1d-0000-4000-8000-000000000001"
+
+
+def _agy_hook(event, pid=None, conversation_id=AGY_ID, token=None):
+    payload = {"conversationId": conversation_id, "hookEventName": event, "cwd": "/work/agy",
+               "workspacePaths": ["/work/agy"]}
+    return agy.run_hook(payload, pid or os.getpid(), token)
+
+
+class _LanguageServer:
+    """A stand-in for agy's plain-HTTP language server that records each request."""
+
+    def __init__(self, token="tok"):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        requests = self.requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.headers.get("x-antigravity-csrf-token") != token:
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                requests.append((self.path, body))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("localhost", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+
+
+@pytest.fixture
+def language_server(monkeypatch):
+    server = _LanguageServer()
+    monkeypatch.setattr(agy, "_listening_ports", lambda pid: [server.port])
+    yield server
+    server.close()
+
+
+def test_agy_hook_registers_conversation(homes):
+    _agy_hook("SessionStart")
+    assert [(s.address, s.cwd) for s in agy.list_sessions()] == [(f"agy:{AGY_ID}", "/work/agy")]
+
+
+def test_agy_hook_before_a_model_call_injects_queued_messages_as_user_turns(homes):
+    _agy_hook("SessionStart")
+    for text in ("one", "two"):
+        agy.deliver(agy.list_sessions()[0], text)
+    assert _agy_hook("PreInvocation") == {"injectSteps": [{"userMessage": "one"}, {"userMessage": "two"}]}
+
+
+def test_agy_hook_at_turn_end_continues_with_queued_messages(homes):
+    _agy_hook("SessionStart")
+    agy.deliver(agy.list_sessions()[0], "one")
+    assert _agy_hook("Stop") == {"decision": "continue", "reason": "one"}
+
+
+def test_agy_hook_hands_each_message_over_once(homes):
+    _agy_hook("SessionStart")
+    agy.deliver(agy.list_sessions()[0], "one")
+    _agy_hook("PreInvocation")
+    assert _agy_hook("Stop") == {}
+
+
+def test_agy_hook_at_turn_end_marks_session_idle(homes):
+    _agy_hook("Stop")
+    assert agy.list_sessions()[0].status == "idle"
+
+
+def test_agy_new_conversation_in_the_same_process_replaces_the_old_one(homes):
+    _agy_hook("SessionStart", conversation_id="first-conversation")
+    _agy_hook("SessionStart")
+    assert [s.id for s in agy.list_sessions()] == [AGY_ID]
+
+
+def test_agy_hook_ignores_path_like_conversation_id(homes):
+    assert _agy_hook("SessionStart", conversation_id="../../escape") == {}
+
+
+def test_agy_skips_exited_process(homes, dead_pid):
+    _agy_hook("SessionStart", pid=dead_pid)
+    assert agy.list_sessions() == []
+
+
+def test_agy_session_takes_the_indexed_title(homes):
+    import sqlite3
+    (homes / "agy-home").mkdir()
+    with sqlite3.connect(homes / "agy-home" / "conversation_summaries.db") as conn:
+        conn.execute("CREATE TABLE conversation_summaries (conversation_id text, title text, preview text)")
+        conn.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?)", (AGY_ID, "", "Fix the widget"))
+    _agy_hook("SessionStart")
+    assert agy.list_sessions()[0].title == "Fix the widget"
+
+
+def test_agy_delivery_without_a_known_server_waits_for_a_hook(homes):
+    _agy_hook("Stop")
+    assert agy.deliver(agy.list_sessions()[0], "hello") == "queued until this session's next model call or turn end"
+
+
+def test_agy_delivery_refuses_empty_text(homes):
+    _agy_hook("Stop")
+    with pytest.raises(ValueError):
+        agy.deliver(agy.list_sessions()[0], "")
+
+
+def test_agy_hook_with_launch_token_records_the_language_server(homes, language_server):
+    _agy_hook("SessionStart", token="tok")
+    assert agy.list_sessions()[0].delivery == "language server"
+
+
+def test_agy_delivery_through_language_server_sends_a_user_message(homes, language_server):
+    _agy_hook("SessionStart", token="tok")
+    agy.deliver(agy.list_sessions()[0], "hello")
+    assert language_server.requests[-1] == (agy.CASCADE_SEND, {"cascadeId": AGY_ID, "items": [{"text": "hello"}]})
+
+
+def test_agy_delivery_through_language_server_leaves_inbox_empty(homes, language_server):
+    _agy_hook("SessionStart", token="tok")
+    agy.deliver(agy.list_sessions()[0], "hello")
+    assert not agy.inbox(AGY_ID).exists()
+
+
+def test_agy_delivery_falls_back_to_inbox_when_server_is_gone(homes, language_server):
+    _agy_hook("SessionStart", token="tok")
+    language_server.close()
+    language_server.server.server_close()
+    assert agy.deliver(agy.list_sessions()[0], "hello").startswith("queued")
+
+
+def test_agy_hook_with_a_wrong_token_finds_no_server(homes, language_server):
+    _agy_hook("SessionStart", token="other")
+    assert agy.list_sessions()[0].delivery == "lifecycle hook"
+
+
+def test_agy_hook_script_runs_without_uv(homes):
+    agy.deliver(router.resolve(f"agy:{AGY_ID}", sessions=[LiveSession("agy", AGY_ID)]), "hello")
+    script = Path(agy.__file__).with_name("agy_hook.py")
+    result = subprocess.run([sys.executable, "-I", str(script)], input=json.dumps(
+        {"conversationId": AGY_ID, "hookEventName": "PreInvocation", "cwd": "/work/agy"}),
+        capture_output=True, text=True, check=True, env={**os.environ, "ONE_CONV_LIVE_DIR": str(homes / "live")})
+    assert json.loads(result.stdout) == {"injectSteps": [{"userMessage": "hello"}]}
+
+
+def test_agy_launch_passes_the_same_token_to_flag_and_hook(homes):
+    argv, env = agy.launch_command(["--model", "flash"])
+    assert argv == ["agy", f"--csrf_token={env[agy.TOKEN_ENV]}", "--model", "flash"]
+
+
+def test_agy_hook_command_keeps_agy_as_parent(homes):
+    assert agy.hook_command("/usr/bin/python3", Path("/x/agy_hook.py")) == "exec /usr/bin/python3 -I /x/agy_hook.py"
+
+
 # --- routing and identity ---------------------------------------------------------------
 
 
@@ -728,6 +891,28 @@ def test_whoami_cursor_cli_chat_from_open_store(homes, monkeypatch):
     assert router.whoami(pid=100).address == "cursor:b1bf197e-7306"
 
 
+def test_whoami_agy_mcp_server_finds_registered_conversation(homes, monkeypatch):
+    _agy_hook("SessionStart", pid=900)
+    monkeypatch.setattr(router, "_process", lambda pid: {100: (900, "python3")}.get(pid, (1, "agy")))
+    assert router.whoami(pid=100).address == f"agy:{AGY_ID}"
+
+
+def test_whoami_agy_shell_uses_conversation_env(homes, monkeypatch):
+    monkeypatch.setattr(router, "_process", lambda pid: {100: (900, "zsh")}.get(pid, (1, "agy")))
+    monkeypatch.setenv("ANTIGRAVITY_CONVERSATION_ID", AGY_ID)
+    assert router.whoami(pid=100).address == f"agy:{AGY_ID}"
+
+
+def test_resolve_closed_agy_conversation_waits_for_its_resume(homes):
+    (homes / "agy-home" / "brain" / AGY_ID).mkdir(parents=True)
+    assert router.resolve(f"agy:{AGY_ID}", sessions=[]).status == "not running"
+
+
+def test_resolve_unknown_agy_conversation_is_refused(homes):
+    with pytest.raises(router.LiveError):
+        router.resolve(f"agy:{AGY_ID}", sessions=[])
+
+
 def test_whoami_plain_terminal_is_user(homes, monkeypatch):
     monkeypatch.setattr(router, "_process", lambda pid: (1, "zsh"))
     assert router.whoami(pid=100) is None
@@ -775,6 +960,33 @@ def test_install_detects_mcp_registered_from_another_checkout(monkeypatch):
 
 def test_install_omp_extension_is_done_after_apply(homes):
     step = _step("relay extension")
+    step.apply()
+    assert step.done()
+
+
+def test_install_agy_mcp_entry_in_an_empty_config(homes):
+    (homes / "agy-config").mkdir()
+    (homes / "agy-config" / "mcp_config.json").write_text("")
+    _step("MCP server to " + str(homes / "agy-config")).apply()
+    assert json.loads((homes / "agy-config" / "mcp_config.json").read_text())["mcpServers"]["one-conv"] == {
+        "command": "one-conv", "args": ["mcp"]}
+
+
+def test_install_agy_hooks_keep_other_hooks(homes):
+    (homes / "agy-config").mkdir()
+    (homes / "agy-config" / "hooks.json").write_text(json.dumps({"lint": {"Stop": [{"command": "lint"}]}}))
+    _step("relay lifecycle hooks").apply()
+    assert sorted(json.loads((homes / "agy-config" / "hooks.json").read_text())) == ["lint", agy.HOOK_NAME]
+
+
+def test_install_agy_hooks_cover_every_delivery_point(homes):
+    _step("relay lifecycle hooks").apply()
+    assert sorted(json.loads((homes / "agy-config" / "hooks.json").read_text())[agy.HOOK_NAME]) == [
+        "PreInvocation", "SessionStart", "Stop"]
+
+
+def test_install_agy_hooks_are_done_after_apply(homes):
+    step = _step("relay lifecycle hooks")
     step.apply()
     assert step.done()
 

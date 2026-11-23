@@ -11,7 +11,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import claude, codex, cursor, hubclient, names, omp
+from . import agy, claude, codex, cursor, hubclient, names, omp
 from .model import LiveSession, envelope, is_session_id, live_home, parse_address
 
 try:
@@ -20,7 +20,7 @@ except ImportError:  # Windows has no flock; the rate log is then updated unlock
     fcntl = None
 
 logger = logging.getLogger(__name__)
-ADAPTERS = {"claude": claude, "codex": codex, "omp": omp, "cursor": cursor}
+ADAPTERS = {"claude": claude, "codex": codex, "omp": omp, "cursor": cursor, "agy": agy}
 # Two agents told to reply to each other would otherwise relay forever.
 RATE_LIMIT = 10
 RATE_WINDOW_SECONDS = 300
@@ -118,7 +118,7 @@ def whoami(explicit: str | None = None, meta: dict | None = None, pid: int | Non
         return next((s for s in codex.list_sessions() if s.id == thread_id), LiveSession("codex", thread_id))
     current = pid or os.getpid()
     for _ in range(32):
-        found = claude.session_for_pid(current) or omp.session_for_pid(current)
+        found = claude.session_for_pid(current) or omp.session_for_pid(current) or agy.session_for_pid(current)
         if found:
             return found
         step = _process(current)
@@ -130,6 +130,11 @@ def whoami(explicit: str | None = None, meta: dict | None = None, pid: int | Non
             return LiveSession("codex", ident) if ident else LiveSession("codex", "?unknown")
         if name == "cursor-agent":
             return LiveSession("cursor", cursor.chat_for_pid(current) or "?unknown")
+        if name == "agy":
+            # Without the hooks installed, agy's shell commands still carry their conversation id;
+            # its MCP servers get none.
+            ident = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+            return LiveSession("agy", ident if ident and is_session_id(ident) else "?unknown")
         if name in ("Cursor", "Cursor Helper (Plugin)"):
             # The IDE hosts every chat in one process, so the calling chat cannot be told apart.
             return LiveSession("cursor", "?unknown")
@@ -172,6 +177,9 @@ def resolve(target: str, sessions: list[LiveSession] | None = None,
             raise LiveError(f"{query!r} is not a Cursor conversation id.")
         return LiveSession("cursor", query, status="not seen recently", delivery="stop hook",
                            endpoint=str(cursor.inbox(query)))
+    if harness == "agy" and is_session_id(query) and (agy.agy_home() / "brain" / query).is_dir():
+        # A closed conversation's hooks hand the message over once `agy --conversation` resumes it.
+        return LiveSession("agy", query, status="not running", delivery="lifecycle hook", endpoint=str(agy.inbox(query)))
     hint = " A closed Claude Code session can be continued with `one-conv local send`." if harness == "claude" else ""
     raise LiveError(f"No live session matches {target!r}. Run `one-conv live ls`.{hint}")
 

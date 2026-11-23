@@ -9,7 +9,7 @@ name. It keeps the archive in `archive.db` beside the relay database
 (`--archive-db` picks another file).
 
 A machine running `one-conv live serve` needs nothing else. The bridge runs
-`scripts/archive-sync.py` in the background for Claude Code, Codex, Oh My Pi and
+`scripts/archive-sync.py` in the background for Claude Code, Codex, Oh My Pi, agy and
 Cursor CLI history every minute, and for Cursor IDE chats every 15 minutes
 (`ONE_CONV_ARCHIVE_SYNC_MINUTES`; `0` turns it off), with its relay URL and node
 token, and uploads under its node name. Its output goes to `archive-sync.log` in

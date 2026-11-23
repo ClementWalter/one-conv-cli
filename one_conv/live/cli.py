@@ -1,12 +1,13 @@
 """`one-conv live`: list running agent sessions and message them while they run."""
 
 import json
+import os
 import re
 import sys
 
 import click
 
-from . import cursor, hubclient, names, router
+from . import agy, cursor, hubclient, names, router
 from .. import cloud_send
 from . import install as installer
 from .model import HARNESSES
@@ -23,7 +24,7 @@ def examples(*lines: str) -> str:
 
 def build_live_group(launcher: list[str]) -> click.Group:
     @click.group("live", context_settings=HELP,
-                 epilog="\b\nTargets:\n  claude:<id> codex:<id> omp:<id> cursor:<id>  a session address (or id prefix)\n"
+                 epilog="\b\nTargets:\n  claude:<id> codex:<id> omp:<id> cursor:<id> agy:<id>  a session address (or id prefix)\n"
                         "  NODE/claude:<full id>                      a session on another machine (live serve)\n"
                         "  @name                                      the agent that chose the name, here or elsewhere\n"
                         "  claude-chat:<id> cowork:<id>               a saved Claude chat or Cowork session\n"
@@ -51,7 +52,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             return
         if not sessions:
             click.echo("No live sessions found. Sessions started before `one-conv live install` "
-                       "may not be reachable (omp, Cursor).", err=True)
+                       "may not be reachable (omp, Cursor, agy).", err=True)
         width = max((len(s.address) for s in sessions), default=0)
         for s in sessions:
             # A Cursor session names its app, since the IDE and the `agent` CLI share the cursor: address.
@@ -210,7 +211,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
     @click.option("--harness", type=click.Choice(HARNESSES), help="Only this harness.")
     @click.option("--yes", is_flag=True, help="Apply the missing steps. Without it, only lists them.")
     def install_command(harness, yes):
-        """Register the MCP server, omp extension and Cursor hook that live relaying needs."""
+        """Register the MCP server, omp extension, Cursor hook and agy hooks that live relaying needs."""
         steps = [step for step in installer.plan(launcher) if harness in (None, step.harness)]
         for step in steps:
             if step.done():
@@ -231,6 +232,32 @@ def build_live_group(launcher: list[str]) -> click.Group:
         except ValueError:
             payload = {}
         click.echo(json.dumps(cursor.run_stop_hook(payload)))
+
+    @live.command("agy", context_settings={**HELP, "ignore_unknown_options": True, "allow_extra_args": True},
+                  epilog=examples('one-conv live agy', 'one-conv live agy -- --model gemini-3.8-flash-high',
+                                  'one-conv live agy -- --conversation 0a9e7c1d-0000-4000-8000-000000000001'))
+    @click.argument("agy_args", nargs=-1, type=click.UNPROCESSED)
+    def agy_command(agy_args):
+        """Start agy so messages reach it at once, even while it waits for you.
+
+        Arguments after `--` go to agy unchanged. An agy started any other way receives
+        messages through its hooks, before its next model call or when a turn ends.
+        """
+        argv, env = agy.launch_command(list(agy_args))
+        try:
+            os.execvpe(argv[0], argv, env)
+        except FileNotFoundError:
+            raise click.ClickException("agy is not on PATH; install the Antigravity CLI first.") from None
+
+    @live.command("agy-hook", hidden=True, epilog=examples('one-conv live agy-hook < hook-payload.json'))
+    def agy_hook_command():
+        """agy hook entry point for tests and debugging; installed hooks run agy_hook.py directly."""
+        try:
+            payload = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            payload = {}
+        click.echo(json.dumps(agy.run_hook(payload if isinstance(payload, dict) else {}, os.getppid(),
+                                           os.environ.get(agy.TOKEN_ENV))))
 
     from .bridge_cli import add_bridge_commands
     add_bridge_commands(live)

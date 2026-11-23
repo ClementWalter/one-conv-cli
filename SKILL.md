@@ -3,9 +3,9 @@ name: one-conv-cli
 description: >-
   Read the user's AI conversation history with one-conv. Use cloud for ChatGPT,
   Claude Chat, Codex cloud and Cowork; use local for Claude Code, Codex CLI,
-  Cursor and Oh My Pi, on this machine and in the shared archive. Discover accounts, pull cloud
+  Cursor, Oh My Pi and the Antigravity CLI (agy), on this machine and in the shared archive. Discover accounts, pull cloud
   history, list conversations, search messages and read threads. Message
-  running Claude Code, Codex, Oh My Pi and Cursor sessions with live. Local agent
+  running Claude Code, Codex, Oh My Pi, Cursor and agy sessions with live. Local agent
   continuation and live sends require explicit --yes. Cloud authentication reuses
   authorized browser sessions without Keychain password prompts.
 ---
@@ -30,7 +30,7 @@ one-conv local --help
 - `cloud claude`: Claude web chat, distinct from local Claude Code.
 - `cloud codex`: Codex cloud tasks, distinct from local Codex CLI.
 - `cloud cowork`: remote Cowork sessions and paginated event transcripts.
-- `local`: Claude Code, Codex CLI, Cursor (IDE and CLI) and Oh My Pi, read on this machine and from the archive.
+- `local`: Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi and the Antigravity CLI (agy), read on this machine and from the archive.
 
 Old top-level commands remain compatibility aliases. Prefer namespaces for new
 invocations so local work cannot implicitly scan cloud accounts. For legacy
@@ -218,7 +218,7 @@ one-conv local thread macbook/claude:2d69d3d1-... --around msg-42 --context 3 --
 ```
 
 Local `--source` accepts `claude`, `codex`, `cursor` (the Cursor IDE), `cursor-cli` (Cursor's
-terminal agent, the `agent` command), `omp`, or `corpus` (sessions imported into the archive from the
+terminal agent, the `agent` command), `omp`, `agy` (the Antigravity CLI), or `corpus` (sessions imported into the archive from the
 retired shared corpus).
 Queries naming the same local project merge matching agent histories.
 `--raw` includes tool details. Reading updates local unread bookkeeping unless
@@ -237,7 +237,7 @@ These agents can modify files or use tools, so preserve the user's action scope.
 ### Messaging running sessions
 
 `one-conv live ls` lists running sessions with addresses such as
-`claude:<id>`, `codex:<id>`, `omp:<id>` and `cursor:<id>`. `one-conv live send TARGET MESSAGE --yes`
+`claude:<id>`, `codex:<id>`, `omp:<id>`, `cursor:<id>` and `agy:<id>`. `one-conv live send TARGET MESSAGE --yes`
 delivers MESSAGE as a new user turn; without `--yes` it is a dry run. TARGET is an
 address, id prefix, title/cwd substring, `@name` of an agent (on this machine
 first, else one another machine published), `NODE/harness:<full id>` for an agent

@@ -6,7 +6,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-HARNESSES = ("claude", "codex", "omp", "cursor")
+HARNESSES = ("claude", "codex", "omp", "cursor", "agy")
 
 
 @dataclass(frozen=True)

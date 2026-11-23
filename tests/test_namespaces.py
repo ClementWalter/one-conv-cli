@@ -204,7 +204,7 @@ def test_nested_short_help(app, path):
 
 
 @pytest.mark.parametrize(("path", "expected"), [
-    (["local"], ("claude", "codex", "cursor", "cursor-cli", "omp", "corpus")),
+    (["local"], ("claude", "codex", "cursor", "cursor-cli", "omp", "agy", "corpus")),
     (["cloud"], ("chatgpt", "claude-chat", "codex-cloud", "cowork-cloud")),
     (["cloud", "claude"], ("claude-chat",)),
     (["cloud", "codex"], ("codex-cloud",)),

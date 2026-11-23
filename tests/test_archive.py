@@ -196,7 +196,7 @@ def fixture_env(tmp_path):
     env = {**os.environ, "CLAUDE_CONFIG_DIR": str(tmp_path / "claude"),
         "CODEX_HOME": str(tmp_path / "codex"), "CURSOR_USER_DIR": str(tmp_path / "cursor"),
         "CURSOR_CLI_HOME": str(tmp_path / "cursor-cli"), "OMP_HOME": str(tmp_path / "omp"),
-        "ONE_CONV_CLOUD_CACHE": str(tmp_path / "cloud"),
+        "ONE_CONV_AGY_HOME": str(tmp_path / "agy"), "ONE_CONV_CLOUD_CACHE": str(tmp_path / "cloud"),
         # Without this, sync reads the developer's own saved ChatGPT conversations.
         "ONE_CONV_CHATGPT_CACHE": str(tmp_path / "chatgpt"), "AGENT_CONV_CHATGPT_CACHE": str(tmp_path / "chatgpt"),
         "ONE_CONV_STATE_DIR": str(tmp_path / "state"), "AGENT_CONV_STATE_DIR": str(tmp_path / "state")}
@@ -296,7 +296,7 @@ def test_auth_failure_and_unavailable_archive_are_visible(tmp_path, archive):
     assert list(client.list_conversations()) == []
 
 
-@pytest.mark.parametrize("source", ["cursor", "cursor-cli", "omp", "codex", "claude-chat"])
+@pytest.mark.parametrize("source", ["cursor", "cursor-cli", "omp", "agy", "codex", "claude-chat"])
 def test_other_sources_keep_native_thread_shape(tmp_path, archive, source):
     _, client, url = archive
     env = fixture_env(tmp_path)
@@ -326,6 +326,11 @@ def test_other_sources_keep_native_thread_shape(tmp_path, archive, source):
         _write_session(Path(env["OMP_HOME"]))
         project, text = CWD, "widget"
         native_root = "OMP_HOME"
+    elif source == "agy":
+        from test_agy import CWD, _write_conversation
+        _write_conversation(Path(env["ONE_CONV_AGY_HOME"]))
+        project, text = CWD, "widget"
+        native_root = "ONE_CONV_AGY_HOME"
     elif source == "codex":
         project, text, native_root = "/example/codex-fixture", "Quartz", "CODEX_HOME"
         write_codex(env)

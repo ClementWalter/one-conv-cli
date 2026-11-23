@@ -17,7 +17,7 @@ one, and read or continue a session wherever it ran.
 | Namespace | Sources |
 | --- | --- |
 | `cloud` | ChatGPT, Claude Chat, Codex cloud, Cowork cloud |
-| `local` | Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi, on this machine and every machine syncing to the archive |
+| `local` | Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi, Antigravity CLI (agy), on this machine and every machine syncing to the archive |
 | `live` | Messages between running agent sessions, names, and the relay that links machines |
 
 Cloud conversations are addressed by ID or title. Local sessions are grouped
@@ -212,7 +212,9 @@ them for any word of TEXT, and stay searchable once indexed.
 Replace `PROJECT` with a name from the listing. `local read` lists its sessions;
 `local thread` reads the newest one. Choose another with `--session ID` or
 `--nth 2`, or use `local read PROJECT --expand` to read all of them.
-`--source claude|codex|cursor|cursor-cli|omp|corpus` narrows the source: `cursor` (or
+`--source claude|codex|cursor|cursor-cli|omp|agy|corpus` narrows the source: `agy` is the
+Antigravity CLI, read from `~/.gemini/antigravity-cli/brain` with titles and folders from its
+conversation index (`$ONE_CONV_AGY_HOME` overrides the home); `cursor` (or
 `cursor-ide`) is the Cursor IDE's chats, `cursor-cli` those of Cursor's terminal agent, the
 `agent` command, which keeps them under `~/.cursor/chats`. `corpus` is sessions imported
 into the archive from the retired shared corpus. Local readers never
@@ -254,7 +256,7 @@ not your accounts' live connection status.
 
 ## Message running sessions
 
-`one-conv live` lets any running Claude Code, Codex, Oh My Pi or Cursor session
+`one-conv live` lets any running Claude Code, Codex, Oh My Pi, Cursor or agy session
 message any other, on this machine or another one. A message arrives in the
 receiver's context as a new user turn, labelled with the sender's address and
 chosen name:
@@ -283,8 +285,8 @@ One `live send` reaches any of these, and defaults to a dry run until `--yes`:
 
 | Target | Reaches |
 | --- | --- |
-| `claude:<id>`, `codex:<id>`, `omp:<id>`, `cursor:<id>` | a session on this machine; a unique id prefix or a substring of its title or folder works too |
-| `NODE/claude:<full id>` (also `codex`, `omp`, `cursor`) | a session on another machine, through the relay (see [Working across machines](#working-across-machines)); the id must be complete |
+| `claude:<id>`, `codex:<id>`, `omp:<id>`, `cursor:<id>`, `agy:<id>` | a session on this machine; a unique id prefix or a substring of its title or folder works too |
+| `NODE/claude:<full id>` (also `codex`, `omp`, `cursor`, `agy`) | a session on another machine, through the relay (see [Working across machines](#working-across-machines)); the id must be complete |
 | `@name` | the agent that chose that name: on this machine first, else one another machine published |
 | `claude-chat:<id or title>`, `cowork:<id or title>` | a saved Claude chat or Cowork session; it answers inline and the reply comes back in the receipt |
 
@@ -304,6 +306,7 @@ one-conv live send claude:4f1a 'what does this show?' --image shot.png --yes
 | Codex | `codex queue` | Yes; an unloaded thread gets it on its next resume | MCP server |
 | Oh My Pi | Extension inbox (`~/.omp/agent/extensions/one-conv-live.ts`) | Yes | Extension, which also adds a `one_conv_send` tool |
 | Cursor | `stop` hook follow-up | No: the message waits until a turn ends | MCP server and `~/.cursor/hooks.json` hook |
+| agy | Its language server's `SendUserCascadeMessage` when started with `one-conv live agy`; otherwise lifecycle hooks | Started with `one-conv live agy`: yes. Otherwise no: the message waits for the next model call or turn end | MCP server and `one-conv-live` hooks in `~/.gemini/config/` |
 
 Sessions started before the install are reachable only for Claude Code and
 Codex. Cursor's stop hook runs in the IDE and in interactive `cursor-agent`, not
@@ -311,6 +314,16 @@ in `cursor-agent -p`. A Cursor IDE chat cannot be identified as a sender, so its
 messages carry `from="cursor:?unknown"` and cannot be answered. Both share the
 `cursor:<id>` address; `live ls` labels each session `cursor-cli` (a chat the
 `agent` command stored under `~/.cursor/chats`) or `cursor-ide`.
+
+agy's local language server accepts a message only with a CSRF token it keeps in
+memory and never hands to hooks or MCP servers. `one-conv live agy [-- AGY ARGS]`
+starts agy with a token one-conv chose (agy's `--csrf_token` flag), so a message
+reaches it at once, idle or busy. Any other agy gets messages through its
+`SessionStart`, `PreInvocation` and `Stop` hooks: as a user turn before its next
+model call, or by continuing the loop when a turn ends. The hooks run a stdlib-only
+Python script, not uv, because `PreInvocation` fires on every model call. An agy
+session is listed once it has taken its first prompt; a closed conversation's
+messages wait until `agy --conversation ID` resumes it.
 
 ### Names
 

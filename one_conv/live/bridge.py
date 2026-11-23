@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 PUBLISH_SECONDS = 15.0
 # Harness histories a node syncs to its hub's archive, so any session can read them by live address.
-ARCHIVE_SOURCES = ("claude", "codex", "omp", "cursor", "cursor-cli")
+ARCHIVE_SOURCES = ("claude", "codex", "omp", "cursor", "cursor-cli", "agy")
 # Cursor IDE chats are rows of one multi-gigabyte database: checking each costs a third of a
 # second, against milliseconds for a file. They sync in their own slower lane, so the agent
 # sessions another machine may need to take over are never queued behind them.

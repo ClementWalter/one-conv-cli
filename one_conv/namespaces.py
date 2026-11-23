@@ -5,7 +5,7 @@ from copy import copy
 import click
 
 
-LOCAL_SOURCES = ("claude", "codex", "cursor", "cursor-cli", "omp", "corpus")
+LOCAL_SOURCES = ("claude", "codex", "cursor", "cursor-cli", "omp", "agy", "corpus")
 CLOUD_PRODUCTS = {"chatgpt": "chatgpt", "claude": "claude-chat",
                   "codex": "codex-cloud", "cowork": "cowork-cloud"}
 READ_COMMANDS = ("chats", "read", "thread", "search", "find", "unread")

@@ -17,7 +17,7 @@ from .namespaces import CLOUD_PRODUCTS, LOCAL_SOURCES
 Namespace = Literal["cloud", "local"]
 LAUNCHER = Path(__file__).resolve().parents[1] / "one_conv_cli.py"
 # A live session's address, NODE/harness:id, names a local conversation on whichever machine ran it.
-LIVE_ADDRESS = re.compile(r"(?:[a-z0-9][a-z0-9-]{0,31}/)?(?:claude|codex|omp|cursor):[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+LIVE_ADDRESS = re.compile(r"(?:[a-z0-9][a-z0-9-]{0,31}/)?(?:claude|codex|omp|cursor|agy):[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
 def read_cli(namespace: Namespace, command: str, *, query: str | None = None,
@@ -142,7 +142,7 @@ def create_server() -> MCPServer:
 
     @server.tool(annotations=readonly, structured_output=True)
     def list_live_sessions(harness: str | None = None) -> dict[str, Any]:
-        """List running agent sessions (claude, codex, omp, cursor) with their message addresses."""
+        """List running agent sessions (claude, codex, omp, cursor, agy) with their message addresses."""
         from .live import router
         return {"sessions": [session.to_json() for session in router.list_all(harness)]}
 

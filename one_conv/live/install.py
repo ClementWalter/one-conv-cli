@@ -1,18 +1,22 @@
 """Install the per-harness pieces live relaying needs, each one checked before it is written.
 
 Claude Code and Codex register the one-conv MCP server through their own CLIs; omp gets an
-extension file; Cursor gets its MCP entry plus a `stop` hook. Claude Code also needs
+extension file; Cursor gets its MCP entry plus a `stop` hook; agy gets its MCP entry plus
+lifecycle hooks in its global customization root. Claude Code also needs
 `crossSessionInbound: "accept"`, without which bypass-mode sessions hold relayed messages.
 """
 
 import json
+import os
 import shlex
+import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import claude, cursor, omp
+from . import agy, claude, cursor, omp
 
 
 @dataclass
@@ -25,9 +29,11 @@ class Step:
 
 def _json_file(path: Path) -> dict:
     try:
-        return json.loads(path.read_text())
+        text = path.read_text()
     except FileNotFoundError:
         return {}
+    # agy creates its `mcp_config.json` empty.
+    return json.loads(text) if text.strip() else {}
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -37,6 +43,16 @@ def _write_json(path: Path, data: dict) -> None:
     if path.exists():
         partial.chmod(path.stat().st_mode)
     partial.rename(path)
+
+
+def _system_python() -> str:
+    """A python3 outside this process's environment: uv's cached script environments come and go."""
+    own = {Path(sys.prefix).absolute(), Path(sys.prefix).resolve()}
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        found = shutil.which("python3", path=folder) if folder else None
+        if found and not own & set(Path(found).absolute().parents):
+            return found
+    return "python3"
 
 
 def _registered(command: list[str], mcp: list[str]) -> bool:
@@ -67,6 +83,10 @@ def plan(launcher: list[str]) -> list[Step]:
     cursor_hooks = cursor.cursor_home() / "hooks.json"
     hook_command = shlex.join([*launcher, "live", "cursor-hook"])
     extension = omp.render_extension(launcher)
+    agy_mcp = agy.config_dir() / "mcp_config.json"
+    agy_hooks = agy.config_dir() / "hooks.json"
+    # The hook runs on every model call, so it starts a plain Python on the stdlib-only module.
+    agy_hook = agy.hook_events(agy.hook_command(_system_python(), Path(agy.__file__).with_name("agy_hook.py")))
 
     def inbound_done():
         return _json_file(settings).get("crossSessionInbound") == "accept"
@@ -107,6 +127,23 @@ def plan(launcher: list[str]) -> list[Step]:
         stops.append({"command": hook_command})
         _write_json(cursor_hooks, data)
 
+    def agy_mcp_done():
+        return _json_file(agy_mcp).get("mcpServers", {}).get("one-conv") == {"command": mcp[0], "args": mcp[1:]}
+
+    def agy_mcp_apply():
+        data = _json_file(agy_mcp)
+        data.setdefault("mcpServers", {})["one-conv"] = {"command": mcp[0], "args": mcp[1:]}
+        _write_json(agy_mcp, data)
+
+    def agy_hooks_done():
+        return _json_file(agy_hooks).get(agy.HOOK_NAME) == agy_hook
+
+    def agy_hooks_apply():
+        data = _json_file(agy_hooks)
+        # A named entry: a reinstall from another checkout replaces it instead of adding a second.
+        data[agy.HOOK_NAME] = agy_hook
+        _write_json(agy_hooks, data)
+
     return [
         Step("claude", "register the one-conv MCP server (user scope)",
              lambda: _registered(["claude", "mcp", "get", "one-conv"], mcp),
@@ -122,4 +159,6 @@ def plan(launcher: list[str]) -> list[Step]:
         Step("omp", f"write the relay extension {omp.extension_path()}", extension_done, extension_apply),
         Step("cursor", f"add the one-conv MCP server to {cursor_mcp}", cursor_mcp_done, cursor_mcp_apply),
         Step("cursor", f"add the relay stop hook to {cursor_hooks}", cursor_hook_done, cursor_hook_apply),
+        Step("agy", f"add the one-conv MCP server to {agy_mcp}", agy_mcp_done, agy_mcp_apply),
+        Step("agy", f"add the relay lifecycle hooks to {agy_hooks}", agy_hooks_done, agy_hooks_apply),
     ]

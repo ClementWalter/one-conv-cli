@@ -13,7 +13,7 @@
 # [tool.uv]
 # exclude-newer = "2026-10-27T00:00:00Z"
 # ///
-"""Read your own local Claude Code / Codex CLI / Cursor / Oh My Pi conversation history.
+"""Read your own local Claude Code / Codex CLI / Cursor / Oh My Pi / Antigravity CLI conversation history.
 
 Claude Code writes every session to `~/.claude/projects/<cwd-encoded>/<uuid>.jsonl`
 — one JSON-lines file per session, in (roughly) the Anthropic Messages API shape:
@@ -41,7 +41,11 @@ across all four sources at once:
   order) and `bubbleId:<composerId>:<bubbleId>` (each bubble's text). Oh My Pi
   writes `~/.omp/agent/sessions/<cwd-encoded>/<timestamp>_<uuid>.jsonl`
   (override with `$OMP_HOME`); cwd/id/title live on the `session` event, so
-  this CLI groups by that recorded cwd the way Codex does. Every backend
+  this CLI groups by that recorded cwd the way Codex does. The Antigravity
+  CLI (agy) writes `~/.gemini/antigravity-cli/brain/<id>/.system_generated/
+  logs/transcript_full.jsonl`, one step per line, and keeps each
+  conversation's title and workspace in its `conversation_summaries.db`
+  index (override with `$ONE_CONV_AGY_HOME`). Every backend
   normalizes into the same `Turn(ts, role, blocks)` shape, so
   rendering/cleaning/search all work identically regardless of source.
 * **The directory name is not the source of truth for the project path**
@@ -60,7 +64,7 @@ across all four sources at once:
   mirrors Slack's `thread <channel> <ts>`: reads exactly one thread in full
   (defaults to the most recent; `--nth`/`--session` to pick another). `search`
   full-text-searches across everything; `find` locates a thread by its
-  derived title (name) across every project. `--source claude|codex|cursor|omp`
+  derived title (name) across every project. `--source claude|codex|cursor|omp|agy`
   scopes any of these to one backend. `fork`/`send` hand off to a real
   `claude --resume [--fork-session]` process to continue a past Claude Code
   thread live or headlessly — Claude-only for now (Codex has an analogous
@@ -118,7 +122,7 @@ logging.basicConfig(
 log = logging.getLogger("one-conv")
 
 CLOUD_SOURCES = ("claude-chat", "codex-cloud", "cowork-cloud")
-SOURCES = ("claude", "codex", "cursor", "cursor-cli", "omp", "chatgpt", "corpus", *CLOUD_SOURCES)
+SOURCES = ("claude", "codex", "cursor", "cursor-cli", "omp", "agy", "chatgpt", "corpus", *CLOUD_SOURCES)
 
 # Resolve the checkout behind the launcher symlink for the shared provider package.
 _PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -145,8 +149,21 @@ CURSOR_WORKSPACE_STORAGE = CURSOR_USER_DIR / "workspaceStorage"
 # Code owns that directory and this CLI never writes into it. Claude Code and
 # Codex have no concept of read/unread; Cursor does (its own composerHeaders
 # flag, read directly — never written to by this tool). This file tracks
-# Claude Code, Codex, and Oh My Pi threads.
-STATE_DIR = Path(os.environ.get("ONE_CONV_STATE_DIR", os.environ.get("AGENT_CONV_STATE_DIR", str(Path.home() / ".config" / ("agent-conv-cli" if (Path.home() / ".config/agent-conv-cli").exists() else "one-conv-cli")))))
+# Claude Code, Codex, Oh My Pi and agy threads.
+def _default_state_dir() -> Path:
+    override = os.environ.get("ONE_CONV_STATE_DIR") or os.environ.get("AGENT_CONV_STATE_DIR")
+    if override:
+        return Path(override)
+    legacy = Path.home() / ".config" / "agent-conv-cli"
+    try:
+        if legacy.exists():
+            return legacy
+    except OSError:
+        pass
+    return Path.home() / ".config" / "one-conv-cli"
+
+
+STATE_DIR = _default_state_dir()
 READ_STATE_FILE = STATE_DIR / "read-state.json"
 
 _SYSTEM_REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
@@ -1254,6 +1271,165 @@ def _omp_session_tokens(path: Path) -> int | None:
     return total if found else None
 
 
+# ---------------------------------------------------------------------------
+# Antigravity CLI (agy) backend
+#
+# ~/.gemini/antigravity-cli/brain/<conversation id>/.system_generated/logs/
+# transcript_full.jsonl — one JSON-lines file per conversation, one line per
+# step (`USER_INPUT`, `PLANNER_RESPONSE`, `GENERIC` tool output, `SYSTEM_MESSAGE`,
+# `ERROR_MESSAGE`). `transcript.jsonl` beside it truncates long fields. The
+# title and workspace live in agy's own `conversation_summaries.db` index.
+# Override the home with $ONE_CONV_AGY_HOME.
+# ---------------------------------------------------------------------------
+
+AGY_HOME = Path(os.environ.get("ONE_CONV_AGY_HOME", str(Path.home() / ".gemini" / "antigravity-cli")))
+AGY_BRAIN_DIR = AGY_HOME / "brain"
+_AGY_USER_REQUEST_RE = re.compile(r"<USER_REQUEST>\n?(.*?)\n?</USER_REQUEST>", re.DOTALL)
+# agy opens every tool output with its start and end times, often twice.
+_AGY_TIMING_RE = re.compile(r"\A(?:(?:Created|Completed) At: [^\n]*\n)+")
+# The block's own tag opens a line; agy's preamble names the tag mid-sentence.
+_AGY_SYSTEM_MESSAGE_RE = re.compile(r"(?:^|\n)<SYSTEM_MESSAGE>\n?(.*?)\n?</SYSTEM_MESSAGE>", re.DOTALL)
+
+_agy_project_cache: dict[str, list[tuple[Path, dict]]] | None = None
+
+
+def _agy_transcript(folder: Path) -> Path | None:
+    logs = folder / ".system_generated" / "logs"
+    for name in ("transcript_full.jsonl", "transcript.jsonl"):
+        if (logs / name).is_file():
+            return logs / name
+    return None
+
+
+def _agy_index() -> dict[str, dict]:
+    """conversation id -> {cwd, title} from agy's summaries index; empty when it is missing."""
+    database = AGY_HOME / "conversation_summaries.db"
+    if not database.is_file():
+        return {}
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=2) as conn:
+            rows = conn.execute("SELECT conversation_id, title, preview, workspace_uris FROM conversation_summaries").fetchall()
+    except sqlite3.Error as error:
+        log.warning("agy conversation index unreadable: %s", error)
+        return {}
+    index = {}
+    for conversation_id, title, preview, workspaces in rows:
+        try:
+            uris = json.loads(workspaces or "[]")
+        except ValueError:
+            uris = []
+        cwd = next((uri.removeprefix("file://") for uri in uris if isinstance(uri, str) and uri.startswith("file://")), None)
+        index[conversation_id] = {"cwd": cwd, "title": (title or "").strip() or (preview or "").strip()}
+    return index
+
+
+def _agy_history_cwds() -> dict[str, str]:
+    """conversation id -> workspace from agy's prompt history, for conversations the index lacks."""
+    cwds: dict[str, str] = {}
+    try:
+        lines = (AGY_HOME / "history.jsonl").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return cwds
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("conversationId") and row.get("workspace"):
+            cwds.setdefault(row["conversationId"], row["workspace"])
+    return cwds
+
+
+def _agy_projects_map() -> dict[str, list[tuple[Path, dict]]]:
+    global _agy_project_cache
+    if _agy_project_cache is None:
+        by_cwd: dict[str, list[tuple[Path, dict]]] = {}
+        if AGY_BRAIN_DIR.is_dir():
+            index, history = _agy_index(), None
+            for folder in AGY_BRAIN_DIR.iterdir():
+                path = _agy_transcript(folder) if folder.is_dir() else None
+                if path is None:
+                    continue
+                meta = index.get(folder.name) or {}
+                cwd = meta.get("cwd")
+                if not cwd:
+                    history = _agy_history_cwds() if history is None else history
+                    cwd = history.get(folder.name, "(unknown workspace)")
+                by_cwd.setdefault(cwd, []).append((path, {"session_id": folder.name, "title": meta.get("title") or ""}))
+        _agy_project_cache = by_cwd
+    return _agy_project_cache
+
+
+def _agy_iter_projects():
+    for cwd in _agy_projects_map():
+        yield ProjectHandle(source="agy", cwd=cwd, key=cwd)
+
+
+def _agy_project_sessions(project: ProjectHandle) -> list[SessionHandle]:
+    return sorted((SessionHandle(source="agy", uuid=meta["session_id"], project_cwd=project.cwd, path=path,
+                                 mtime=path.stat().st_mtime, title_hint=meta.get("title") or None)
+                   for path, meta in _agy_projects_map().get(project.cwd, [])),
+                  key=lambda handle: handle.mtime, reverse=True)
+
+
+def _agy_iter_turns(path: Path):
+    """Normalize agy steps into Turn/blocks.
+
+    A prompt's `<USER_REQUEST>` is its text; the metadata agy appends is dropped. Tool output
+    (`GENERIC`) and system notices become tool_result blocks, so compact rendering drops them
+    and `--raw` keeps them, except a relayed one-conv message, which reads as a user turn.
+    Errors agy retries (capacity, transport) are not conversation.
+    """
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            try:
+                step = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(step, dict):
+                continue
+            kind, ts, content = step.get("type"), step.get("created_at", ""), step.get("content") or ""
+            if kind == "USER_INPUT":
+                match = _AGY_USER_REQUEST_RE.search(content)
+                text = (match.group(1) if match else content).strip()
+                if text:
+                    yield Turn(ts=ts, role="user", blocks=[{"type": "text", "text": text}])
+            elif kind == "PLANNER_RESPONSE":
+                blocks: list[dict] = []
+                if step.get("thinking"):
+                    blocks.append({"type": "thinking", "thinking": step["thinking"]})
+                if content.strip():
+                    blocks.append({"type": "text", "text": content})
+                for call in step.get("tool_calls") or []:
+                    if isinstance(call, dict):
+                        blocks.append({"type": "tool_use", "name": call.get("name", "?"), "input": call.get("args") or {}})
+                if blocks:
+                    yield Turn(ts=ts, role="assistant", blocks=blocks)
+            elif kind == "SYSTEM_MESSAGE" and "<one-conv-message" in content:
+                match = _AGY_SYSTEM_MESSAGE_RE.search(content)
+                yield Turn(ts=ts, role="user", blocks=[{"type": "text", "text": (match.group(1) if match else content).strip()}])
+            elif kind in ("GENERIC", "SYSTEM_MESSAGE") and content.strip():
+                body = _AGY_TIMING_RE.sub("", content)
+                yield Turn(ts=ts, role="user", blocks=[{"type": "tool_result", "content": body or content}])
+
+
+def _agy_session_tokens(path: Path) -> int | None:
+    """Input + output only — cache reads excluded, same as Claude."""
+    total = 0
+    found = False
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            try:
+                step = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(step, dict) or step.get("type") != "PLANNER_RESPONSE":
+                continue
+            if "input_tokens" in step or "output_tokens" in step:
+                found = True
+                total += int(step.get("input_tokens") or 0) + int(step.get("output_tokens") or 0)
+    return total if found else None
+
 
 # ---------------------------------------------------------------------------
 # Unified dispatch — every command operates on ProjectHandle/SessionHandle,
@@ -1271,9 +1447,20 @@ def _omp_session_tokens(path: Path) -> int | None:
 # `chatgpt sync` pulls conversations over the web API into CHATGPT_CACHE, and
 # every read command works off that cache — so `chats`/`read`/`search` stay
 # offline and fast, exactly like the file-backed sources.
-CHATGPT_CACHE = Path(
-    os.environ.get("ONE_CONV_CHATGPT_CACHE", os.environ.get("AGENT_CONV_CHATGPT_CACHE", str(Path.home() / ".cache" / ("agent-conv-cli" if (Path.home() / ".cache/agent-conv-cli").exists() else "one-conv-cli") / "chatgpt")))
-)
+def _default_chatgpt_cache() -> Path:
+    override = os.environ.get("ONE_CONV_CHATGPT_CACHE") or os.environ.get("AGENT_CONV_CHATGPT_CACHE")
+    if override:
+        return Path(override)
+    legacy = Path.home() / ".cache" / "agent-conv-cli"
+    try:
+        if legacy.exists():
+            return legacy / "chatgpt"
+    except OSError:
+        pass
+    return Path.home() / ".cache" / "one-conv-cli" / "chatgpt"
+
+
+CHATGPT_CACHE = _default_chatgpt_cache()
 CHATGPT_HOST = "https://chatgpt.com"
 CHATGPT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -2000,6 +2187,8 @@ def _native_projects(sources: tuple[str, ...]):
         yield from _cursor_cli_iter_projects()
     if "omp" in sources:
         yield from _omp_iter_projects()
+    if "agy" in sources:
+        yield from _agy_iter_projects()
     if "chatgpt" in sources:
         yield from _chatgpt_iter_projects()
     yield from _cloud_projects(sources)
@@ -2213,6 +2402,8 @@ def _native_project_sessions(project: ProjectHandle) -> list[SessionHandle]:
         return _cursor_cli_project_sessions(project)
     if project.source == "omp":
         return _omp_project_sessions(project)
+    if project.source == "agy":
+        return _agy_project_sessions(project)
     if project.source == "chatgpt":
         return _chatgpt_project_sessions(project)
     return []
@@ -2242,9 +2433,10 @@ def _archive_handle(row: dict) -> SessionHandle:
 
 
 # Live sessions are addressed NODE/harness:id across machines; a bare harness:id is this machine's.
-LIVE_ADDRESS = re.compile(r"(?:(?P<node>[a-z0-9][a-z0-9-]{0,31})/)?(?P<harness>claude|codex|omp|cursor):"
+LIVE_ADDRESS = re.compile(r"(?:(?P<node>[a-z0-9][a-z0-9-]{0,31})/)?(?P<harness>claude|codex|omp|cursor|agy):"
                           r"(?P<session>[A-Za-z0-9][A-Za-z0-9._-]{0,127})")
-HARNESS_SOURCES = {"claude": ("claude",), "codex": ("codex",), "omp": ("omp",), "cursor": ("cursor", "cursor-cli")}
+HARNESS_SOURCES = {"claude": ("claude",), "codex": ("codex",), "omp": ("omp",), "cursor": ("cursor", "cursor-cli"),
+                   "agy": ("agy",)}
 SOURCE_HARNESS = {source: harness for harness, sources in HARNESS_SOURCES.items() for source in sources}
 
 
@@ -2364,6 +2556,8 @@ def _handle_iter_turns(handle: SessionHandle, include_subagents: bool) -> list[T
         return _cursor_cli_iter_turns(handle.path)
     if handle.source == "omp":
         return list(_omp_iter_turns(handle.path))
+    if handle.source == "agy":
+        return list(_agy_iter_turns(handle.path))
     if handle.source == "chatgpt":
         return _chatgpt_iter_turns(handle.path)
     return []
@@ -2380,6 +2574,8 @@ def _handle_token_total(handle: SessionHandle) -> int | None:
         return _cursor_session_tokens(handle.composer_id)
     if handle.source == "omp":
         return _omp_session_tokens(handle.path)
+    if handle.source == "agy":
+        return _agy_session_tokens(handle.path)
     return None
 
 
@@ -2715,7 +2911,7 @@ _SOURCE_OPTION = click.option(
     "--source",
     "source_filter",
     type=SourceChoice(SOURCES),
-    help="Restrict to one source (default: claude + codex + cursor + cursor-cli + omp + chatgpt, all at once).",
+    help="Restrict to one source (default: claude + codex + cursor + cursor-cli + omp + agy + chatgpt, all at once).",
 )
 
 
@@ -2880,7 +3076,7 @@ def thread(
     read (see `unread`) unless --no-mark-read is passed.
 
     QUERY may instead be a live address, NODE/harness:id (harness claude,
-    codex, omp or cursor), as `one-conv live ls` and message envelopes show
+    codex, omp, cursor or agy), as `one-conv live ls` and message envelopes show
     it: read from this machine's history when NODE is this machine, and from
     the live hub's archive otherwise. `--around` narrows the output to the
     turns around a time or a message.
@@ -2991,7 +3187,7 @@ def _exact_search(needle, sessions, sources, candidates, limit):
         cursor_ids = _cursor_composer_ids_matching(needle)
     results = []
     for h in sessions:
-        if not h.archive and h.source in ("claude", "codex", "omp") and probe:
+        if not h.archive and h.source in ("claude", "codex", "omp", "agy") and probe:
             with h.path.open("rb") as f:
                 if probe not in f.read().lower():
                     continue
@@ -3123,7 +3319,7 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
     any word of TEXT.
 
     A cheap pre-filter runs before any full parsing — a raw-bytes substring
-    check for claude/codex/omp's flat JSONL files, one batched SQL LIKE query
+    check for claude/codex/omp/agy's flat JSONL files, one batched SQL LIKE query
     for cursor's SQLite store (no single-file check is possible there) — so
     searching everywhere stays fast even with a lot of history.
 
@@ -3184,7 +3380,7 @@ def search(text: str, source_filter: str | None, project_query: str | None, limi
 def unread(source_filter: str | None, project_query: str | None, limit: int, mark_all_read: bool, as_json: bool) -> None:
     """List threads with activity you haven't seen yet, across every source.
 
-    Claude Code, Codex, Oh My Pi and the Cursor CLI have no concept of read/unread,
+    Claude Code, Codex, Oh My Pi, agy and the Cursor CLI have no concept of read/unread,
     so those are tracked via local bookkeeping (~/.config/one-conv-cli/read-state.json,
     override with $AGENT_CONV_STATE_DIR): a thread counts as unread until you
     view its full content via `thread` or `read --expand` (or catch up in
@@ -3232,7 +3428,7 @@ def find(text: str, source_filter: str | None, limit: int, as_json: bool) -> Non
     """Find a thread by name — i.e. by its derived title — across every
     project and source.
 
-    Cursor (IDE and CLI) and Oh My Pi store a real thread title; Claude Code/Codex don't,
+    Cursor (IDE and CLI), Oh My Pi and agy store a real thread title; Claude Code/Codex don't,
     so "name" there is the first substantive thing you said in it (same text
     `chats`/`read` derive titles from). Unlike `search`, which matches
     anywhere in a transcript and returns one row per matching turn, this
@@ -3900,7 +4096,7 @@ def cloud_command(context):
                     obj={"browser_accounts": _chatgpt_accounts})
 
 
-_FEED_SOURCES = ("claude", "codex", "cursor", "cursor-cli", "omp")
+_FEED_SOURCES = ("claude", "codex", "cursor", "cursor-cli", "omp", "agy")
 
 
 def _feed_stamp(handle: SessionHandle) -> str:

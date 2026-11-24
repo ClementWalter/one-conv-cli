@@ -258,7 +258,9 @@ do not change your permissions. `one-conv live install` lists the per-harness
 setup and `--yes` applies it.
 
 To bring another agent into the work, start it with `one-conv live spawn
-claude|codex|cursor|omp|agy --cwd DIR --brief-file BRIEF --yes`. It runs the harness's
+claude|codex|cursor|omp|agy --cwd DIR --brief-file BRIEF --yes`. Add `--mode auto` so the
+harness's reviewed auto mode answers shell and edit prompts instead of the user; `--mode yolo`
+drops all prompts and is only for a sandboxed box or when the user asked for it. It runs the harness's
 interactive TUI in a detached tmux session, with the brief as its first prompt headed
 by your address, and returns the new session's address once it shows in `live ls`.
 Never run peers headless (`codex exec`, `agent -p`, `claude -p`): they get no

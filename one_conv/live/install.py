@@ -1,7 +1,8 @@
 """Install the per-harness pieces live relaying needs, each one checked before it is written.
 
 Claude Code and Codex register the one-conv MCP server through their own CLIs; omp gets an
-extension file; Cursor gets its MCP entry plus a `stop` hook; agy gets its MCP entry plus
+extension file; Cursor gets its MCP entry, a `stop` hook and an allowlist for the one-conv
+tools; agy gets its MCP entry plus
 lifecycle hooks in its global customization root. Claude Code also needs
 `crossSessionInbound: "accept"`, without which bypass-mode sessions hold relayed messages.
 """
@@ -17,7 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import agy, claude, cursor, omp
+from . import agy, claude, cursor, omp, spawn
 
 
 @dataclass
@@ -141,6 +142,20 @@ def plan(launcher: list[str]) -> list[Step]:
         stops.append({"command": hook_command})
         _write_json(cursor_hooks, data)
 
+    cursor_cli = cursor.cursor_home() / "cli-config.json"
+    # The `agent` CLI has no per-launch tool approval, so spawned and hand-started chats share this allowlist.
+    cursor_tools = [f"Mcp(one-conv:{tool})" for tool in spawn.TOOLS]
+
+    def cursor_tools_done():
+        allowed = _json_file(cursor_cli).get("permissions", {}).get("allow", [])
+        return all(tool in allowed for tool in cursor_tools)
+
+    def cursor_tools_apply():
+        data = _json_file(cursor_cli)
+        allowed = data.setdefault("permissions", {}).setdefault("allow", [])
+        allowed.extend(tool for tool in cursor_tools if tool not in allowed)
+        _write_json(cursor_cli, data)
+
     def agy_mcp_done():
         return _same(_json_file(agy_mcp).get("mcpServers", {}).get("one-conv"), {"command": mcp[0], "args": mcp[1:]})
 
@@ -173,6 +188,8 @@ def plan(launcher: list[str]) -> list[Step]:
         Step("omp", f"write the relay extension {omp.extension_path()}", extension_done, extension_apply),
         Step("cursor", f"add the one-conv MCP server to {cursor_mcp}", cursor_mcp_done, cursor_mcp_apply),
         Step("cursor", f"add the relay stop hook to {cursor_hooks}", cursor_hook_done, cursor_hook_apply),
+        Step("cursor", f"allow the one-conv tools without a prompt in {cursor_cli}", cursor_tools_done,
+             cursor_tools_apply),
         Step("agy", f"add the one-conv MCP server to {agy_mcp}", agy_mcp_done, agy_mcp_apply),
         Step("agy", f"add the relay lifecycle hooks to {agy_hooks}", agy_hooks_done, agy_hooks_apply),
     ]

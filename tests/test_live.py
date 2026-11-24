@@ -1042,6 +1042,19 @@ def test_install_cursor_mcp_through_a_symlinked_launcher_is_done(homes, tmp_path
     assert step.done()
 
 
+def test_install_cursor_tool_allowlist_keeps_other_permissions(homes):
+    (homes / "cursor" / "cli-config.json").write_text(json.dumps({"permissions": {"allow": ["Shell(ls)"], "deny": []}}))
+    _step("allow the one-conv tools").apply()
+    assert json.loads((homes / "cursor" / "cli-config.json").read_text())["permissions"]["allow"][:2] == [
+        "Shell(ls)", "Mcp(one-conv:send_message)"]
+
+
+def test_install_cursor_tool_allowlist_is_done_after_apply(homes):
+    step = _step("allow the one-conv tools")
+    step.apply()
+    assert step.done()
+
+
 def test_install_omp_extension_is_done_after_apply(homes):
     step = _step("relay extension")
     step.apply()

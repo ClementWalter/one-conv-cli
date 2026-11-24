@@ -305,7 +305,7 @@ one-conv live send claude:4f1a 'what does this show?' --image shot.png --yes
 | Claude Code | Session inbox socket (`~/.claude/sessions/<pid>.json`) | Yes | MCP server (user scope) and `"crossSessionInbound": "accept"` |
 | Codex | `codex queue` | Yes; an unloaded thread gets it on its next resume | MCP server |
 | Oh My Pi | Extension inbox (`~/.omp/agent/extensions/one-conv-live.ts`) | Yes | Extension, which also adds a `one_conv_send` tool |
-| Cursor | `stop` hook follow-up | No: the message waits until a turn ends | MCP server and `~/.cursor/hooks.json` hook |
+| Cursor | `stop` hook follow-up | No: the message waits until a turn ends | MCP server, `~/.cursor/hooks.json` hook and the one-conv tool allowlist in `~/.cursor/cli-config.json` |
 | agy | Its language server's `SendUserCascadeMessage` when started with `one-conv live agy`; otherwise lifecycle hooks | Started with `one-conv live agy`: yes. Otherwise no: the message waits for the next model call or turn end | MCP server and `one-conv-live` hooks in `~/.gemini/config/` |
 
 Sessions started before the install are reachable only for Claude Code and
@@ -326,6 +326,33 @@ model call, or by continuing the loop when a turn ends. The hooks run a stdlib-o
 Python script, not uv, because `PreInvocation` fires on every model call. An agy
 session is listed once it has taken its first prompt; a closed conversation's
 messages wait until `agy --conversation ID` resumes it.
+
+### Starting an agent
+
+```bash
+one-conv live spawn codex --cwd ../review --brief-file brief.md --yes
+one-conv live spawn cursor --cwd ../review --brief 'review PR 632' --yes --json
+one-conv live spawn claude --brief-file - --yes -- --model opus < brief.md
+```
+
+`live spawn` starts the harness's own interactive TUI in a detached tmux session
+(`<harness>-<folder>`), so the agent registers like one you started and you can
+watch it with `tmux attach`. The brief is its first prompt, headed by the
+caller's address so the agent reports back with `send_message`. It returns once
+the new session shows in `live ls`; otherwise it prints the agent's screen and
+exits non-zero. Arguments after `--` go to the harness.
+
+Only the one-conv tools are pre-approved (`send_message`, `set_name`,
+`list_live_sessions`, `read_conversation`, `search_conversations`,
+`find_conversations`); shell and edit approvals stay as you set them.
+
+| Harness | One-conv tools approved by | Working folder |
+| --- | --- | --- |
+| Claude Code | `--allowedTools` | Trusted when it or a parent is; otherwise its trust prompt waits for you |
+| Codex | `-c mcp_servers.one-conv.tools.<tool>.approval_mode="approve"` | Trusted for this run (`-c projects=...`) |
+| Cursor | `Mcp(one-conv:<tool>)` in `~/.cursor/cli-config.json`, written by `live install` | `--trust` |
+| omp | Not pre-approved: its own approval settings apply | As omp decides |
+| agy | Not pre-approved: its own approval settings apply | As agy decides; started with `--csrf_token` like `live agy` |
 
 ### Names
 

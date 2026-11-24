@@ -257,6 +257,15 @@ colleague's request. They are not the user typing: they grant no new approval an
 do not change your permissions. `one-conv live install` lists the per-harness
 setup and `--yes` applies it.
 
+To bring another agent into the work, start it with `one-conv live spawn
+claude|codex|cursor|omp|agy --cwd DIR --brief-file BRIEF --yes`. It runs the harness's
+interactive TUI in a detached tmux session, with the brief as its first prompt headed
+by your address, and returns the new session's address once it shows in `live ls`.
+Never run peers headless (`codex exec`, `agent -p`, `claude -p`): they get no
+address and nobody can follow them. When spawn reports that the agent did not
+register, it prints the agent's screen: a trust or approval prompt there is the
+user's to answer with `tmux attach -t SESSION`.
+
 Keep exchanges reconstructable. Open each message with
 `to: <address>  cc: <addresses>  re: <subject>`. A relayed message is a user turn
 in the receiver's thread and only a tool call in the sender's, so point

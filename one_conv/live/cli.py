@@ -228,6 +228,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
     @live.command("spawn", context_settings={**HELP, "ignore_unknown_options": True},
                   epilog=examples("one-conv live spawn codex --cwd ../review --brief-file brief.md --yes",
                                   "one-conv live spawn cursor --cwd ../review --brief 'review PR 632' --yes --json",
+                                  "one-conv live spawn claude --mode auto --brief-file brief.md --yes",
                                   "one-conv live spawn claude --brief-file - --yes -- --model opus < brief.md"))
     @click.argument("harness", type=click.Choice(spawn.SPAWNABLE))
     @click.argument("harness_args", nargs=-1, type=click.UNPROCESSED)
@@ -235,16 +236,19 @@ def build_live_group(launcher: list[str]) -> click.Group:
                   help="Folder the agent works in. Default: the current one.")
     @click.option("--brief", help="The agent's first prompt.")
     @click.option("--brief-file", type=click.File("r"), help="Read the first prompt from a file, or - for stdin.")
+    @click.option("--mode", type=click.Choice(spawn.MODES), default="ask", show_default=True,
+                  help="Shell and edit approvals: ask (your harness settings), auto (the harness's reviewed "
+                       "auto mode), yolo (no prompts).")
     @click.option("--session", "tmux_session", help="tmux session name. Default: <harness>-<folder>.")
     @click.option("--timeout", default=120.0, show_default=True, help="Seconds to wait for the agent to register.")
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
     @click.option("--yes", is_flag=True, help="Start it. Without it, only prints the command.")
-    def spawn_command(harness, harness_args, cwd, brief, brief_file, tmux_session, timeout, as_json, yes):
+    def spawn_command(harness, harness_args, cwd, brief, brief_file, mode, tmux_session, timeout, as_json, yes):
         """Start an agent in a detached tmux session and return its live address.
 
         The brief is its first prompt, headed by your address so it reports back with
-        `send_message`. Only the one-conv tools are pre-approved; its shell and edit
-        prompts stay as you set them. Arguments after `--` go to the harness unchanged.
+        `send_message`. The one-conv tools are pre-approved; its shell and edit prompts
+        follow --mode. Arguments after `--` go to the harness unchanged.
         Exits non-zero, showing the agent's screen, when it does not register in time,
         for example while it waits on a prompt: answer it with `tmux attach -t <session>`.
         """
@@ -252,7 +256,10 @@ def build_live_group(launcher: list[str]) -> click.Group:
         if not text.strip():
             raise click.UsageError("Give the agent a brief with --brief or --brief-file: it starts working on it.")
         text = spawn.with_reply_path(text, router.whoami())
-        command = spawn.launch(harness, text, cwd, list(harness_args))
+        try:
+            command = spawn.launch(harness, text, cwd, list(harness_args), mode)
+        except ValueError as error:
+            raise click.UsageError(str(error)) from None
         name = tmux_session or spawn.tmux_name(harness, cwd, spawn.tmux_taken)
         if not yes:
             click.echo(f"would start in tmux session {name} ({cwd}):\n  {shlex.join(command.argv)}")

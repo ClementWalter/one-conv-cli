@@ -3,7 +3,8 @@
 The harness runs its own interactive TUI, so it registers like any session the user starts
 and stays attachable. Its first prompt is the brief, the one-conv MCP tools are pre-approved
 through the harness's per-launch flags (Cursor reads them from the allowlist `live install`
-writes), and its working directory is trusted. Shell and edit approvals stay as the user set them.
+writes), and its working directory is trusted. Shell and edit approvals follow `mode`: the user's
+own harness settings (`ask`), the harness's reviewed auto mode (`auto`), or no prompts at all (`yolo`).
 """
 
 import os
@@ -23,6 +24,26 @@ SPAWNABLE = ("claude", "codex", "cursor", "omp", "agy")
 TOOLS = ("send_message", "set_name", "list_live_sessions", "read_conversation", "search_conversations",
          "find_conversations")
 
+MODES = ("ask", "auto", "yolo")
+# Per-harness flags for each mode; `ask` adds none. omp has no reviewed auto mode.
+MODE_FLAGS: dict[str, dict[str, list[str]]] = {
+    "claude": {"auto": ["--permission-mode", "auto"], "yolo": ["--dangerously-skip-permissions"]},
+    "codex": {"auto": ["--approve-for-me"], "yolo": ["--dangerously-bypass-approvals-and-sandbox"]},
+    "cursor": {"auto": ["--auto-review"], "yolo": ["--yolo"]},
+    "omp": {"yolo": ["--approval-mode", "yolo"]},
+    "agy": {"auto": ["--mode", "auto"], "yolo": ["--dangerously-skip-permissions"]},
+}
+
+
+def mode_flags(harness: str, mode: str) -> list[str]:
+    """The flags that start `harness` in `mode`; ValueError when the harness has no such mode."""
+    if mode == "ask":
+        return []
+    flags = MODE_FLAGS[harness].get(mode)
+    if flags is None:
+        raise ValueError(f"{harness} has no {mode} mode: use --mode ask or --mode yolo")
+    return flags
+
 
 @dataclass
 class Launch:
@@ -30,8 +51,9 @@ class Launch:
     env: dict[str, str]
 
 
-def launch(harness: str, brief: str, cwd: str, extra: list[str]) -> Launch:
+def launch(harness: str, brief: str, cwd: str, extra: list[str], mode: str = "ask") -> Launch:
     """The harness command that opens an interactive session on `brief`."""
+    extra = [*mode_flags(harness, mode), *extra]
     if harness == "claude":
         allowed = ",".join(f"mcp__one-conv__{tool}" for tool in TOOLS)
         return Launch(["claude", *extra, "--allowedTools", allowed, "--", brief], {})

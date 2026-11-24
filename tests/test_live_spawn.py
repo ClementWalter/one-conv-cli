@@ -52,6 +52,47 @@ def test_harness_arguments_come_before_the_brief():
     assert spawn.launch("omp", "brief", "/w", ["--model", "opus"]).argv == ["omp", "--model", "opus", "brief"]
 
 
+@pytest.mark.parametrize(("harness", "mode", "flags"), [
+    ("claude", "auto", ["--permission-mode", "auto"]),
+    ("claude", "yolo", ["--dangerously-skip-permissions"]),
+    ("codex", "auto", ["--approve-for-me"]),
+    ("codex", "yolo", ["--dangerously-bypass-approvals-and-sandbox"]),
+    ("cursor", "auto", ["--auto-review"]),
+    ("cursor", "yolo", ["--yolo"]),
+    ("omp", "yolo", ["--approval-mode", "yolo"]),
+])
+def test_mode_flags_follow_the_harness_name(harness, mode, flags):
+    assert spawn.launch(harness, "brief", "/w", [], mode).argv[1:1 + len(flags)] == flags
+
+
+def test_ask_mode_adds_no_flags():
+    assert spawn.launch("omp", "brief", "/w", [], "ask").argv == ["omp", "brief"]
+
+
+def test_mode_flags_come_before_harness_arguments():
+    assert spawn.launch("omp", "brief", "/w", ["--model", "opus"], "yolo").argv == [
+        "omp", "--approval-mode", "yolo", "--model", "opus", "brief"]
+
+
+def test_agy_auto_mode_uses_its_mode_flag():
+    assert spawn.mode_flags("agy", "auto") == ["--mode", "auto"]
+
+
+def test_omp_has_no_auto_mode():
+    with pytest.raises(ValueError, match="omp has no auto mode"):
+        spawn.mode_flags("omp", "auto")
+
+
+def test_spawn_dry_run_shows_the_mode_flag(started):
+    result = CliRunner().invoke(build_live_group(["one-conv"]), ["spawn", "claude", "--mode", "yolo", "--brief", "b"])
+    assert "--dangerously-skip-permissions" in result.output
+
+
+def test_spawn_refuses_a_mode_the_harness_lacks(started):
+    result = CliRunner().invoke(build_live_group(["one-conv"]), ["spawn", "omp", "--mode", "auto", "--brief", "b"])
+    assert "omp has no auto mode" in result.output
+
+
 def test_agy_launch_passes_its_language_server_token(monkeypatch):
     monkeypatch.setattr(agy, "launch_command", lambda args: (["agy", "--csrf_token=t", *args], {agy.TOKEN_ENV: "t"}))
     assert spawn.launch("agy", "brief", "/w", []).env == {agy.TOKEN_ENV: "t"}

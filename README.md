@@ -332,6 +332,7 @@ messages wait until `agy --conversation ID` resumes it.
 ```bash
 one-conv live spawn codex --cwd ../review --brief-file brief.md --yes
 one-conv live spawn cursor --cwd ../review --brief 'review PR 632' --yes --json
+one-conv live spawn claude --mode auto --brief-file brief.md --yes
 one-conv live spawn claude --brief-file - --yes -- --model opus < brief.md
 ```
 
@@ -342,9 +343,17 @@ caller's address so the agent reports back with `send_message`. It returns once
 the new session shows in `live ls`; otherwise it prints the agent's screen and
 exits non-zero. Arguments after `--` go to the harness.
 
-Only the one-conv tools are pre-approved (`send_message`, `set_name`,
+The one-conv tools are pre-approved (`send_message`, `set_name`,
 `list_live_sessions`, `read_conversation`, `search_conversations`,
-`find_conversations`); shell and edit approvals stay as you set them.
+`find_conversations`). `--mode` sets the shell and edit approvals:
+
+| `--mode` | Claude Code | Codex | Cursor | omp | agy |
+| --- | --- | --- | --- | --- | --- |
+| `ask` (default) | your settings | your settings | your settings | your settings | your settings |
+| `auto` | `--permission-mode auto` | `--approve-for-me` | `--auto-review` | refused: no reviewed auto mode | `--mode auto` |
+| `yolo` | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `--yolo` | `--approval-mode yolo` | `--dangerously-skip-permissions` |
+
+With `ask` or `auto`, a prompt the harness still raises waits in the tmux pane.
 
 | Harness | One-conv tools approved by | Working folder |
 | --- | --- | --- |

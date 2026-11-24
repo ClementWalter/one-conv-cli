@@ -8,6 +8,7 @@ lifecycle hooks in its global customization root. Claude Code also needs
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -55,13 +56,26 @@ def _system_python() -> str:
     return "python3"
 
 
+_ABSOLUTE_PATH = re.compile(r"/[^\s\"',\[\]]+")
+
+
+def _canonical(text: str) -> str:
+    """`text` with each existing absolute path replaced by its target, so a symlinked launcher still matches."""
+    return _ABSOLUTE_PATH.sub(lambda m: os.path.realpath(m.group()) if os.path.exists(m.group()) else m.group(), text)
+
+
+def _same(found, wanted) -> bool:
+    return _canonical(json.dumps(found)) == _canonical(json.dumps(wanted))
+
+
 def _registered(command: list[str], mcp: list[str]) -> bool:
     """The server exists and its printed command line is the one this checkout would register."""
     try:
         result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=60)
     except FileNotFoundError:
         return False
-    return result.returncode == 0 and mcp[0] in result.stdout and " ".join(mcp[1:]) in result.stdout
+    printed = _canonical(result.stdout)
+    return result.returncode == 0 and _canonical(mcp[0]) in printed and _canonical(" ".join(mcp[1:])) in printed
 
 
 def _replace(remove: list[str], add: list[str]) -> None:
@@ -98,14 +112,14 @@ def plan(launcher: list[str]) -> list[Step]:
 
     def extension_done():
         path = omp.extension_path()
-        return path.exists() and path.read_text() == extension
+        return path.exists() and _canonical(path.read_text()) == _canonical(extension)
 
     def extension_apply():
         omp.extension_path().parent.mkdir(parents=True, exist_ok=True)
         omp.extension_path().write_text(extension)
 
     def cursor_mcp_done():
-        return _json_file(cursor_mcp).get("mcpServers", {}).get("one-conv") == {"command": mcp[0], "args": mcp[1:]}
+        return _same(_json_file(cursor_mcp).get("mcpServers", {}).get("one-conv"), {"command": mcp[0], "args": mcp[1:]})
 
     def cursor_mcp_apply():
         data = _json_file(cursor_mcp)
@@ -116,7 +130,7 @@ def plan(launcher: list[str]) -> list[Step]:
         return _json_file(cursor_hooks).get("hooks", {}).get("stop", [])
 
     def cursor_hook_done():
-        return any(entry.get("command") == hook_command for entry in hook_entries())
+        return any(_canonical(entry.get("command", "")) == _canonical(hook_command) for entry in hook_entries())
 
     def cursor_hook_apply():
         data = _json_file(cursor_hooks)
@@ -128,7 +142,7 @@ def plan(launcher: list[str]) -> list[Step]:
         _write_json(cursor_hooks, data)
 
     def agy_mcp_done():
-        return _json_file(agy_mcp).get("mcpServers", {}).get("one-conv") == {"command": mcp[0], "args": mcp[1:]}
+        return _same(_json_file(agy_mcp).get("mcpServers", {}).get("one-conv"), {"command": mcp[0], "args": mcp[1:]})
 
     def agy_mcp_apply():
         data = _json_file(agy_mcp)
@@ -136,7 +150,7 @@ def plan(launcher: list[str]) -> list[Step]:
         _write_json(agy_mcp, data)
 
     def agy_hooks_done():
-        return _json_file(agy_hooks).get(agy.HOOK_NAME) == agy_hook
+        return _same(_json_file(agy_hooks).get(agy.HOOK_NAME), agy_hook)
 
     def agy_hooks_apply():
         data = _json_file(agy_hooks)

@@ -50,6 +50,8 @@ def homes(tmp_path, monkeypatch):
                       ("cursor", "ONE_CONV_CURSOR_HOME"), ("live", "ONE_CONV_LIVE_DIR")):
         (tmp_path / name).mkdir()
         monkeypatch.setenv(var, str(tmp_path / name))
+    # This machine's running Cursor CLI chats stay out of the isolated homes.
+    monkeypatch.setattr(cursor, "_agent_pids", lambda: [])
     return tmp_path
 
 
@@ -387,6 +389,59 @@ def test_an_agent_cli_chat_publishes_its_stored_title(homes):
 def test_a_chat_the_agent_cli_never_stored_is_labelled_cursor_ide(homes):
     _hook()
     assert cursor.list_sessions()[0].product == "cursor-ide"
+
+
+def _stub_agent_process(monkeypatch, chat="k1", cwd="/work/ui"):
+    """One running `agent` CLI process (pid 700) that holds `chat` open in `cwd`."""
+    monkeypatch.setattr(cursor, "_agent_pids", lambda: [700])
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 0, f"p700\nfcwd\nn{cwd}\nf12\nn/Users/u/.cursor/chats/d5d6/{chat}/store.db\n", ""))
+
+
+def test_running_agent_cli_chat_is_listed_before_its_first_turn_ends(homes, monkeypatch):
+    _stub_agent_process(monkeypatch)
+    assert [s.address for s in cursor.list_sessions()] == ["cursor:k1"]
+
+
+def test_running_agent_cli_chat_reports_its_process_cwd(homes, monkeypatch):
+    _stub_agent_process(monkeypatch, cwd="/work/staking")
+    assert cursor.list_sessions()[0].cwd == "/work/staking"
+
+
+def test_running_agent_cli_chat_replaces_its_stop_hook_record(homes, monkeypatch):
+    _hook("k1")
+    _stub_agent_process(monkeypatch)
+    assert [(s.address, s.status) for s in cursor.list_sessions()] == [("cursor:k1", "running")]
+
+
+def test_message_to_running_agent_cli_chat_waits_for_its_stop_hook(homes, monkeypatch):
+    _stub_agent_process(monkeypatch)
+    cursor.deliver(cursor.list_sessions()[0], "brief")
+    assert _hook("k1") == {"followup_message": "brief"}
+
+
+def test_agent_process_without_an_open_chat_is_not_listed(homes, monkeypatch):
+    monkeypatch.setattr(cursor, "_agent_pids", lambda: [700])
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 0, "p700\nfcwd\nn/work\n", ""))
+    assert cursor.list_sessions() == []
+
+
+def test_agent_pids_are_read_from_the_process_table(monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 0, "  1 /sbin/launchd\n700 /opt/cursor/cursor-agent\n701 /usr/bin/ssh-agent\n", ""))
+    assert cursor._agent_pids() == [700]
+
+
+def test_agent_symlink_to_cursor_agent_is_the_cursor_cli(tmp_path):
+    (tmp_path / "cursor-agent").touch()
+    (tmp_path / "agent").symlink_to(tmp_path / "cursor-agent")
+    assert cursor.is_cursor_agent(str(tmp_path / "agent"))
+
+
+def test_unrelated_agent_binary_is_not_the_cursor_cli(tmp_path):
+    (tmp_path / "agent").touch()
+    assert not cursor.is_cursor_agent(str(tmp_path / "agent"))
 
 
 def _inbox_with_bad_file(homes):
@@ -891,6 +946,16 @@ def test_whoami_cursor_cli_chat_from_open_store(homes, monkeypatch):
     assert router.whoami(pid=100).address == "cursor:b1bf197e-7306"
 
 
+def test_whoami_cursor_cli_started_through_agent_symlink(homes, monkeypatch, tmp_path):
+    (tmp_path / "cursor-agent").touch()
+    (tmp_path / "agent").symlink_to(tmp_path / "cursor-agent")
+    commands = {100: f"900 python3", 900: f"1 {tmp_path / 'agent'}"}
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 0, commands.get(int(argv[-1]), "") if argv[0] == "ps"
+        else "p900\nf12\nn/Users/u/.cursor/chats/d5d6/b1bf197e-7306/store.db\n", ""))
+    assert router.whoami(pid=100).address == "cursor:b1bf197e-7306"
+
+
 def test_whoami_agy_mcp_server_finds_registered_conversation(homes, monkeypatch):
     _agy_hook("SessionStart", pid=900)
     monkeypatch.setattr(router, "_process", lambda pid: {100: (900, "python3")}.get(pid, (1, "agy")))
@@ -956,6 +1021,25 @@ def test_install_detects_mcp_registered_from_another_checkout(monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(
         a, 0, "Command: uv\nArgs: run --script /old/one-conv mcp", ""))
     assert not install._registered(["claude", "mcp", "get", "one-conv"], ["uv", "run", "--script", "/new/one-conv", "mcp"])
+
+
+def test_install_accepts_mcp_registered_through_a_symlinked_launcher(monkeypatch, tmp_path):
+    (tmp_path / "one_conv_cli.py").touch()
+    (tmp_path / "one-conv").symlink_to(tmp_path / "one_conv_cli.py")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(
+        a, 0, f"Command: uv\nArgs: run --script {tmp_path / 'one-conv'} mcp", ""))
+    assert install._registered(["claude", "mcp", "get", "one-conv"],
+                               ["uv", "run", "--script", str(tmp_path / "one_conv_cli.py"), "mcp"])
+
+
+def test_install_cursor_mcp_through_a_symlinked_launcher_is_done(homes, tmp_path):
+    (tmp_path / "one_conv_cli.py").touch()
+    (tmp_path / "one-conv").symlink_to(tmp_path / "one_conv_cli.py")
+    (homes / "cursor" / "mcp.json").write_text(json.dumps({"mcpServers": {"one-conv": {
+        "command": "uv", "args": ["run", "--script", str(tmp_path / "one-conv"), "mcp"]}}}))
+    step = next(s for s in install.plan(["uv", "run", "--script", str(tmp_path / "one_conv_cli.py")])
+                if "MCP server to " + str(homes / "cursor") in s.summary)
+    assert step.done()
 
 
 def test_install_omp_extension_is_done_after_apply(homes):

@@ -3,11 +3,12 @@
 import json
 import os
 import re
+import shlex
 import sys
 
 import click
 
-from . import agy, cursor, hubclient, names, router
+from . import agy, cursor, hubclient, names, router, spawn
 from .. import cloud_send
 from . import install as installer
 from .model import HARNESSES
@@ -223,6 +224,56 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 click.echo(f"  missing  [{step.harness}] {step.summary}")
         if not yes:
             click.echo("Re-run with --yes to apply the missing steps. Running sessions pick them up on restart.")
+
+    @live.command("spawn", context_settings={**HELP, "ignore_unknown_options": True},
+                  epilog=examples("one-conv live spawn codex --cwd ../review --brief-file brief.md --yes",
+                                  "one-conv live spawn cursor --cwd ../review --brief 'review PR 632' --yes --json",
+                                  "one-conv live spawn claude --brief-file - --yes -- --model opus < brief.md"))
+    @click.argument("harness", type=click.Choice(spawn.SPAWNABLE))
+    @click.argument("harness_args", nargs=-1, type=click.UNPROCESSED)
+    @click.option("--cwd", default=".", type=click.Path(exists=True, file_okay=False, resolve_path=True),
+                  help="Folder the agent works in. Default: the current one.")
+    @click.option("--brief", help="The agent's first prompt.")
+    @click.option("--brief-file", type=click.File("r"), help="Read the first prompt from a file, or - for stdin.")
+    @click.option("--session", "tmux_session", help="tmux session name. Default: <harness>-<folder>.")
+    @click.option("--timeout", default=120.0, show_default=True, help="Seconds to wait for the agent to register.")
+    @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+    @click.option("--yes", is_flag=True, help="Start it. Without it, only prints the command.")
+    def spawn_command(harness, harness_args, cwd, brief, brief_file, tmux_session, timeout, as_json, yes):
+        """Start an agent in a detached tmux session and return its live address.
+
+        The brief is its first prompt, headed by your address so it reports back with
+        `send_message`. Only the one-conv tools are pre-approved; its shell and edit
+        prompts stay as you set them. Arguments after `--` go to the harness unchanged.
+        Exits non-zero, showing the agent's screen, when it does not register in time,
+        for example while it waits on a prompt: answer it with `tmux attach -t <session>`.
+        """
+        text = brief if brief is not None else (brief_file.read() if brief_file else "")
+        if not text.strip():
+            raise click.UsageError("Give the agent a brief with --brief or --brief-file: it starts working on it.")
+        text = spawn.with_reply_path(text, router.whoami())
+        command = spawn.launch(harness, text, cwd, list(harness_args))
+        name = tmux_session or spawn.tmux_name(harness, cwd, spawn.tmux_taken)
+        if not yes:
+            click.echo(f"would start in tmux session {name} ({cwd}):\n  {shlex.join(command.argv)}")
+            click.echo("Re-run with --yes to start it.")
+            return
+        adapter = router.ADAPTERS[harness]
+        before = {session.id for session in adapter.list_sessions()}
+        try:
+            spawn.start(name, cwd, command)
+        except (RuntimeError, OSError) as error:
+            raise click.ClickException(str(error)) from None
+        session = spawn.wait_for(adapter.list_sessions, before, cwd, timeout, lambda: spawn.tmux_taken(name))
+        if session is None:
+            state = "is still running" if spawn.tmux_taken(name) else "exited"
+            raise click.ClickException(
+                f"{harness} {state} but did not register within {timeout:g}s. Its screen:\n{spawn.screen(name)}\n"
+                f"Attach with: tmux attach -t {name}")
+        if as_json:
+            click.echo(json.dumps({**session.to_json(), "tmux": name}))
+            return
+        click.echo(f"started {session.address} in tmux session {name} (attach: tmux attach -t {name})")
 
     @live.command("cursor-hook", hidden=True, epilog=examples('one-conv live cursor-hook < hook-payload.json'))
     def cursor_hook_command():

@@ -61,7 +61,8 @@ def _process(pid: int) -> tuple[int, str] | None:
     parts = result.stdout.strip().split(None, 1)
     if len(parts) != 2:
         return None
-    return int(parts[0]), Path(parts[1]).name
+    # The Cursor CLI runs as its `agent` symlink; whoami knows it by the binary's own name.
+    return int(parts[0]), "cursor-agent" if cursor.is_cursor_agent(parts[1]) else Path(parts[1]).name
 
 
 def node_name() -> str | None:

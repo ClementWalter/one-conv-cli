@@ -1,5 +1,7 @@
 """Cursor: the `stop` hook registers each chat and hands it queued messages as a follow-up.
 
+A running `agent` CLI chat is listed from its process before its first turn ends.
+
 A chat only picks a message up when one of its turns ends, so delivery into an idle chat
 waits for the user's next prompt. When Cursor's Desktop Bridge is
 enabled (a discovery file under `~/.cursor/desktop-bridge/`), `cursor desktop send` delivers
@@ -87,7 +89,37 @@ def list_sessions() -> list[LiveSession]:
         bridged = _bridge_threads()
         if bridged:
             return bridged
-    return _hook_chats()
+    running = {session.id: session for session in _running_chats()}
+    # A chat registers through its stop hook only once a turn ends; its process shows it before that.
+    return [*running.values(), *(session for session in _hook_chats() if session.id not in running)]
+
+
+def is_cursor_agent(command: str) -> bool:
+    """The CLI binary is `cursor-agent`, usually started through the `agent` symlink it installs."""
+    name = Path(command).name
+    if name == "cursor-agent":
+        return True
+    return name == "agent" and os.path.isabs(command) and Path(command).resolve().name == "cursor-agent"
+
+
+def _agent_pids() -> list[int]:
+    result = subprocess.run(["ps", "-Ao", "pid=,comm="], check=False, capture_output=True, text=True, timeout=30)
+    pids = []
+    for line in result.stdout.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if pid.isdigit() and is_cursor_agent(command.strip()):
+            pids.append(int(pid))
+    return pids
+
+
+def _running_chats() -> list[LiveSession]:
+    sessions = []
+    for pid in _agent_pids():
+        chat, cwd = _open_chat(pid)
+        if chat and is_session_id(chat):
+            sessions.append(LiveSession("cursor", chat, cwd, title(chat), "running", pid, "stop hook",
+                                        str(inbox(chat)), product="cursor-cli"))
+    return sessions
 
 
 def deliver(session: LiveSession, text: str) -> str:
@@ -112,13 +144,26 @@ def _queue(conversation_id: str, text: str) -> Path:
 
 
 def chat_for_pid(pid: int) -> str | None:
-    """A CLI chat keeps `chats/<workspace hash>/<chat id>/store.db` open; the id is the hook's conversation_id."""
-    result = subprocess.run(["lsof", "-a", "-p", str(pid), "-Fn"], check=False, capture_output=True, text=True)
+    return _open_chat(pid)[0]
+
+
+def _open_chat(pid: int) -> tuple[str | None, str]:
+    """(chat id, working directory) of an `agent` process.
+
+    A CLI chat keeps `chats/<workspace hash>/<chat id>/store.db` open; the id is the hook's conversation_id.
+    """
+    result = subprocess.run(["lsof", "-p", str(pid), "-Ffn"], check=False, capture_output=True, text=True, timeout=30)
+    chat, cwd, descriptor = None, "", ""
     for line in result.stdout.splitlines():
-        path = Path(line[1:])
-        if line.startswith("n") and path.name == "store.db" and path.parent.parent.parent.name == "chats":
-            return path.parent.name
-    return None
+        if line.startswith("f"):
+            descriptor = line[1:]
+        elif line.startswith("n"):
+            path = Path(line[1:])
+            if descriptor == "cwd":
+                cwd = str(path)
+            elif chat is None and path.name == "store.db" and path.parent.parent.parent.name == "chats":
+                chat = path.parent.name
+    return chat, cwd
 
 
 def run_stop_hook(payload: dict) -> dict:

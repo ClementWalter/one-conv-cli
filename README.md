@@ -313,7 +313,9 @@ Codex. Cursor's stop hook runs in the IDE and in interactive `cursor-agent`, not
 in `cursor-agent -p`. A Cursor IDE chat cannot be identified as a sender, so its
 messages carry `from="cursor:?unknown"` and cannot be answered. Both share the
 `cursor:<id>` address; `live ls` labels each session `cursor-cli` (a chat the
-`agent` command stored under `~/.cursor/chats`) or `cursor-ide`.
+`agent` command stored under `~/.cursor/chats`) or `cursor-ide`. A running
+`agent` chat is listed from its process as soon as it opens its chat, so it can be
+addressed before its first turn ends; messages still wait for that turn's end.
 
 agy's local language server accepts a message only with a CSRF token it keeps in
 memory and never hands to hooks or MCP servers. `one-conv live agy [-- AGY ARGS]`

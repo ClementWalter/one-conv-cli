@@ -20,8 +20,8 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Relay", "ArchiveIndex"] }],
   "r2_buckets": [{ "binding": "ARCHIVE", "bucket_name": "one-conv-archive" }],
-  // OAuth state of the remote MCP server; `wrangler deploy` creates the namespace when no id is given.
-  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
+  // OAuth grants for the remote MCP connector; a new namespace would sign every connected app out.
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "718a87ea9b324606bac5e217a25b5d29" }],
   // A chunk upload decompresses and hashes up to 16 MB of captures; the plan default would cut it off.
   "limits": { "cpu_ms": 120000 },
   "observability": { "enabled": true }

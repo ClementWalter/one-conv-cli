@@ -389,7 +389,7 @@ it in. Verified live: forking a small thread with `--permission-mode plan`
 and a tool-free prompt returns a reply in a few seconds, and the original
 thread's turn count is untouched (only a `--fork`'d branch grows).
 
-### `one-conv port <query> --into claude|codex [--source S] [--session UUID | --nth N] [--match N] [--limit N] [--raw] [--include-subagents] [--print] [--permission-mode MODE] [--timeout SECS] [--no-mark-read] [--yes]`
+### `one-conv port <query> --into claude|codex [--source S] [--session UUID | --nth N] [--match N] [--limit N] [--budget CHARS] [--raw] [--include-subagents] [--print] [--permission-mode MODE] [--timeout SECS] [--no-mark-read] [--yes]`
 
 Port a thread's content from **any** source into a **brand-new** conversation
 with another provider. This is *not* a true resume — each provider only
@@ -399,6 +399,22 @@ thread's rendered transcript (the same clean text `thread`/`read` show, no
 raw tool-call replay) becomes the *opening prompt* of a fresh session with
 the target provider, started in the same directory, so the model has full
 context to pick up from a similar point without an exact state replay.
+
+The seed holds at most `--budget` characters of transcript (default 64000,
+about 16k tokens; `0` ports the whole thread). A thread that fits transfers
+whole. A longer one keeps its first user request and its most recent turns,
+newest first until the budget is spent, in chronological order, each turn
+whole with its number, role and time. Only a newest turn larger than the
+budget on its own is cut, keeping its end. The seed opens with a line naming
+what it leaves out and how to read it, e.g.:
+
+```text
+Turns 2–73 of 113 are omitted. Read them with `one-conv local thread NODE/claude:ID --no-mark-read --around TS --context 36` or the one-conv MCP read_conversation tool (...).
+```
+
+`--limit N` narrows the
+recent turns to the last N; the first request is kept either way. QUERY may
+also be a live address (`NODE/harness:id`), as `thread` accepts.
 
 **Cursor can only ever be a source, never a `--into` target** — it has no CLI
 at all to start or seed a chat with a prompt (verified: `cursor --help` is

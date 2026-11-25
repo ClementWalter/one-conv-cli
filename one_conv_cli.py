@@ -2898,7 +2898,7 @@ def _print_handle_list(cwd_label: str, handles: list[SessionHandle], as_json: bo
 
 from one_conv.namespaces import NamespaceRoot, SourceChoice, install as install_namespaces, selected_sources
 from one_conv.cloud_send import register_accounts as _register_cloud_accounts
-from one_conv import update_check
+from one_conv import handoff, update_check
 
 
 @click.group(cls=NamespaceRoot, context_settings={"help_option_names": ["-h", "--help"]},
@@ -3702,32 +3702,64 @@ def send(
     click.echo(result.stdout if as_json else result.stdout.strip())
 
 
-def _port_seed_text(handle: SessionHandle, raw: bool, include_subagents: bool, limit: int) -> str:
-    turns = _handle_rendered_turns(handle, raw, include_subagents, limit)
+def _port_read_hint(handle: SessionHandle, turns: list[dict], low: int, high: int,
+                    raw: bool, include_subagents: bool) -> str:
+    """How to read turns LOW..HIGH (1-based) of the source thread: a `local thread` command and the MCP equivalent."""
+    address = _handle_address(handle)
+    target = [address] if address else [handle.project_cwd, "--source", handle.source, "--session", handle.uuid]
+    middle = (low + high) // 2
+    stamp = turns[middle - 1]["ts"]
+    reach = max(middle - low, high - middle)
+    window = ["--around", stamp, "--context", str(reach)] if stamp else []
+    flags = (["--raw"] if raw else []) + (["--include-subagents"] if include_subagents else [])
+    command = shlex.join(["one-conv", "local", "thread", *target, "--no-mark-read", *window, *flags])
+    tool = f'query "{address}"' if address else f'query "{handle.project_cwd}", source "{handle.source}", session "{handle.uuid}"'
+    if stamp:
+        # The MCP tool serves at most 100 turns on each side.
+        tool += f', around "{stamp}", context {min(reach, 100)}'
+    return f"`{command}` or the one-conv MCP read_conversation tool (namespace \"local\", {tool}{', raw true' if raw else ''})"
+
+
+def _port_seed_text(handle: SessionHandle, raw: bool, include_subagents: bool, limit: int,
+                    budget: int) -> tuple[str, str]:
+    """The opening prompt for the new agent, and the sentence naming what it leaves out ('' if nothing)."""
+    turns = _handle_rendered_turns(handle, raw, include_subagents, 0)
+    plan = handoff.select(turns, budget, limit)
+    note = handoff.describe(plan)
+    if plan.omitted:
+        hints = [(low, high, _port_read_hint(handle, turns, low, high, raw, include_subagents))
+                 for low, high in plan.omitted]
+        if len(hints) == 1:
+            note += f" Read them with {hints[0][2]}."
+        else:
+            note += " Read them with " + "; ".join(
+                f"turns {low}–{high}: {hint}" if low != high else f"turn {low}: {hint}" for low, high, hint in hints) + "."
     title = _handle_title(handle)
     lines = [
         f"Continuing a conversation ported from {handle.source} "
-        f"(project: {handle.project_cwd}, thread: {title}):",
-        "",
-        "---",
+        f"(project: {handle.project_cwd}, thread: {title}, session: {handle.uuid}).",
     ]
-    for t in turns:
-        lines.append(f"{t['role']}: {t['text']}")
+    if note:
+        lines.append(note)
+    lines += ["", "---"]
+    for index in plan.kept:
+        lines.append(handoff.render_turn(index, turns, plan))
         lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append("Please pick up from here.")
-    return "\n".join(lines)
+    lines += ["---", "", "Please pick up from here."]
+    return "\n".join(lines), note
 
 
-@cli.command(epilog="\b\nExamples:\n  one-conv port PROJECT --into codex\n  one-conv port PROJECT --into claude --limit 20 --print --yes")
+@cli.command(epilog="\b\nExamples:\n  one-conv port PROJECT --into codex\n  one-conv port claude:SESSION --into codex --budget 32000\n  one-conv port PROJECT --into claude --limit 20 --print --yes")
 @click.argument("query")
 @click.option("--into", "target", type=click.Choice(("claude", "codex")), required=True, help="Which provider to start the new conversation in.")
 @_SOURCE_OPTION
 @click.option("--session", "session_uuid", help="Port exactly this thread (session UUID or prefix).")
 @click.option("--nth", default=1, help="Which thread to port, 1 = most recent (default).")
 @click.option("--match", default=0, help="Pick the Nth matching project (1-based).")
-@click.option("--limit", default=0, help="Only port the last N turns (0 = all).")
+@click.option("--limit", default=0, type=click.IntRange(min=0),
+              help="Only consider the last N turns besides the first request (0 = as many as --budget allows).")
+@click.option("--budget", default=handoff.DEFAULT_BUDGET, show_default=True, type=click.IntRange(min=0),
+              help="Characters of transcript in the seed (~4 per token); 0 = the whole thread.")
 @click.option("--raw", is_flag=True, help="Include thinking blocks and tool calls/results in the ported transcript.")
 @click.option("--include-subagents", is_flag=True, help="Include forked subagent turns (claude source only).")
 @click.option("--print", "headless", is_flag=True, help="Send headlessly and print the reply, instead of opening an interactive session.")
@@ -3743,6 +3775,7 @@ def port(
     nth: int,
     match: int,
     limit: int,
+    budget: int,
     raw: bool,
     include_subagents: bool,
     headless: bool,
@@ -3762,6 +3795,13 @@ def port(
     provider, started in the same directory, so the model has full context
     to pick up from a similar point without an exact state replay.
 
+    The seed fits --budget characters: a thread that fits transfers whole;
+    a longer one keeps its first user request and its most recent turns
+    whole, and names the omitted turns with the `local thread` command (and
+    MCP call) that reads them. Only a newest turn larger than the budget on
+    its own is cut, keeping its end. QUERY may also be a live address,
+    NODE/harness:id, as `local thread` accepts.
+
     Cursor can only ever be a source here, never a --into target: it has no
     CLI at all to start or seed a chat with a prompt (verified — `cursor
     --help` is purely an editor launcher: open files, diff, goto-line; no
@@ -3777,10 +3817,15 @@ def port(
     --no-mark-read is passed.
     """
     sources = selected_sources(source_filter, SOURCES)
-    projects = _resolve_projects(query, match, sources)
-    sessions = _all_sessions_for(projects)
-    handle = _pick_session_handle(sessions, session_uuid, nth)
-    seed = _port_seed_text(handle, raw, include_subagents, limit)
+    if LIVE_ADDRESS.fullmatch(query):
+        if session_uuid:
+            raise click.UsageError("A live address names one conversation; drop --session.")
+        handle = _address_handle(query)
+    else:
+        projects = _resolve_projects(query, match, sources)
+        sessions = _all_sessions_for(projects)
+        handle = _pick_session_handle(sessions, session_uuid, nth)
+    seed, note = _port_seed_text(handle, raw, include_subagents, limit, budget)
     cwd = handle.project_cwd
     title = _handle_title(handle)
 
@@ -3801,6 +3846,7 @@ def port(
         click.echo(f"  cwd:     {cwd}")
         first_line = seed.splitlines()[0] if seed else ""
         click.echo(f"  seed:    {len(seed)} chars, {len(seed.splitlines())} lines — {first_line}")
+        click.echo(f"  context: {note or 'whole thread, nothing omitted'}")
         cmd_display = cmd[:-1] + [f"<seed: {len(seed)} chars>"]
         click.echo(f"  command: {' '.join(shlex.quote(c) for c in cmd_display)}")
         return

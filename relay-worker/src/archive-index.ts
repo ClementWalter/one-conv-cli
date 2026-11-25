@@ -41,7 +41,17 @@ export interface ImportedHead extends Head {
   change_sequence: number;
 }
 
-export type PutResult = { key: string; revision: string } | { conflict: string };
+export interface SearchHit {
+  key: string;
+  metadata: string;
+  mtime: number;
+  snippet: string;
+}
+
+// Characters of search text shown around a search hit.
+const SNIPPET = 240;
+
+export type PutResult ={ key: string; revision: string } | { conflict: string };
 
 /** `search_text` as (part, tail) pairs: consecutive parts join back to the text, a tail repeats what follows. */
 export function searchParts(text: string): [string, string][] {
@@ -118,6 +128,64 @@ export class ArchiveIndex extends DurableObject<Env> {
       if (found.length >= wanted) break;
     }
     return found;
+  }
+
+  /**
+   * The newest heads whose search text holds every one of `words` (already lowercased; none lists
+   * the newest heads), optionally only those of one origin node and source, each with a snippet
+   * around its first word. The snippet is lowercase, as the search text is.
+   */
+  search(words: string[], limit: number, origin: string | null, source: string | null): SearchHit[] {
+    const where: string[] = [];
+    const params: SqlStorageValue[] = [];
+    for (const word of words) {
+      where.push("key IN (SELECT key FROM search_parts WHERE instr(text || tail, ?) > 0)");
+      params.push(word);
+    }
+    if (origin !== null) {
+      where.push("json_extract(metadata, '$.origin') = ?");
+      params.push(origin);
+    }
+    if (source !== null) {
+      where.push("json_extract(metadata, '$.source') = ?");
+      params.push(source);
+    }
+    const filter = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const rows = this.sql.exec(`SELECT key, metadata, mtime FROM heads ${filter} ORDER BY mtime DESC LIMIT ?`, ...params, limit).toArray();
+    return rows.map((row) => ({ key: row.key as string, metadata: row.metadata as string, mtime: row.mtime as number, snippet: words.length ? this.snippet(row.key as string, words[0]) : "" }));
+  }
+
+  private snippet(key: string, word: string): string {
+    const row = this.sql
+      .exec(
+        "SELECT substr(text || tail, max(1, instr(text || tail, ?) - ?), ?) AS around FROM search_parts WHERE key = ? AND instr(text || tail, ?) > 0 ORDER BY part LIMIT 1",
+        word,
+        SNIPPET / 2,
+        SNIPPET + word.length,
+        key,
+        word,
+      )
+      .toArray()[0];
+    return row ? (row.around as string) : "";
+  }
+
+  /** The key and metadata of the newest head of a session id, optionally from one origin node. */
+  findSession(session: string, origin: string | null): { key: string; metadata: string } | null {
+    const row = this.sql
+      .exec(
+        "SELECT key, metadata FROM heads WHERE json_extract(metadata, '$.session') = ? AND (? IS NULL OR json_extract(metadata, '$.origin') = ?) ORDER BY mtime DESC LIMIT 1",
+        session,
+        origin,
+        origin,
+      )
+      .toArray()[0];
+    return row ? { key: row.key as string, metadata: row.metadata as string } : null;
+  }
+
+  /** The metadata of a conversation's head, or null when the key has none. */
+  headMetadata(key: string): string | null {
+    const row = this.sql.exec("SELECT metadata FROM heads WHERE key = ?", key).toArray()[0];
+    return row ? (row.metadata as string) : null;
   }
 
   /** Changed heads and a watermark from one snapshot, ordered by sequence. */

@@ -27,6 +27,8 @@ WORKER_DIR = Path(__file__).resolve().parents[1] / "relay-worker"
 ENABLED = os.environ.get("ONE_CONV_TEST_RELAY_WORKER") == "1"
 BACKENDS = ["python", *(["worker"] if ENABLED else [])]
 ARCHIVE_SECRET = "test-secret"
+# What the MCP server's /authorize page accepts as the owner's passphrase.
+MCP_PASSPHRASE = "test-passphrase"
 # The first start compiles the Worker and boots workerd.
 START_SECONDS = 90
 
@@ -68,6 +70,7 @@ class WorkerProcess:
         self.process = subprocess.Popen(
             [str(wrangler), "dev", "--local", "--ip", "127.0.0.1", "--port", str(port), "--inspector-port", str(inspector), "--persist-to",
              str(self.state / "data"), "--var", f"RELAY_ADMIN_TOKEN:{self.admin}", "--var", "RELAY_ALLOW_RESET:1",
+             "--var", f"MCP_OWNER_PASSPHRASE:{MCP_PASSPHRASE}",
              "--show-interactive-dev-session=false"],
             cwd=WORKER_DIR, stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True,
             env={**os.environ, "WRANGLER_SEND_METRICS": "false"})

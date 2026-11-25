@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
-      miniflare: { bindings: { RELAY_ADMIN_TOKEN: "admin-secret", RELAY_ALLOW_RESET: "1" } },
+      miniflare: { bindings: { RELAY_ADMIN_TOKEN: "admin-secret", RELAY_ALLOW_RESET: "1", MCP_OWNER_PASSPHRASE: "owner-passphrase" } },
     }),
   ],
 });

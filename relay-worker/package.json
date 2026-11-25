@@ -13,5 +13,8 @@
     "typescript": "6.0.3",
     "vitest": "5.0.5",
     "wrangler": "4.156.1"
+  },
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "1.2.4"
   }
 }

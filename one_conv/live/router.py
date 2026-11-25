@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlencode
 
-from . import agy, claude, codex, cursor, hubclient, names, omp
+from . import agy, claude, codex, cursor, held, hubclient, names, omp
 from .model import LiveSession, envelope, is_session_id, live_home, parse_address
 
 try:
@@ -290,10 +290,12 @@ def _hub():
 
 def send(target: str, text: str, sender: LiveSession | None, origin: str = "unknown",
          fyi: bool = False, reply: str = "expected", message_id: str | None = None, images=(),
-         tags=()) -> dict:
+         tags=(), when: str = "now") -> dict:
     """Deliver to one session: here, in a cloud conversation, or on another machine through the relay.
 
     `message_id` is chosen once and reused on retry, so a receiver can drop a duplicate.
+    `when="now"` hands the message over at once, so a busy agent takes it at its next tool
+    boundary; `when="idle"` holds it until the agent's current turn ends (see held.py).
     `images` are file paths: a cloud conversation receives the images themselves, an agent
     on this machine a saved copy of each, named in the text, and an agent on another machine
     a copy its bridge fetches from the relay.
@@ -301,9 +303,15 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
     """
     from .. import cloud_send, images as attached
     message_id = message_id or uuid.uuid4().hex
+    if when not in held.WHEN:
+        raise LiveError(f"when must be one of {', '.join(held.WHEN)}, got {when!r}")
+    if when == "idle" and fyi:
+        raise LiveError("An fyi never interrupts the receiver; send it without when=idle.")
     if target == USER:
         if fyi or images:
             raise LiveError("A message to user is a note in the person's inbox: send text only, without fyi or images.")
+        if when == "idle":
+            raise LiveError("A note to user never interrupts anyone; send it without when=idle.")
         return _send_user(text, sender, origin, list(tags), message_id)
     if tags:
         raise LiveError("Tags label messages to user only.")
@@ -312,6 +320,8 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
     except attached.ImageError as error:
         raise LiveError(str(error)) from error
     if cloud_send.is_cloud_target(target):
+        if when == "idle":
+            raise LiveError("A cloud conversation answers each message in turn; send it without when=idle.")
         return _send_cloud(target, text, sender, origin, fyi, reply, message_id, loaded)
     sender_label = sender.address if sender else origin
     node, local = remote_address(target)
@@ -324,11 +334,11 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
             raise LiveError(f"{target} is on another machine; reaching it needs this machine's bridge "
                             "(`one-conv live serve --hub ...`).")
         if node != hub.node:
-            return _post_remote(hub, target, text, sender_label, fyi, reply, message_id, loaded)
+            return _post_remote(hub, target, text, sender_label, fyi, reply, message_id, loaded, when)
         target = local  # This machine's own NODE/ prefix: deliver here.
     if loaded:
         text += attached.saved_lines(loaded, live_home() / "attachments")
-    return _send_one(target, text, sender, origin, fyi, reply, message_id)
+    return _send_one(target, text, sender, origin, fyi, reply, message_id, when)
 
 
 def named_elsewhere(target: str) -> bool:
@@ -363,8 +373,11 @@ def _upload(hub, images) -> list[str]:
 
 
 def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str, message_id: str,
-                 images=()) -> dict:
+                 images=(), when: str = "now") -> dict:
     """Post a direct message to a session on another machine; the relay hands it to that machine's bridge.
+
+    `when="idle"` travels with the message, and the receiving bridge holds it while the
+    session is busy; a relay that does not echo it back delivered the message as `now`.
 
     The message sits in the bridge's outbox from before the request until the relay answers,
     so a crash or an unreachable relay leaves it for the bridge to repost under the same id.
@@ -372,6 +385,9 @@ def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str
     """
     message = {"id": message_id, "to": target, "from": sender, "reply": "none" if fyi else reply,
                "mode": "fyi" if fyi else "push", "text": text}
+    # Only a held message carries `when`, so a `now` post is the same payload any relay accepts.
+    if when == "idle":
+        message["when"] = when
     if images:
         message["attachments"] = _upload(hub, images)
     try:
@@ -382,8 +398,11 @@ def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str
         return {"to": target, "id": message_id, "from": sender, "via": "hub", "delivery": "hub",
                 "status": "queued for the relay: no receipt yet, the bridge will resend it under the same id"}
     row = (receipt.get("recipients") or [{}])[0]
-    return {"to": row.get("to", target), "id": message_id, "from": sender, "via": "hub", "delivery": "hub",
-            "status": "stored on the relay" if row.get("status") == "stored" else row.get("status", "stored")}
+    result = {"to": row.get("to", target), "id": message_id, "from": sender, "via": "hub", "delivery": "hub",
+              "status": "stored on the relay" if row.get("status") == "stored" else row.get("status", "stored")}
+    if when == "idle" and receipt.get("when") != "idle":
+        result["warning"] = "the relay does not carry when=idle yet, so the message is delivered at once"
+    return result
 
 
 def _send_cloud(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
@@ -403,8 +422,13 @@ def _send_cloud(target: str, text: str, sender: LiveSession | None, origin: str,
 
 
 def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,
-              reply: str, message_id: str) -> dict:
+              reply: str, message_id: str, when: str = "now") -> dict:
+    """Deliver to a session on this machine, or hold it for the bridge while the session is busy."""
     session = resolve(target, exclude=sender)
+    holding = when == "idle" and not fyi and held.is_busy(session)
+    if holding and not held.bridge_running():
+        raise LiveError(f"{session.address} is busy and only this machine's bridge delivers held messages: "
+                        "start it with `one-conv live serve`, or send with when=now.")
     if sender is not None and session.address == sender.address:
         raise LiveError(f"{session.address} is the sending session itself.")
     sender_label = sender.address if sender else origin
@@ -414,6 +438,9 @@ def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, f
         if fyi:
             _append_fyi(session.address, sender_label, wrapped)
             status, delivery = "stored FYI", "fyi"
+        elif holding:
+            held.hold(message_id, session.address, sender_label, wrapped)
+            status, delivery = held.held_label(session.address), "held"
         else:
             status, delivery = ADAPTERS[session.harness].deliver(session, wrapped), session.delivery
     receipt = {"to": session.address, "title": session.title, "cwd": session.cwd,

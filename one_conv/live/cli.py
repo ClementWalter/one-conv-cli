@@ -9,7 +9,7 @@ import time
 
 import click
 
-from . import agy, cursor, hubclient, names, router, spawn
+from . import agy, cursor, held, hubclient, names, router, spawn
 from .. import cloud_send
 from . import install as installer
 from .model import HARNESSES
@@ -62,7 +62,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             context = (f"[{s.product}] " if s.product else "") + (s.title or s.cwd)
             click.echo(f"{s.address:<{width}}  {s.status or '-':<10}  {s.delivery:<15}  {context}")
 
-    @live.command("send", context_settings=HELP, epilog="\b\nExamples:\n  one-conv live send @reviewer 'PR #20 is ready' --yes\n  one-conv live send codex:019a 'rerun the suite' --yes\n  one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes\n  one-conv live send @reviewer 'build is green' --fyi --yes\n  one-conv live send codex:019a --stdin --yes < findings.md\n  one-conv live send claude:4f1a 'what does this show?' --image shot.png --yes")
+    @live.command("send", context_settings=HELP, epilog="\b\nExamples:\n  one-conv live send @reviewer 'PR #20 is ready' --yes\n  one-conv live send codex:019a 'rerun the suite' --yes\n  one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes\n  one-conv live send @reviewer 'build is green' --fyi --yes\n  one-conv live send @builder 'after this, rebase on main' --when idle --yes\n  one-conv live send codex:019a --stdin --yes < findings.md\n  one-conv live send claude:4f1a 'what does this show?' --image shot.png --yes")
     @click.argument("target")
     @click.argument("message", required=False)
     @click.option("--stdin", "from_stdin", is_flag=True, help="Read the message from stdin.")
@@ -76,8 +76,11 @@ def build_live_group(launcher: list[str]) -> click.Group:
                        "Cowork session receives the image; an agent a saved copy to read, on whichever machine it runs.")
     @click.option("--tag", "tags", multiple=True, metavar="TAG",
                   help="Label a message to user (repeatable); `live inbox --tag` filters by it.")
+    @click.option("--when", type=click.Choice(held.WHEN), default="now", show_default=True,
+                  help="now: a busy agent takes it at its next tool boundary. idle: hold it until the "
+                       "agent's current turn ends, so it does not steer the run (needs `live serve`).")
     @click.option("--json", "as_json", is_flag=True, help="Emit the delivery receipt as JSON.")
-    def send_command(target, message, from_stdin, sender, fyi, no_reply, images, tags, yes, as_json):
+    def send_command(target, message, from_stdin, sender, fyi, no_reply, images, tags, when, yes, as_json):
         """Send MESSAGE to TARGET: an address, id prefix, title, NODE/address, @name, claude-chat: or cowork:.
 
         The message arrives as a new user turn wrapped with the sender's address and name,
@@ -110,7 +113,8 @@ def build_live_group(launcher: list[str]) -> click.Group:
                             or (target.startswith("@") and router.named_elsewhere(target))):
                 click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
                 click.echo(f"  to:       {target}")
-                click.echo(f"  delivery: {'fyi' if fyi else 'push'} through the relay to that machine's bridge")
+                click.echo(f"  delivery: {'fyi' if fyi else 'push'} through the relay to that machine's bridge"
+                           + (", held there until the agent is idle" if when == "idle" else ""))
                 click.echo(f"  from:     {me.address if me else origin}")
                 _echo_images(images)
                 return
@@ -119,11 +123,13 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
                 click.echo(f"  to:       {session.address}  {session.title or session.cwd}")
                 click.echo(f"  delivery: {'fyi (feed inbox)' if fyi else session.delivery} ({session.status or 'unknown'})")
+                if when == "idle" and not fyi and held.is_busy(session):
+                    click.echo(f"  when:     {held.held_label(session.address)}")
                 click.echo(f"  from:     {me.address if me else origin}")
                 _echo_images(images)
                 return
             receipt = router.send(target, message, me, origin, fyi=fyi,
-                                  reply="none" if no_reply else "expected", images=images, tags=tags)
+                                  reply="none" if no_reply else "expected", images=images, tags=tags, when=when)
         except (router.LiveError, names.NameRefused, RuntimeError, OSError) as error:
             raise click.ClickException(str(error)) from None
         if as_json:
@@ -133,7 +139,8 @@ def build_live_group(launcher: list[str]) -> click.Group:
             if receipt.get("via") == "claude.ai":
                 click.echo(receipt["reply"])
         # A note to user has no delivery to follow; the relay tracks deliveries to agents only.
-        if receipt.get("via") == "hub" and receipt["to"] != router.USER and not as_json:
+        if ((receipt.get("via") == "hub" and receipt["to"] != router.USER) or receipt.get("delivery") == "held") \
+                and not as_json:
             click.echo(f"  follow it with: one-conv live status {receipt['id']}")
         if receipt.get("warning") and not as_json:
             click.echo(f"warning: {receipt['warning']}", err=True)
@@ -218,13 +225,24 @@ def build_live_group(launcher: list[str]) -> click.Group:
     @click.argument("message_id")
     @click.option("--json", "as_json", is_flag=True, help="Emit the outcome as JSON.")
     def status_command(message_id, as_json):
-        """Show what became of a message sent through the relay, by its 32-character id.
+        """Show what became of a held message or one sent through the relay, by its 32-character id.
 
         The outcome per recipient is what that machine's harness did (accepted, refused,
-        unconfirmed), or stored while it has not been handed over yet.
+        unconfirmed), held while the agent is busy, or stored while it has not been handed
+        over yet. A message held on this machine shows `held until ... is idle`, then
+        delivered, unconfirmed or expired.
         """
         if not HUB_MESSAGE_ID.fullmatch(message_id):
-            raise click.UsageError("MESSAGE_ID is the 32-character id a send through the relay printed.")
+            raise click.UsageError("MESSAGE_ID is the 32-character id a held send or a send through the relay printed.")
+        kept = held.lookup(message_id)
+        if kept is not None:
+            if as_json:
+                click.echo(json.dumps({key: kept[key] for key in ("id", "target", "status", "detail", "held", "finished")}))
+            elif kept["status"] == "held":
+                click.echo(f"{kept['detail']}")
+            else:
+                click.echo(f"{kept['status']}: {kept['target']} ({kept['detail']})")
+            return
         try:
             hub = hubclient.configured()
             if hub is None:
@@ -236,7 +254,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             click.echo(json.dumps(record))
             return
         for row in record.get("recipients", []):
-            click.echo(f"{row['outcome']}: {row['to']}")
+            click.echo(held.held_label(row["to"]) if row["outcome"] == "held" else f"{row['outcome']}: {row['to']}")
 
     @live.command("whoami", context_settings=HELP, epilog=examples('one-conv live whoami'))
     def whoami_command():

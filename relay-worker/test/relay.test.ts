@@ -137,6 +137,38 @@ describe("sending", () => {
     expect((await call("/v1/messages", { method: "POST", token: mac, body: { ...message("box/claude:bbb"), ...bad } })).status).toBe(status);
   });
 
+  test("when=idle reaches the receiving bridge", async () => {
+    const { mac, box } = await twoNodes();
+    await call("/v1/messages", { method: "POST", token: mac, body: message("box/claude:bbb", { when: "idle" }) });
+    const { messages } = await body<{ messages: { when?: string }[] }>(call("/v1/inbox?wait=0", { token: box }));
+    expect(messages[0].when).toBe("idle");
+  });
+
+  test("a message sent now carries no when", async () => {
+    const { mac, box } = await twoNodes();
+    await call("/v1/messages", { method: "POST", token: mac, body: message("box/claude:bbb", { when: "now" }) });
+    const { messages } = await body<{ messages: Record<string, unknown>[] }>(call("/v1/inbox?wait=0", { token: box }));
+    expect("when" in messages[0]).toBe(false);
+  });
+
+  test("the receipt echoes when=idle", async () => {
+    const { mac } = await twoNodes();
+    const receipt = await body(call("/v1/messages", { method: "POST", token: mac, body: message("box/claude:bbb", { when: "idle" }) }));
+    expect(receipt.when).toBe("idle");
+  });
+
+  test.each([["later"], [null], [1]])("when=%j is refused", async (when) => {
+    const { mac } = await twoNodes();
+    expect((await call("/v1/messages", { method: "POST", token: mac, body: message("box/claude:bbb", { when }) })).status).toBe(400);
+  });
+
+  test("a reused id with another when is a conflict", async () => {
+    const { mac } = await twoNodes();
+    const sent = message("box/claude:bbb");
+    await call("/v1/messages", { method: "POST", token: mac, body: sent });
+    expect((await call("/v1/messages", { method: "POST", token: mac, body: { ...sent, when: "idle" } })).status).toBe(409);
+  });
+
   test("a malformed address names itself in Python's repr", async () => {
     const { mac } = await twoNodes();
     expect(await body(call("/v1/messages", { method: "POST", token: mac, body: message("nowhere") }))).toEqual({
@@ -240,6 +272,31 @@ describe("delivery", () => {
     await new Promise((resolve) => setTimeout(resolve, 200));
     await call("/v1/messages", { method: "POST", token: mac, body: message("box/claude:bbb") });
     expect((await polling).messages).toHaveLength(1);
+  });
+
+  test("a held delivery leaves the inbox", async () => {
+    const { box, delivery } = await delivered();
+    await call("/v1/acks", { method: "POST", token: box, body: { delivery, outcome: "held" } });
+    expect(await body(call("/v1/inbox?wait=0", { token: box }))).toEqual({ messages: [] });
+  });
+
+  test("the sender reads a held delivery as held", async () => {
+    const { mac, box, id, delivery } = await delivered();
+    await call("/v1/acks", { method: "POST", token: box, body: { delivery, outcome: "held" } });
+    const status = await body<{ recipients: { outcome: string }[] }>(call(`/v1/messages/${id}`, { token: mac }));
+    expect(status.recipients[0].outcome).toBe("held");
+  });
+
+  test("a final outcome replaces held", async () => {
+    const { box, delivery } = await delivered();
+    await call("/v1/acks", { method: "POST", token: box, body: { delivery, outcome: "held" } });
+    expect(await body(call("/v1/acks", { method: "POST", token: box, body: { delivery, outcome: "accepted" } }))).toEqual({ delivery, outcome: "accepted" });
+  });
+
+  test("held never replaces a final outcome", async () => {
+    const { box, delivery } = await delivered();
+    await call("/v1/acks", { method: "POST", token: box, body: { delivery, outcome: "accepted" } });
+    expect(await body(call("/v1/acks", { method: "POST", token: box, body: { delivery, outcome: "held" } }))).toEqual({ delivery, outcome: "accepted" });
   });
 
   test("an empty long poll ends at its wait", async () => {

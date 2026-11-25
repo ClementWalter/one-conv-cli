@@ -154,7 +154,7 @@ def create_server(update_notice: str = "") -> MCPServer:
                  structured_output=True)
     def send_message(to: str, text: str, ctx: Context, fyi: bool = False,
                      expect_reply: bool = True, images: list[str] | None = None,
-                     tags: list[str] | None = None) -> dict[str, Any]:
+                     tags: list[str] | None = None, when: str = "now") -> dict[str, Any]:
         """Send text as a new user turn to `to`: an address, id prefix, title, NODE/address or @name.
 
         to="user" instead files a note in the person's inbox (`one-conv live inbox`), labelled
@@ -175,13 +175,16 @@ def create_server(update_notice: str = "") -> MCPServer:
         fyi=true for acknowledgments, sign-offs and completion notices: they wait in the
         receiver's `local feed` and do not wake it. expect_reply=false marks a pushed message
         as needing no answer. Never answer a message marked reply="none".
+        when="now" lets a busy agent take the message at its next tool boundary, steering its
+        run; when="idle" holds it until the agent's current turn ends (the result's status
+        says "held until ... is idle", and `one-conv live status ID` follows it).
         """
         from .live import names, router
         meta = dict(ctx.request_context.meta or {})
         try:
             return router.send(to, text, router.whoami(meta=meta), fyi=fyi,
                                reply="expected" if expect_reply else "none", images=images or (),
-                               tags=tags or ())
+                               tags=tags or (), when=when)
         except (router.LiveError, names.NameRefused, RuntimeError, OSError) as error:
             raise ToolError(str(error)) from error
 

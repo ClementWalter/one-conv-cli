@@ -619,6 +619,36 @@ The server exposes history access, explicit refresh, and live-session
 messaging, with no arbitrary command execution. This repository contains the CLI, agent skill,
 and local MCP server. The hosted OneConv application is developed separately.
 
+### Remote MCP server (Claude app)
+
+The Cloudflare Worker relay (`relay-worker/`) also serves MCP at `/mcp`
+(streamable HTTP), so the Claude app on phone, desktop or web, and Claude cloud
+sessions, can read the archive every bridge syncs and message running agents.
+It uses OAuth 2.1 with dynamic client registration; there is one user, and the
+authorization page asks for the owner passphrase.
+
+Setup, once, from `relay-worker/`:
+
+```bash
+npx wrangler secret put MCP_OWNER_PASSPHRASE   # a long random passphrase
+npx wrangler deploy                            # creates the OAUTH_KV namespace on first deploy
+```
+
+Then in Claude: Settings → Connectors → Add custom connector, URL
+`https://<worker-host>/mcp`, and type the passphrase when the page asks.
+
+| Tool | Purpose |
+| --- | --- |
+| `search_conversations` | Phrase (or `all_words`) search over archived message text, newest first, with a snippet; empty query lists recent ones |
+| `read_conversation` | Turns of an archived conversation by key, session id or `NODE/harness:id`, paged (`offset`, `around`, `limit`), `raw` for tools |
+| `list_live_sessions` | Sessions the bridges publish, with address and `@name` |
+| `send_message` | Post to a session as the user (`claude-app/user`, a human turn); a retry within 10 minutes is stored once |
+| `message_status` | Outcome of a sent message |
+| `read_notes` | Notes agents sent to the user (`to=user`), after a cursor, by tag |
+
+Search covers only what the bridges have synced to the archive. The search text is lowercase, so are
+snippets. A read page holds at most 60,000 characters; follow `next_offset`.
+
 ## Command reference
 
 Start with `one-conv --help`, `one-conv cloud --help`, `one-conv local --help`, or `one-conv live --help`.

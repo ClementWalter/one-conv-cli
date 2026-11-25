@@ -4,11 +4,14 @@
  *   /v1/...          the live relay, handled by the Relay Durable Object
  *   /archive/v1/...  the conversation archive (ArchiveIndex Durable Object + R2), same node tokens
  *   /admin/...       token minting and archive import, guarded by the RELAY_ADMIN_TOKEN secret
+ *   /mcp, /authorize, /oauth/..., /.well-known/oauth-...
+ *                    the remote MCP server for the Claude app, behind OAuth (mcp-auth.ts)
  */
 
 import { archive } from "./archive";
 import type { ImportedHead } from "./archive-index";
 import type { Env } from "./env";
+import { isMcpPath, mcp } from "./mcp-auth";
 import { HttpError, type Route, bearer, boundedBody, decodedPath, dispatch, errorResponse, json, path, sha256, utf8 } from "./http";
 
 export { ArchiveIndex } from "./archive-index";
@@ -104,8 +107,9 @@ async function admin(request: Request, env: Env, pathname: string): Promise<Resp
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const pathname = decodedPath(new URL(request.url));
+    if (isMcpPath(pathname)) return mcp(request, env, ctx);
     if (pathname.startsWith(`${ARCHIVE_PATH}/`)) {
       const caller = async () => {
         if (await isAdmin(request, env)) return { node: "" };

@@ -4,6 +4,7 @@
 // Deploy:  npx wrangler r2 bucket create one-conv-archive
 //          npx wrangler deploy
 //          npx wrangler secret put RELAY_ADMIN_TOKEN
+//          npx wrangler secret put MCP_OWNER_PASSPHRASE   (typed on /authorize to connect the Claude app)
 // Tokens:  RELAY_ADMIN_TOKEN=<secret> uv run scripts/relay_admin.py --url https://<worker-url> token add <node>
 // Import:  RELAY_ADMIN_TOKEN=<secret> uv run scripts/import_archive.py --url https://<worker-url> --db archive.db
 {
@@ -19,6 +20,8 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Relay", "ArchiveIndex"] }],
   "r2_buckets": [{ "binding": "ARCHIVE", "bucket_name": "one-conv-archive" }],
+  // OAuth state of the remote MCP server; `wrangler deploy` creates the namespace when no id is given.
+  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
   // A chunk upload decompresses and hashes up to 16 MB of captures; the plan default would cut it off.
   "limits": { "cpu_ms": 120000 },
   "observability": { "enabled": true }

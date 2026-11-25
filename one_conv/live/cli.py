@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import sys
+import time
 
 import click
 
@@ -255,7 +256,8 @@ def build_live_group(launcher: list[str]) -> click.Group:
         text = brief if brief is not None else (brief_file.read() if brief_file else "")
         if not text.strip():
             raise click.UsageError("Give the agent a brief with --brief or --brief-file: it starts working on it.")
-        text = spawn.with_reply_path(text, router.whoami())
+        sender = router.whoami()
+        text = spawn.with_reply_path(text, sender)
         try:
             command = spawn.launch(harness, text, cwd, list(harness_args), mode)
         except ValueError as error:
@@ -271,16 +273,80 @@ def build_live_group(launcher: list[str]) -> click.Group:
             spawn.start(name, cwd, command)
         except (RuntimeError, OSError) as error:
             raise click.ClickException(str(error)) from None
+        # Recorded before registering, so an agent stuck on a prompt can still be stopped by its tmux name.
+        row = spawn.Spawned(name, harness, cwd, "", sender.address if sender else "", time.time())
+        spawn.record(row)
         session = spawn.wait_for(adapter.list_sessions, before, cwd, timeout, lambda: spawn.tmux_taken(name))
         if session is None:
             state = "is still running" if spawn.tmux_taken(name) else "exited"
             raise click.ClickException(
                 f"{harness} {state} but did not register within {timeout:g}s. Its screen:\n{spawn.screen(name)}\n"
-                f"Attach with: tmux attach -t {name}")
+                f"Attach with: tmux attach -t {name}, or stop it: one-conv live stop {name} --yes")
+        row.address = session.address
+        spawn.record(row)
         if as_json:
             click.echo(json.dumps({**session.to_json(), "tmux": name}))
             return
-        click.echo(f"started {session.address} in tmux session {name} (attach: tmux attach -t {name})")
+        click.echo(f"started {session.address} in tmux session {name} (attach: tmux attach -t {name}, "
+                   f"stop: one-conv live stop {session.address} --yes)")
+
+    @live.command("stop", context_settings=HELP,
+                  epilog=examples("one-conv live stop", "one-conv live stop codex:019a0c5e --yes",
+                                  "one-conv live stop @reviewer --yes", "one-conv live stop codex-review --yes",
+                                  "one-conv live stop --all --yes"))
+    @click.argument("targets", nargs=-1)
+    @click.option("--all", "stop_all", is_flag=True, help="Every agent `live spawn` started on this machine.")
+    @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+    @click.option("--yes", is_flag=True, help="Stop them. Without it, only lists what would stop.")
+    def stop_command(targets, stop_all, as_json, yes):
+        """End agents started with `live spawn`, by address, @name, id prefix or tmux session.
+
+        Kills the agent's tmux session; its conversation stays readable with `one-conv local`.
+        Without a target, lists the spawned agents. Sessions `live spawn` did not start
+        are refused: stop those yourself.
+        """
+        registry = spawn.load_registry()
+        if not targets and not stop_all:
+            rows = [{**vars(row), "running": spawn.tmux_taken(row.tmux)} for row in registry.values()]
+            if as_json:
+                click.echo(json.dumps(rows))
+                return
+            if not rows:
+                click.echo("No agent started with `live spawn` on this machine.")
+            for row in rows:
+                state = "running" if row["running"] else "ended"
+                click.echo(f"  {row['tmux']:<28} {row['address'] or '(never registered)':<52} {state}  {row['cwd']}")
+            return
+        chosen: dict[str, spawn.Spawned] = dict(registry) if stop_all else {}
+        for target in targets:
+            try:
+                resolved = router.resolve(target).address
+            except router.LiveError:
+                resolved = None
+            matches = spawn.find(target, registry, resolved)
+            if not matches:
+                raise click.ClickException(f"{target} was not started by `live spawn` on this machine: stop it yourself. "
+                                           "Run `one-conv live stop` to list the agents it can stop.")
+            if len(matches) > 1:
+                listing = "\n".join(f"  {row.tmux}  {row.address}" for row in matches)
+                raise click.ClickException(f"{target!r} matches several spawned agents:\n{listing}")
+            chosen[matches[0].tmux] = matches[0]
+        if not yes:
+            for row in chosen.values():
+                click.echo(f"would stop {row.address or '(never registered)'} (tmux session {row.tmux})")
+            click.echo("Re-run with --yes to stop them.")
+            return
+        results = []
+        for row in chosen.values():
+            try:
+                was_running = spawn.stop(row)
+            except RuntimeError as error:
+                raise click.ClickException(str(error)) from None
+            results.append({**vars(row), "was_running": was_running})
+            if not as_json:
+                click.echo(f"{'stopped' if was_running else 'already ended'} {row.address or row.tmux} (tmux session {row.tmux})")
+        if as_json:
+            click.echo(json.dumps(results))
 
     @live.command("cursor-hook", hidden=True, epilog=examples('one-conv live cursor-hook < hook-payload.json'))
     def cursor_hook_command():

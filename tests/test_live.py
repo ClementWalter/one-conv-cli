@@ -46,6 +46,8 @@ CLI = Path(__file__).resolve().parents[1] / "one_conv_cli.py"
 
 @pytest.fixture
 def homes(tmp_path, monkeypatch):
+    # A touched lock file stands for one a running Codex holds; test_codex_locks probes real ones.
+    monkeypatch.setattr(codex, "lock_held", lambda path: True)
     for name, var in (("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME"), ("omp", "OMP_HOME"),
                       ("cursor", "ONE_CONV_CURSOR_HOME"), ("live", "ONE_CONV_LIVE_DIR")):
         (tmp_path / name).mkdir()

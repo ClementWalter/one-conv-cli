@@ -215,7 +215,11 @@ async function sendMessage(args: Args, env: Env): Promise<unknown> {
     text,
     reply: bool(args, "expect_reply", true) ? "expected" : "none",
     mode: bool(args, "fyi", false) ? "fyi" : "push",
+    // Only a held message carries `when`, as the CLI posts it; the relay validates the value.
+    ...(str(args, "when") === "idle" ? { when: "idle" } : {}),
   };
+  const when = str(args, "when");
+  if (when !== null && when !== "now" && when !== "idle") throw new ToolError("when must be now or idle");
   try {
     return await relay(env).send(APP_NODE, message);
   } catch (error) {
@@ -303,6 +307,7 @@ export const TOOLS: Tool[] = [
     description:
       "Send text to a running agent session as the user (it arrives as a human message): `to` is an address NODE/harness:id or an @name " +
       "from list_live_sessions. fyi=true files a notice without waking the agent; expect_reply=false marks it as needing no answer. " +
+      "when=now reaches a busy agent at its next tool boundary; when=idle holds it on the agent's machine until its current turn ends. " +
       "Retrying the same text to the same target within 10 minutes is stored once. Read the session later with read_conversation to see the answer.",
     inputSchema: {
       type: "object",
@@ -311,6 +316,7 @@ export const TOOLS: Tool[] = [
         text: { type: "string" },
         fyi: { type: "boolean", default: false },
         expect_reply: { type: "boolean", default: true },
+        when: { type: "string", enum: ["now", "idle"], default: "now" },
         id: { type: "string", description: "Optional 32 lowercase hex characters; the same id is never stored twice." },
       },
       required: ["to", "text"],
@@ -320,7 +326,7 @@ export const TOOLS: Tool[] = [
   },
   {
     name: "message_status",
-    description: "Whether a message sent with send_message was accepted by the receiving agent's machine: stored, accepted, refused or unconfirmed.",
+    description: "Whether a message sent with send_message was accepted by the receiving agent's machine: stored, held (until the agent is idle), accepted, refused or unconfirmed.",
     inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
     annotations: { title: "Check a sent message", ...READ_ONLY },
     run: messageStatus,

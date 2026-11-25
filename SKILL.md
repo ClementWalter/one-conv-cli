@@ -19,6 +19,10 @@ Invoke it as **`one-conv`** (alias `agent-conv`), put on `$PATH` by
 `<skill-dir>/bin/one-conv`, a symlink to `one_conv_cli.py`, a PEP 723 script
 whose dependencies `uv` resolves on first run.
 
+When a command prints `one-conv update available: ...` on stderr, or the one-conv
+MCP instructions start with it, tell the user what is new and how to update. Never
+update unasked; `one-conv update --yes` pulls once they agree.
+
 Choose the namespace first:
 
 ```bash

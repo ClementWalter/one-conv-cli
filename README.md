@@ -37,6 +37,22 @@ shown below.
 The repository also includes an [agent skill](SKILL.md). Install the checkout
 as a skill in your agent runtime to give it the same launcher and usage guide.
 
+### Updates
+
+one-conv never updates itself. Once a day it asks GitHub whether a newer version
+exists and, if so, says so: in the one-conv MCP server's instructions, so every
+agent session that loads it sees the notice, and on stderr of a CLI command at
+most once a day. A git checkout is compared with `main`, the Desktop extension
+with the latest release; a copy that is neither has no version to compare.
+
+```bash
+one-conv update          # up to date, or what is new and how to get it
+one-conv update --yes    # fast-forward a clean checkout of main
+```
+
+Set `ONE_CONV_NO_UPDATE_CHECK=1` to turn the check off. Restart running agents
+after an update so their MCP server reloads.
+
 Local history readers use files on your machine. Browser-session discovery and
 login currently target macOS. Initial Keychain setup requires Apple's
 command-line developer tools to build the native credential helper.

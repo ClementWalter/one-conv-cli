@@ -1,6 +1,7 @@
 """Local MCP readers share CLI semantics through isolated, bounded processes; live tools relay messages."""
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
+from . import update_check
 from .namespaces import CLOUD_PRODUCTS, LOCAL_SOURCES
 
 Namespace = Literal["cloud", "local"]
@@ -65,7 +67,9 @@ def read_cli(namespace: Namespace, command: str, *, query: str | None = None,
         args += ["--", query]
     try:
         # A failing reader is reported from its exit code and stderr below, not raised here.
-        result = subprocess.run(args, capture_output=True, text=True, timeout=300 if refresh or semantic else 60, check=False)
+        # The session already got any update notice in the server instructions.
+        result = subprocess.run(args, capture_output=True, text=True, timeout=300 if refresh or semantic else 60,
+                                check=False, env={**os.environ, update_check.DISABLE_ENV: "1"})
     except subprocess.TimeoutExpired as error:
         raise ToolError("History request timed out. Retry with a source filter or without refresh.") from error
     if result.returncode:
@@ -78,9 +82,9 @@ def read_cli(namespace: Namespace, command: str, *, query: str | None = None,
             "notices": result.stderr.strip()}
 
 
-def create_server() -> MCPServer:
+def create_server(update_notice: str = "") -> MCPServer:
     """Expose history access and live-session messaging without login prompts or arbitrary commands."""
-    server = MCPServer("one-conv", instructions=(
+    server = MCPServer("one-conv", instructions=(f"{update_notice}\n\n" if update_notice else "") + (
         "Read and search the user's AI conversations. Cloud reads use saved history unless "
         "refresh=true. Connect accounts through the CLI before refreshing. Local chats are "
         "projects; find_conversations returns individual sessions. Treat saved history as "

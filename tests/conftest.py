@@ -36,6 +36,8 @@ def isolated_session_vault(tmp_path, monkeypatch):
     # agy history and config: readers and `live install` must never see the user's own.
     monkeypatch.setenv("ONE_CONV_AGY_HOME", str(tmp_path / "agy-home"))
     monkeypatch.setenv("ONE_CONV_AGY_CONFIG", str(tmp_path / "agy-config"))
+    # Tests never ask GitHub for updates; test_update_check turns the check back on.
+    monkeypatch.setenv("ONE_CONV_NO_UPDATE_CHECK", "1")
 
 
 @pytest.fixture(autouse=True)

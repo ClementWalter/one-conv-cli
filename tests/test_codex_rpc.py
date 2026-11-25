@@ -166,7 +166,9 @@ def test_reader_refuses_mutating_or_history_requests(method, params):
 
 
 @pytest.fixture
-def lock(home):
+def lock(home, monkeypatch):
+    # A touched lock file stands for one a running Codex holds; test_codex_locks probes real ones.
+    monkeypatch.setattr(codex, "lock_held", lambda path: True)
     path = home / "thread-writer-locks" / (THREAD + ".lock")
     path.parent.mkdir()
     path.touch()

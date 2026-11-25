@@ -5,19 +5,23 @@ and stays attachable. Its first prompt is the brief, the one-conv MCP tools are 
 through the harness's per-launch flags (Cursor reads them from the allowlist `live install`
 writes), and its working directory is trusted. Shell and edit approvals follow `mode`: the user's
 own harness settings (`ask`), the harness's reviewed auto mode (`auto`), or no prompts at all (`yolo`).
+
+Every spawned agent is recorded in `spawned.json` under the live folder, keyed by its tmux session,
+so `live stop` can end it later and refuses to touch sessions it did not start.
 """
 
+import json
 import os
 import re
 import shlex
 import subprocess
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 from . import agy
-from .model import LiveSession
+from .model import LiveSession, live_home
 
 SPAWNABLE = ("claude", "codex", "cursor", "omp", "agy")
 # The tools an agent needs to report, ask and follow its peers; the cloud account tools stay gated.
@@ -125,3 +129,66 @@ def wait_for(list_sessions: Callable[[], list[LiveSession]], before: set[str], c
         if clock() >= deadline or not alive():
             return None
         sleep(poll)
+
+
+@dataclass
+class Spawned:
+    tmux: str
+    harness: str
+    cwd: str
+    address: str = ""
+    by: str = ""
+    started: float = 0.0
+
+
+def registry_path() -> Path:
+    return live_home() / "spawned.json"
+
+
+def load_registry() -> dict[str, Spawned]:
+    try:
+        rows = json.loads(registry_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    # Rows from older spawners carry extra keys (`attach`, `active_at`); only the known ones are read.
+    known = {item.name for item in fields(Spawned)}
+    return {name: Spawned(**{key: value for key, value in row.items() if key in known})
+            for name, row in rows.items() if isinstance(row, dict) and {"tmux", "harness", "cwd"} <= row.keys()}
+
+
+def save_registry(registry: dict[str, Spawned]) -> None:
+    path = registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({name: vars(row) for name, row in registry.items()}, indent=1))
+    tmp.replace(path)
+
+
+def record(row: Spawned) -> None:
+    registry = load_registry()
+    registry[row.tmux] = row
+    save_registry(registry)
+
+
+def find(target: str, registry: dict[str, Spawned], resolved: str | None) -> list[Spawned]:
+    """Spawned agents matching a tmux session name, an address (resolved from @name or id prefix), or an id prefix."""
+    if target in registry:
+        return [registry[target]]
+    if resolved:
+        return [row for row in registry.values() if row.address == resolved]
+    query = target.split(":", 1)[-1]
+    return [row for row in registry.values()
+            if row.address and (row.address == target or row.address.split(":", 1)[-1].startswith(query))]
+
+
+def stop(row: Spawned) -> bool:
+    """Kill the agent's tmux session and forget it; False when the session had already ended."""
+    running = tmux_taken(row.tmux)
+    if running:
+        result = _tmux("kill-session", "-t", f"={row.tmux}")
+        if result.returncode:
+            raise RuntimeError(f"tmux could not stop {row.tmux}: {result.stderr.strip()}")
+    registry = load_registry()
+    registry.pop(row.tmux, None)
+    save_registry(registry)
+    return running

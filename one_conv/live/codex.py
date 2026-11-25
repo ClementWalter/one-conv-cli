@@ -1,4 +1,4 @@
-"""Codex: a loaded thread holds `thread-writer-locks/<id>.lock`; `codex queue` delivers into it.
+"""Codex: a loaded thread holds a flock on `thread-writer-locks/<id>.lock`; `codex queue` delivers into it.
 
 `codex queue` starts a turn on an idle thread, runs after the current turn on a busy
 one, and stores the message for the next resume when no process has the thread loaded.
@@ -6,9 +6,16 @@ one, and stores the message for the next resume when no process has the thread l
 
 import json
 import os
+import struct
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows has no advisory file locks to probe.
+    fcntl = None
 
 from . import codex_rpc
 from .model import LiveSession
@@ -67,11 +74,47 @@ def unattended(thread_id: str, now: float | None = None) -> bool:
     return written is not None and (time.time() if now is None else now) - written >= UNATTENDED_SECONDS
 
 
+def flock_inodes(proc_locks: str) -> set[int]:
+    """Inodes under a FLOCK in Linux's /proc/locks (`1: FLOCK ADVISORY WRITE pid maj:min:inode 0 EOF`)."""
+    inodes = set()
+    for line in proc_locks.splitlines():
+        parts = line.split()
+        if len(parts) > 5 and parts[1] == "FLOCK":
+            try:
+                inodes.add(int(parts[5].rsplit(":", 1)[-1]))
+            except ValueError:
+                continue
+    return inodes
+
+
+def lock_held(path: Path) -> bool:
+    """Whether a live Codex holds the flock on a thread lock; a killed one leaves the file unlocked.
+
+    The probe never takes the lock, so a Codex starting up at that instant cannot lose it to us.
+    An unknown answer counts as held, which keeps the thread listed.
+    """
+    try:
+        if sys.platform.startswith("linux"):
+            # Linux keeps flock and fcntl locks apart, so F_GETLK cannot see Codex's flock.
+            return path.stat().st_ino in flock_inodes(Path("/proc/locks").read_text())
+        if fcntl is None:
+            return True
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            # Darwin's struct flock: l_start, l_len, l_pid, l_type, l_whence; flocks conflict with F_GETLK there.
+            request = struct.pack("qqihh", 0, 0, 0, fcntl.F_WRLCK, os.SEEK_SET)
+            return struct.unpack("qqihh", fcntl.fcntl(fd, fcntl.F_GETLK, request))[3] != fcntl.F_UNLCK
+        finally:
+            os.close(fd)
+    except OSError:
+        return True
+
+
 def list_sessions() -> list[LiveSession]:
     names = _names()
     sessions = {}
     for lock in sorted((codex_home() / "thread-writer-locks").glob("*.lock")):
-        if not THREAD_ID.fullmatch(lock.stem):
+        if not THREAD_ID.fullmatch(lock.stem) or not lock_held(lock):
             continue
         sessions[lock.stem] = LiveSession("codex", lock.stem, _cwd(lock.stem), names.get(lock.stem, ""), "loaded",
                                         None, "codex queue")

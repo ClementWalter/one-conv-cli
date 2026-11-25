@@ -371,6 +371,16 @@ The one-conv tools are pre-approved (`send_message`, `set_name`,
 
 With `ask` or `auto`, a prompt the harness still raises waits in the tmux pane.
 
+```bash
+one-conv live stop                      # the agents spawn started, running or ended
+one-conv live stop codex:019a --yes     # by address, id prefix, @name or tmux session
+one-conv live stop --all --yes
+```
+
+`live stop` kills the agent's tmux session and forgets it; its conversation stays
+readable with `one-conv local`. It only stops agents `live spawn` started on this
+machine, recorded in `spawned.json` in the live folder, and refuses any other session.
+
 | Harness | One-conv tools approved by | Working folder |
 | --- | --- | --- |
 | Claude Code | `--allowedTools` | Trusted when it or a parent is; otherwise its trust prompt waits for you |

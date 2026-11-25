@@ -271,6 +271,8 @@ Never run peers headless (`codex exec`, `agent -p`, `claude -p`): they get no
 address and nobody can follow them. When spawn reports that the agent did not
 register, it prints the agent's screen: a trust or approval prompt there is the
 user's to answer with `tmux attach -t SESSION`.
+When a spawned agent's work is done and reported, end it with `one-conv live stop
+ADDRESS --yes`; `one-conv live stop` lists the agents you can stop.
 
 Keep exchanges reconstructable. Open each message with
 `to: <address>  cc: <addresses>  re: <subject>`. A relayed message is a user turn

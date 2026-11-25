@@ -1,5 +1,6 @@
 """`one-conv live spawn`: the harness command, the reply header, the tmux name and the wait for registration."""
 
+import json
 import subprocess
 
 import pytest
@@ -179,3 +180,99 @@ def test_cli_shows_the_screen_when_the_agent_does_not_register(started, monkeypa
     result = CliRunner().invoke(build_live_group(["one-conv"]), [
         "spawn", "claude", "--cwd", str(tmp_path), "--brief", "go", "--yes", "--timeout", "0"])
     assert "Is this a project you trust?" in result.output
+
+
+def test_spawn_records_the_registered_agent(started, monkeypatch, tmp_path):
+    _sessions(monkeypatch, "cursor", lambda: [LiveSession("cursor", "k9", str(tmp_path))] if started else [])
+    CliRunner().invoke(build_live_group(["one-conv"]), ["spawn", "cursor", "--cwd", str(tmp_path), "--brief", "b", "--yes"])
+    assert spawn.load_registry()[f"cursor-{tmp_path.name}"].address == "cursor:k9"
+
+
+def test_spawn_records_an_agent_that_never_registers(started, monkeypatch, tmp_path):
+    _sessions(monkeypatch, "claude", lambda: [])
+    monkeypatch.setattr(spawn, "screen", lambda name: "trust this folder?")
+    CliRunner().invoke(build_live_group(["one-conv"]),
+                       ["spawn", "claude", "--cwd", str(tmp_path), "--brief", "b", "--timeout", "0", "--yes"])
+    assert f"claude-{tmp_path.name}" in spawn.load_registry()
+
+
+@pytest.fixture
+def spawned():
+    """Two recorded agents, both still running in tmux."""
+    spawn.record(spawn.Spawned("codex-review", "codex", "/w/review", "codex:019a0c5e-aaaa", "claude:c1", 1.0))
+    spawn.record(spawn.Spawned("claude-docs", "claude", "/w/docs", "claude:4f1a-bbbb", "claude:c1", 2.0))
+    return spawn.load_registry()
+
+
+@pytest.fixture
+def killed(monkeypatch):
+    """Records tmux kill-session calls; every recorded session is running."""
+    calls = []
+    monkeypatch.setattr(spawn, "tmux_taken", lambda name: name not in calls)
+
+    def tmux(*args):
+        calls.append(args[-1].lstrip("="))
+        return subprocess.CompletedProcess(args, 0, "", "")
+    monkeypatch.setattr(spawn, "_tmux", tmux)
+    monkeypatch.setattr(router, "resolve", lambda target: (_ for _ in ()).throw(router.LiveError("gone")))
+    return calls
+
+
+def test_find_by_tmux_session(spawned):
+    assert [row.address for row in spawn.find("claude-docs", spawned, None)] == ["claude:4f1a-bbbb"]
+
+
+def test_find_by_resolved_address(spawned):
+    assert [row.tmux for row in spawn.find("@reviewer", spawned, "codex:019a0c5e-aaaa")] == ["codex-review"]
+
+
+def test_find_by_id_prefix_once_the_session_left_live_ls(spawned):
+    assert [row.tmux for row in spawn.find("codex:019a", spawned, None)] == ["codex-review"]
+
+
+def test_find_ignores_sessions_spawn_did_not_start(spawned):
+    assert spawn.find("claude:9999", spawned, "claude:9999-cccc") == []
+
+
+def test_stop_kills_the_tmux_session(spawned, killed):
+    CliRunner().invoke(build_live_group(["one-conv"]), ["stop", "codex:019a", "--yes"])
+    assert killed == ["codex-review"]
+
+
+def test_stop_forgets_the_agent(spawned, killed):
+    CliRunner().invoke(build_live_group(["one-conv"]), ["stop", "codex:019a", "--yes"])
+    assert list(spawn.load_registry()) == ["claude-docs"]
+
+
+def test_stop_without_yes_kills_nothing(spawned, killed):
+    CliRunner().invoke(build_live_group(["one-conv"]), ["stop", "codex:019a"])
+    assert killed == []
+
+
+def test_stop_refuses_a_session_spawn_did_not_start(spawned, killed):
+    result = CliRunner().invoke(build_live_group(["one-conv"]), ["stop", "claude:9999", "--yes"])
+    assert "was not started by `live spawn`" in result.output
+
+
+def test_stop_all_kills_every_spawned_agent(spawned, killed):
+    CliRunner().invoke(build_live_group(["one-conv"]), ["stop", "--all", "--yes"])
+    assert sorted(killed) == ["claude-docs", "codex-review"]
+
+
+def test_stop_without_target_lists_spawned_agents(spawned, killed):
+    result = CliRunner().invoke(build_live_group(["one-conv"]), ["stop", "--json"])
+    assert [row["tmux"] for row in json.loads(result.output)] == ["codex-review", "claude-docs"]
+
+
+def test_stop_reports_an_agent_that_already_ended(spawned, monkeypatch, killed):
+    monkeypatch.setattr(spawn, "tmux_taken", lambda name: False)
+    result = CliRunner().invoke(build_live_group(["one-conv"]), ["stop", "claude-docs", "--yes"])
+    assert result.output.startswith("already ended claude:4f1a-bbbb")
+
+
+def test_registry_reads_rows_from_older_spawners():
+    spawn.registry_path().parent.mkdir(parents=True, exist_ok=True)
+    spawn.registry_path().write_text(json.dumps({"oneconv-codex-4e": {
+        "tmux": "oneconv-codex-4e", "harness": "codex", "cwd": "/w", "address": "codex:01a1",
+        "attach": "tmux attach -t oneconv-codex-4e", "active_at": 1.0}}))
+    assert spawn.load_registry()["oneconv-codex-4e"].address == "codex:01a1"

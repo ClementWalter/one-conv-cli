@@ -103,7 +103,7 @@ import sys
 import time
 import tempfile
 import threading
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -2898,6 +2898,7 @@ def _print_handle_list(cwd_label: str, handles: list[SessionHandle], as_json: bo
 
 from one_conv.namespaces import NamespaceRoot, SourceChoice, install as install_namespaces, selected_sources
 from one_conv.cloud_send import register_accounts as _register_cloud_accounts
+from one_conv import update_check
 
 
 @click.group(cls=NamespaceRoot, context_settings={"help_option_names": ["-h", "--help"]},
@@ -2905,6 +2906,19 @@ from one_conv.cloud_send import register_accounts as _register_cloud_accounts
 def cli() -> None:
     """Read conversation history from cloud products or local agent tools."""
     _archive_sync_in_background()
+    _show_update_notice()
+
+
+# Hooks and daemons have no reader for stderr; the MCP server puts the notice in its instructions.
+_NO_UPDATE_NOTICE = {"mcp", "update", "cursor-hook", "agy-hook", "serve", "bridge"}
+
+
+def _show_update_notice() -> None:
+    if _NO_UPDATE_NOTICE & set(sys.argv[1:]):
+        return
+    text = update_check.cli_notice(STATE_DIR)
+    if text:
+        click.echo(text, err=True)
 
 
 _SOURCE_OPTION = click.option(
@@ -4208,7 +4222,39 @@ def mcp_command(config):
             "command": sys.executable, "args": ["-O", str(Path(__file__).resolve()), "mcp"],
         }}}, indent=2))
         return
-    create_server().run(transport="stdio")
+    create_server(update_check.session_notice(STATE_DIR)).run(transport="stdio")
+
+
+@cli.command("update", epilog="\b\nExamples:\n  one-conv update\n  one-conv update --json\n  one-conv update --yes")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+@click.option("--yes", is_flag=True, help="Pull a git checkout of main. Without it, only reports.")
+def update_command(as_json, yes):
+    """Check GitHub for a newer one-conv, and pull it with --yes.
+
+    A git checkout compares its HEAD with GitHub's main; the Desktop extension its
+    version with the latest release. Other commands print the same notice at most
+    once a day; set ONE_CONV_NO_UPDATE_CHECK=1 to silence it. Restart running agents
+    after an update so their one-conv MCP server reloads.
+    """
+    status = update_check.check(STATE_DIR, force=True)
+    if as_json:
+        click.echo(json.dumps({**asdict(status), "outdated": status.outdated}))
+    elif status.kind == "copy":
+        click.echo(f"one-conv at {update_check.ROOT} is neither a git checkout nor the Desktop extension: "
+                   f"its version is unknown. Reinstall from https://github.com/{update_check.REPO} to get updates.")
+    elif not status.outdated:
+        click.echo(f"one-conv is up to date ({status.kind} {status.local[:12]}).")
+    else:
+        click.echo(update_check.notice(status).rsplit(" Tell the user", 1)[0])
+    if not yes or not status.outdated:
+        return
+    if status.kind != "git":
+        raise click.ClickException(f"Only a git checkout updates itself: {update_check.how_to_update(status)}")
+    try:
+        click.echo(update_check.pull())
+    except ValueError as error:
+        raise click.ClickException(str(error)) from None
+    click.echo("Updated. Restart running agents to reload the one-conv MCP server.")
 
 
 if __name__ == "__main__":

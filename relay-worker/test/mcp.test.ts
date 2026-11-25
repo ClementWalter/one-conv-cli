@@ -166,6 +166,7 @@ describe("the MCP protocol", () => {
       "list_live_sessions",
       "send_message",
       "message_status",
+      "read_notes",
     ]);
   });
 
@@ -288,6 +289,22 @@ describe("live tools", () => {
     const token = await connect();
     const sent = await tool(token, "send_message", { to: "@worker", text: "status?" });
     expect((await tool(token, "message_status", { id: sent.id })).recipients[0].outcome).toBe("stored");
+  });
+});
+
+describe("read_notes", () => {
+  test("a note an agent sent to the user reads back", async () => {
+    const mac = await mint("mac");
+    await (await publish(mac, [{ address: "claude:aaa" }])).text();
+    await call("/v1/messages", { method: "POST", token: mac, body: { id: "a".repeat(32), to: "user", from: "claude:aaa", text: "PR merged", tags: ["done"] } });
+    expect((await tool(await connect(), "read_notes", {})).messages.map((note: { text: string }) => note.text)).toEqual(["PR merged"]);
+  });
+
+  test("a tag filter excludes other notes", async () => {
+    const mac = await mint("mac");
+    await (await publish(mac, [{ address: "claude:aaa" }])).text();
+    await call("/v1/messages", { method: "POST", token: mac, body: { id: "a".repeat(32), to: "user", from: "claude:aaa", text: "PR merged", tags: ["done"] } });
+    expect((await tool(await connect(), "read_notes", { tags: ["blocked"] })).messages).toEqual([]);
   });
 });
 

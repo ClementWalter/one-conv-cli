@@ -477,8 +477,10 @@ export class Relay extends DurableObject<Env> {
   /**
    * Notes after `after`, oldest first, at most `limit`; `tag` (repeatable) keeps notes carrying any of them.
    * `last` is the newest note's seq overall, so a reader's cursor can move past notes its filter skipped.
+   * A caller over RPC passes the URL as text, since a URL object does not cross that boundary.
    */
-  notes(url: URL): Body {
+  notes(target: URL | string): Body {
+    const url = typeof target === "string" ? new URL(target) : target;
     const after = Math.max(0, Math.trunc(pyFloat(url.searchParams.get("after") ?? "0") ?? 0));
     const asked = Math.trunc(pyFloat(url.searchParams.get("limit") ?? String(NOTES_LIMIT)) ?? NOTES_LIMIT);
     const limit = Math.max(1, Math.min(asked, NOTES_LIMIT));

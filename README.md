@@ -644,6 +644,7 @@ Then in Claude: Settings → Connectors → Add custom connector, URL
 | `list_live_sessions` | Sessions the bridges publish, with address and `@name` |
 | `send_message` | Post to a session as the user (`claude-app/user`, a human turn); a retry within 10 minutes is stored once |
 | `message_status` | Outcome of a sent message |
+| `read_notes` | Notes agents sent to the user (`to=user`), after a cursor, by tag |
 
 Search covers only what the bridges have synced to the archive. The search text is lowercase, so are
 snippets. A read page holds at most 60,000 characters; follow `next_offset`.

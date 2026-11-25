@@ -232,6 +232,20 @@ async function messageStatus(args: Args, env: Env): Promise<unknown> {
   }
 }
 
+async function readNotes(args: Args, env: Env): Promise<unknown> {
+  const url = new URL("https://relay/v1/user");
+  url.searchParams.set("after", String(int(args, "after", 0, 0, Number.MAX_SAFE_INTEGER)));
+  url.searchParams.set("limit", String(int(args, "limit", 50, 1, 200)));
+  const tags = args.tags ?? [];
+  if (!Array.isArray(tags) || !tags.every((tag) => typeof tag === "string")) throw new ToolError("tags must be a list of strings");
+  for (const tag of tags) url.searchParams.append("tag", tag);
+  try {
+    return await relay(env).notes(url.href);
+  } catch (error) {
+    throw new ToolError(error instanceof Error ? error.message : String(error));
+  }
+}
+
 // --- tools -------------------------------------------------------------------------------------------
 
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
@@ -310,6 +324,22 @@ export const TOOLS: Tool[] = [
     inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
     annotations: { title: "Check a sent message", ...READ_ONLY },
     run: messageStatus,
+  },
+  {
+    name: "read_notes",
+    description:
+      "Read the notes agents sent to the user (their send_message to `user`), oldest first after seq `after`. " +
+      "`tags` keeps notes carrying any of them. Pass the result's `last` as `after` next time to see only newer notes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        after: { type: "integer", minimum: 0, default: 0 },
+        limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        tags: { type: "array", items: { type: "string" } },
+      },
+    },
+    annotations: { title: "Read agents' notes to you", ...READ_ONLY },
+    run: readNotes,
   },
 ];
 

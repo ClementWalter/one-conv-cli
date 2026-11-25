@@ -48,7 +48,7 @@ READER_EXAMPLES = {
     "find": ("QUERY --json",),
     "unread": ("--json", "--limit 10"),
     "fork": ("PROJECT", "PROJECT --nth 2 --yes"),
-    "port": ("PROJECT --into codex", "PROJECT --into claude --limit 20 --print --yes"),
+    "port": ("PROJECT --into codex", "claude:SESSION --into codex --budget 32000", "PROJECT --into claude --limit 20 --print --yes"),
     "send": ("PROJECT 'summarize the open TODOs'", "PROJECT 'run the tests' --fork --yes"),
     "skill-usage": ("--since-days 30 --json",),
     "feed": ("--follow ADDRESS", "--peek --json"),

@@ -234,6 +234,10 @@ operations.
 `local fork`, `local send` and `local port` launch actual agents. They default
 to dry-run and require `--yes` to act. `fork` and `send` target Claude Code;
 `port --into claude|codex` starts a new conversation with rendered context.
+The `port` seed fits `--budget` characters (default 64000, about 16k tokens): a
+short thread transfers whole; a long one keeps the first user request and the
+latest turns, and names the omitted turns with the `local thread` command that
+reads them. `port` also accepts a live address such as `claude:<id>`.
 These agents can modify files or use tools, so preserve the user's action scope.
 
 `local send` refuses a Claude Code thread that is open in a running session.

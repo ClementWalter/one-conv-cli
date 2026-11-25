@@ -8,8 +8,10 @@ import re
 import subprocess
 import time
 import uuid
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlencode
 
 from . import agy, claude, codex, cursor, hubclient, names, omp
 from .model import LiveSession, envelope, is_session_id, live_home, parse_address
@@ -28,6 +30,11 @@ RATE_WINDOW_SECONDS = 300
 FYI_KEEP_SECONDS = 7 * 24 * 3600
 # Clock skew tolerated on an existing notice; anything further ahead is corrupt.
 FYI_MAX_SKEW_SECONDS = 3600
+# The person every agent works for: a message to it is a note in their inbox, never a new turn.
+USER = "user"
+TAG = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+TAGS_PER_NOTE = 8
+NOTES_LIMIT = 200
 
 
 def _valid_fyi_time(at: object, now: float) -> bool:
@@ -282,16 +289,24 @@ def _hub():
 
 
 def send(target: str, text: str, sender: LiveSession | None, origin: str = "unknown",
-         fyi: bool = False, reply: str = "expected", message_id: str | None = None, images=()) -> dict:
+         fyi: bool = False, reply: str = "expected", message_id: str | None = None, images=(),
+         tags=()) -> dict:
     """Deliver to one session: here, in a cloud conversation, or on another machine through the relay.
 
     `message_id` is chosen once and reused on retry, so a receiver can drop a duplicate.
     `images` are file paths: a cloud conversation receives the images themselves, an agent
     on this machine a saved copy of each, named in the text, and an agent on another machine
     a copy its bridge fetches from the relay.
+    `tags` apply to a message to USER only: the person filters their inbox by them.
     """
     from .. import cloud_send, images as attached
     message_id = message_id or uuid.uuid4().hex
+    if target == USER:
+        if fyi or images:
+            raise LiveError("A message to user is a note in the person's inbox: send text only, without fyi or images.")
+        return _send_user(text, sender, origin, list(tags), message_id)
+    if tags:
+        raise LiveError("Tags label messages to user only.")
     try:
         loaded = attached.load(images)
     except attached.ImageError as error:
@@ -412,3 +427,105 @@ def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, f
             logger.warning("delivered, but could not record the peer pair: %s", error)
             receipt["warning"] = f"peer pair not recorded: {error}"
     return receipt
+
+
+def _user_store() -> Path:
+    """This machine's notes for the person when no relay is configured: one JSON object per line."""
+    return live_home() / "user" / "notes.jsonl"
+
+
+def check_tags(tags: list[str]) -> list[str]:
+    """Tags in order without repeats, refused unless each is a lowercase word the relay accepts."""
+    unique = list(dict.fromkeys(tags))
+    if len(unique) > TAGS_PER_NOTE or not all(TAG.fullmatch(t) for t in unique):
+        raise LiveError(f"Tags are at most {TAGS_PER_NOTE} lowercase words (letters, digits, dashes), "
+                        f"got {', '.join(unique)}.")
+    return unique
+
+
+def _send_user(text: str, sender: LiveSession | None, origin: str, tags: list[str], message_id: str) -> dict:
+    """File a note for the person: on the relay when one is configured, so every machine reads it, else here."""
+    tags = check_tags(tags)
+    if not text.strip():
+        raise LiveError("A message to user needs text.")
+    known = sender is not None and not sender.id.startswith("?")
+    handle = names.name_for(sender.address) if known else None
+    # The relay vouches only for this node's published sessions and the person at its terminal.
+    label = sender.address if known else ("user" if origin == "user" else "unknown")
+    name = f"@{handle}" if handle else (sender.title if known else ("" if origin in ("user", "unknown") else origin))
+    with _rate_slot(sender.address if sender else origin, USER):
+        hub = _hub()
+        if hub is None:
+            _append_note(message_id, label, name, text, tags)
+            return {"to": USER, "id": message_id, "from": label, "delivery": "inbox", "status": "stored on this machine"}
+        message = {"id": message_id, "to": USER, "from": label, "name": name, "text": text, "tags": tags}
+        try:
+            receipt = hubclient.submit(hub, message)
+        except (hubclient.HubRefused, hubclient.PendingConflict) as error:
+            raise LiveError(str(error)) from error
+    if receipt is None:
+        return {"to": USER, "id": message_id, "from": label, "via": "hub", "delivery": "inbox",
+                "status": "queued for the relay: no receipt yet, the bridge will resend it under the same id"}
+    return {"to": USER, "id": message_id, "from": label, "via": "hub", "delivery": "inbox", "status": "stored on the relay"}
+
+
+def _append_note(message_id: str, sender: str, name: str, text: str, tags: list[str]) -> None:
+    path = _user_store()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with (path.parent / ".notes.lock").open("a") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        seq = sum(1 for _ in _read_notes(path)) + 1
+        row = {"seq": seq, "id": message_id, "from": sender, "name": name, "text": text, "tags": tags,
+               "created": time.time()}
+        with path.open("a") as handle:
+            handle.write(json.dumps(row) + "\n")
+
+
+def _read_notes(path: Path) -> list[dict]:
+    try:
+        lines = path.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    rows = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue  # A torn last line is skipped; the next append numbers past it.
+        if isinstance(row, dict) and isinstance(row.get("seq"), int):
+            rows.append(row)
+    return rows
+
+
+def user_notes(after: int = 0, tags=(), limit: int = NOTES_LIMIT) -> dict:
+    """{"messages": notes after `after` oldest first, "last": newest seq, "source": relay URL or "local"}.
+
+    `tags` keeps notes carrying any of them.
+    """
+    tags = check_tags(list(tags))
+    limit = max(1, min(limit, NOTES_LIMIT))
+    hub = _hub()
+    if hub is None:
+        rows = _read_notes(_user_store())
+        kept = [r for r in rows if r["seq"] > after and (not tags or set(tags) & set(r.get("tags") or []))]
+        return {"messages": kept[:limit], "last": max((r["seq"] for r in rows), default=0), "source": "local"}
+    query = urlencode([("after", max(0, after)), ("limit", limit), *(("tag", t) for t in tags)])
+    try:
+        page = hub.request("GET", f"/v1/user?{query}")
+    except (hubclient.HubRefused, hubclient.HubUnavailable) as error:
+        raise LiveError(str(error)) from error
+    return {"messages": page.get("messages", []), "last": page.get("last", 0), "source": hub.url}
+
+
+def latest_notes(tags=(), limit: int = 50) -> dict:
+    """The newest `limit` notes carrying any of `tags`, oldest first, paging through the inbox."""
+    tail: deque = deque(maxlen=max(1, limit))
+    after, last = 0, 0
+    while True:
+        page = user_notes(after, tags, NOTES_LIMIT)
+        tail.extend(page["messages"])
+        last = page["last"]
+        if len(page["messages"]) < NOTES_LIMIT:
+            return {"messages": list(tail), "last": last, "source": page["source"]}
+        after = page["messages"][-1]["seq"]

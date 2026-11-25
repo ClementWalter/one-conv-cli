@@ -30,6 +30,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
                         "  NODE/claude:<full id>                      a session on another machine (live serve)\n"
                         "  @name                                      the agent that chose the name, here or elsewhere\n"
                         "  claude-chat:<id> cowork:<id>               a saved Claude chat or Cowork session\n"
+                        "  user                                       you: a note in your inbox (`live inbox`), never a new turn\n"
                         "\b\nExamples:\n  one-conv live name reviewer\n"
                         "  one-conv live send @builder 'can you take the migration?' --yes\n"
                         "  one-conv live serve --hub ssh://me@relay-box --node laptop --token-stdin < token\n"
@@ -73,8 +74,10 @@ def build_live_group(launcher: list[str]) -> click.Group:
     @click.option("--image", "images", multiple=True, metavar="PATH",
                   help="Attach an image (PNG, JPEG, GIF or WebP; repeat for up to 4). A Claude chat or "
                        "Cowork session receives the image; an agent a saved copy to read, on whichever machine it runs.")
+    @click.option("--tag", "tags", multiple=True, metavar="TAG",
+                  help="Label a message to user (repeatable); `live inbox --tag` filters by it.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the delivery receipt as JSON.")
-    def send_command(target, message, from_stdin, sender, fyi, no_reply, images, yes, as_json):
+    def send_command(target, message, from_stdin, sender, fyi, no_reply, images, tags, yes, as_json):
         """Send MESSAGE to TARGET: an address, id prefix, title, NODE/address, @name, claude-chat: or cowork:.
 
         The message arrives as a new user turn wrapped with the sender's address and name,
@@ -88,6 +91,12 @@ def build_live_group(launcher: list[str]) -> click.Group:
         try:
             me = router.whoami(sender)
             origin = router.origin(sys.stdin.isatty() and not from_stdin)
+            if not yes and target == router.USER:
+                click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
+                click.echo(f"  to:       user, in {'the relay' if hubclient.configured() else 'this machine'}'s inbox"
+                           f"{' tagged ' + ', '.join(router.check_tags(list(tags))) if tags else ''}")
+                click.echo(f"  from:     {me.address if me else origin}")
+                return
             if not yes and cloud_send.is_cloud_target(target):
                 product, query = cloud_send.split_target(target)
                 row = cloud_send.saved_conversation(query, product)
@@ -114,7 +123,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 _echo_images(images)
                 return
             receipt = router.send(target, message, me, origin, fyi=fyi,
-                                  reply="none" if no_reply else "expected", images=images)
+                                  reply="none" if no_reply else "expected", images=images, tags=tags)
         except (router.LiveError, names.NameRefused, RuntimeError, OSError) as error:
             raise click.ClickException(str(error)) from None
         if as_json:
@@ -136,6 +145,72 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 click.echo(f"  image:    {image.path} ({image.media_type}, {len(image.data)} bytes)")
         except attached.ImageError as error:
             raise click.ClickException(str(error)) from None
+
+    @live.command("inbox", context_settings=HELP, epilog=examples(
+        "one-conv live inbox", "one-conv live inbox --tag deploy", "one-conv live inbox --all --limit 20",
+        "one-conv live send user 'release notes drafted' --tag release --yes"))
+    @click.option("--tag", "tags", multiple=True, metavar="TAG", help="Only notes carrying this tag (repeatable: any of them).")
+    @click.option("--all", "show_all", is_flag=True, help="Show the latest notes, read or not, without moving the read position.")
+    @click.option("--peek", is_flag=True, help="Show unread notes without marking them read.")
+    @click.option("--limit", default=50, show_default=True, help="Most notes to show.")
+    @click.option("--json", "as_json", is_flag=True, help="Emit the notes as JSON.")
+    def inbox_command(tags, show_all, peek, limit, as_json):
+        """Read the notes agents (or you) sent to `user`, oldest unread first, and mark them read.
+
+        Notes live on the relay when this machine has one, so every machine shows the same
+        inbox; otherwise on this machine. Each tag filter keeps its own read position, so
+        reading `--tag deploy` leaves the other notes unread.
+        """
+        try:
+            tags = router.check_tags(list(tags))
+            source_key = "relay" if hubclient.configured() else "local"
+            position = _inbox_position_key(source_key, tags)
+            positions = _inbox_positions()
+            after = positions.get(position, 0)
+            page = router.latest_notes(tags, limit) if show_all else router.user_notes(after, tags, limit)
+        except (router.LiveError, hubclient.HubRefused) as error:
+            raise click.ClickException(str(error)) from None
+        notes = page["messages"]
+        if not show_all and not peek:
+            # A full page may stop short of the newest note; otherwise everything up to `last` was seen.
+            seen = notes[-1]["seq"] if len(notes) >= limit else max(page["last"], after)
+            if seen != after:
+                positions[position] = seen
+                _save_inbox_positions(positions)
+        if as_json:
+            click.echo(json.dumps(notes, ensure_ascii=False))
+            return
+        if not notes:
+            click.echo("No unread notes." if not show_all else "No notes.", err=True)
+            return
+        for note in notes:
+            when = time.strftime("%m-%d %H:%M", time.localtime(note.get("created") or 0))
+            who = note["from"] + (f" ({note['name']})" if note.get("name") else "")
+            labels = f"  [{', '.join(note['tags'])}]" if note.get("tags") else ""
+            click.echo(f"#{note['seq']}  {when}  {who}{labels}")
+            for line in (note.get("text") or "").splitlines() or [""]:
+                click.echo(f"  {line}")
+
+    def _inbox_positions_path():
+        from .model import live_home
+        return live_home() / "user" / "read.json"
+
+    def _inbox_position_key(source: str, tags: list[str]) -> str:
+        return " ".join([source, *sorted(tags)])
+
+    def _inbox_positions() -> dict:
+        try:
+            positions = json.loads(_inbox_positions_path().read_text())
+        except (FileNotFoundError, ValueError):
+            return {}
+        return positions if isinstance(positions, dict) else {}
+
+    def _save_inbox_positions(positions: dict) -> None:
+        path = _inbox_positions_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        partial = path.with_name(f".read.{os.getpid()}.tmp")
+        partial.write_text(json.dumps(positions, indent=1, sort_keys=True))
+        os.replace(partial, path)
 
     @live.command("status", context_settings=HELP, epilog=examples(
         "one-conv live status 9f2c41d07a5e4b1c8d3e6f7a8b9c0d1e"))

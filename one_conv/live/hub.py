@@ -13,6 +13,9 @@ receiving bridge acknowledges with an outcome the sender reads back with `status
 A node token vouches for the sessions its bridge publishes, not for each process on that
 machine. Only token hashes are stored. Delivery is at least once to the bridge; the bridge's
 ingress log is what keeps a retried delivery from prompting an agent twice.
+
+A message to `user` is for the person, not an agent: it is filed as a note with optional tags
+that any of the person's nodes reads back in order through GET /v1/user, and no bridge is woken.
 """
 
 import hashlib
@@ -45,6 +48,12 @@ MAX_WAIT = 30.0
 LEASE_SECONDS = 60.0
 # The apps a published session can name beside its harness.
 PRODUCTS = ("cursor-cli", "cursor-ide")
+# The address of the person every node works for; no session can publish it.
+USER = "user"
+TAG = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+TAGS_PER_NOTE = 8
+NAME_LIMIT = 200
+NOTES_LIMIT = 200
 # CREATE IF NOT EXISTS only: a database holding other tables or extra nullable columns opens unchanged.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tokens (node TEXT PRIMARY KEY, hash TEXT NOT NULL, created REAL NOT NULL);
@@ -61,6 +70,9 @@ CREATE TABLE IF NOT EXISTS deliveries (delivery TEXT PRIMARY KEY, post INTEGER N
 CREATE INDEX IF NOT EXISTS pending ON deliveries (to_node, outcome, post);
 CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, node TEXT NOT NULL, media_type TEXT NOT NULL,
     size INTEGER NOT NULL, body BLOB NOT NULL, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS notes (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_node TEXT NOT NULL, id TEXT NOT NULL,
+    digest TEXT NOT NULL, sender TEXT NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL, tags TEXT NOT NULL,
+    created REAL NOT NULL, UNIQUE (from_node, id));
 """
 
 
@@ -234,7 +246,9 @@ class Hub:
             raise HubError(400, f"mode must be one of {', '.join(MODES)}")
         target = message.get("to")
         if not isinstance(target, str) or not target:
-            raise HubError(400, "to must be NODE/harness:id or @name")
+            raise HubError(400, "to must be NODE/harness:id, @name or user")
+        if target == USER:
+            return self._note(node, msg_id, sender, text, message, bool(attached))
         digest = hashlib.sha256(json.dumps([target, sender, reply, mode, text, *attached]).encode()).hexdigest()
         with self.lock, self._db() as db:
             # The duplicate check and the durable claim share one snapshot across server instances.
@@ -257,6 +271,51 @@ class Hub:
             db.execute("INSERT INTO deliveries (delivery, post, to_node, to_address) VALUES (?, ?, ?, ?)",
                        (secrets.token_hex(16), seq, to_node, to_address))
             return self._receipt(db, seq, msg_id, False)
+
+    def _note(self, node: str, msg_id: str, sender, text: str, message: dict, attached: bool) -> dict:
+        """File a message to the person; a retry of the same note returns its first receipt."""
+        if attached:
+            raise HubError(400, "a message to user carries text only")
+        tags = message.get("tags") or []
+        if (not isinstance(tags, list) or len(tags) > TAGS_PER_NOTE
+                or not all(isinstance(t, str) and TAG.fullmatch(t) for t in tags)):
+            raise HubError(400, f"tags is a list of at most {TAGS_PER_NOTE} lowercase words (letters, digits, dashes)")
+        name = message.get("name") or ""
+        if not isinstance(name, str) or len(name) > NAME_LIMIT:
+            raise HubError(400, f"name is a string of at most {NAME_LIMIT} characters")
+        unique = list(dict.fromkeys(tags))
+        digest = hashlib.sha256(json.dumps([USER, sender, name, text, *unique]).encode()).hexdigest()
+        with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute("SELECT digest FROM notes WHERE from_node = ? AND id = ?", (node, msg_id)).fetchone()
+            if existing and existing[0] != digest:
+                raise HubError(409, "this id was already used for a different message; send it under a new id")
+            if not existing:
+                if not isinstance(sender, str) or (not self._published(db, node, sender) and sender not in ("user", "unknown")):
+                    raise HubError(403, "from must be a session this node published, or user/unknown")
+                db.execute("INSERT INTO notes (from_node, id, digest, sender, name, text, tags, created)"
+                           " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                           (node, msg_id, digest, sender, name, text, json.dumps(unique), time.time()))
+            return {"id": msg_id, "duplicate": bool(existing), "recipients": [{"to": USER, "status": "stored"}]}
+
+    def notes(self, after: int = 0, tags: list[str] = (), limit: int = NOTES_LIMIT) -> dict:
+        """Notes after `after`, oldest first, at most `limit`; `tags` keeps notes carrying any of them.
+
+        `last` is the newest note's seq overall, so a reader's cursor can move past notes its filter skipped.
+        """
+        if not all(TAG.fullmatch(t) for t in tags):
+            raise HubError(400, "a tag is lowercase letters, digits and dashes")
+        limit = max(1, min(limit, NOTES_LIMIT))
+        tag_filter = (f" AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value IN ({', '.join('?' * len(tags))}))"
+                      if tags else "")
+        with self._db() as db:
+            rows = db.execute("SELECT seq, id, from_node, sender, name, text, tags, created FROM notes"
+                              f" WHERE seq > ?{tag_filter} ORDER BY seq LIMIT ?", (max(0, after), *tags, limit)).fetchall()
+            last = db.execute("SELECT MAX(seq) FROM notes").fetchone()[0] or 0
+        return {"messages": [{"seq": seq, "id": ident, "from": f"{from_node}/{sender}", "name": name, "text": text,
+                              "tags": json.loads(tag_list), "created": created}
+                             for seq, ident, from_node, sender, name, text, tag_list, created in rows],
+                "last": last}
 
     def _attachments(self, db, ids: list[str]) -> list[dict] | None:
         """The metadata of the attached images, in the order given; an unknown id refuses the message."""
@@ -436,6 +495,17 @@ def application(hub: Hub, archive_db: str | None = None):
     async def whoami(request):
         return await handle(request, lambda node, body, _: {"node": node})
 
+    def int_param(request, name: str, default: int) -> int:
+        try:
+            return int(float(request.query_params.get(name, str(default))))
+        except ValueError:
+            return default
+
+    async def user_notes(request):
+        return await handle(request, lambda node, body, req: hub.notes(int_param(req, "after", 0),
+                                                                      req.query_params.getlist("tag"),
+                                                                      int_param(req, "limit", NOTES_LIMIT)))
+
     routes = [
         Route("/v1/whoami", whoami, methods=["GET"]),
         Route("/v1/sessions", sessions, methods=["GET", "PUT"]),
@@ -445,6 +515,7 @@ def application(hub: Hub, archive_db: str | None = None):
         Route("/v1/acks", acks, methods=["POST"]),
         Route("/v1/attachments", upload, methods=["POST"]),
         Route("/v1/attachments/{ident}", attachment, methods=["GET"]),
+        Route("/v1/user", user_notes, methods=["GET"]),
     ]
     if archive_db is not None:
         routes.append(Mount(_archive_path(), app=archive_application(hub, archive_db)))

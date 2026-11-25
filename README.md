@@ -305,6 +305,7 @@ One `live send` reaches any of these, and defaults to a dry run until `--yes`:
 | `NODE/claude:<full id>` (also `codex`, `omp`, `cursor`, `agy`) | a session on another machine, through the relay (see [Working across machines](#working-across-machines)); the id must be complete |
 | `@name` | the agent that chose that name: on this machine first, else one another machine published |
 | `claude-chat:<id or title>`, `cowork:<id or title>` | a saved Claude chat or Cowork session; it answers inline and the reply comes back in the receipt |
+| `user` | you: a note in your inbox, never a new turn; `--tag WORD` labels it |
 
 Inside an agent, the one-conv MCP tools `list_live_sessions` and `send_message`
 do the same; the sender is identified from the calling session.
@@ -314,7 +315,13 @@ one-conv live name lead                                       # others can write
 one-conv live send @reviewer 'the migration is on branch m42' --yes
 one-conv live send @reviewer 'fyi: CI is green' --fyi --yes   # lands in its feed, no wake
 one-conv live send claude:4f1a 'what does this show?' --image shot.png --yes
+one-conv live send user 'PR #42 needs your call on the API name' --tag pr-42 --yes
+one-conv live inbox                                           # unread notes to you, then marked read
+one-conv live inbox --tag pr-42                               # one topic; the others stay unread
 ```
+
+Notes to `user` live on the relay when this machine has one, so every machine
+shows the same inbox; without a relay they stay on this machine.
 
 | Harness | Delivery | Reaches an idle session? | Installed by `live install` |
 | --- | --- | --- | --- |

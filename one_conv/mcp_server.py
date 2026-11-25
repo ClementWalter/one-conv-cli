@@ -153,8 +153,14 @@ def create_server(update_notice: str = "") -> MCPServer:
     @server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=True),
                  structured_output=True)
     def send_message(to: str, text: str, ctx: Context, fyi: bool = False,
-                     expect_reply: bool = True, images: list[str] | None = None) -> dict[str, Any]:
+                     expect_reply: bool = True, images: list[str] | None = None,
+                     tags: list[str] | None = None) -> dict[str, Any]:
         """Send text as a new user turn to `to`: an address, id prefix, title, NODE/address or @name.
+
+        to="user" instead files a note in the person's inbox (`one-conv live inbox`), labelled
+        with `tags` (lowercase words) they can filter by. The person reads that inbox to keep up
+        with many agents, so send only what they must see: a decision you are blocked on, a
+        finished result, a failure. Never progress updates or acknowledgments.
 
         `to` may also be a saved Claude chat, `claude-chat:<ID prefix or title>`, or Cowork
         session, `cowork:<ID prefix or title>` (see the cloud chats listing): the turn is
@@ -174,8 +180,22 @@ def create_server(update_notice: str = "") -> MCPServer:
         meta = dict(ctx.request_context.meta or {})
         try:
             return router.send(to, text, router.whoami(meta=meta), fyi=fyi,
-                               reply="expected" if expect_reply else "none", images=images or ())
+                               reply="expected" if expect_reply else "none", images=images or (),
+                               tags=tags or ())
         except (router.LiveError, names.NameRefused, RuntimeError, OSError) as error:
+            raise ToolError(str(error)) from error
+
+    @server.tool(annotations=readonly, structured_output=True)
+    def read_user_inbox(tags: list[str] | None = None, after: int = 0, limit: int = 50) -> dict[str, Any]:
+        """Read the person's inbox: notes agents sent to "user", oldest first after seq `after`.
+
+        `tags` keeps notes carrying any of them. Reading here does not mark notes read;
+        `last` is the newest seq, to pass as `after` next time.
+        """
+        from .live import router
+        try:
+            return router.user_notes(after, tags or (), limit)
+        except router.LiveError as error:
             raise ToolError(str(error)) from error
 
     def _caller(ctx: Context):

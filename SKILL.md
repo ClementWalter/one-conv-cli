@@ -291,6 +291,11 @@ so two polite agents can acknowledge each other forever.
   wakes the receiver; it reads them in `local feed`. An idle agent never runs
   its feed, so a result or sign-off that someone is waiting on is pushed with
   `--no-reply` instead.
+- To reach the person, send to `user` (`send_message` with `to="user"`, or
+  `live send user TEXT --tag WORD --yes`). It files a note in their inbox, which
+  they read with `one-conv live inbox` from any machine on the relay. Send only
+  what they must see: a decision you are blocked on, a finished result, a
+  failure. Tag it with the topic (`deploy`, `pr-42`) so they can filter.
 - Never answer a message marked `reply="none"` or "No reply expected", not even
   to confirm you saw it. Still act on the evidence it carries.
 - Say "done" once. Close a subject in the last message that needs action

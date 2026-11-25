@@ -42,7 +42,7 @@ import pytest
 uvicorn = pytest.importorskip("uvicorn")
 pytest.importorskip("starlette")
 
-from one_conv.live import bridge, hubclient, router, tunnel
+from one_conv.live import bridge, held, hubclient, router, tunnel
 from one_conv.live.hub import Hub, application
 from one_conv.live.model import LiveSession, envelope
 
@@ -769,3 +769,117 @@ def test_live_status_shows_what_the_receiving_harness_did(sending, sent_to_mac):
     delivery = sending.mac.request("GET", "/v1/inbox?wait=0")["messages"][0]["delivery"]
     sending.mac.request("POST", "/v1/acks", {"delivery": delivery, "outcome": "accepted"})
     assert live_status(sent_to_mac) == "accepted: mac/claude:aaa\n"
+
+
+def test_live_status_shows_a_message_held_on_the_receiving_machine(sending, sent_to_mac):
+    delivery = sending.mac.request("GET", "/v1/inbox?wait=0")["messages"][0]["delivery"]
+    sending.mac.request("POST", "/v1/acks", {"delivery": delivery, "outcome": "held"})
+    assert live_status(sent_to_mac) == "held until mac/claude:aaa is idle\n"
+
+
+@pytest.fixture
+def busy(delivered, monkeypatch):
+    """SESSION mid-turn; set `state["status"] = "idle"` to end its turn."""
+    state = {"status": "busy"}
+
+    def listing(harness=None):
+        session = LiveSession("omp", "worker-1", "/work", "worker", state["status"])
+        return [session] if harness in (None, "omp") else []
+    monkeypatch.setattr(router, "list_all", listing)
+    return state
+
+
+def test_an_idle_push_to_a_busy_session_is_not_delivered_yet(hub, box, busy, delivered):
+    post(hub, when="idle")
+    box.step(wait=0)
+    assert delivered == []
+
+
+def test_the_sender_sees_an_idle_push_to_a_busy_session_held(hub, box, busy):
+    message = post(hub, when="idle")
+    box.step(wait=0)
+    assert outcome(hub, message) == "held"
+
+
+def test_a_held_push_reaches_the_session_once_it_is_idle(hub, box, busy, delivered):
+    post(hub, when="idle")
+    box.step(wait=0)
+    busy["status"] = "idle"
+    held.deliver_due(router.list_all, router.ADAPTERS)
+    assert len(delivered) == 1
+
+
+def test_a_held_push_keeps_the_senders_message_id(hub, box, busy, delivered):
+    message = post(hub, when="idle")
+    box.step(wait=0)
+    busy["status"] = "idle"
+    held.deliver_due(router.list_all, router.ADAPTERS)
+    assert f'id="{message["id"]}"' in delivered[0]
+
+
+def test_the_sender_sees_a_held_push_accepted_once_delivered(hub, box, busy):
+    message = post(hub, when="idle")
+    box.step(wait=0)
+    busy["status"] = "idle"
+    held.deliver_due(router.list_all, router.ADAPTERS)
+    box.step(wait=0)
+    assert outcome(hub, message) == "accepted"
+
+
+def test_a_held_delivery_handed_out_again_is_not_delivered_twice(hub, box, busy, delivered):
+    post(hub, when="idle")
+    item = box.client.request("GET", "/v1/inbox?wait=0")["messages"][0]
+    box.handle(item)
+    box.handle(item)
+    busy["status"] = "idle"
+    held.deliver_due(router.list_all, router.ADAPTERS)
+    held.deliver_due(router.list_all, router.ADAPTERS)
+    assert len(delivered) == 1
+
+
+def test_an_idle_push_to_an_idle_session_is_delivered_at_once(hub, box, busy, delivered):
+    busy["status"] = "idle"
+    post(hub, when="idle")
+    box.step(wait=0)
+    assert len(delivered) == 1
+
+
+def test_a_held_push_whose_session_ended_is_refused_to_the_sender(hub, box, busy, monkeypatch):
+    message = post(hub, when="idle")
+    box.step(wait=0)
+    monkeypatch.setattr(router, "list_all", lambda harness=None: [])
+    held.deliver_due(router.list_all, router.ADAPTERS, now=time.time() + held.GONE_SECONDS + 1)
+    box.step(wait=0)
+    assert outcome(hub, message) == "refused"
+
+
+def test_an_idle_send_to_another_machine_carries_when(sending):
+    router.send("mac/claude:aaa", "after your turn", SESSION, when="idle")
+    assert sending.mac.request("GET", "/v1/inbox?wait=0")["messages"][0]["when"] == "idle"
+
+
+def test_an_idle_send_through_a_relay_that_carries_when_has_no_warning(sending):
+    receipt = router.send("mac/claude:aaa", "after your turn", SESSION, when="idle")
+    assert "warning" not in receipt
+
+
+def test_an_idle_send_through_a_relay_that_drops_when_warns(sending, monkeypatch):
+    def strip_when(client, message, real_post):
+        receipt = real_post(client, {key: value for key, value in message.items() if key != "when"})
+        return {key: value for key, value in receipt.items() if key != "when"}
+    answering(monkeypatch, strip_when)
+    receipt = router.send("mac/claude:aaa", "after your turn", SESSION, when="idle")
+    assert "delivered at once" in receipt["warning"]
+
+
+def test_a_relay_without_the_held_outcome_leaves_the_delivery_pending(hub, box, busy, monkeypatch):
+    message = post(hub, when="idle")
+    real_request = hubclient.HubClient.request
+
+    def no_held(client, method, path, body=None):
+        if path == "/v1/acks" and body["outcome"] == "held":
+            raise hubclient.HubRefused(400, "outcome must be one of accepted, refused, unconfirmed")
+        return real_request(client, method, path, body)
+    monkeypatch.setattr(hubclient.HubClient, "request", no_held)
+    box.step(wait=0)
+    assert outcome(hub, message) == "stored"

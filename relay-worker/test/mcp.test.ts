@@ -271,6 +271,17 @@ describe("live tools", () => {
     expect((await body<{ messages: { from: string }[] }>(call("/v1/inbox?wait=0", { token: box }))).messages[0].from).toBe("claude-app/user");
   });
 
+  test("send_message with when=idle reaches the receiving bridge as idle", async () => {
+    const box = await mint("box");
+    await (await publish(box, [{ address: "claude:bbb", name: "worker" }])).text();
+    await tool(await connect(), "send_message", { to: "@worker", text: "after your turn", when: "idle" });
+    expect((await body<{ messages: { when?: string }[] }>(call("/v1/inbox?wait=0", { token: box }))).messages[0].when).toBe("idle");
+  });
+
+  test("send_message refuses an unknown when", async () => {
+    expect((await tool(await connect(), "send_message", { to: "@worker", text: "hi", when: "later" })).error).toContain("when must be now or idle");
+  });
+
   test("a retried send is stored once", async () => {
     const box = await mint("box");
     await (await publish(box, [{ address: "claude:bbb", name: "worker" }])).text();

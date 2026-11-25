@@ -29,8 +29,12 @@ import { pyLen, pyRepr, pyStr, truthy } from "./pyrepr";
 export const NODE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const MESSAGE_ID = /^[0-9a-f]{32}$/;
 const ATTACHMENT_ID = /^[0-9a-f]{32}$/;
-const OUTCOMES = ["accepted", "refused", "unconfirmed"];
+// `held` is provisional: the bridge keeps a when=idle message for a busy session and reports
+// a final outcome once it leaves; a held delivery is not handed out again.
+const OUTCOMES = ["accepted", "refused", "unconfirmed", "held"];
 const MODES = ["push", "fyi"];
+// now: delivered at once; idle: the receiving bridge holds it while the session is busy.
+const WHEN = ["now", "idle"];
 const REPLIES = ["expected", "none", "inline"];
 export const ATTACHMENT_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 export const ATTACHMENT_LIMIT = 10_000_000;
@@ -64,7 +68,7 @@ CREATE INDEX IF NOT EXISTS session_names ON sessions (name);
 CREATE TABLE IF NOT EXISTS posts (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_node TEXT NOT NULL, id TEXT NOT NULL,
     digest TEXT NOT NULL, target TEXT NOT NULL, sender TEXT NOT NULL, reply TEXT NOT NULL,
     mode TEXT NOT NULL DEFAULT 'push', text TEXT NOT NULL, created REAL NOT NULL, attachments TEXT,
-    UNIQUE (from_node, id));
+    timing TEXT NOT NULL DEFAULT 'now', UNIQUE (from_node, id));
 CREATE TABLE IF NOT EXISTS deliveries (delivery TEXT PRIMARY KEY, post INTEGER NOT NULL REFERENCES posts (seq),
     to_node TEXT NOT NULL, to_address TEXT NOT NULL, taken REAL, outcome TEXT, outcome_at REAL,
     UNIQUE (post, to_node, to_address));
@@ -77,7 +81,7 @@ CREATE TABLE IF NOT EXISTS notes (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_no
 `;
 // The columns a delivery is handed out with, by /v1/inbox and /v1/stream alike.
 const PENDING =
-  "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.reply, p.mode, p.text, p.created, p.attachments FROM deliveries d JOIN posts p ON p.seq = d.post";
+  "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.reply, p.mode, p.text, p.created, p.attachments, p.timing FROM deliveries d JOIN posts p ON p.seq = d.post";
 const TABLES = ["tokens", "nodes", "sessions", "deliveries", "posts", "attachments", "notes"];
 
 type Row = Record<string, SqlStorageValue>;
@@ -112,6 +116,10 @@ export class Relay extends DurableObject<Env> {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec(SCHEMA);
+    // A relay stored before `when` existed gains the column, every old post being `now`.
+    if (!this.sql.exec("PRAGMA table_info(posts)").toArray().some((column) => column.name === "timing")) {
+      this.sql.exec("ALTER TABLE posts ADD COLUMN timing TEXT NOT NULL DEFAULT 'now'");
+    }
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PING, PONG));
     const work = (handler: Work) => (request: Request, params: Record<string, string>) => this.handle(request, params, handler);
     this.routes = [
@@ -389,7 +397,9 @@ export class Relay extends DurableObject<Env> {
 
   private receipt(seq: number, id: string, duplicate: boolean): Body {
     const rows = this.sql.exec("SELECT delivery, to_node, to_address, outcome FROM deliveries WHERE post = ? ORDER BY rowid", seq).toArray();
-    return { id, duplicate, recipients: rows.map((row) => ({ to: `${row.to_node}/${row.to_address}`, delivery: row.delivery, status: row.outcome ?? "stored" })) };
+    const timing = this.sql.exec("SELECT timing FROM posts WHERE seq = ?", seq).one().timing;
+    // Echoing `when` tells the sender this relay carries it.
+    return { id, duplicate, ...(timing === "idle" ? { when: timing } : {}), recipients: rows.map((row) => ({ to: `${row.to_node}/${row.to_address}`, delivery: row.delivery, status: row.outcome ?? "stored" })) };
   }
 
   /** Store a post and its delivery; a retry of the same post returns its first receipt. */
@@ -408,10 +418,13 @@ export class Relay extends DurableObject<Env> {
     // push wakes the receiver; fyi only files a notice for it to read when it chooses.
     const mode = "mode" in message ? message.mode : "push";
     if (!MODES.includes(mode as string)) throw new HttpError(400, `mode must be one of ${MODES.join(", ")}`);
+    const timing = "when" in message ? message.when : "now";
+    if (!WHEN.includes(timing as string)) throw new HttpError(400, `when must be one of ${WHEN.join(", ")}`);
     const target = message.to;
     if (typeof target !== "string" || !target) throw new HttpError(400, "to must be NODE/harness:id, @name or user");
     if (target === USER) return this.note(node, id, sender, text, message, attached.length > 0);
-    const digest = await sha256(JSON.stringify([target, sender ?? null, reply, mode, text, ...attached]));
+    // `when` joins the digest only when idle, so a `now` post hashes as it always has.
+    const digest = await sha256(JSON.stringify([target, sender ?? null, reply, mode, text, ...attached, ...(timing === "idle" ? ["when=idle"] : [])]));
     const result = this.ctx.storage.transactionSync(() => {
       const existing = this.sql.exec("SELECT seq, digest FROM posts WHERE from_node = ? AND id = ?", node, id).toArray()[0];
       if (existing) {
@@ -426,7 +439,7 @@ export class Relay extends DurableObject<Env> {
       const [toNode, toAddress] = this.recipient(target);
       const seq = this.sql
         .exec(
-          "INSERT INTO posts (from_node, id, digest, target, sender, reply, mode, text, created, attachments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
+          "INSERT INTO posts (from_node, id, digest, target, sender, reply, mode, text, created, attachments, timing) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
           node,
           id,
           digest,
@@ -437,6 +450,7 @@ export class Relay extends DurableObject<Env> {
           text,
           now(),
           attachments ? JSON.stringify(attachments) : null,
+          timing as string,
         )
         .one().seq as number;
       const delivery = randomHex(16);
@@ -571,13 +585,22 @@ export class Relay extends DurableObject<Env> {
     });
   }
 
-  /** Record the outcome of one of this node's deliveries; the first outcome reported stands. */
+  /**
+   * Record the outcome of one of this node's deliveries; the first final outcome reported stands.
+   * `held` is recorded only on a delivery without an outcome, and a final outcome replaces it.
+   */
   ack(node: string, delivery: string, outcome: string): Body {
     if (!OUTCOMES.includes(outcome)) throw new HttpError(400, `outcome must be one of ${OUTCOMES.join(", ")}`);
     const row = this.sql.exec("SELECT outcome FROM deliveries WHERE delivery = ? AND to_node = ?", delivery, node).toArray()[0];
     if (!row) throw new HttpError(404, "no such delivery for this node");
-    this.sql.exec("UPDATE deliveries SET outcome = ?, outcome_at = ? WHERE delivery = ? AND outcome IS NULL", outcome, now(), delivery);
-    return { delivery, outcome: row.outcome ?? outcome };
+    this.sql.exec(
+      "UPDATE deliveries SET outcome = ?, outcome_at = ? WHERE delivery = ? AND (outcome IS NULL OR (outcome = 'held' AND ? != 'held'))",
+      outcome,
+      now(),
+      delivery,
+      outcome,
+    );
+    return { delivery, outcome: this.sql.exec("SELECT outcome FROM deliveries WHERE delivery = ?", delivery).one().outcome };
   }
 
   /** The outcome per recipient of a message this node sent; other nodes cannot read it. */
@@ -613,5 +636,6 @@ function handed(row: Row): Body {
     text: row.text,
     created: row.created,
     ...(row.attachments ? { attachments: parsedList(row.attachments) } : {}),
+    ...(row.timing === "idle" ? { when: row.timing } : {}),
   };
 }

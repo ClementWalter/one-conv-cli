@@ -12,7 +12,9 @@ Each delivery is claimed in a durable ingress log before its adapter runs, then 
 its outcome. A delivery seen again (a lost ack) is acked with the recorded outcome and never
 delivered twice. One claimed but without an outcome (the bridge stopped mid-delivery) is
 reported `unconfirmed` and not retried, since the agent may already have it. Outcomes say
-what the adapter did: `accepted` is not `read`.
+what the adapter did: `accepted` is not `read`. A delivery sent with when=idle to a busy
+session is acked `held` and kept in held.py's store; a background thread hands held messages
+to their sessions once idle, and the bridge then acks the relay with the final outcome.
 
 Beside delivery, the bridge syncs this machine's agent histories to the relay's archive, so
 any machine can read a session here as `NODE/harness:id` and continue it.
@@ -33,7 +35,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import hubclient, names, router, tunnel
+from . import held, hubclient, names, router, tunnel
 from .stream import InboxStream, StreamUnsupported
 from .model import envelope, live_home, parse_address
 
@@ -58,6 +60,8 @@ ARCHIVE_SYNC_MINUTES = 1.0
 ARCHIVE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "archive-sync.py"
 # How long one inbox long-poll or stream read waits; also how long a stop request can take to be noticed.
 POLL_SECONDS = 5.0
+# How often held messages are checked against their sessions' status.
+HELD_SECONDS = 1.0
 MAX_BACKOFF = 30.0
 
 
@@ -207,6 +211,7 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, fetch=
     Only a session listed live on this machine receives it: a stored-only Codex thread or a
     stopped one is refused rather than queued for nobody. An fyi is filed for `local feed`
     and never wakes the session. `fetch` saves an attached image locally and returns its path.
+    A push with when=idle to a busy session is stored in held.py and reported `held`.
     """
     target, sender_route = str(item.get("to", "")), str(item.get("from", ""))
     harness, _ = parse_address(target)
@@ -228,6 +233,9 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, fetch=
     wrapped = envelope(text, sender, sender_route, reply, item.get("id"), remote.get("name"))
     try:
         with router._rate_slot(sender_route, target):
+            if item.get("when") == "idle" and held.is_busy(session):
+                held.hold(str(item.get("id")), target, sender_route, wrapped, delivery=item["delivery"])
+                return "held", held.held_label(target)
             try:
                 detail = router.ADAPTERS[harness].deliver(session, wrapped)
                 # An adapter that cannot confirm a send says so in its answer rather than raising.
@@ -301,14 +309,37 @@ class Bridge:
             self.ingress.finish(item["delivery"], outcome, "the bridge stopped while delivering it")
         else:
             outcome = recorded
-        self.client.request("POST", "/v1/acks", {"delivery": item["delivery"], "outcome": outcome})
+        if outcome == "held":
+            self.ack_held(item["delivery"])
+        else:
+            self.client.request("POST", "/v1/acks", {"delivery": item["delivery"], "outcome": outcome})
         return outcome
+
+    def ack_held(self, delivery: str) -> None:
+        """Tell the relay a delivery is held; a relay without the `held` outcome hands it out again, harmlessly."""
+        try:
+            self.client.request("POST", "/v1/acks", {"delivery": delivery, "outcome": "held"})
+        except hubclient.HubRefused as error:
+            if error.status != 400:
+                raise
+            logger.info("the relay does not record held deliveries: %s", error)
+
+    def ack_finished_held(self) -> int:
+        """Ack the relay with the final outcome of every held delivery that left the held store."""
+        rows = held.unacked()
+        for row in rows:
+            outcome = held.RELAY_OUTCOMES[row["status"]]
+            self.client.request("POST", "/v1/acks", {"delivery": row["delivery"], "outcome": outcome})
+            self.ingress.finish(row["delivery"], outcome, row["detail"] or "")
+            held.mark_acked(row["delivery"])
+        return len(rows)
 
     def step(self, wait: float | None = None) -> None:
         wait = POLL_SECONDS if wait is None else wait
         if time.monotonic() - self.published_at >= PUBLISH_SECONDS:
             self.publish()
         self.drain_outbox()
+        self.ack_finished_held()
         if self.stream is not None:
             items = self.stream.receive(wait)
             for item in items:
@@ -398,6 +429,31 @@ class ArchiveLanes:
             lane.stop()
 
 
+class HeldDelivery:
+    """Delivers held messages every HELD_SECONDS in a thread, whether or not the hub is reachable."""
+
+    def __init__(self, seconds: float = HELD_SECONDS):
+        self.seconds = seconds
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="held-delivery", daemon=True)
+
+    def _run(self) -> None:
+        while not self.stopped.wait(self.seconds):
+            try:
+                held.deliver_due(router.list_all, router.ADAPTERS)
+            except (OSError, sqlite3.Error) as error:
+                # A transient store or listing failure must not end delivery for the bridge's lifetime.
+                logger.warning("held messages: %s", error)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stopped.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=10)
+
+
 def _report(**state) -> None:
     _write_private(bridge_dir() / "state.json", {**_read(bridge_dir() / "state.json"), **state, "pid": os.getpid()})
 
@@ -423,6 +479,8 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
     ingress, backoff = Ingress(bridge_dir() / "ingress.db"), 1.0
     stream = None
     archive = archive or ArchiveLanes()
+    holding = HeldDelivery()
+    holding.start()
     _report(hub=hub, node=node, started=time.time(), last_error=None)
     try:
         while not (stop_requested or stopping()):
@@ -476,6 +534,7 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
             backoff = min(backoff * 2, MAX_BACKOFF)
         return 0
     finally:
+        holding.stop()
         archive.stop()
         _report(stopped=time.time())
         lock.close()

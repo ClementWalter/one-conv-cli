@@ -300,6 +300,11 @@ so two polite agents can acknowledge each other forever.
   they read with `one-conv live inbox` from any machine on the relay. Send only
   what they must see: a decision you are blocked on, a finished result, a
   failure. Tag it with the topic (`deploy`, `pr-42`) so they can filter.
+- A pushed message reaches a busy agent at its next tool boundary and steers its
+  run (`--when now`, the default). When it should not interrupt the current run,
+  send it with `--when idle` (`when="idle"` in `send_message`): this machine's
+  bridge (`one-conv live serve`) holds it until the receiver's turn ends, and
+  `one-conv live status ID` shows "held until ... is idle", then the outcome.
 - Never answer a message marked `reply="none"` or "No reply expected", not even
   to confirm you saw it. Still act on the evidence it carries.
 - Say "done" once. Close a subject in the last message that needs action

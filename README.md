@@ -526,6 +526,15 @@ reference must point at the receiver's thread.
   `--no-reply`, because an idle agent does not run its feed. Nobody answers a
   message marked `reply="none"`, and the last message that needs action says
   "closing re: <subject>". A sign-off ends acknowledgments, not new findings.
+- Choose when a push lands. `--when now` (the default) reaches a busy agent at
+  its next tool boundary and steers its run. `--when idle` holds the message
+  until the receiver's current turn ends (a session reporting `busy` or
+  `waiting`), so it does not interrupt the run. The bridge (`live serve`)
+  delivers held messages, on the receiver's machine for a remote target, at most
+  once and under the same id; without a bridge here, an idle send to a busy local
+  agent is refused. `live status ID` shows `held until ... is idle`, then
+  `delivered`, `unconfirmed` or `expired` (the session ended, or stayed busy for
+  24 hours).
 
 Delivery order is not guaranteed across harnesses: a `codex queue` message can
 arrive after one sent later through another route.

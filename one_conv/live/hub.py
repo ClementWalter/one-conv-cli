@@ -32,8 +32,12 @@ NODE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 MESSAGE_ID = re.compile(r"[0-9a-f]{32}")
 # What the receiving bridge reports: the adapter accepted it (not that the agent read it),
 # the adapter refused it, or the bridge cannot tell (it crashed between claiming and reporting).
-OUTCOMES = ("accepted", "refused", "unconfirmed")
+# `held` is provisional: the bridge keeps a when=idle message for a busy session and reports
+# one of the others once it leaves; a held delivery is not handed out again.
+OUTCOMES = ("accepted", "refused", "unconfirmed", "held")
 MODES = ("push", "fyi")
+# now: delivered at once; idle: the receiving bridge holds it while the session is busy.
+WHEN = ("now", "idle")
 REPLIES = ("expected", "none", "inline")
 # Images a sender attaches to a message: stored on the relay, fetched by the receiving bridge.
 ATTACHMENT_TYPES = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}
@@ -63,7 +67,7 @@ CREATE TABLE IF NOT EXISTS sessions (node TEXT NOT NULL, address TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS posts (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_node TEXT NOT NULL, id TEXT NOT NULL,
     digest TEXT NOT NULL, target TEXT NOT NULL, sender TEXT NOT NULL, reply TEXT NOT NULL,
     mode TEXT NOT NULL DEFAULT 'push', text TEXT NOT NULL, created REAL NOT NULL, attachments TEXT,
-    UNIQUE (from_node, id));
+    timing TEXT NOT NULL DEFAULT 'now', UNIQUE (from_node, id));
 CREATE TABLE IF NOT EXISTS deliveries (delivery TEXT PRIMARY KEY, post INTEGER NOT NULL REFERENCES posts (seq),
     to_node TEXT NOT NULL, to_address TEXT NOT NULL, taken REAL, outcome TEXT, outcome_at REAL,
     UNIQUE (post, to_node, to_address));
@@ -108,6 +112,9 @@ class Hub:
         self.path, self.lock = path, threading.Lock()
         with self._db() as db:
             db.executescript(SCHEMA)
+            # A relay database from before `when` existed gains the column, every old post being `now`.
+            if "timing" not in {row[1] for row in db.execute("PRAGMA table_info(posts)")}:
+                db.execute("ALTER TABLE posts ADD COLUMN timing TEXT NOT NULL DEFAULT 'now'")
 
     @contextmanager
     def _db(self):
@@ -223,7 +230,9 @@ class Hub:
     def _receipt(db, seq: int, msg_id: str, duplicate: bool) -> dict:
         rows = db.execute("SELECT delivery, to_node, to_address, outcome FROM deliveries WHERE post = ? "
                           "ORDER BY rowid", (seq,)).fetchall()
-        return {"id": msg_id, "duplicate": duplicate,
+        timing = db.execute("SELECT timing FROM posts WHERE seq = ?", (seq,)).fetchone()[0]
+        # Echoing `when` tells the sender this relay carries it.
+        return {"id": msg_id, "duplicate": duplicate, **({"when": timing} if timing == "idle" else {}),
                 "recipients": [{"to": f"{n}/{a}", "delivery": d, "status": o or "stored"} for d, n, a, o in rows]}
 
     def send(self, node: str, message: dict) -> dict:
@@ -244,12 +253,17 @@ class Hub:
         mode = message.get("mode", "push")
         if mode not in MODES:
             raise HubError(400, f"mode must be one of {', '.join(MODES)}")
+        timing = message.get("when", "now")
+        if timing not in WHEN:
+            raise HubError(400, f"when must be one of {', '.join(WHEN)}")
         target = message.get("to")
         if not isinstance(target, str) or not target:
             raise HubError(400, "to must be NODE/harness:id, @name or user")
         if target == USER:
             return self._note(node, msg_id, sender, text, message, bool(attached))
-        digest = hashlib.sha256(json.dumps([target, sender, reply, mode, text, *attached]).encode()).hexdigest()
+        # `when` joins the digest only when idle, so a `now` post hashes as it always has.
+        fields = [target, sender, reply, mode, text, *attached] + (["when=idle"] if timing == "idle" else [])
+        digest = hashlib.sha256(json.dumps(fields).encode()).hexdigest()
         with self.lock, self._db() as db:
             # The duplicate check and the durable claim share one snapshot across server instances.
             db.execute("BEGIN IMMEDIATE")
@@ -265,9 +279,9 @@ class Hub:
                 raise HubError(403, "from must be a session this node published, or user/unknown")
             to_node, to_address = self._recipient(db, target)
             seq = db.execute("INSERT INTO posts (from_node, id, digest, target, sender, reply, mode, text, created,"
-                             " attachments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             " attachments, timing) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                              (node, msg_id, digest, target, sender, reply, mode, text, time.time(),
-                              json.dumps(attachments) if attachments else None)).lastrowid
+                              json.dumps(attachments) if attachments else None, timing)).lastrowid
             db.execute("INSERT INTO deliveries (delivery, post, to_node, to_address) VALUES (?, ?, ?, ?)",
                        (secrets.token_hex(16), seq, to_node, to_address))
             return self._receipt(db, seq, msg_id, False)
@@ -371,7 +385,7 @@ class Hub:
                 self._seen(db, node)
                 rows = db.execute(
                     "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.reply, p.mode, p.text,"
-                    " p.created, p.attachments FROM deliveries d JOIN posts p ON p.seq = d.post"
+                    " p.created, p.attachments, p.timing FROM deliveries d JOIN posts p ON p.seq = d.post"
                     " WHERE d.to_node = ? AND d.outcome IS NULL ORDER BY d.post LIMIT 50", (node,)).fetchall()
                 if rows:
                     db.executemany("UPDATE deliveries SET taken = ? WHERE delivery = ?",
@@ -382,12 +396,16 @@ class Hub:
 
     @classmethod
     def _handed(cls, row) -> dict:
-        d, i, a, fn, s, r, m, x, c, attachments = row
+        d, i, a, fn, s, r, m, x, c, attachments, timing = row
         return {"delivery": d, "id": i, "to": a, "from": f"{fn}/{s}", "reply": r, "mode": m, "text": x,
-                "created": c, **({"attachments": cls._parsed(attachments)} if attachments else {})}
+                "created": c, **({"attachments": cls._parsed(attachments)} if attachments else {}),
+                **({"when": timing} if timing == "idle" else {})}
 
     def ack(self, node: str, delivery: str, outcome: str) -> dict:
-        """Record the outcome of one of this node's deliveries; the first outcome reported stands."""
+        """Record the outcome of one of this node's deliveries; the first final outcome reported stands.
+
+        `held` is recorded only on a delivery without an outcome, and a final outcome replaces it.
+        """
         if outcome not in OUTCOMES:
             raise HubError(400, f"outcome must be one of {', '.join(OUTCOMES)}")
         with self.lock, self._db() as db:
@@ -395,9 +413,11 @@ class Hub:
                              (delivery, node)).fetchone()
             if row is None:
                 raise HubError(404, "no such delivery for this node")
-            db.execute("UPDATE deliveries SET outcome = ?, outcome_at = ? WHERE delivery = ? AND outcome IS NULL",
-                       (outcome, time.time(), delivery))
-        return {"delivery": delivery, "outcome": row[0] or outcome}
+            db.execute("UPDATE deliveries SET outcome = ?, outcome_at = ? WHERE delivery = ?"
+                       " AND (outcome IS NULL OR (outcome = 'held' AND ? != 'held'))",
+                       (outcome, time.time(), delivery, outcome))
+            current = db.execute("SELECT outcome FROM deliveries WHERE delivery = ?", (delivery,)).fetchone()[0]
+        return {"delivery": delivery, "outcome": current}
 
     def status(self, node: str, msg_id: str) -> dict:
         """The outcome per recipient of a message this node sent; other nodes cannot read it."""

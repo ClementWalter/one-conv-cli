@@ -132,7 +132,8 @@ def build_live_group(launcher: list[str]) -> click.Group:
             click.echo(f"{receipt['status']}: {receipt['to']}")
             if receipt.get("via") == "claude.ai":
                 click.echo(receipt["reply"])
-        if receipt.get("via") == "hub" and not as_json:
+        # A note to user has no delivery to follow; the relay tracks deliveries to agents only.
+        if receipt.get("via") == "hub" and receipt["to"] != router.USER and not as_json:
             click.echo(f"  follow it with: one-conv live status {receipt['id']}")
         if receipt.get("warning") and not as_json:
             click.echo(f"warning: {receipt['warning']}", err=True)

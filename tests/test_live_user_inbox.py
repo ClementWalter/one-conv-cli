@@ -109,3 +109,10 @@ def test_all_shows_read_notes_again(live_home):
 def test_send_to_user_is_a_dry_run_without_yes(live_home):
     CliRunner().invoke(cli, ["live", "send", "user", "hello"])
     assert router.user_notes()["messages"] == []
+
+
+def test_a_note_through_the_relay_prints_no_status_hint(live_home, monkeypatch):
+    monkeypatch.setattr(router, "send", lambda *a, **k: {"to": "user", "id": "0" * 32, "via": "hub",
+                                                           "status": "stored on the relay"})
+    result = CliRunner().invoke(cli, ["live", "send", "user", "hello", "--yes"])
+    assert "live status" not in result.output

@@ -393,3 +393,66 @@ def test_a_chunked_body_growing_too_large_is_refused(two_nodes):
 def test_a_malformed_message_is_refused(two_nodes, bad):
     _, url, mac, _ = two_nodes
     assert call(url, "/v1/messages", mac, "POST", {**message("box/claude:bbb"), **bad})[0] in (400, 404)
+
+
+# --- messages to the user ------------------------------------------------------------------------
+
+def test_a_message_to_user_is_stored_for_the_person(two_nodes):
+    _, url, mac, _ = two_nodes
+    sent = message("user")
+    assert call(url, "/v1/messages", mac, "POST", sent)[1] == {
+        "id": sent["id"], "duplicate": False, "recipients": [{"to": "user", "status": "stored"}]}
+
+
+def test_any_node_reads_a_note_another_node_filed(two_nodes):
+    _, url, mac, box = two_nodes
+    call(url, "/v1/messages", mac, "POST", message("user", text="PR is green", name="@lead"))
+    notes = call(url, "/v1/user", box)[1]["messages"]
+    assert [(n["from"], n["name"], n["text"]) for n in notes] == [("mac/claude:aaa", "@lead", "PR is green")]
+
+
+def test_a_retried_note_is_stored_once(two_nodes):
+    _, url, mac, _ = two_nodes
+    sent = message("user")
+    call(url, "/v1/messages", mac, "POST", sent)
+    call(url, "/v1/messages", mac, "POST", sent)
+    assert len(call(url, "/v1/user", mac)[1]["messages"]) == 1
+
+
+def test_a_note_wakes_no_bridge(two_nodes):
+    _, url, mac, _ = two_nodes
+    call(url, "/v1/messages", mac, "POST", message("user"))
+    assert call(url, "/v1/inbox", mac)[1] == {"messages": []}
+
+
+def test_after_skips_notes_already_read(two_nodes):
+    _, url, mac, _ = two_nodes
+    call(url, "/v1/messages", mac, "POST", message("user", text="one"))
+    call(url, "/v1/messages", mac, "POST", message("user", text="two"))
+    assert [n["text"] for n in call(url, "/v1/user?after=1", mac)[1]["messages"]] == ["two"]
+
+
+def test_a_tag_keeps_only_notes_carrying_it(two_nodes):
+    _, url, mac, _ = two_nodes
+    call(url, "/v1/messages", mac, "POST", message("user", text="deploy done", tags=["deploy"]))
+    call(url, "/v1/messages", mac, "POST", message("user", text="idea", tags=["ideas"]))
+    assert [n["text"] for n in call(url, "/v1/user?tag=deploy", mac)[1]["messages"]] == ["deploy done"]
+
+
+def test_last_is_the_newest_note_even_when_the_tag_skips_it(two_nodes):
+    _, url, mac, _ = two_nodes
+    call(url, "/v1/messages", mac, "POST", message("user", tags=["deploy"]))
+    call(url, "/v1/messages", mac, "POST", message("user", tags=["ideas"]))
+    assert call(url, "/v1/user?tag=deploy", mac)[1]["last"] == 2
+
+
+@pytest.mark.parametrize("extra,status", [
+    ({"tags": ["Deploy"]}, 400),
+    ({"tags": list("abcdefghi")}, 400),
+    ({"name": 3}, 400),
+    ({"attachments": ["0" * 32]}, 400),
+    ({"from": "claude:bbb"}, 403),
+], ids=["upper-case tag", "too many tags", "non-string name", "attachment", "another node's session"])
+def test_a_malformed_note_is_refused(two_nodes, extra, status):
+    _, url, mac, _ = two_nodes
+    assert call(url, "/v1/messages", mac, "POST", message("user", **extra))[0] == status

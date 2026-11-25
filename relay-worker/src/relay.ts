@@ -16,6 +16,9 @@
  * socket opens and when a send creates it, and acks still go through POST /v1/acks. The object
  * sleeps between frames: a socket is found again by its node tag, never through instance memory,
  * and the runtime answers the bridge's "ping" with "pong" without waking it.
+ *
+ * A message to `user` is for the person, not an agent: it is filed as a note with optional tags
+ * that any of the person's nodes reads back in order through GET /v1/user, and no bridge is woken.
  */
 
 import { DurableObject } from "cloudflare:workers";
@@ -40,6 +43,12 @@ export const MAX_WAIT = 30;
 export const LEASE_SECONDS = 60;
 const PRODUCTS = ["cursor-cli", "cursor-ide"];
 const INBOX_LIMIT = 50;
+// The address of the person every node works for; no session can publish it.
+export const USER = "user";
+export const TAG = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const TAGS_PER_NOTE = 8;
+const NAME_LIMIT = 200;
+export const NOTES_LIMIT = 200;
 // Keepalive text frames the runtime answers itself, so a ping never wakes a hibernated object.
 export const PING = "ping";
 export const PONG = "pong";
@@ -62,11 +71,14 @@ CREATE TABLE IF NOT EXISTS deliveries (delivery TEXT PRIMARY KEY, post INTEGER N
 CREATE INDEX IF NOT EXISTS pending ON deliveries (to_node, outcome, post);
 CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, node TEXT NOT NULL, media_type TEXT NOT NULL,
     size INTEGER NOT NULL, created REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS notes (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_node TEXT NOT NULL, id TEXT NOT NULL,
+    digest TEXT NOT NULL, sender TEXT NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL, tags TEXT NOT NULL,
+    created REAL NOT NULL, UNIQUE (from_node, id));
 `;
 // The columns a delivery is handed out with, by /v1/inbox and /v1/stream alike.
 const PENDING =
   "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.reply, p.mode, p.text, p.created, p.attachments FROM deliveries d JOIN posts p ON p.seq = d.post";
-const TABLES = ["tokens", "nodes", "sessions", "deliveries", "posts", "attachments"];
+const TABLES = ["tokens", "nodes", "sessions", "deliveries", "posts", "attachments", "notes"];
 
 type Row = Record<string, SqlStorageValue>;
 type Body = Record<string, unknown>;
@@ -116,6 +128,7 @@ export class Relay extends DurableObject<Env> {
       { pattern: path("/v1/acks"), methods: ["POST"], handle: work((node, body) => this.ack(node, pyStr(body.delivery ?? null), pyStr(body.outcome ?? null))) },
       { pattern: path("/v1/attachments"), methods: ["POST"], handle: (request) => this.upload(request) },
       { pattern: path("/v1/attachments/{ident}"), methods: ["GET"], handle: (request, params) => this.download(request, params.ident) },
+      { pattern: path("/v1/user"), methods: ["GET"], handle: work((_, __, request) => this.notes(new URL(request.url))) },
     ];
   }
 
@@ -169,7 +182,7 @@ export class Relay extends DurableObject<Env> {
   /** Empties every table and attachment; only reachable when the deployment enables resets (tests). */
   async reset(): Promise<void> {
     for (const table of TABLES) this.sql.exec(`DELETE FROM ${table}`);
-    this.sql.exec("DELETE FROM sqlite_sequence WHERE name = 'posts'");
+    this.sql.exec("DELETE FROM sqlite_sequence WHERE name IN ('posts', 'notes')");
     for (;;) {
       const listed = await this.env.ARCHIVE.list({ prefix: "attachments/" });
       if (!listed.objects.length) break;
@@ -396,7 +409,8 @@ export class Relay extends DurableObject<Env> {
     const mode = "mode" in message ? message.mode : "push";
     if (!MODES.includes(mode as string)) throw new HttpError(400, `mode must be one of ${MODES.join(", ")}`);
     const target = message.to;
-    if (typeof target !== "string" || !target) throw new HttpError(400, "to must be NODE/harness:id or @name");
+    if (typeof target !== "string" || !target) throw new HttpError(400, "to must be NODE/harness:id, @name or user");
+    if (target === USER) return this.note(node, id, sender, text, message, attached.length > 0);
     const digest = await sha256(JSON.stringify([target, sender ?? null, reply, mode, text, ...attached]));
     const result = this.ctx.storage.transactionSync(() => {
       const existing = this.sql.exec("SELECT seq, digest FROM posts WHERE from_node = ? AND id = ?", node, id).toArray()[0];
@@ -431,6 +445,62 @@ export class Relay extends DurableObject<Env> {
     });
     if (result.wake) this.wake(result.wake.node, result.wake.delivery);
     return result.receipt;
+  }
+
+  /** File a message to the person; a retry of the same note returns its first receipt. */
+  private async note(node: string, id: string, sender: unknown, text: string, message: Body, attached: boolean): Promise<Body> {
+    if (attached) throw new HttpError(400, "a message to user carries text only");
+    const tags = truthy(message.tags) ? message.tags : [];
+    if (!Array.isArray(tags) || tags.length > TAGS_PER_NOTE || !tags.every((tag) => typeof tag === "string" && TAG.test(tag))) {
+      throw new HttpError(400, `tags is a list of at most ${TAGS_PER_NOTE} lowercase words (letters, digits, dashes)`);
+    }
+    const name = truthy(message.name) ? message.name : "";
+    if (typeof name !== "string" || name.length > NAME_LIMIT) throw new HttpError(400, `name is a string of at most ${NAME_LIMIT} characters`);
+    const unique = [...new Set(tags as string[])];
+    const digest = await sha256(JSON.stringify([USER, sender ?? null, name, text, ...unique]));
+    return this.ctx.storage.transactionSync(() => {
+      const existing = this.sql.exec("SELECT seq, digest FROM notes WHERE from_node = ? AND id = ?", node, id).toArray()[0];
+      if (existing && existing.digest !== digest) throw new HttpError(409, "this id was already used for a different message; send it under a new id");
+      if (!existing && (typeof sender !== "string" || (!this.published(node, sender) && sender !== "user" && sender !== "unknown"))) {
+        throw new HttpError(403, "from must be a session this node published, or user/unknown");
+      }
+      if (!existing) {
+        this.sql.exec(
+          "INSERT INTO notes (from_node, id, digest, sender, name, text, tags, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          node, id, digest, sender as string, name, text, JSON.stringify(unique), now(),
+        );
+      }
+      return { id, duplicate: Boolean(existing), recipients: [{ to: USER, status: "stored" }] };
+    });
+  }
+
+  /**
+   * Notes after `after`, oldest first, at most `limit`; `tag` (repeatable) keeps notes carrying any of them.
+   * `last` is the newest note's seq overall, so a reader's cursor can move past notes its filter skipped.
+   */
+  notes(url: URL): Body {
+    const after = Math.max(0, Math.trunc(pyFloat(url.searchParams.get("after") ?? "0") ?? 0));
+    const asked = Math.trunc(pyFloat(url.searchParams.get("limit") ?? String(NOTES_LIMIT)) ?? NOTES_LIMIT);
+    const limit = Math.max(1, Math.min(asked, NOTES_LIMIT));
+    const tags = url.searchParams.getAll("tag");
+    if (!tags.every((tag) => TAG.test(tag))) throw new HttpError(400, "a tag is lowercase letters, digits and dashes");
+    const filter = tags.length ? ` AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value IN (${tags.map(() => "?").join(", ")}))` : "";
+    const rows = this.sql
+      .exec(`SELECT seq, id, from_node, sender, name, text, tags, created FROM notes WHERE seq > ?${filter} ORDER BY seq LIMIT ?`, after, ...tags, limit)
+      .toArray();
+    const last = (this.sql.exec("SELECT MAX(seq) AS last FROM notes").one().last as number | null) ?? 0;
+    return {
+      messages: rows.map((row) => ({
+        seq: row.seq,
+        id: row.id,
+        from: `${row.from_node}/${row.sender}`,
+        name: row.name,
+        text: row.text,
+        tags: parsedList(row.tags),
+        created: row.created,
+      })),
+      last,
+    };
   }
 
   /** The metadata of the attached images, in the order given; an unknown id refuses the message. */
@@ -521,7 +591,7 @@ function waitParam(request: Request): number {
   return pyFloat(query(new URL(request.url), "wait") ?? "0") ?? 0;
 }
 
-function parsedAttachments(text: SqlStorageValue): unknown[] {
+function parsedList(text: SqlStorageValue): unknown[] {
   try {
     const rows = text ? JSON.parse(text as string) : [];
     return Array.isArray(rows) ? rows : [];
@@ -540,6 +610,6 @@ function handed(row: Row): Body {
     mode: row.mode,
     text: row.text,
     created: row.created,
-    ...(row.attachments ? { attachments: parsedAttachments(row.attachments) } : {}),
+    ...(row.attachments ? { attachments: parsedList(row.attachments) } : {}),
   };
 }

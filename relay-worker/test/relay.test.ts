@@ -300,3 +300,72 @@ describe("attachments", () => {
     expect((await call("/v1/attachments/zz", { token: mac })).status).toBe(400);
   });
 });
+
+describe("messages to the user", () => {
+  type Notes = { messages: { seq: number; from: string; name: string; text: string; tags: string[] }[]; last: number };
+
+  test("a message to user is stored for the person", async () => {
+    const { mac } = await twoNodes();
+    expect(await body(call("/v1/messages", { method: "POST", token: mac, body: message("user", { id: "a".repeat(32) }) }))).toEqual({
+      id: "a".repeat(32),
+      duplicate: false,
+      recipients: [{ to: "user", status: "stored" }],
+    });
+  });
+
+  test("any node reads a note another node filed", async () => {
+    const { mac, box } = await twoNodes();
+    await (await call("/v1/messages", { method: "POST", token: mac, body: message("user", { text: "PR is green", name: "@lead" }) })).text();
+    const { messages } = await body<Notes>(call("/v1/user", { token: box }));
+    expect(messages.map((m) => [m.from, m.name, m.text])).toEqual([["mac/claude:aaa", "@lead", "PR is green"]]);
+  });
+
+  test("a retried note is stored once", async () => {
+    const { mac } = await twoNodes();
+    const sent = message("user");
+    await (await call("/v1/messages", { method: "POST", token: mac, body: sent })).text();
+    await (await call("/v1/messages", { method: "POST", token: mac, body: sent })).text();
+    expect((await body<Notes>(call("/v1/user", { token: mac }))).messages.length).toBe(1);
+  });
+
+  test("a note reuses no delivery: the bridge inbox stays empty", async () => {
+    const { mac } = await twoNodes();
+    await (await call("/v1/messages", { method: "POST", token: mac, body: message("user") })).text();
+    expect(await body(call("/v1/inbox", { token: mac }))).toEqual({ messages: [] });
+  });
+
+  test("after skips notes already read", async () => {
+    const { mac } = await twoNodes();
+    for (const text of ["one", "two"]) await (await call("/v1/messages", { method: "POST", token: mac, body: message("user", { text }) })).text();
+    expect((await body<Notes>(call("/v1/user?after=1", { token: mac }))).messages.map((m) => m.text)).toEqual(["two"]);
+  });
+
+  test("a tag keeps only notes carrying it", async () => {
+    const { mac } = await twoNodes();
+    await (await call("/v1/messages", { method: "POST", token: mac, body: message("user", { text: "deploy done", tags: ["deploy"] }) })).text();
+    await (await call("/v1/messages", { method: "POST", token: mac, body: message("user", { text: "idea", tags: ["ideas"] }) })).text();
+    expect((await body<Notes>(call("/v1/user?tag=deploy", { token: mac }))).messages.map((m) => m.text)).toEqual(["deploy done"]);
+  });
+
+  test("last is the newest note even when the tag filter skips it", async () => {
+    const { mac } = await twoNodes();
+    await (await call("/v1/messages", { method: "POST", token: mac, body: message("user", { tags: ["deploy"] }) })).text();
+    await (await call("/v1/messages", { method: "POST", token: mac, body: message("user", { tags: ["ideas"] }) })).text();
+    expect((await body<Notes>(call("/v1/user?tag=deploy", { token: mac }))).last).toBe(2);
+  });
+
+  test.each([
+    ["an upper-case tag", { tags: ["Deploy"] }, 400],
+    ["too many tags", { tags: ["a", "b", "c", "d", "e", "f", "g", "h", "i"] }, 400],
+    ["a non-string name", { name: 3 }, 400],
+    ["an attachment", { attachments: ["0".repeat(32)] }, 400],
+    ["another node's session as sender", { from: "claude:bbb" }, 403],
+  ])("a note with %s is refused", async (_, extra, status) => {
+    const { mac } = await twoNodes();
+    expect((await call("/v1/messages", { method: "POST", token: mac, body: message("user", extra) })).status).toBe(status);
+  });
+
+  test("a note needs a token to be read", async () => {
+    expect((await call("/v1/user")).status).toBe(401);
+  });
+});

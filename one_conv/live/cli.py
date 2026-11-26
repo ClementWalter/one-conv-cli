@@ -9,7 +9,7 @@ import time
 
 import click
 
-from . import agy, cursor, held, hubclient, names, router, spawn
+from . import agy, cursor, held, hubclient, names, router, share, spawn
 from .. import cloud_send
 from . import install as installer
 from .model import HARNESSES
@@ -66,7 +66,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
             context = (f"[{s.product}] " if s.product else "") + (s.title or s.cwd)
             click.echo(f"{s.address:<{width}}  {s.status or '-':<10}  {s.delivery:<15}  {context}")
 
-    @live.command("send", context_settings=HELP, epilog="\b\nExamples:\n  one-conv live send @reviewer 'PR #20 is ready' --yes\n  one-conv live send codex:019a 'rerun the suite' --yes\n  one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes\n  one-conv live send @reviewer 'build is green' --fyi --yes\n  one-conv live send @builder 'after this, rebase on main' --when idle --yes\n  one-conv live send codex:019a --stdin --yes < findings.md\n  one-conv live send claude:4f1a 'what does this show?' --image shot.png --yes")
+    @live.command("send", context_settings=HELP, epilog="\b\nExamples:\n  one-conv live send @reviewer 'PR #20 is ready' --yes\n  one-conv live send codex:019a 'rerun the suite' --yes\n  one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes\n  one-conv live send @reviewer 'build is green' --fyi --yes\n  one-conv live send @builder 'after this, rebase on main' --when idle --yes\n  one-conv live send codex:019a --stdin --yes < findings.md\n  one-conv live send claude:4f1a 'what does this show?' --image shot.png --yes\n  one-conv live send 'https://<relay>/s/<id>#<secret>' 'what changed in the API?' --yes   # a share link")
     @click.argument("target")
     @click.argument("message", required=False)
     @click.option("--stdin", "from_stdin", is_flag=True, help="Read the message from stdin.")
@@ -83,9 +83,14 @@ def build_live_group(launcher: list[str]) -> click.Group:
     @click.option("--when", type=click.Choice(held.WHEN), default="now", show_default=True,
                   help="now: a busy agent takes it at its next tool boundary. idle: hold it until the "
                        "agent's current turn ends, so it does not steer the run (needs `live serve`).")
+    @click.option("--no-wait", is_flag=True,
+                  help="To a share link: post without waiting for the session's answer.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the delivery receipt as JSON.")
-    def send_command(target, message, from_stdin, sender, fyi, no_reply, images, tags, when, yes, as_json):
-        """Send MESSAGE to TARGET: an address, id prefix, title, NODE/address, @name, claude-chat: or cowork:.
+    def send_command(target, message, from_stdin, sender, fyi, no_reply, images, tags, when, no_wait, yes, as_json):
+        """Send MESSAGE to TARGET: an address, id prefix, title, NODE/address, @name, claude-chat:, cowork: or share link.
+
+        A share link (`https://<relay>/s/<id>#<secret>`, from someone's `live share`) reaches the
+        one session they shared; its answer is printed, like a claude-chat: reply.
 
         The message arrives as a new user turn wrapped with the sender's address and name,
         so the receiver can answer with the one-conv send_message tool. A session on another
@@ -102,6 +107,12 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
                 click.echo(f"  to:       user, in {'the relay' if hubclient.configured() else 'this machine'}'s inbox"
                            f"{' tagged ' + ', '.join(router.check_tags(list(tags))) if tags else ''}")
+                click.echo(f"  from:     {me.address if me else origin}")
+                return
+            if not yes and share.is_link(target):
+                click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
+                click.echo(f"  to:       {share.redacted(target)}, a session shared with you")
+                click.echo("  delivery: posted to the share; " + ("no wait" if no_wait else "its answer is printed here"))
                 click.echo(f"  from:     {me.address if me else origin}")
                 return
             if not yes and target.startswith(router.GUEST):
@@ -139,14 +150,15 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 _echo_images(images)
                 return
             receipt = router.send(target, message, me, origin, fyi=fyi,
-                                  reply="none" if no_reply else "expected", images=images, tags=tags, when=when)
-        except (router.LiveError, names.NameRefused, RuntimeError, OSError) as error:
+                                  reply="none" if no_reply else "expected", images=images, tags=tags, when=when,
+                                  wait_reply=not no_wait)
+        except (router.LiveError, names.NameRefused, share.ShareError, RuntimeError, OSError) as error:
             raise click.ClickException(str(error)) from None
         if as_json:
             click.echo(json.dumps(receipt))
         else:
             click.echo(f"{receipt['status']}: {receipt['to']}")
-            if receipt.get("via") == "claude.ai":
+            if receipt.get("reply") is not None:
                 click.echo(receipt["reply"])
         # Notes to user and answers to a guest have no delivery to follow; the relay tracks deliveries to agents only.
         if ((receipt.get("via") == "hub" and receipt["to"] != router.USER and receipt.get("delivery") != "guest")

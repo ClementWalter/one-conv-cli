@@ -167,6 +167,7 @@ export class Relay extends DurableObject<Env> {
       },
       { pattern: path("/v1/shares/{share}"), methods: ["DELETE"], handle: work((node, _, __, params) => this.shares.revoke(node, params.share)) },
       { pattern: path("/v1/shares/{share}/messages"), methods: ["GET", "POST"], handle: (request, params) => this.shares.guest(request, params.share) },
+      { pattern: path("/s/{share}/mcp"), methods: ["POST"], handle: (request, params) => this.shares.mcp(request, params.share) },
     ];
   }
 

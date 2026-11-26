@@ -9,6 +9,7 @@ as the self-hosted Python relay (`scripts/live-hub.py`).
 | --- | --- |
 | Live relay: node tokens, sessions, messages, invites, session shares | Durable Object `Relay` (SQLite) |
 | Guest page of a shared session (`/s/<id>`, `live share`) | `src/share-page.html`, bundled as text |
+| MCP server of a shared session for a guest's agent (`/s/<id>/mcp`, share secret as bearer token, no OAuth) | Durable Object `Relay` (`src/share-mcp.ts`); `ask` waits on an in-memory promise, so a wait costs no CPU |
 | Archive index | Durable Object `ArchiveIndex` (SQLite) |
 | Archive chunks and message images | R2 bucket, binding `ARCHIVE` |
 | OAuth grants of the remote MCP connector | KV namespace, binding `OAUTH_KV` |

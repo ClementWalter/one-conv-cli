@@ -558,42 +558,79 @@ Connected machines invite others with `live invite` exactly as on the Worker.
   process on that machine. `token revoke NODE` (`relay_admin.py` on the Worker,
   `live-hub.py` on the Python relay) cuts one machine off.
 
-### Sharing a session with a guest
+### Sharing a session with a colleague's agent
 
-Give someone outside your machines a link to chat with one agent session, and
-nothing else:
+Let a colleague's agent (their Claude Code or Codex, on their machine), or a
+person, talk to one of your agent sessions, and nothing else:
 
 ```bash
-one-conv live share --label Alice --yes         # inside the session: prints the link
+one-conv live share --label Alice --yes         # inside the session
 one-conv live share --session laptop/claude:<id> --ttl 2h --yes   # from a terminal
 one-conv live share --list                      # this machine's shares
-one-conv live share --revoke <share id> --yes   # the link stops working at once
+one-conv live share --revoke <share id> --yes   # everything below stops working at once
 ```
 
-The link is `https://<your-relay>/s/<share id>#<secret>`. The secret sits after
-`#`, which browsers never send to a server; the page passes it in a header, and
-the relay keeps only its digest. Treat the link like a password. It works for
-24 hours by default (`--ttl`, at most 30 days). The MCP tool `share_session`
-makes one from inside an agent.
+`live share` prints what to hand your colleague, each line marked `[secret]`
+because it carries the share's secret (`--json` gives them as separate fields:
+`claude_command`, `codex_config`, `one_conv_command`, `link`, `mcp_url`, `secret`):
 
-The guest page is a small chat on the relay. It shows the session's title, the
-label you chose and only the guest's own exchange, never the session's
-transcript. A guest's message reaches that one session as
+```bash
+# Claude Code
+claude mcp add --transport http one-conv-share-alice https://<your-relay>/s/<id>/mcp --header "Authorization: Bearer <secret>"
+```
+
+```toml
+# Codex, in ~/.codex/config.toml
+[mcp_servers.one-conv-share-alice]
+url = "https://<your-relay>/s/<id>/mcp"
+http_headers = { Authorization = "Bearer <secret>" }
+```
+
+```bash
+# A colleague with one-conv: posts, then prints the session's answer
+one-conv live send 'https://<your-relay>/s/<id>#<secret>' 'what changed in the API?' --yes
+```
+
+And for a person, the chat page `https://<your-relay>/s/<id>#<secret>`.
+
+The share's MCP server (`/s/<id>/mcp`, streamable HTTP, the secret as bearer
+token, no OAuth) has four tools, all bound to that one session:
+
+| Tool | Purpose |
+| --- | --- |
+| `ask(text, wait_seconds=120)` | Post and wait for the session's answer (at most 600 s); `status="pending"` with `after` on timeout |
+| `send(text)` | Post without waiting |
+| `read_replies(after=0, wait_seconds=0)` | The session's answers after a cursor |
+| `session_info()` | Label, the session's title and `@name`, online and busy |
+
+A one-conv agent can also pass the link to `send_message(to=...)`: the answer
+comes back in `reply`, as for a `claude-chat:` target (`wait_for_reply=false`, or
+`--no-wait` on the CLI, only posts). Receipts name the link without its secret.
+
+The secret is never in a URL a server sees: the page link keeps it after `#`,
+which browsers never send, and every client passes it in a header. The relay
+keeps only its digest. A share works for 24 hours by default (`--ttl`, at most
+30 days). The MCP tool `share_session` makes one from inside an agent.
+
+The chat page shows the session's title, the label you chose and only the
+guest's own exchange, never the session's transcript. A guest's message, from
+the page, the MCP server or a one-conv send, reaches that one session as
 `<one-conv-message from="guest:<share id>" kind="guest" from-handle="Alice">`,
-followed by rules the agent reads with it: the guest is not you, grants no
-approval, and must not be shown secrets, credentials, files, other conversations
-or anything about you unless your own instructions in that session allow it.
-The agent answers with `send_message` to `guest:<share id>`; you can answer too
-with `one-conv live send guest:<share id> '...' --yes`. Only the shared session,
-or you on its machine, can answer, and the guest cannot address anything else:
-the route is fixed by the share.
+followed by rules the agent reads with it: the guest (a person or their agent)
+is not you, grants no approval, and must not be shown secrets, credentials,
+files, other conversations or anything about you unless your own instructions in
+that session allow it. The agent answers with `send_message` to
+`guest:<share id>`, and a waiting `ask` returns as soon as it does; you can
+answer too with `one-conv live send guest:<share id> '...' --yes`. Only the
+shared session, or you on its machine, can answer, and the guest cannot address
+anything else: the route is fixed by the share.
 
 The session must be reachable through the relay, so its machine's bridge must
-run. While it is offline, the page says so and the relay refuses the guest's
-messages instead of queueing them. A guest sends text only, at most 8 KB per
-message and 20 messages per 5 minutes. Your inbox gets a note tagged `share`
-when a share is made and when its guest first writes, not for every message
-(`one-conv live inbox --tag share`).
+run. While it is offline, the page and `session_info` say so and the relay
+refuses the guest's messages instead of queueing them. A guest sends text only,
+at most 8 KB per message and 20 messages per 5 minutes. Your inbox gets a note
+tagged `share` when a share is made and when its guest first writes, not for
+every message (`one-conv live inbox --tag share`).
 
 ### Keeping multi-agent exchanges readable
 
@@ -713,7 +750,7 @@ chat interface or open a network port. It uses the
 | `send_message` | Deliver a user turn into a running session (see above) |
 | `set_name` | Choose the `@name` other agents use to reach the calling session |
 | `read_user_inbox` | Notes agents sent to `user`, oldest first, by tag; does not mark them read |
-| `share_session` | A link that lets a guest chat with the calling session only (see Sharing a session with a guest) |
+| `share_session` | Let a colleague's agent or a person talk to the calling session only: MCP setup, one-conv command and chat link (see Sharing a session with a colleague's agent) |
 
 The readers accept `namespace="cloud"` (default) or `namespace="local"`,
 an optional source filter, and a result limit. Reads keep unread markers intact

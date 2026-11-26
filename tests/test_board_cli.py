@@ -171,6 +171,16 @@ def test_a_download_reports_the_sha256(attached, tmp_path):
     assert result["sha256"] == hashlib.sha256(data).hexdigest()
 
 
+def test_a_download_from_a_read_only_folder_lands_in_downloads(attached, tmp_path, monkeypatch):
+    file_id, data = attached
+    locked = tmp_path / "locked"
+    locked.mkdir(mode=0o555)
+    monkeypatch.chdir(locked)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    run("get", "release", file_id)
+    assert (tmp_path / "home" / "Downloads" / "data.bin").read_bytes() == data
+
+
 def test_a_download_never_overwrites_without_force(attached, tmp_path):
     file_id, _ = attached
     (tmp_path / "copy.bin").write_text("mine")

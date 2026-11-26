@@ -1,9 +1,12 @@
 # Claude Desktop extension: a v* tag publishes one-conv-cli.mcpb on its GitHub release.
+# release.yml dispatches this on the tag it creates for every shipped change on main (a tag
+# pushed with the workflow token starts no push run); a tag pushed by hand runs it directly.
 name: extension
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read

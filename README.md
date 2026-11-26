@@ -4,12 +4,24 @@
 
 **Claude Desktop extension:** download
 [one-conv-cli.mcpb](https://github.com/ClementWalter/one-conv-cli/releases/latest/download/one-conv-cli.mcpb),
-double-click it and click Install. It serves the commands listed in
-[`mcpb.json`](mcpb.json): the `cloud` and `local` readers, and the `live`
-commands that list, name and message agents (`ls`, `send`, `status`, `inbox`,
-`whoami`, `name`, `names`, `install`). It does not run the bridge, invite or
-join machines, or start agents; use the CLI for those. It ships the credential
-helper prebuilt so `connect` needs no developer tools.
+double-click it and click Install. It serves every CLI command listed in
+[`mcpb.json`](mcpb.json) `tools`: the `cloud` and `local` readers, the `live`
+commands that list, name, message, spawn, stop, share and teleport agents and
+invite machines, the shared `board`, and `update`. It leaves out only what
+cannot run as a tool call: `live serve` (the long-running bridge), `live join`
+(installs that bridge as a login service), `live agy` (a terminal UI), `mcp`
+and the legacy top-level aliases; `tests/test_extension_scope.py` lists each
+with its reason and fails when a new command is neither shipped nor excluded.
+Commands that take `--yes` in the CLI stay dry runs until Claude passes
+`confirm=true`. It ships the credential helper prebuilt so `connect` needs no
+developer tools.
+
+Every merge to `main` that changes shipped files (anything but Markdown docs,
+`tests/` and `relay-worker/`; `SKILL.md` counts as shipped) publishes a new
+extension: `.github/workflows/release.yml` tags the next `vX.Y.Z` (the highest
+tag with its patch bumped) and runs `extension.yml` on it, which attaches the
+`.mcpb` to that release. The tag is the only version; for a new minor or major
+line, push its first tag by hand (`git tag v0.2.0 && git push origin v0.2.0`).
 
 Read and search your AI conversations from one CLI. Pull cloud conversations
 into a local history, or read sessions already saved by your coding tools.

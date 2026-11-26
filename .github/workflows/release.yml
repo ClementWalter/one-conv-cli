@@ -1,0 +1,62 @@
+# Every push to main that changes what the extension ships tags the next vX.Y.Z (patch bump of
+# the highest tag) and dispatches extension.yml on it, so the Desktop extension never lags the
+# CLI. The version lives only in the tag; mcp-bridge writes it into the packed manifest.json.
+# Pull requests and pushes first run the extension-scope drift test.
+name: release
+
+on:
+  push:
+    branches: [main]
+    # Docs, tests and the Cloudflare relay do not reach the extension; SKILL.md does (usage_guide).
+    paths:
+      - "**"
+      - "!**.md"
+      - "SKILL.md"
+      - "!tests/**"
+      - "!relay-worker/**"
+      - "!.github/workflows/relay-worker.yml"
+      - "!.github/workflows/privacy.yml"
+  pull_request:
+
+permissions:
+  contents: read
+
+# One release at a time on main, so two merges never compute the same next tag.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  scope:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+      - run: uv run --no-project --with-requirements tests/conftest.py python -m pytest -q tests/test_extension_scope.py tests/test_next_version.py
+
+  release:
+    needs: scope
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tag the next version and publish the extension
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$(git tag --points-at "$GITHUB_SHA" -l 'v*')" ]; then
+            echo "$GITHUB_SHA already has a v* tag; its push started extension.yml" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          tag="v$(git tag -l 'v*' | python3 scripts/next-version.py)"
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" > /dev/null
+          gh workflow run extension.yml --repo "$GITHUB_REPOSITORY" --ref "$tag"
+          echo "Tagged $tag at $GITHUB_SHA and dispatched extension.yml" >> "$GITHUB_STEP_SUMMARY"

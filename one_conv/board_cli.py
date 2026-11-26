@@ -1,6 +1,7 @@
 """`one-conv board`: post notes and files on shared topics, and read them later. Pull-only, quiet."""
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -23,6 +24,16 @@ def _size(size: int) -> str:
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1000
     return f"{size} B"
+
+
+def _download_dir() -> Path:
+    """The current folder, else ~/Downloads: an app-launched server (the Desktop extension) may run from /."""
+    here = Path.cwd()
+    if os.access(here, os.W_OK):
+        return here
+    downloads = Path.home() / "Downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    return downloads
 
 
 def _session():
@@ -169,7 +180,8 @@ def build_board_group() -> click.Group:
     @click.argument("topic")
     @click.argument("file_id")
     @click.option("-o", "--output", type=click.Path(dir_okay=False, writable=True),
-                  help="Where to write it; defaults to the file's name in the current folder.")
+                  help="Where to write it; defaults to the file's name in the current folder, "
+                       "or in ~/Downloads when that folder is read-only.")
     @click.option("--force", is_flag=True, help="Overwrite an existing file.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the file's metadata and path as JSON.")
     def get_command(topic, file_id, output, force, as_json):
@@ -178,7 +190,7 @@ def build_board_group() -> click.Group:
             meta, data = board.get_file(topic, file_id)
         except board.BoardError as error:
             fail(error)
-        path = Path(output) if output else Path.cwd() / meta["name"]
+        path = Path(output) if output else _download_dir() / meta["name"]
         if path.exists() and not force:
             raise click.ClickException(f"{path} exists; pass --force or -o another path.")
         path.write_bytes(data)

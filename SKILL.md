@@ -304,7 +304,9 @@ a person (logins, 2FA, secrets; never ask for secret values in chat). Then pick
 up the task: what isn't blocked now, the rest once provisioned. Read turns the brief omits with `one-conv local thread
 ORIGIN --around ...`. The other machine must have opted in with
 `one-conv live serve --accept-teleport`; if it refuses, tell the user that
-command.
+command. A node listed by `one-conv live box ls` is a cloud box: teleporting
+there powers it on first (about a minute), and it powers off after 30 minutes
+without a busy session, so finish by pushing your work.
 
 Keep exchanges reconstructable. Open each message with
 `to: <address>  cc: <addresses>  re: <subject>`. A relayed message is a user turn

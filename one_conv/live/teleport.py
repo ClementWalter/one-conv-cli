@@ -50,6 +50,10 @@ class TeleportError(Exception):
         self.screen = screen
 
 
+class NoAnswer(TeleportError):
+    """The target's bridge did not answer in time: it may be down, or still booting."""
+
+
 def post_request(hub: hubclient.HubClient, node: str, sender: str, request: dict,
                  sleep: Callable[[float], None] = time.sleep) -> str:
     """Post a request to `node`'s bridge under one id, retried on an unreachable relay; returns the id."""
@@ -82,7 +86,7 @@ def wait_answer(hub: hubclient.HubClient, node: str, message_id: str, timeout: f
             return row["outcome"], row.get("result") or {}
         if clock() >= deadline:
             state = "is working on it" if row.get("outcome") == "held" else "has not taken it"
-            raise TeleportError(f"{node} did not answer within {timeout:g}s ({node}'s bridge {state}); "
+            raise NoAnswer(f"{node} did not answer within {timeout:g}s ({node}'s bridge {state}); "
                                 f"check `one-conv live serve --status` on {node}")
         sleep(1.0)
 
@@ -160,10 +164,11 @@ def choose_mode(harness: str, explicit: str | None, detected: str) -> str:
 def run(node: str, sender: LiveSession, transcript: dict, inventory: Inventory, *, cwd: str | None = None,
         mode: str | None = None, check_only: bool = False, force: bool = False,
         hub: hubclient.HubClient | None = None, probe_timeout: float = PROBE_TIMEOUT,
-        spawn_wait: float = SPAWN_WAIT, **waiting) -> dict:
+        spawn_wait: float = SPAWN_WAIT, probe_attempts: int = 1, **waiting) -> dict:
     """Check `node`, write the provisioning brief, then (unless check_only or blocked) move `sender` there.
 
-    `transcript` carries the session's handoff `seed` and last request `summary`.
+    `transcript` carries the session's handoff `seed` and last request `summary`. `probe_attempts`
+    re-asks a target that did not answer, for a box still booting.
     """
     hub = hub or hubclient.configured()
     if hub is None:
@@ -175,8 +180,14 @@ def run(node: str, sender: LiveSession, transcript: dict, inventory: Inventory, 
     short = uuid.uuid4().hex[:8]
     repo = inventory.repo
     fetch = repo.branch if repo else ""
-    probe = ask(hub, node, sender.address, {"kind": "probe", "inventory": inventory.to_json(), "cwd": cwd,
-                                            "fetch": fetch, "ttl": REQUEST_TTL}, probe_timeout, **waiting)
+    for attempt in range(probe_attempts):
+        try:
+            probe = ask(hub, node, sender.address, {"kind": "probe", "inventory": inventory.to_json(), "cwd": cwd,
+                                                    "fetch": fetch, "ttl": REQUEST_TTL}, probe_timeout, **waiting)
+            break
+        except NoAnswer:
+            if attempt == probe_attempts - 1:
+                raise
     report["rows"], report["dir"] = probe.get("rows") or [], probe.get("dir") or ""
     report["blockers"] = blockers(report["rows"], force)
     pending = plan_snapshot(inventory) if needs_snapshot(inventory, report["rows"]) else None

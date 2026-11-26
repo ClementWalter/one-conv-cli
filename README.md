@@ -4,9 +4,12 @@
 
 **Claude Desktop extension:** download
 [one-conv-cli.mcpb](https://github.com/ClementWalter/one-conv-cli/releases/latest/download/one-conv-cli.mcpb),
-double-click it and click Install. It serves the `cloud` commands only
-(ChatGPT, Claude Chat, Codex cloud, Cowork), and ships the credential helper
-prebuilt so `connect` needs no developer tools.
+double-click it and click Install. It serves the commands listed in
+[`mcpb.json`](mcpb.json): the `cloud` and `local` readers, and the `live`
+commands that list, name and message agents (`ls`, `send`, `status`, `inbox`,
+`whoami`, `name`, `names`, `install`). It does not run the bridge, invite or
+join machines, or start agents; use the CLI for those. It ships the credential
+helper prebuilt so `connect` needs no developer tools.
 
 Read and search your AI conversations from one CLI. Pull cloud conversations
 into a local history, or read sessions already saved by your coding tools.
@@ -23,6 +26,23 @@ one, and read or continue a session wherever it ran.
 Cloud conversations are addressed by ID or title. Local sessions are grouped
 by the project where the agent ran.
 
+## Set up a machine
+
+1. Clone this repository and put `one-conv` on your `PATH`: symlink
+   `<checkout>/bin/one-conv` into `~/.local/bin`, or add `<checkout>/bin` to
+   `PATH` (see [Install](#install)).
+2. Run `one-conv live install --yes` so local agents can message each other.
+   Restart running agent sessions afterwards.
+3. Connect the machine to your relay. On a machine already connected, run
+   `one-conv live invite NODE` and paste the command it prints here
+   (`one-conv live join '<invite>' --yes`). For the very first machine, deploy
+   the relay first: [relay-worker/README.md](relay-worker/README.md).
+4. Optional: connect cloud accounts ([Connect a cloud account](#connect-a-cloud-account)).
+5. Optional: keep conversation history longer. Ask your agent to follow
+   "First-time setup: keep conversation history" in [SKILL.md](SKILL.md).
+
+Check the result with `one-conv live serve --status` and `one-conv live ls`.
+
 ## Install
 
 You need Python 3.12+ and [uv](https://docs.astral.sh/uv/). The launcher declares
@@ -30,9 +50,13 @@ its dependencies inline; uv resolves them on first use.
 
 Clone this repository and run `./bin/one-conv --help`. The CLI is
 [`one_conv_cli.py`](one_conv_cli.py); `bin/one-conv` and `bin/agent-conv` are
-symlinks to it, and `bin/one-conv.cmd` launches it on Windows. Add the
-checkout's `bin` directory to your `PATH` to use the shorter `one-conv` command
-shown below.
+symlinks to it, and `bin/one-conv.cmd` launches it on Windows. To use the
+shorter `one-conv` command shown below, link it onto your `PATH`:
+
+```bash
+mkdir -p ~/.local/bin
+ln -s "$PWD/bin/one-conv" ~/.local/bin/one-conv   # from the checkout
+```
 
 The repository also includes an [agent skill](SKILL.md). Install the checkout
 as a skill in your agent runtime to give it the same launcher and usage guide.
@@ -288,7 +312,9 @@ Agents on one machine work for the same user, so a message is a teammate's
 request to act on within that user's task. It is not the user typing: it grants
 no new approval and does not override the receiving agent's own permissions.
 
-Set it up once, then restart the sessions you want to reach:
+Set it up once, then restart the sessions you want to reach. To reach agents
+on other machines too, connect this one to a relay
+([Working across machines](#working-across-machines)).
 
 ```bash
 one-conv live install          # lists the missing pieces
@@ -437,27 +463,62 @@ permission and is not evidence of anyone's approval.
 Agents on different machines reach each other through a relay. Each machine runs
 one bridge, `live serve`, which needs no inbound network access. Agents never
 need to know where another one runs beyond its address, `NODE/harness:id` with
-the full id, as `live serve` publishes it, or its `@name`.
+the full id, as the bridge publishes it, or its `@name`.
 
-The relay is one process that serves the message API and the conversation
-archive every bridge syncs to, both behind the same node tokens. On the machine
-that hosts it (it binds to localhost by default):
+The relay serves the message API and the conversation archive every bridge syncs
+to, both behind per-machine node tokens. The default relay is a Cloudflare
+Worker you deploy once to your own account:
+[relay-worker/README.md](relay-worker/README.md) covers the deploy and the first
+machine.
+
+Add every next machine with an invite, without copying any secret:
 
 ```bash
-(umask 077; uv run scripts/live-hub.py token add laptop --db relay.db > laptop.token)   # one per machine, private
-uv run scripts/live-hub.py serve --db relay.db       # 127.0.0.1:8789; the archive goes to archive.db beside it
+one-conv live invite studio      # on a connected machine; prints the command below
+one-conv live join 'https://<your-relay>.workers.dev#studio.<code>'          # on the new machine: lists the steps
+one-conv live join 'https://<your-relay>.workers.dev#studio.<code>' --yes    # joins
 ```
 
-On each machine, with the token issued to it:
+`live join --yes` redeems the code for the node's token, saves the relay, node
+and token in `<live dir>/bridge/serve.json` (mode 600), applies the `live install`
+steps, installs the bridge as a login service and starts it. An invite works once
+and expires after 15 minutes (`--ttl 2h`, at most 24h). The code travels after
+`#`, which no HTTP client sends, and only ever in a request body. An invite for a
+node that already has a token needs `--replace`; joining then revokes the old one.
+
+Then, from any connected machine:
 
 ```bash
-one-conv live serve --hub ssh://me@relay-box --node laptop --token-stdin < laptop.token
-one-conv live serve --hub https://relay.example.com --node ci-runner --token-stdin < ci-runner.token
 one-conv live serve --status
-one-conv live serve --install --yes   # launchd or systemd: start on its own, restart after a crash
-one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes
-one-conv local thread ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03   # read it from here, and continue it
+one-conv live send studio/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes
+one-conv local thread studio/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03   # read it from here, and continue it
 ```
+
+`live serve` also connects a machine by hand, with a token from the relay's
+operator, and controls the bridge:
+
+```bash
+one-conv live serve --hub https://<your-relay>.workers.dev --node ci-runner --token-stdin < ci-runner.token
+one-conv live serve --install --yes   # launchd or systemd: start on its own, restart after a crash
+one-conv live serve --stop
+```
+
+#### Self-hosted alternative: the Python relay
+
+`scripts/live-hub.py` is the same relay as one Python process, for a machine you
+run yourself. It binds to localhost by default; reach it over `ssh://` or put it
+behind a TLS proxy.
+
+```bash
+uv run scripts/live-hub.py serve --db relay.db       # 127.0.0.1:8789; the archive goes to archive.db beside it
+uv run scripts/live-hub.py invite laptop --db relay.db --url ssh://me@relay-box   # prints a live join command
+(umask 077; uv run scripts/live-hub.py token add laptop --db relay.db > laptop.token)   # or a raw token
+one-conv live serve --hub ssh://me@relay-box --node laptop --token-stdin < laptop.token
+```
+
+Connected machines invite others with `live invite` exactly as on the Worker.
+
+#### How the bridge works
 
 - `--install --yes` hands the bridge to launchd on a Mac, or to a systemd user
   unit (`one-conv-bridge.service`) on Linux, once its settings are saved: it starts
@@ -494,7 +555,8 @@ one-conv local thread ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03   # r
   search` or the MCP `read_conversation`, so an agent elsewhere can pick up a
   session where it stopped. A node uploads only under its own name.
 - A machine's token vouches for the sessions its bridge publishes, not for each
-  process on that machine. `token revoke NODE` cuts one machine off.
+  process on that machine. `token revoke NODE` (`relay_admin.py` on the Worker,
+  `live-hub.py` on the Python relay) cuts one machine off.
 
 ### Keeping multi-agent exchanges readable
 
@@ -612,6 +674,8 @@ chat interface or open a network port. It uses the
 | `list_accounts` | Saved cloud account groups, without checking login validity |
 | `list_live_sessions` | Running agent sessions and their message addresses |
 | `send_message` | Deliver a user turn into a running session (see above) |
+| `set_name` | Choose the `@name` other agents use to reach the calling session |
+| `read_user_inbox` | Notes agents sent to `user`, oldest first, by tag; does not mark them read |
 
 The readers accept `namespace="cloud"` (default) or `namespace="local"`,
 an optional source filter, and a result limit. Reads keep unread markers intact
@@ -636,15 +700,13 @@ sessions, can read the archive every bridge syncs and message running agents.
 It uses OAuth 2.1 with dynamic client registration; there is one user, and the
 authorization page asks for the owner passphrase.
 
-Setup, once, from `relay-worker/`:
-
-```bash
-npx wrangler secret put MCP_OWNER_PASSPHRASE   # a long random passphrase
-npx wrangler deploy                            # creates the OAUTH_KV namespace on first deploy
-```
+It needs the `OAUTH_KV` namespace and the `MCP_OWNER_PASSPHRASE` secret, both
+set up by the deploy steps in [relay-worker/README.md](relay-worker/README.md).
+`wrangler.jsonc` pins the owner's KV namespace id; a deploy to another account
+creates its own namespace and replaces that id first.
 
 Then in Claude: Settings → Connectors → Add custom connector, URL
-`https://<worker-host>/mcp`, and type the passphrase when the page asks.
+`https://<your-relay>.workers.dev/mcp`, and type the passphrase when the page asks.
 
 | Tool | Purpose |
 | --- | --- |

@@ -19,6 +19,10 @@
  *
  * A message to `user` is for the person, not an agent: it is filed as a note with optional tags
  * that any of the person's nodes reads back in order through GET /v1/user, and no bridge is woken.
+ *
+ * A connected node (or the admin API) can invite a new machine: POST /v1/invites returns a
+ * one-time code bound to a node name, kept only as a digest, that expires within a day.
+ * POST /v1/join, unauthenticated, trades the code for that node's token exactly once.
  */
 
 import { DurableObject } from "cloudflare:workers";
@@ -58,6 +62,14 @@ export const PING = "ping";
 export const PONG = "pong";
 // Close code for a socket whose token was revoked or replaced: the bridge reads it as a 401.
 export const REVOKED = 4401;
+// An invite is short-lived: long enough to walk to the other machine, never a standing credential.
+export const INVITE_TTL = 15 * 60;
+const INVITE_TTL_MIN = 60;
+const INVITE_TTL_MAX = 24 * 3600;
+// Used and expired invites are kept this long for the operator to see, then pruned.
+const INVITE_KEEP = 7 * 24 * 3600;
+const MAX_CODE = 256;
+const JOIN_BODY = 4096;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tokens (node TEXT PRIMARY KEY, hash TEXT NOT NULL UNIQUE, created REAL NOT NULL);
@@ -78,11 +90,13 @@ CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, node TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS notes (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_node TEXT NOT NULL, id TEXT NOT NULL,
     digest TEXT NOT NULL, sender TEXT NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL, tags TEXT NOT NULL,
     created REAL NOT NULL, UNIQUE (from_node, id));
+CREATE TABLE IF NOT EXISTS invites (hash TEXT PRIMARY KEY, node TEXT NOT NULL, inviter TEXT NOT NULL,
+    takes_over INTEGER NOT NULL, created REAL NOT NULL, expires REAL NOT NULL, used REAL);
 `;
 // The columns a delivery is handed out with, by /v1/inbox and /v1/stream alike.
 const PENDING =
   "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.reply, p.mode, p.text, p.created, p.attachments, p.timing FROM deliveries d JOIN posts p ON p.seq = d.post";
-const TABLES = ["tokens", "nodes", "sessions", "deliveries", "posts", "attachments", "notes"];
+const TABLES = ["tokens", "nodes", "sessions", "deliveries", "posts", "attachments", "notes", "invites"];
 
 type Row = Record<string, SqlStorageValue>;
 type Body = Record<string, unknown>;
@@ -137,6 +151,8 @@ export class Relay extends DurableObject<Env> {
       { pattern: path("/v1/attachments"), methods: ["POST"], handle: (request) => this.upload(request) },
       { pattern: path("/v1/attachments/{ident}"), methods: ["GET"], handle: (request, params) => this.download(request, params.ident) },
       { pattern: path("/v1/user"), methods: ["GET"], handle: work((_, __, request) => this.notes(new URL(request.url))) },
+      { pattern: path("/v1/invites"), methods: ["POST"], handle: work((node, body) => this.invite(node, body)) },
+      { pattern: path("/v1/join"), methods: ["POST"], handle: (request) => this.join(request) },
     ];
   }
 
@@ -153,6 +169,82 @@ export class Relay extends DurableObject<Env> {
     // A socket opened with the replaced token must not outlive it.
     this.closeStreams(node, "this node's token was replaced");
     return { token };
+  }
+
+  /**
+   * A one-time code that POST /v1/join trades for NODE's token; `by` is the inviting node ("" for
+   * the admin API). A node that already has a token is refused unless `replace`, so an invite
+   * never silently takes over a running machine's identity.
+   */
+  async invite(by: string, body: Body): Promise<{ node: string; code: string; expires: number }> {
+    const { node } = body;
+    const ttl = "ttl" in body ? body.ttl : INVITE_TTL;
+    const replace = "replace" in body ? body.replace : false;
+    if (typeof node !== "string" || !NODE.test(node)) throw new HttpError(400, `node names are lowercase letters, digits and dashes: ${pyRepr(node ?? null)}`);
+    if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < INVITE_TTL_MIN || ttl > INVITE_TTL_MAX) {
+      throw new HttpError(400, `ttl is a whole number of seconds from ${INVITE_TTL_MIN} to ${INVITE_TTL_MAX}`);
+    }
+    if (typeof replace !== "boolean") throw new HttpError(400, "replace is true or false");
+    const code = tokenUrlsafe();
+    const digest = await sha256(code);
+    const at = now();
+    this.ctx.storage.transactionSync(() => {
+      if (!replace && this.sql.exec("SELECT 1 FROM tokens WHERE node = ?", node).toArray().length) {
+        throw new HttpError(409, `node ${node} already has a token; invite with replace to take it over`);
+      }
+      this.sql.exec("DELETE FROM invites WHERE expires < ?", at - INVITE_KEEP);
+      this.sql.exec("INSERT INTO invites VALUES (?, ?, ?, ?, ?, ?, NULL)", digest, node, by, replace ? 1 : 0, at, at + ttl);
+    });
+    return { node, code, expires: at + ttl };
+  }
+
+  /** `invite` for the admin API, whose errors cross the RPC boundary as values. */
+  async adminInvite(body: Body): Promise<{ invite?: { node: string; code: string; expires: number }; status?: number; error?: string }> {
+    try {
+      return { invite: await this.invite("", body) };
+    } catch (error) {
+      if (error instanceof HttpError) return { status: error.status, error: error.message };
+      throw error;
+    }
+  }
+
+  /** NODE's new token for an unused, unexpired invite code; the code is spent in the same transaction. */
+  private async join(request: Request): Promise<Response> {
+    try {
+      // No token: the invite code in the body is the credential.
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(utf8(await boundedBody(request, JOIN_BODY, new HttpError(413, "request too large"))) || "{}");
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        throw new HttpError(400, "invalid JSON");
+      }
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new HttpError(400, "the request body must be a JSON object");
+      const { code } = parsed as Body;
+      if (typeof code !== "string" || !code || code.length > MAX_CODE) throw new HttpError(400, "code is the invite code `one-conv live invite` printed");
+      const digest = await sha256(code);
+      const token = tokenUrlsafe();
+      const tokenHash = await sha256(token);
+      const node = this.ctx.storage.transactionSync(() => {
+        const row = this.sql.exec("SELECT node, takes_over, expires, used FROM invites WHERE hash = ?", digest).toArray()[0];
+        if (!row) throw new HttpError(404, "unknown invite code");
+        if (row.used !== null) throw new HttpError(410, "this invite was already used; ask for a new one with `one-conv live invite`");
+        if ((row.expires as number) < now()) throw new HttpError(410, "this invite expired; ask for a new one with `one-conv live invite`");
+        const invited = row.node as string;
+        if (!row.takes_over && this.sql.exec("SELECT 1 FROM tokens WHERE node = ?", invited).toArray().length) {
+          throw new HttpError(409, `node ${invited} got a token after this invite was made; ask for one with --replace`);
+        }
+        this.sql.exec("UPDATE invites SET used = ? WHERE hash = ?", now(), digest);
+        this.sql.exec("INSERT OR REPLACE INTO tokens VALUES (?, ?, ?)", invited, tokenHash, now());
+        return invited;
+      });
+      // A socket opened with a replaced token must not outlive it.
+      this.closeStreams(node, "this node's token was replaced");
+      return json({ node, token });
+    } catch (error) {
+      if (error instanceof HttpError) return errorResponse(error.status, error.message);
+      throw error;
+    }
   }
 
   revoke(node: string): boolean {

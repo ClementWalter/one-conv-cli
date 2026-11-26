@@ -110,7 +110,7 @@ def _systemctl(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=60, check=False)
 
 
-def _require_supported() -> None:
+def require_supported() -> None:
     if sys.platform != "darwin" and not sys.platform.startswith("linux"):
         raise RuntimeError("The login service needs launchd (macOS) or systemd (Linux); run the bridge under tmux instead.")
 
@@ -134,7 +134,7 @@ def _wait_until_unloaded(timeout: float = 20.0) -> None:
 def install() -> list[str]:
     """Write the job and start it. A bridge already running outside launchd is stopped first,
     since only one bridge per machine can hold the serve lock."""
-    _require_supported()
+    require_supported()
     if not bridge.settings().get("hub"):
         raise RuntimeError("Run `one-conv live serve --hub ... --node ... --token-stdin` once before installing it.")
     notes = []
@@ -177,7 +177,7 @@ def _install_systemd(path_env: str) -> list[str]:
 
 def uninstall() -> list[str]:
     """Stop the job and remove it; the bridge then runs only when started by hand."""
-    _require_supported()
+    require_supported()
     if not installed():
         return ["the login service is not installed"]
     if sys.platform == "darwin":

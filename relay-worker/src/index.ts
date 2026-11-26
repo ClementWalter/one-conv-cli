@@ -3,7 +3,7 @@
  *
  *   /v1/...          the live relay, handled by the Relay Durable Object
  *   /archive/v1/...  the conversation archive (ArchiveIndex Durable Object + R2), same node tokens
- *   /admin/...       token minting and archive import, guarded by the RELAY_ADMIN_TOKEN secret
+ *   /admin/...       token minting, invites and archive import, guarded by the RELAY_ADMIN_TOKEN secret
  *   /mcp, /authorize, /oauth/..., /.well-known/oauth-...
  *                    the remote MCP server for the Claude app, behind OAuth (mcp-auth.ts)
  */
@@ -62,6 +62,14 @@ const ADMIN: Route<Env>[] = [
     pattern: path("/admin/tokens/{node}"),
     methods: ["DELETE"],
     handle: async (_, params, env) => ((await relay(env).revoke(params.node)) ? json({ revoked: params.node }) : errorResponse(404, `no token for node ${params.node}`)),
+  },
+  {
+    pattern: path("/admin/invites"),
+    methods: ["POST"],
+    handle: async (request, _, env) => {
+      const made = await relay(env).adminInvite(await adminBody(request));
+      return made.invite ? json(made.invite) : errorResponse(made.status ?? 400, made.error ?? "invite refused");
+    },
   },
   { pattern: path("/admin/archive/stats"), methods: ["GET"], handle: async (_, __, env) => json(await index(env).stats()) },
   {

@@ -2,11 +2,15 @@
 
 ## The live relay's archive
 
-The live relay (`scripts/live-hub.py serve`) serves an archive at `/archive` on
-its own origin, authenticated with the node tokens it issues. Every node token
-reads every capture; a node uploads only captures whose origin is its own node
-name. It keeps the archive in `archive.db` beside the relay database
-(`--archive-db` picks another file).
+The live relay serves an archive at `/archive` on its own origin,
+authenticated with the node tokens it issues. Every node token reads every
+capture; a node uploads only captures whose origin is its own node name.
+
+- The Cloudflare Worker relay (`relay-worker/`, the default; see
+  [relay-worker/README.md](relay-worker/README.md)) keeps the archive index in a
+  Durable Object and the chunks in an R2 bucket.
+- The self-hosted Python relay (`scripts/live-hub.py serve`) keeps it in
+  `archive.db` beside the relay database (`--archive-db` picks another file).
 
 A machine running `one-conv live serve` needs nothing else. The bridge runs
 `scripts/archive-sync.py` in the background for Claude Code, Codex, Oh My Pi, agy and
@@ -33,14 +37,20 @@ archive. A bare `harness:id` names this machine. `search` and `find` JSON rows
 carry each agent session's `address`. The MCP `read_conversation` tool takes the
 address as `query`, with `around` and `context`.
 
-## A standalone archive
+## Self-hosted alternative: a standalone archive
+
+This section, [Run a standalone archive locally](#run-a-standalone-archive-locally) and
+[Deploy the standalone archive](#deploy-the-standalone-archive-on-railway-or-another-host)
+are optional. They cover an archive without a relay: a separate server you run
+yourself, with its own shared token. A machine connected to a relay does not need
+them. The sync, freeing and storage rules apply to both kinds of archive.
 
 Copy captured history to your own service and use the existing `chats`, `find`,
 `search`, `read`, and `thread` commands. Provider filters and JSON shapes stay the
 same, and archived conversations render exactly as native ones, including `--raw`.
 Nothing deletes or changes native history. Python commands use `uv`.
 
-## Run locally
+## Run a standalone archive locally
 
 Generate a private token and keep it out of shell history, source control and logs.
 Set it as `ONE_CONV_ARCHIVE_TOKEN` for both the server and client.
@@ -164,7 +174,7 @@ separately for each field and original record. Requests stay under 16 MiB, so
 captures of any size upload in batches, and an append transfers only the changed
 tail chunks. Reads fetch normalized turns, never original records.
 
-## Deploy on Railway or another host
+## Deploy the standalone archive on Railway or another host
 
 Build `archive/Dockerfile` from the repository root. Mount persistent storage, set
 `ONE_CONV_ARCHIVE_DATABASE_URL` to a SQLite file on it, and set a private

@@ -355,8 +355,25 @@ def test_a_deleted_post_is_not_read(board):
 def test_a_deleted_post_leaves_the_topic_count(board):
     url, mac, _ = board
     found = post(url, mac, "release")[1]
+    post(url, mac, "release")
     call(url, f"/v1/board/release/posts/{found['id']}", mac, "DELETE")
-    assert call(url, "/v1/board", mac)[1]["topics"][0]["posts"] == 0
+    assert call(url, "/v1/board", mac)[1]["topics"][0]["posts"] == 1
+
+
+def test_deleting_the_last_post_drops_the_topic_from_the_listing(board):
+    url, mac, _ = board
+    found = post(url, mac, "release")[1]
+    post(url, mac, "infra")
+    call(url, f"/v1/board/release/posts/{found['id']}", mac, "DELETE")
+    assert [t["topic"] for t in call(url, "/v1/board", mac)[1]["topics"]] == ["infra"]
+
+
+def test_posting_to_an_emptied_topic_lists_it_again(board):
+    url, mac, _ = board
+    found = post(url, mac, "release")[1]
+    call(url, f"/v1/board/release/posts/{found['id']}", mac, "DELETE")
+    post(url, mac, "release", "back")
+    assert [(t["topic"], t["posts"]) for t in call(url, "/v1/board", mac)[1]["topics"]] == [("release", 1)]
 
 
 def test_deleting_twice_counts_once(board):

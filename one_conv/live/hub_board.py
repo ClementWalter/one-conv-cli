@@ -106,11 +106,11 @@ class Board:
         return self.root / topic / ident
 
     def topics(self, reads: dict[str, int]) -> dict:
-        """Every topic, most recently posted first; `unread` counts live posts after the reader's position."""
+        """Every topic with a live post, most recently posted first; `unread` counts live posts after the reader's position."""
         with self.hub._db() as db:
             rows = db.execute("SELECT slug, title, created, last_post, posts, archived,"
                               " (SELECT COALESCE(MAX(seq), 0) FROM board_posts WHERE topic = slug)"
-                              " FROM board_topics ORDER BY last_post DESC, slug").fetchall()
+                              " FROM board_topics WHERE posts > 0 ORDER BY last_post DESC, slug").fetchall()
             out = []
             for slug, title, created, last_post, posts, archived, last in rows:
                 unread = db.execute("SELECT COUNT(*) FROM board_posts WHERE topic = ? AND seq > ? AND deleted = 0",

@@ -86,6 +86,16 @@ def set_name(name: str, address: str, is_live, replace: bool = False) -> str:
     return name
 
 
+def release(address: str) -> str | None:
+    """Unbind the name `address` holds, so another session (here or on another machine) can take it; returns it."""
+    with _locked():
+        table = names()
+        held = next((n for n, a in table.items() if a == address), None)
+        if held is not None:
+            _write(_root() / "names.json", {n: a for n, a in table.items() if a != address})
+    return held
+
+
 def address_for(name: str) -> str | None:
     return names().get(_check(name))
 

@@ -18,6 +18,10 @@ to their sessions once idle, and the bridge then acks the relay with the final o
 A delivery of kind "guest" comes from a share link (`live share`): it is wrapped with the
 guest trust rules, which tell the session the guest is not the user.
 
+A delivery with mode `request` is for the bridge itself (a `live teleport` probe or spawn, see
+provision.py): it is claimed the same way, acked `held`, run in its own thread, and answered
+with its final outcome and result once that thread ends.
+
 Beside delivery, the bridge syncs this machine's agent histories to the relay's archive, so
 any machine can read a session here as `NODE/harness:id` and continue it.
 """
@@ -37,7 +41,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import held, hubclient, names, router, tunnel
+from . import held, hubclient, names, provision, router, tunnel
 from .stream import InboxStream, StreamUnsupported
 from .model import envelope, guest_envelope, live_home, parse_address
 
@@ -94,8 +98,15 @@ def settings() -> dict:
     return _read(bridge_dir() / "serve.json")
 
 
-def save_settings(hub: str, node: str, hub_port: int, token: str) -> None:
-    _write_private(bridge_dir() / "serve.json", {"hub": hub, "node": node, "hub_port": hub_port, "token": token})
+def save_settings(hub: str, node: str, hub_port: int, token: str, **extra) -> None:
+    """Save the connection; machine preferences already saved (accept_teleport, project roots) are kept."""
+    _write_private(bridge_dir() / "serve.json", {**settings(), **extra, "hub": hub, "node": node,
+                                                 "hub_port": hub_port, "token": token})
+
+
+def save_accept_teleport(accept: bool) -> None:
+    """Whether this machine starts sessions teleported from other nodes; read again for every request."""
+    _write_private(bridge_dir() / "serve.json", {**settings(), provision.ACCEPT_KEY: accept})
 
 
 def status() -> dict:
@@ -271,29 +282,76 @@ def _deliver_guest(item: dict, session) -> tuple[str, str]:
     return ("unconfirmed" if detail.startswith(UNKNOWN_RESULTS) else "accepted"), detail
 
 
+def publish_sessions(client: hubclient.HubClient) -> tuple[int, list[str]]:
+    """Replace this node's entries in the relay directory with the sessions running here; (count, notes).
+
+    The bridge does this on a timer; `live send` does it too when the relay does not know a
+    session that just started here yet.
+    """
+    rows = [{"address": s.address, "name": names.name_for(s.address), "title": s.title, "cwd": s.cwd,
+             "status": s.status, "product": s.product} for s in router.list_all()]
+    try:
+        return client.request("PUT", "/v1/sessions", {"sessions": rows})["published"], []
+    except hubclient.HubRefused as error:
+        if error.status != 409:
+            raise
+        # A name taken on another node must not keep every session here unreachable.
+        count = client.request("PUT", "/v1/sessions", {"sessions": [{**r, "name": None} for r in rows]})["published"]
+        return count, [f"names not published: {error}"]
+
+
+class Requests:
+    """Runs relay requests (teleport probes and spawns) in threads, so a spawn's wait never stalls deliveries."""
+
+    def __init__(self, node: str, run=None):
+        self.run = run or (lambda item: provision.handle(item, node, settings()))
+        self.lock = threading.Lock()
+        self.running: set[str] = set()
+        self.finished: list[tuple[str, str, dict]] = []
+
+    def start(self, item: dict) -> None:
+        with self.lock:
+            self.running.add(item["delivery"])
+        threading.Thread(target=self._work, args=(item,), name=f"request-{item['delivery'][:8]}", daemon=True).start()
+
+    def _work(self, item: dict) -> None:
+        try:
+            outcome, result = self.run(item)
+        except Exception as error:  # A request must always be answered, whatever failed.
+            logger.exception("request %s failed", item["delivery"])
+            outcome, result = "refused", {"error": f"{type(error).__name__}: {error}"}
+        with self.lock:
+            self.running.discard(item["delivery"])
+            self.finished.append((item["delivery"], outcome, result))
+
+    def is_running(self, delivery: str) -> bool:
+        with self.lock:
+            return delivery in self.running
+
+    def take(self) -> list[tuple[str, str, dict]]:
+        with self.lock:
+            rows, self.finished = self.finished, []
+        return rows
+
+    def put_back(self, rows: list[tuple[str, str, dict]]) -> None:
+        with self.lock:
+            self.finished = rows + self.finished
+
+
 class Bridge:
-    def __init__(self, client: hubclient.HubClient, node: str, ingress: Ingress, stream: InboxStream | None = None):
+    def __init__(self, client: hubclient.HubClient, node: str, ingress: Ingress, stream: InboxStream | None = None,
+                 requests: Requests | None = None):
         self.client, self.node, self.ingress = client, node, ingress
         # Without a stream, deliveries come from long-polling /v1/inbox.
         self.stream = stream
+        self.requests = requests or Requests(node)
         self.directory: dict[str, dict] = {}
         self.published_at = 0.0
         self.notes: list[str] = []
 
     def publish(self) -> int:
         """Replace this node's entries in the relay directory, renewing its lease."""
-        rows = [{"address": s.address, "name": names.name_for(s.address), "title": s.title, "cwd": s.cwd,
-                 "status": s.status, "product": s.product} for s in router.list_all()]
-        try:
-            count = self.client.request("PUT", "/v1/sessions", {"sessions": rows})["published"]
-            self.notes = []
-        except hubclient.HubRefused as error:
-            if error.status != 409:
-                raise
-            # A name taken on another node must not keep every session here unreachable.
-            self.notes = [f"names not published: {error}"]
-            count = self.client.request("PUT", "/v1/sessions",
-                                        {"sessions": [{**r, "name": None} for r in rows]})["published"]
+        count, self.notes = publish_sessions(self.client)
         self.directory = {row["address"]: row for row in self.client.request("GET", "/v1/sessions")["sessions"]}
         self.published_at = time.monotonic()
         return count
@@ -320,8 +378,51 @@ class Bridge:
                 handle.write(body)
         return path
 
+    def handle_request(self, item: dict) -> str:
+        """Run one relay request at most once: ack it `held`, answer with the final outcome once its thread ends.
+
+        A request claimed by a bridge that stopped before answering is never run again; it is
+        answered `unconfirmed`, since a spawn may already have started.
+        """
+        delivery = item["delivery"]
+        fresh, recorded = self.ingress.claim(item)
+        if fresh or (recorded is None and self.requests.is_running(delivery)):
+            if fresh:
+                logger.info("request %s from %s", delivery, item.get("from"))
+                self.requests.start(item)
+            self.ack_held(delivery)
+            return "held"
+        if recorded is None:
+            outcome, result = "unconfirmed", {"error": "the bridge stopped while handling this request"}
+            self.ingress.finish(delivery, outcome, json.dumps(result))
+        else:
+            outcome, detail = self.ingress.outcome(delivery)
+            try:
+                result = json.loads(detail or "{}")
+            except ValueError:
+                result = {}
+        self.client.request("POST", "/v1/acks", {"delivery": delivery, "outcome": outcome, "result": result})
+        return outcome
+
+    def ack_finished_requests(self) -> int:
+        """Answer each request whose thread ended; one the relay did not take is answered on the next step."""
+        rows = self.requests.take()
+        if any(outcome == "accepted" and result.get("address") for _, outcome, result in rows):
+            # A session started for a teleport is published before its origin learns its address.
+            self.publish()
+        for index, (delivery, outcome, result) in enumerate(rows):
+            self.ingress.finish(delivery, outcome, json.dumps(result))
+            try:
+                self.client.request("POST", "/v1/acks", {"delivery": delivery, "outcome": outcome, "result": result})
+            except (hubclient.HubUnavailable, hubclient.HubRefused):
+                self.requests.put_back(rows[index:])
+                raise
+        return len(rows)
+
     def handle(self, item: dict) -> str:
         """Deliver one inbox item at most once, then ack its outcome."""
+        if item.get("mode") == "request":
+            return self.handle_request(item)
         fresh, recorded = self.ingress.claim(item)
         if fresh:
             outcome, detail = deliver_inbound(item, self.directory, fetch=self.fetch_attachment)
@@ -362,6 +463,7 @@ class Bridge:
             self.publish()
         self.drain_outbox()
         self.ack_finished_held()
+        self.ack_finished_requests()
         if self.stream is not None:
             items = self.stream.receive(wait)
             for item in items:

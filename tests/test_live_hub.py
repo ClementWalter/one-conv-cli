@@ -551,3 +551,85 @@ def test_the_relay_keeps_only_a_digest_of_the_code(inviter):
     with sqlite3.connect(local_database(state)) as db:
         rows = db.execute("SELECT * FROM invites").fetchall()
     assert code not in json.dumps(rows)
+
+
+# requests: a node asks another node's bridge, which answers on its ack ---------------------------
+
+@pytest.fixture
+def probe(two_nodes):
+    """mac sends box's bridge a request; returns (url, mac, box, the request, its delivery id)."""
+    _, url, mac, box = two_nodes
+    sent = message("box", mode="request", reply="none", text=json.dumps({"kind": "probe"}))
+    call(url, "/v1/messages", mac, "POST", sent)
+    return url, mac, box, sent, delivery_of(url, box)
+
+
+def test_a_request_reaches_the_target_nodes_bridge(probe):
+    url, _, box, _, _ = probe
+    assert call(url, "/v1/inbox?wait=0", box)[1]["messages"][0]["to"] == "bridge"
+
+
+def test_a_request_is_handed_out_as_a_request(probe):
+    url, _, box, _, _ = probe
+    assert call(url, "/v1/inbox?wait=0", box)[1]["messages"][0]["mode"] == "request"
+
+
+def test_a_request_answer_reaches_the_sender(probe):
+    url, mac, box, sent, delivery = probe
+    call(url, "/v1/acks", box, "POST", {"delivery": delivery, "outcome": "accepted", "result": {"rows": [1, 2]}})
+    assert call(url, f"/v1/messages/{sent['id']}", mac)[1]["recipients"][0]["result"] == {"rows": [1, 2]}
+
+
+def test_a_held_request_keeps_the_final_answer(probe):
+    url, mac, box, sent, delivery = probe
+    call(url, "/v1/acks", box, "POST", {"delivery": delivery, "outcome": "held"})
+    call(url, "/v1/acks", box, "POST", {"delivery": delivery, "outcome": "accepted", "result": {"address": "x"}})
+    assert call(url, f"/v1/messages/{sent['id']}", mac)[1]["recipients"][0]["result"] == {"address": "x"}
+
+
+def test_a_later_answer_does_not_replace_the_first(probe):
+    url, mac, box, sent, delivery = probe
+    call(url, "/v1/acks", box, "POST", {"delivery": delivery, "outcome": "refused", "result": {"error": "first"}})
+    call(url, "/v1/acks", box, "POST", {"delivery": delivery, "outcome": "accepted", "result": {"error": "second"}})
+    assert call(url, f"/v1/messages/{sent['id']}", mac)[1]["recipients"][0]["result"] == {"error": "first"}
+
+
+def test_a_result_that_is_not_an_object_is_refused(probe):
+    url, _, box, _, delivery = probe
+    assert call(url, "/v1/acks", box, "POST", {"delivery": delivery, "outcome": "accepted", "result": [1]})[0] == 400
+
+
+def test_a_result_over_the_limit_is_refused(probe):
+    url, _, box, _, delivery = probe
+    assert call(url, "/v1/acks", box, "POST",
+                {"delivery": delivery, "outcome": "accepted", "result": {"x": "a" * 70_000}})[0] == 413
+
+
+def test_a_message_to_a_session_cannot_carry_a_result(two_nodes):
+    _, url, mac, box = two_nodes
+    call(url, "/v1/messages", mac, "POST", message("box/claude:bbb"))
+    assert call(url, "/v1/acks", box, "POST",
+                {"delivery": delivery_of(url, box), "outcome": "accepted", "result": {"x": 1}})[0] == 400
+
+
+def test_a_request_to_an_unknown_node_is_refused(two_nodes):
+    _, url, mac, _ = two_nodes
+    assert call(url, "/v1/messages", mac, "POST", message("studio", mode="request", text="{}"))[0] == 404
+
+
+def test_a_request_to_a_session_address_is_refused(two_nodes):
+    _, url, mac, _ = two_nodes
+    assert call(url, "/v1/messages", mac, "POST", message("box/claude:bbb", mode="request", text="{}"))[0] == 400
+
+
+def test_a_request_from_another_nodes_session_is_refused(two_nodes):
+    _, url, mac, _ = two_nodes
+    assert call(url, "/v1/messages", mac, "POST",
+                message("box", sender="claude:bbb", mode="request", text="{}"))[0] == 403
+
+
+def test_a_request_without_an_answer_has_no_result(two_nodes):
+    _, url, mac, _ = two_nodes
+    sent = message("box", mode="request", text="{}")
+    call(url, "/v1/messages", mac, "POST", sent)
+    assert "result" not in call(url, f"/v1/messages/{sent['id']}", mac)[1]["recipients"][0]

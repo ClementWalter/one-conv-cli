@@ -25,6 +25,11 @@
  * POST /v1/join, unauthenticated, trades the code for that node's token exactly once.
  *
  * A node can share one of its sessions with a guest through a link: see shares.ts.
+ *
+ * A post with mode `request` is for a node's bridge rather than a session: `to` is a node name,
+ * the delivery reaches that node as `to: "bridge"`, and `text` is the request (`live teleport`
+ * asks another machine what it lacks for a session, then to start it there). The bridge answers
+ * with its final ack, which may carry a JSON `result` the sender reads back with `status`.
  */
 
 import { DurableObject } from "cloudflare:workers";
@@ -39,7 +44,12 @@ const ATTACHMENT_ID = /^[0-9a-f]{32}$/;
 // `held` is provisional: the bridge keeps a when=idle message for a busy session and reports
 // a final outcome once it leaves; a held delivery is not handed out again.
 const OUTCOMES = ["accepted", "refused", "unconfirmed", "held"];
-const MODES = ["push", "fyi"];
+// request: for the receiving node's bridge itself, answered with a result on the ack.
+const MODES = ["push", "fyi", "request"];
+// The address a request delivery carries: the receiving node's bridge.
+const BRIDGE = "bridge";
+// A request's answer is small: a list of checks, or the address of a started session.
+const RESULT_LIMIT = 65_536;
 // now: delivered at once; idle: the receiving bridge holds it while the session is busy.
 const WHEN = ["now", "idle"];
 const REPLIES = ["expected", "none", "inline"];
@@ -85,7 +95,7 @@ CREATE TABLE IF NOT EXISTS posts (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_no
     mode TEXT NOT NULL DEFAULT 'push', text TEXT NOT NULL, created REAL NOT NULL, attachments TEXT,
     timing TEXT NOT NULL DEFAULT 'now', UNIQUE (from_node, id));
 CREATE TABLE IF NOT EXISTS deliveries (delivery TEXT PRIMARY KEY, post INTEGER NOT NULL REFERENCES posts (seq),
-    to_node TEXT NOT NULL, to_address TEXT NOT NULL, taken REAL, outcome TEXT, outcome_at REAL,
+    to_node TEXT NOT NULL, to_address TEXT NOT NULL, taken REAL, outcome TEXT, outcome_at REAL, result TEXT,
     UNIQUE (post, to_node, to_address));
 CREATE INDEX IF NOT EXISTS pending ON deliveries (to_node, outcome, post);
 CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, node TEXT NOT NULL, media_type TEXT NOT NULL,
@@ -141,6 +151,10 @@ export class Relay extends DurableObject<Env> {
     if (!this.sql.exec("PRAGMA table_info(posts)").toArray().some((column) => column.name === "timing")) {
       this.sql.exec("ALTER TABLE posts ADD COLUMN timing TEXT NOT NULL DEFAULT 'now'");
     }
+    // A relay stored before requests existed gains the column for their answers.
+    if (!this.sql.exec("PRAGMA table_info(deliveries)").toArray().some((column) => column.name === "result")) {
+      this.sql.exec("ALTER TABLE deliveries ADD COLUMN result TEXT");
+    }
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PING, PONG));
     const work = (handler: Work) => (request: Request, params: Record<string, string>) => this.handle(request, params, handler);
     this.routes = [
@@ -154,7 +168,7 @@ export class Relay extends DurableObject<Env> {
       { pattern: path("/v1/messages/{msg_id}"), methods: ["GET"], handle: work((node, _, __, params) => this.status(node, params.msg_id)) },
       { pattern: path("/v1/inbox"), methods: ["GET"], handle: work(async (node, _, request) => ({ messages: await this.inbox(node, waitParam(request)) })) },
       { pattern: path("/v1/stream"), methods: ["GET"], handle: (request) => this.stream(request) },
-      { pattern: path("/v1/acks"), methods: ["POST"], handle: work((node, body) => this.ack(node, pyStr(body.delivery ?? null), pyStr(body.outcome ?? null))) },
+      { pattern: path("/v1/acks"), methods: ["POST"], handle: work((node, body) => this.ack(node, pyStr(body.delivery ?? null), pyStr(body.outcome ?? null), body.result ?? null)) },
       { pattern: path("/v1/attachments"), methods: ["POST"], handle: (request) => this.upload(request) },
       { pattern: path("/v1/attachments/{ident}"), methods: ["GET"], handle: (request, params) => this.download(request, params.ident) },
       { pattern: path("/v1/user"), methods: ["GET"], handle: work((_, __, request) => this.notes(new URL(request.url))) },
@@ -502,6 +516,13 @@ export class Relay extends DurableObject<Env> {
     return [node, address];
   }
 
+  /** Where a request goes: the bridge of a node that holds a token on this relay. */
+  private bridgeRecipient(target: string): [string, string] {
+    if (!NODE.test(target)) throw new HttpError(400, `a request goes to a node name, not ${pyRepr(target)}`);
+    if (!this.sql.exec("SELECT 1 FROM tokens WHERE node = ?", target).toArray().length) throw new HttpError(404, `no node is called ${target}`);
+    return [target, BRIDGE];
+  }
+
   private receipt(seq: number, id: string, duplicate: boolean): Body {
     const rows = this.sql.exec("SELECT delivery, to_node, to_address, outcome FROM deliveries WHERE post = ? ORDER BY rowid", seq).toArray();
     const timing = this.sql.exec("SELECT timing FROM posts WHERE seq = ?", seq).one().timing;
@@ -531,6 +552,7 @@ export class Relay extends DurableObject<Env> {
     if (typeof target !== "string" || !target) throw new HttpError(400, "to must be NODE/harness:id, @name or user");
     if (target === USER) return this.note(node, id, sender, text, message, attached.length > 0);
     if (target.startsWith(GUEST)) return this.shares.reply(node, id, sender, text, target, attached.length > 0);
+    if (mode === "request" && attached.length) throw new HttpError(400, "a request carries text only");
     // `when` joins the digest only when idle, so a `now` post hashes as it always has.
     const digest = await sha256(JSON.stringify([target, sender ?? null, reply, mode, text, ...attached, ...(timing === "idle" ? ["when=idle"] : [])]));
     const result = this.ctx.storage.transactionSync(() => {
@@ -544,7 +566,7 @@ export class Relay extends DurableObject<Env> {
       if (typeof sender !== "string" || (!this.published(node, sender) && sender !== "user" && sender !== "unknown")) {
         throw new HttpError(403, "from must be a session this node published, or user/unknown");
       }
-      const [toNode, toAddress] = this.recipient(target);
+      const [toNode, toAddress] = mode === "request" ? this.bridgeRecipient(target) : this.recipient(target);
       const seq = this.sql
         .exec(
           "INSERT INTO posts (from_node, id, digest, target, sender, reply, mode, text, created, attachments, timing) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
@@ -696,15 +718,26 @@ export class Relay extends DurableObject<Env> {
   /**
    * Record the outcome of one of this node's deliveries; the first final outcome reported stands.
    * `held` is recorded only on a delivery without an outcome, and a final outcome replaces it.
+   * `result` is a JSON object answering a request, kept with the outcome it came with.
    */
-  ack(node: string, delivery: string, outcome: string): Body {
+  ack(node: string, delivery: string, outcome: string, result: unknown = null): Body {
     if (!OUTCOMES.includes(outcome)) throw new HttpError(400, `outcome must be one of ${OUTCOMES.join(", ")}`);
-    const row = this.sql.exec("SELECT outcome FROM deliveries WHERE delivery = ? AND to_node = ?", delivery, node).toArray()[0];
+    let stored: string | null = null;
+    if (result !== null) {
+      if (typeof result !== "object" || Array.isArray(result)) throw new HttpError(400, "result is a JSON object");
+      stored = JSON.stringify(result);
+      if (pyLen(stored) > RESULT_LIMIT) throw new HttpError(413, `a result is at most ${RESULT_LIMIT} characters of JSON`);
+    }
+    const row = this.sql
+      .exec("SELECT d.outcome, p.mode FROM deliveries d JOIN posts p ON p.seq = d.post WHERE d.delivery = ? AND d.to_node = ?", delivery, node)
+      .toArray()[0];
     if (!row) throw new HttpError(404, "no such delivery for this node");
+    if (stored !== null && row.mode !== "request") throw new HttpError(400, "only a request is answered with a result");
     this.sql.exec(
-      "UPDATE deliveries SET outcome = ?, outcome_at = ? WHERE delivery = ? AND (outcome IS NULL OR (outcome = 'held' AND ? != 'held'))",
+      "UPDATE deliveries SET outcome = ?, outcome_at = ?, result = COALESCE(?, result) WHERE delivery = ? AND (outcome IS NULL OR (outcome = 'held' AND ? != 'held'))",
       outcome,
       now(),
+      stored,
       delivery,
       outcome,
     );
@@ -715,8 +748,17 @@ export class Relay extends DurableObject<Env> {
   status(node: string, id: string): Body {
     const post = this.sql.exec("SELECT seq FROM posts WHERE from_node = ? AND id = ?", node, id).toArray()[0];
     if (!post) throw new HttpError(404, "no such message from this node");
-    const rows = this.sql.exec("SELECT delivery, to_node, to_address, outcome, outcome_at FROM deliveries WHERE post = ? ORDER BY rowid", post.seq).toArray();
-    return { id, recipients: rows.map((row) => ({ to: `${row.to_node}/${row.to_address}`, delivery: row.delivery, outcome: row.outcome ?? "stored", outcome_at: row.outcome_at })) };
+    const rows = this.sql.exec("SELECT delivery, to_node, to_address, outcome, outcome_at, result FROM deliveries WHERE post = ? ORDER BY rowid", post.seq).toArray();
+    return {
+      id,
+      recipients: rows.map((row) => ({
+        to: `${row.to_node}/${row.to_address}`,
+        delivery: row.delivery,
+        outcome: row.outcome ?? "stored",
+        outcome_at: row.outcome_at,
+        ...(row.result ? { result: JSON.parse(row.result as string) } : {}),
+      })),
+    };
   }
 }
 

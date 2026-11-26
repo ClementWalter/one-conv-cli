@@ -426,3 +426,84 @@ describe("messages to the user", () => {
     expect((await call("/v1/user")).status).toBe(401);
   });
 });
+
+describe("requests to a node's bridge", () => {
+  interface Handed {
+    delivery: string;
+    to: string;
+    mode: string;
+  }
+  interface Status {
+    recipients: { outcome: string; result?: unknown }[];
+  }
+
+  async function requested(): Promise<{ mac: string; box: string; id: string; handed: Handed }> {
+    const { mac, box } = await twoNodes();
+    const sent = message("box", { mode: "request", reply: "none", text: '{"kind":"probe"}' });
+    await (await call("/v1/messages", { method: "POST", token: mac, body: sent })).text();
+    const { messages } = await body<{ messages: Handed[] }>(call("/v1/inbox?wait=0", { token: box }));
+    return { mac, box, id: sent.id as string, handed: messages[0] };
+  }
+
+  const ack = (token: string, delivery: string, outcome: string, result?: unknown) =>
+    call("/v1/acks", { method: "POST", token, body: { delivery, outcome, ...(result === undefined ? {} : { result }) } });
+
+  test("a request reaches the node's bridge", async () => {
+    expect((await requested()).handed.to).toBe("bridge");
+  });
+
+  test("a request is handed out as a request", async () => {
+    expect((await requested()).handed.mode).toBe("request");
+  });
+
+  test("the answer reaches the sender", async () => {
+    const { mac, box, id, handed } = await requested();
+    await (await ack(box, handed.delivery, "accepted", { rows: [1, 2] })).text();
+    expect((await body<Status>(call(`/v1/messages/${id}`, { token: mac }))).recipients[0].result).toEqual({ rows: [1, 2] });
+  });
+
+  test("a held request keeps the final answer", async () => {
+    const { mac, box, id, handed } = await requested();
+    await (await ack(box, handed.delivery, "held")).text();
+    await (await ack(box, handed.delivery, "accepted", { address: "x" })).text();
+    expect((await body<Status>(call(`/v1/messages/${id}`, { token: mac }))).recipients[0].result).toEqual({ address: "x" });
+  });
+
+  test("a later answer does not replace the first", async () => {
+    const { mac, box, id, handed } = await requested();
+    await (await ack(box, handed.delivery, "refused", { error: "first" })).text();
+    await (await ack(box, handed.delivery, "accepted", { error: "second" })).text();
+    expect((await body<Status>(call(`/v1/messages/${id}`, { token: mac }))).recipients[0].result).toEqual({ error: "first" });
+  });
+
+  test("a request without an answer has no result", async () => {
+    const { mac, id } = await requested();
+    expect((await body<Status>(call(`/v1/messages/${id}`, { token: mac }))).recipients[0]).not.toHaveProperty("result");
+  });
+
+  test.each([
+    ["a list", [1], 400],
+    ["a string", "done", 400],
+    ["an object over the limit", { x: "a".repeat(70_000) }, 413],
+  ])("a result that is %s is refused", async (_, result, status) => {
+    const { box, handed } = await requested();
+    expect((await ack(box, handed.delivery, "accepted", result)).status).toBe(status);
+  });
+
+  test("a message to a session cannot carry a result", async () => {
+    const { mac, box } = await twoNodes();
+    await (await call("/v1/messages", { method: "POST", token: mac, body: message("box/claude:bbb") })).text();
+    const { messages } = await body<{ messages: Handed[] }>(call("/v1/inbox?wait=0", { token: box }));
+    expect((await ack(box, messages[0].delivery, "accepted", { x: 1 })).status).toBe(400);
+  });
+
+  test.each([
+    ["an unknown node", message("studio", { mode: "request", text: "{}" }), 404],
+    ["a session address", message("box/claude:bbb", { mode: "request", text: "{}" }), 400],
+    ["another node's session as sender", message("box", { mode: "request", text: "{}", from: "claude:bbb" }), 403],
+    ["an attachment", message("box", { mode: "request", text: "{}", attachments: ["0".repeat(32)] }), 400],
+  ])("a request to or with %s is refused", async (_, sent, status) => {
+    const { mac } = await twoNodes();
+    expect((await call("/v1/messages", { method: "POST", token: mac, body: sent })).status).toBe(status);
+  });
+});

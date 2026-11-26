@@ -98,6 +98,13 @@ describe("deliveries", () => {
     expect((await stream.delivery()).text).toBe("live");
   });
 
+  test("a request to the node's bridge is pushed like a message", async () => {
+    const { mac, box } = await twoNodes();
+    const stream = await open(box);
+    await call("/v1/messages", { method: "POST", token: mac, body: message("box", { mode: "request", text: '{"kind":"probe"}' }) });
+    expect((await stream.delivery()).text).toBe('{"kind":"probe"}');
+  });
+
   test("every stream the node holds gets the delivery, as every poller would", async () => {
     const { mac, box } = await twoNodes();
     const [first, second] = [await open(box), await open(box)];

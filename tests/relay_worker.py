@@ -152,8 +152,9 @@ class RemoteHub:
     def inbox(self, node: str, wait: float) -> list[dict]:
         return self._call(node, "GET", f"/v1/inbox?wait={wait}")["messages"]
 
-    def ack(self, node: str, delivery: str, outcome: str) -> dict:
-        return self._call(node, "POST", "/v1/acks", {"delivery": delivery, "outcome": outcome})
+    def ack(self, node: str, delivery: str, outcome: str, result: dict | None = None) -> dict:
+        return self._call(node, "POST", "/v1/acks", {"delivery": delivery, "outcome": outcome,
+                                                     **({"result": result} if result is not None else {})})
 
     def status(self, node: str, msg_id: str) -> dict:
         return self._call(node, "GET", f"/v1/messages/{msg_id}")

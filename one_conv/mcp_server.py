@@ -247,4 +247,35 @@ def create_server(update_notice: str = "") -> MCPServer:
         except share.ShareError as error:
             raise ToolError(str(error)) from error
 
+    @server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=True), structured_output=True)
+    def teleport(node: str, ctx: Context, cwd: str | None = None, mode: str | None = None, check_only: bool = False,
+                 force: bool = False, push_wip: bool = False) -> dict[str, Any]:
+        """Move yourself (this session) to machine `node` on the live relay, where you continue your task.
+
+        Use it when the user asks you to continue on another machine. Call with check_only=true
+        first: the result's `rows` say ok / missing / unknown on `node` for your harness, git
+        checkout and commit, the CLIs, MCP servers and skills you used, and dotfiles you read;
+        `blockers` say what stops a move. Commit your changes before moving (a teleport carries
+        commits, never a working tree); push_wip=true pushes unpushed commits to a teleport/<id>
+        branch; force=true moves despite missing tools. `cwd` is a folder on `node` to use instead
+        of its clone found by remote URL; `mode` (ask, auto, yolo) overrides your own approvals mode.
+        After status "teleported", stop working: the new session confirms to you with a message
+        and owns the task from then on.
+        """
+        me = _caller(ctx)
+        args = [sys.executable, "-O", str(LAUNCHER), "live", "teleport", node, "--from", me.address, "--json"]
+        args += ["--check"] if check_only else ["--yes"]
+        args += (["--cwd", cwd] if cwd else []) + (["--mode", mode] if mode else [])
+        args += (["--force"] if force else []) + (["--push-wip"] if push_wip else [])
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=900, check=False,
+                                    env={**os.environ, update_check.DISABLE_ENV: "1"})
+        except subprocess.TimeoutExpired as error:
+            raise ToolError(f"The teleport to {node} did not finish in 15 minutes; check `one-conv live ls` "
+                            "before trying again.") from error
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise ToolError(result.stderr.strip() or "teleport failed without a report") from error
+
     return server

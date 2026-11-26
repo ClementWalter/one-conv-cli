@@ -503,6 +503,58 @@ one-conv live serve --install --yes   # launchd or systemd: start on its own, re
 one-conv live serve --stop
 ```
 
+#### Teleporting a session to another machine
+
+An agent can move itself to another machine on the relay and continue its task
+there, for example from a laptop that is about to close to an always-on box:
+
+```bash
+one-conv live teleport studio --check          # from inside the agent: what studio has and lacks
+one-conv live teleport studio --yes            # move: studio starts the continuation, which confirms back
+one-conv live teleport studio --push-wip --yes # also push unpushed commits to a teleport/<id> branch
+```
+
+Agents call the MCP `teleport` tool (`check_only=true` first) the same way.
+
+1. **Inventory.** From its own transcript: the harness, model and approvals mode;
+   the git checkout (remote, branch, commit, uncommitted files, commits no remote
+   has); the command-line tools its shell commands ran; the MCP servers and
+   skills it used; and dotfiles under `~` it read (names only, never contents).
+2. **Check.** The target's bridge answers each item `ok`, `missing` or `unknown`:
+   the harness and its version, every tool on its PATH, every MCP server in that
+   harness's config, every skill, every dotfile, the repository (a clone found by
+   its normalized remote URL under the project roots) and whether the commit can
+   be fetched. `--check` stops here. Anything missing refuses the move unless
+   `--force`; uncommitted changes always refuse (commit first: a teleport carries
+   commits, never a working tree); commits only on this machine refuse unless
+   `--push-wip`, which pushes HEAD to `teleport/<id>`, never to your branch.
+3. **Move.** The session is synced to the archive, then the target checks the
+   commit out, in its existing clone when that clone is clean and exactly there,
+   else in a new worktree under `~/worktrees/<repo>/teleport-<id>` (an existing
+   checkout is never switched, pulled or reset), and starts the same harness in
+   tmux as `live spawn` does: same model, same approvals mode (or `--mode`),
+   briefed with a handoff of the conversation that names the origin's address
+   for reading omitted turns. The session's `@name` moves with it.
+4. **Confirm.** The new session's first act is one message back to the origin:
+   `teleported: now NODE/harness:id in DIR at BRANCH@SHA; continuing from: ...`.
+   `live teleport` returns once the target reports the new address; the origin
+   session keeps running but stops working on the task.
+
+A machine accepts teleports only once its owner opts in, and only from nodes on
+its relay:
+
+```bash
+one-conv live serve --accept-teleport          # saved in serve.json; a running bridge applies it at once
+one-conv live join '<invite>' --accept-teleport --yes
+```
+
+Project roots default to `~/Documents`, `~/code`, `~/src`, `~/projects`,
+`~/dev`, `~/git`, `~/repos`, `~/work`, `~/worktrees` and `~/github` (two levels
+deep); set `project_roots` (a list) and `worktree_root` in `serve.json`, or
+`ONE_CONV_PROJECT_ROOTS` (`:`-separated) and `ONE_CONV_TELEPORT_WORKTREES` in the
+bridge's environment. Both machines append every teleport to
+`<live dir>/teleports.jsonl`.
+
 #### Self-hosted alternative: the Python relay
 
 `scripts/live-hub.py` is the same relay as one Python process, for a machine you
@@ -554,6 +606,10 @@ Connected machines invite others with `live invite` exactly as on the Worker.
   machine then reads them as `NODE/harness:id` with `local thread`, `local
   search` or the MCP `read_conversation`, so an agent elsewhere can pick up a
   session where it stopped. A node uploads only under its own name.
+- A teleport's check and start travel as requests to the target's bridge (posts
+  with mode `request`, answered on the bridge's ack with a result), each under one
+  id and run at most once. A request the target sees more than a minute late is
+  refused, so a bridge that comes back later never starts a stale session.
 - A machine's token vouches for the sessions its bridge publishes, not for each
   process on that machine. `token revoke NODE` (`relay_admin.py` on the Worker,
   `live-hub.py` on the Python relay) cuts one machine off.
@@ -751,6 +807,7 @@ chat interface or open a network port. It uses the
 | `set_name` | Choose the `@name` other agents use to reach the calling session |
 | `read_user_inbox` | Notes agents sent to `user`, oldest first, by tag; does not mark them read |
 | `share_session` | Let a colleague's agent or a person talk to the calling session only: MCP setup, one-conv command and chat link (see Sharing a session with a colleague's agent) |
+| `teleport` | Move the calling session to another machine on the relay (`check_only=true` lists what it lacks) |
 
 The readers accept `namespace="cloud"` (default) or `namespace="local"`,
 an optional source filter, and a result limit. Reads keep unread markers intact

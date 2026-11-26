@@ -10,6 +10,8 @@
   "name": "one-conv-relay",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-01",
+  // The guest page (src/share-page.html) is bundled as text; the Python relay serves the same file.
+  "rules": [{ "type": "Text", "globs": ["**/*.html"], "fallthrough": true }],
   "durable_objects": {
     "bindings": [
       { "name": "RELAY", "class_name": "Relay" },

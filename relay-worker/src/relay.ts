@@ -23,12 +23,15 @@
  * A connected node (or the admin API) can invite a new machine: POST /v1/invites returns a
  * one-time code bound to a node name, kept only as a digest, that expires within a day.
  * POST /v1/join, unauthenticated, trades the code for that node's token exactly once.
+ *
+ * A node can share one of its sessions with a guest through a link: see shares.ts.
  */
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import { HttpError, type Route, bearer, boundedBody, decodedPath, dispatch, errorResponse, json, path, pyFloat, query, randomHex, sha256, tokenUrlsafe, utf8 } from "./http";
 import { pyLen, pyRepr, pyStr, truthy } from "./pyrepr";
+import { GUEST, SHARE_SCHEMA, SHARE_TABLES, Shares } from "./shares";
 
 export const NODE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const MESSAGE_ID = /^[0-9a-f]{32}$/;
@@ -93,10 +96,11 @@ CREATE TABLE IF NOT EXISTS notes (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_no
 CREATE TABLE IF NOT EXISTS invites (hash TEXT PRIMARY KEY, node TEXT NOT NULL, inviter TEXT NOT NULL,
     takes_over INTEGER NOT NULL, created REAL NOT NULL, expires REAL NOT NULL, used REAL);
 `;
-// The columns a delivery is handed out with, by /v1/inbox and /v1/stream alike.
+// The columns a delivery is handed out with, by /v1/inbox and /v1/stream alike. A guest's post
+// has no sending node; its sender is guest:<share id>, whose share gives the label.
 const PENDING =
-  "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.reply, p.mode, p.text, p.created, p.attachments, p.timing FROM deliveries d JOIN posts p ON p.seq = d.post";
-const TABLES = ["tokens", "nodes", "sessions", "deliveries", "posts", "attachments", "notes", "invites"];
+  "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.reply, p.mode, p.text, p.created, p.attachments, p.timing, s.label FROM deliveries d JOIN posts p ON p.seq = d.post LEFT JOIN shares s ON p.from_node = '' AND p.sender = 'guest:' || s.id";
+const TABLES = ["tokens", "nodes", "sessions", "deliveries", "posts", "attachments", "notes", "invites", ...SHARE_TABLES];
 
 type Row = Record<string, SqlStorageValue>;
 type Body = Record<string, unknown>;
@@ -125,11 +129,14 @@ export class Relay extends DurableObject<Env> {
   // Long-polling inboxes per node, woken when a delivery for that node is stored.
   private waiting = new Map<string, Set<() => void>>();
   private routes: Route<null>[];
+  private shares: Shares;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec(SCHEMA);
+    this.sql.exec(SHARE_SCHEMA);
+    this.shares = new Shares(ctx.storage, (node, delivery) => this.wake(node, delivery));
     // A relay stored before `when` existed gains the column, every old post being `now`.
     if (!this.sql.exec("PRAGMA table_info(posts)").toArray().some((column) => column.name === "timing")) {
       this.sql.exec("ALTER TABLE posts ADD COLUMN timing TEXT NOT NULL DEFAULT 'now'");
@@ -153,6 +160,13 @@ export class Relay extends DurableObject<Env> {
       { pattern: path("/v1/user"), methods: ["GET"], handle: work((_, __, request) => this.notes(new URL(request.url))) },
       { pattern: path("/v1/invites"), methods: ["POST"], handle: work((node, body) => this.invite(node, body)) },
       { pattern: path("/v1/join"), methods: ["POST"], handle: (request) => this.join(request) },
+      {
+        pattern: path("/v1/shares"),
+        methods: ["GET", "POST"],
+        handle: work((node, body, request) => (request.method === "POST" ? this.shares.create(node, body) : this.shares.list(node))),
+      },
+      { pattern: path("/v1/shares/{share}"), methods: ["DELETE"], handle: work((node, _, __, params) => this.shares.revoke(node, params.share)) },
+      { pattern: path("/v1/shares/{share}/messages"), methods: ["GET", "POST"], handle: (request, params) => this.shares.guest(request, params.share) },
     ];
   }
 
@@ -282,7 +296,7 @@ export class Relay extends DurableObject<Env> {
   /** Empties every table and attachment; only reachable when the deployment enables resets (tests). */
   async reset(): Promise<void> {
     for (const table of TABLES) this.sql.exec(`DELETE FROM ${table}`);
-    this.sql.exec("DELETE FROM sqlite_sequence WHERE name IN ('posts', 'notes')");
+    this.sql.exec("DELETE FROM sqlite_sequence WHERE name IN ('posts', 'notes', 'share_messages')");
     for (;;) {
       const listed = await this.env.ARCHIVE.list({ prefix: "attachments/" });
       if (!listed.objects.length) break;
@@ -515,6 +529,7 @@ export class Relay extends DurableObject<Env> {
     const target = message.to;
     if (typeof target !== "string" || !target) throw new HttpError(400, "to must be NODE/harness:id, @name or user");
     if (target === USER) return this.note(node, id, sender, text, message, attached.length > 0);
+    if (target.startsWith(GUEST)) return this.shares.reply(node, id, sender, text, target, attached.length > 0);
     // `when` joins the digest only when idle, so a `now` post hashes as it always has.
     const digest = await sha256(JSON.stringify([target, sender ?? null, reply, mode, text, ...attached, ...(timing === "idle" ? ["when=idle"] : [])]));
     const result = this.ctx.storage.transactionSync(() => {
@@ -718,16 +733,19 @@ function parsedList(text: SqlStorageValue): unknown[] {
 }
 
 function handed(row: Row): Body {
+  // A guest is named by its share alone: it has no node and no session of its own.
+  const guest = row.from_node === "";
   return {
     delivery: row.delivery,
     id: row.id,
     to: row.to_address,
-    from: `${row.from_node}/${row.sender}`,
+    from: guest ? row.sender : `${row.from_node}/${row.sender}`,
     reply: row.reply,
     mode: row.mode,
     text: row.text,
     created: row.created,
     ...(row.attachments ? { attachments: parsedList(row.attachments) } : {}),
     ...(row.timing === "idle" ? { when: row.timing } : {}),
+    ...(guest ? { kind: "guest", label: row.label ?? "" } : {}),
   };
 }

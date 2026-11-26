@@ -6,8 +6,10 @@
  *   /admin/...       token minting, invites and archive import, guarded by the RELAY_ADMIN_TOKEN secret
  *   /mcp, /authorize, /oauth/..., /.well-known/oauth-...
  *                    the remote MCP server for the Claude app, behind OAuth (mcp-auth.ts)
+ *   /s/<share id>    the guest page of a shared session (shares.ts), the same file the Python relay serves
  */
 
+import sharePage from "./share-page.html";
 import { archive } from "./archive";
 import type { ImportedHead } from "./archive-index";
 import type { Env } from "./env";
@@ -18,6 +20,23 @@ export { ArchiveIndex } from "./archive-index";
 export { Relay } from "./relay";
 
 const ARCHIVE_PATH = "/archive";
+// The guest page holds no data: it reads the share through /v1/shares/<id>/messages with the secret in a header.
+const SHARE_PAGE = /^\/s\/[^/]+$/;
+// The page runs only its own inline code and talks only to this origin.
+export const PAGE_HEADERS: Record<string, string> = {
+  "content-type": "text/html; charset=utf-8",
+  "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  "referrer-policy": "no-referrer",
+  "cache-control": "no-store",
+  "x-content-type-options": "nosniff",
+};
+
+function page(request: Request): Response {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return new Response("Method Not Allowed", { status: 405, headers: { allow: "GET, HEAD", "content-type": "text/plain; charset=utf-8" } });
+  }
+  return new Response(request.method === "HEAD" ? null : sharePage, { headers: PAGE_HEADERS });
+}
 // Import batches carry search texts; a Durable Object call takes at most 32 MiB.
 const ADMIN_BODY = 30 * 1024 * 1024;
 
@@ -127,6 +146,7 @@ export default {
       return archive(request, env, pathname.slice(ARCHIVE_PATH.length), caller);
     }
     if (pathname.startsWith("/admin/")) return admin(request, env, pathname);
+    if (SHARE_PAGE.test(pathname)) return page(request);
     return relay(env).fetch(request);
   },
 } satisfies ExportedHandler<Env>;

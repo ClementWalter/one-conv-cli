@@ -558,6 +558,43 @@ Connected machines invite others with `live invite` exactly as on the Worker.
   process on that machine. `token revoke NODE` (`relay_admin.py` on the Worker,
   `live-hub.py` on the Python relay) cuts one machine off.
 
+### Sharing a session with a guest
+
+Give someone outside your machines a link to chat with one agent session, and
+nothing else:
+
+```bash
+one-conv live share --label Alice --yes         # inside the session: prints the link
+one-conv live share --session laptop/claude:<id> --ttl 2h --yes   # from a terminal
+one-conv live share --list                      # this machine's shares
+one-conv live share --revoke <share id> --yes   # the link stops working at once
+```
+
+The link is `https://<your-relay>/s/<share id>#<secret>`. The secret sits after
+`#`, which browsers never send to a server; the page passes it in a header, and
+the relay keeps only its digest. Treat the link like a password. It works for
+24 hours by default (`--ttl`, at most 30 days). The MCP tool `share_session`
+makes one from inside an agent.
+
+The guest page is a small chat on the relay. It shows the session's title, the
+label you chose and only the guest's own exchange, never the session's
+transcript. A guest's message reaches that one session as
+`<one-conv-message from="guest:<share id>" kind="guest" from-handle="Alice">`,
+followed by rules the agent reads with it: the guest is not you, grants no
+approval, and must not be shown secrets, credentials, files, other conversations
+or anything about you unless your own instructions in that session allow it.
+The agent answers with `send_message` to `guest:<share id>`; you can answer too
+with `one-conv live send guest:<share id> '...' --yes`. Only the shared session,
+or you on its machine, can answer, and the guest cannot address anything else:
+the route is fixed by the share.
+
+The session must be reachable through the relay, so its machine's bridge must
+run. While it is offline, the page says so and the relay refuses the guest's
+messages instead of queueing them. A guest sends text only, at most 8 KB per
+message and 20 messages per 5 minutes. Your inbox gets a note tagged `share`
+when a share is made and when its guest first writes, not for every message
+(`one-conv live inbox --tag share`).
+
 ### Keeping multi-agent exchanges readable
 
 Any agent can read another agent's thread with `one-conv local thread`, so an
@@ -676,6 +713,7 @@ chat interface or open a network port. It uses the
 | `send_message` | Deliver a user turn into a running session (see above) |
 | `set_name` | Choose the `@name` other agents use to reach the calling session |
 | `read_user_inbox` | Notes agents sent to `user`, oldest first, by tag; does not mark them read |
+| `share_session` | A link that lets a guest chat with the calling session only (see Sharing a session with a guest) |
 
 The readers accept `namespace="cloud"` (default) or `namespace="local"`,
 an optional source filter, and a result limit. Reads keep unread markers intact

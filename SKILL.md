@@ -484,10 +484,17 @@ explicitly; do not represent them as a connected account with no messages.
 - Reading marks threads read unless `--no-mark-read` is passed.
 - `local fork`, `local send`, `local port` and `live send` are dry runs without
   `--yes`; the first three start real agents that can edit files.
-- The Claude Desktop extension serves only the commands listed in `mcpb.json`
-  `tools`: the `cloud` and `local` readers and `live ls`, `send`, `status`,
-  `inbox`, `whoami`, `name`, `names` and `install`. `live serve`, `invite`,
-  `join`, `spawn`, `stop`, `teleport` and `agy` need the CLI. Writes need `confirm=true`.
+- The Claude Desktop extension serves the commands listed in `mcpb.json`
+  `tools`: every `cloud`, `local`, `live` and `board` command plus `update`,
+  except `live serve`, `live join`, `live agy`, `mcp` and the legacy top-level
+  aliases, which need the CLI. Writes need `confirm=true`. `board get` without
+  `--output` saves to `~/Downloads` when the server's folder is read-only, and
+  `live share` / `live teleport` there need `--session` / `--from`, since the
+  extension is not itself an agent session.
+- Desktop extension: when adding a CLI command, add it to `mcpb.json` `tools`
+  or to `EXCLUDED` in `tests/test_extension_scope.py` with the reason; that
+  test fails otherwise. Every merge to `main` changing shipped files publishes
+  a new extension release by itself (`.github/workflows/release.yml`).
 
 ## First-time setup: keep conversation history
 

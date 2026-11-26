@@ -992,6 +992,28 @@ def _step(summary_part):
     return next(step for step in install.plan(["one-conv"]) if summary_part in step.summary)
 
 
+def _codex_step():
+    return next(step for step in install.plan(["one-conv"]) if step.harness == "codex")
+
+
+def test_install_step_without_its_cli_is_unavailable():
+    assert not _codex_step().available(which=lambda name: None)
+
+
+def test_install_step_with_its_cli_is_available():
+    assert _codex_step().available(which=lambda name: f"/usr/bin/{name}")
+
+
+def test_install_file_step_needs_no_cli():
+    assert _step("stop hook").available(which=lambda name: None)
+
+
+def test_install_lists_a_missing_harness_cli_as_skipped(homes, monkeypatch):
+    monkeypatch.setattr(install.shutil, "which", lambda name, **kw: None if name == "codex" else f"/usr/bin/{name}")
+    result = CliRunner().invoke(build_live_group(["one-conv"]), ["install", "--harness", "codex"])
+    assert "skipped  [codex] codex is not installed" in result.output
+
+
 def test_install_inbound_setting_keeps_other_settings(homes):
     (homes / "claude" / "settings.json").write_text(json.dumps({"theme": "dark"}))
     _step("crossSessionInbound").apply()

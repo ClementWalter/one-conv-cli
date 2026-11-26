@@ -600,6 +600,7 @@ for the next one; only the disk is billed meanwhile. Scaleway is supported,
 through its `scw` CLI logged in on this machine.
 
 ```bash
+scripts/box-bootstrap.py <vm-ip> --yes                  # base tools on a fresh Ubuntu VM (idempotent; rebuilds a lost box)
 one-conv live invite cloud-box                          # here; run the printed join on the VM with --accept-teleport
 one-conv live box add cloud-box --scaleway <instance-id> --zone fr-par-1 --yes
 one-conv live box ls                                    # registered boxes and whether they run

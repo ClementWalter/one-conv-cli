@@ -591,6 +591,28 @@ deep); set `project_roots` (a list) and `worktree_root` in `serve.json`, or
 bridge's environment. Both machines append every teleport to
 `<live dir>/teleports.jsonl`.
 
+#### A cloud box for teleports
+
+A box is a cloud VM joined to the relay like any machine, that this machine
+powers on for a teleport and off when idle. Its disk stays while it is off, so
+what the first teleport installed there (tools, logins, checkouts) is still there
+for the next one; only the disk is billed meanwhile. Scaleway is supported,
+through its `scw` CLI logged in on this machine.
+
+```bash
+one-conv live invite cloud-box                          # here; run the printed join on the VM with --accept-teleport
+one-conv live box add cloud-box --scaleway <instance-id> --zone fr-par-1 --yes
+one-conv live box ls                                    # registered boxes and whether they run
+one-conv live box start cloud-box --yes                 # or let `live teleport cloud-box` do it
+one-conv live box stop cloud-box --yes
+```
+
+`live teleport` to a box that is off powers it on and waits for its bridge
+(about a minute). The bridge of the machine that registered the box powers it
+off once no session on it was busy for 30 minutes (`ONE_CONV_BOX_IDLE_MINUTES`,
+`0` never); sessions still open there end, their transcripts stay on its disk
+and in the archive. Boxes are listed in `<live dir>/boxes.json`.
+
 #### Self-hosted alternative: the Python relay
 
 `scripts/live-hub.py` is the same relay as one Python process, for a machine you

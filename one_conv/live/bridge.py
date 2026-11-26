@@ -603,6 +603,8 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
     ingress, backoff = Ingress(bridge_dir() / "ingress.db"), 1.0
     stream = None
     archive = archive or ArchiveLanes()
+    from . import box
+    keeper = box.Keeper()
     holding = HeldDelivery()
     holding.start()
     _report(hub=hub, node=node, started=time.time(), last_error=None)
@@ -634,6 +636,7 @@ def serve(hub: str, node: str, token: str, hub_port: int = 8789, stopping=None,
                     # Reset only after a full step, so a stream that drops right after opening still backs off.
                     backoff = 1.0
                     archive.poll(url, token, node)
+                    keeper.poll(client)
                     _report(last_ok=time.time(), published=len(bridge.directory), notes=bridge.notes)
             except (hubclient.HubUnavailable, tunnel.TunnelError) as error:
                 logger.warning("hub unreachable, retrying in %.0fs: %s", backoff, error)

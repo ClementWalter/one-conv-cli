@@ -19,6 +19,10 @@ HELP = {"help_option_names": ["-h", "--help"]}
 HUB_MESSAGE_ID = re.compile(r"[0-9a-f]{32}")
 
 
+# A box just powered on boots and starts its bridge in about a minute; each probe waits 60 s.
+BOX_PROBE_ATTEMPTS = 4
+
+
 def examples(*lines: str) -> str:
     """A help epilog click prints as written: its leading \\b keeps the line breaks."""
     return "\b\nExamples:\n" + "\n".join(f"  {line}" for line in lines)
@@ -476,6 +480,95 @@ def build_live_group(launcher: list[str], transcript=None) -> click.Group:
         if as_json:
             click.echo(json.dumps(results))
 
+    @live.group("box", context_settings=HELP,
+                epilog=examples("one-conv live box add cloud-box --scaleway 0123abcd-... --zone fr-par-1 --yes",
+                                "one-conv live box ls",
+                                "one-conv live box start cloud-box --yes",
+                                "one-conv live box stop cloud-box --yes"))
+    def box_group():
+        """Cloud VMs on the relay that this machine powers on for a teleport and off when idle.
+
+        Join the VM as a node first (`live invite` here, `live join --accept-teleport` there), then
+        register it with `live box add`. `live teleport` to a box that is off powers it on; this
+        machine's bridge powers it off after 30 min with no busy session on it
+        (ONE_CONV_BOX_IDLE_MINUTES; 0 never). Its disk stays, so what is installed there stays.
+        Uses the provider's CLI logged in here (Scaleway: scw).
+        """
+
+    @box_group.command("add", context_settings=HELP)
+    @click.argument("node")
+    @click.option("--scaleway", "server", required=True, help="The Scaleway instance id of NODE's VM.")
+    @click.option("--zone", default="fr-par-1", show_default=True, help="The instance's zone.")
+    @click.option("--yes", is_flag=True, help="Register. Without it, only says what would be registered.")
+    def box_add(node, server, zone, yes):
+        """Register NODE's VM so teleports power it on and the bridge powers it off when idle."""
+        from . import box
+        if not yes:
+            click.echo(f"DRY-RUN: would register box {node} (scaleway {server} in {zone}). Re-run with --yes.")
+            return
+        boxes = box.load()
+        boxes[node] = box.Box(node=node, provider="scaleway", server=server, zone=zone)
+        try:
+            current = box.state(boxes[node])
+        except box.BoxError as error:
+            raise click.ClickException(str(error)) from None
+        box.save(boxes)
+        click.echo(f"registered box {node} (scaleway {server} in {zone}, {current}) in {box.registry_path()}")
+
+    @box_group.command("ls", context_settings=HELP)
+    @click.option("--json", "as_json", is_flag=True, help="Emit [{node, provider, server, zone, state}] as JSON.")
+    def box_ls(as_json):
+        """List registered boxes and whether their VM runs."""
+        from . import box
+        rows = []
+        for item in box.load().values():
+            try:
+                current = box.state(item)
+            except box.BoxError as error:
+                current = f"unknown ({error})"
+            rows.append({**box.asdict(item), "state": current})
+        if as_json:
+            click.echo(json.dumps(rows))
+            return
+        if not rows:
+            click.echo("No boxes. Register one with `one-conv live box add NODE --scaleway ID`.")
+        for row in rows:
+            click.echo(f"{row['node']:<16} {row['state']:<10} {row['provider']} {row['server']} {row['zone']}")
+
+    @box_group.command("start", context_settings=HELP)
+    @click.argument("node")
+    @click.option("--yes", is_flag=True, help="Power on. Without it, only says what would happen.")
+    def box_start(node, yes):
+        """Power NODE's VM on and wait until it runs; its bridge reconnects a minute later."""
+        from . import box
+        item = box.load().get(node)
+        if item is None:
+            raise click.ClickException(f"{node} is not a registered box (`one-conv live box ls`)")
+        if not yes:
+            click.echo(f"DRY-RUN: would power on {node} (compute is billed while it runs). Re-run with --yes.")
+            return
+        try:
+            click.echo(f"powered on {node}" if box.start(item) else f"{node} already runs")
+        except box.BoxError as error:
+            raise click.ClickException(str(error)) from None
+
+    @box_group.command("stop", context_settings=HELP)
+    @click.argument("node")
+    @click.option("--yes", is_flag=True, help="Power off. Without it, only says what would happen.")
+    def box_stop(node, yes):
+        """Power NODE's VM off now; its disk stays. Sessions running there end."""
+        from . import box
+        item = box.load().get(node)
+        if item is None:
+            raise click.ClickException(f"{node} is not a registered box (`one-conv live box ls`)")
+        if not yes:
+            click.echo(f"DRY-RUN: would power off {node}; sessions running there end. Re-run with --yes.")
+            return
+        try:
+            click.echo(f"powered off {node}" if box.stop(item) else f"{node} was not running")
+        except box.BoxError as error:
+            raise click.ClickException(str(error)) from None
+
     @live.command("teleport", context_settings=HELP,
                   epilog=examples("one-conv live teleport studio --check",
                                   "one-conv live teleport studio --yes",
@@ -520,9 +613,18 @@ def build_live_group(launcher: list[str], transcript=None) -> click.Group:
             raise click.ClickException(f"cannot read {sender.address}'s transcript: {error.message}") from None
         found = inventories.build(sender.harness, sender.cwd or read.get("cwd") or "", read.get("blocks") or [],
                                   read.get("path"))
+        from . import box
+        attempts = 1
+        if node in box.load():
+            try:
+                if box.start(box.load()[node]):
+                    click.echo(f"powered on box {node}; waiting for its bridge", err=True)
+                    attempts = BOX_PROBE_ATTEMPTS
+            except box.BoxError as error:
+                raise click.ClickException(f"cannot power on box {node}: {error}") from None
         try:
             report = teleport.run(node, sender, read, found, cwd=cwd, mode=mode, check_only=check or not yes,
-                                  force=force)
+                                  force=force, probe_attempts=attempts)
         except (teleport.TeleportError, hubclient.HubRefused) as error:
             if as_json:
                 click.echo(json.dumps({"status": "failed", "error": str(error),

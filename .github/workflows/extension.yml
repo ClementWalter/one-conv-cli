@@ -15,7 +15,7 @@ jobs:
   extension:
     permissions:
       contents: write
-    uses: ClementWalter/mcp-bridge/.github/workflows/extension.yml@613771d874e4b329ea6be596212f74476fe9fc48
+    uses: ClementWalter/mcp-bridge/.github/workflows/extension.yml@cf5a483580ee20a80f4275112c5ecaad4e6eed83
     with:
       launcher: bin/one-conv
-      bridge-ref: 613771d874e4b329ea6be596212f74476fe9fc48
+      bridge-ref: cf5a483580ee20a80f4275112c5ecaad4e6eed83

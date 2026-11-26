@@ -13,12 +13,18 @@
  * A guest's agent uses the same share through its MCP server, `/s/<id>/mcp` (share-mcp.ts), with
  * the secret as its bearer token. Waiting for an answer holds the request on an in-memory promise
  * that the session's answer (or a revocation) resolves, so a wait costs no CPU.
+ *
+ * A share made with `transcript` also lets the guest read and search that one session's archived
+ * transcript (share-transcript.ts), through /v1/shares/<id>/transcript and the MCP tools. The
+ * session's title is part of its content: only such a share shows it.
  */
 
 import { HttpError, boundedBody, errorResponse, json, pyFloat, query, randomHex, sha256, tokenUrlsafe, utf8 } from "./http";
 import { pyRepr } from "./pyrepr";
 import { USER, online, splitAddress } from "./relay";
-import { type ShareAccess, type View, answer } from "./share-mcp";
+import type { Env } from "./env";
+import { type ShareAccess, ToolRefused, type View, answer, readArguments, searchArguments } from "./share-mcp";
+import * as transcript from "./share-transcript";
 
 export const SHARE_ID = /^[0-9a-f]{16}$/;
 export const GUEST = "guest:";
@@ -66,6 +72,7 @@ interface Active {
   label: string;
   expires: number;
   firstUsed: number | null;
+  transcript: boolean;
 }
 
 const now = () => Date.now() / 1000;
@@ -90,7 +97,14 @@ export class Shares {
     private readonly storage: DurableObjectStorage,
     // Wakes the bridge of `node` for a new delivery, as a relayed message does.
     private readonly wake: (node: string, delivery: string) => void,
-  ) {}
+    // The archive a transcript grant reads from.
+    private readonly env: Env,
+  ) {
+    // A relay stored before transcript grants gains the flag, every old share being messaging only.
+    if (!this.sql.exec("PRAGMA table_info(shares)").toArray().some((column) => column.name === "transcript")) {
+      this.sql.exec("ALTER TABLE shares ADD COLUMN transcript INTEGER NOT NULL DEFAULT 0");
+    }
+  }
 
   private get sql(): SqlStorage {
     return this.storage.sql;
@@ -150,11 +164,16 @@ export class Shares {
     };
   }
 
-  /** A guest link bound to one session this node published and holds online; the secret is returned once. */
+  /**
+   * A guest link bound to one session this node published and holds online; the secret is returned once.
+   * `transcript` also lets the guest read and search that session's archived transcript, and nothing else.
+   */
   async create(node: string, body: Body): Promise<Body> {
     const { address } = body;
     const label = "label" in body ? body.label : "guest";
     const ttl = "ttl" in body ? body.ttl : SHARE_TTL;
+    const granted = "transcript" in body ? body.transcript : false;
+    if (typeof granted !== "boolean") throw new HttpError(400, "transcript is true or false");
     if (typeof address !== "string" || !address) throw new HttpError(400, "address is the session to share, harness:id or NODE/harness:id");
     let local = address;
     if (address.includes("/")) {
@@ -179,7 +198,7 @@ export class Shares {
       node,
       local,
       name,
-      `Shared ${node}/${local} with ${name} until ${until} UTC (share ${ident}). Revoke it with \`one-conv live share --revoke ${ident} --yes\`.`,
+      `Shared ${node}/${local}${granted ? " with transcript" : ""} with ${name} until ${until} UTC (share ${ident}). Revoke it with \`one-conv live share --revoke ${ident} --yes\`.`,
     );
     this.storage.transactionSync(() => {
       const state = this.session(node, local);
@@ -191,10 +210,13 @@ export class Shares {
         this.sql.exec("DELETE FROM share_messages WHERE share = ?", row.id);
         this.sql.exec("DELETE FROM shares WHERE id = ?", row.id);
       }
-      this.sql.exec("INSERT INTO shares VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)", ident, hash, node, local, name, at, at + ttl);
+      this.sql.exec(
+        "INSERT INTO shares (id, hash, node, address, label, created, expires, transcript) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ident, hash, node, local, name, at, at + ttl, granted ? 1 : 0,
+      );
       note();
     });
-    return { id: ident, secret, address: `${node}/${local}`, label: name, expires: at + ttl, path: `/s/${ident}` };
+    return { id: ident, secret, address: `${node}/${local}`, label: name, expires: at + ttl, path: `/s/${ident}`, transcript: granted };
   }
 
   /** This node's shares, newest first, with their state and how many messages each guest sent. */
@@ -202,7 +224,7 @@ export class Shares {
     const at = now();
     const rows = this.sql
       .exec(
-        "SELECT s.id, s.address, s.label, s.created, s.expires, s.revoked, s.first_used, (SELECT COUNT(*) FROM share_messages m WHERE m.share = s.id AND m.side = 'guest') AS guest_messages FROM shares s WHERE s.node = ? ORDER BY s.created DESC",
+        "SELECT s.id, s.address, s.label, s.created, s.expires, s.revoked, s.first_used, s.transcript, (SELECT COUNT(*) FROM share_messages m WHERE m.share = s.id AND m.side = 'guest') AS guest_messages FROM shares s WHERE s.node = ? ORDER BY s.created DESC",
         node,
       )
       .toArray();
@@ -216,6 +238,7 @@ export class Shares {
         revoked: row.revoked,
         first_used: row.first_used,
         guest_messages: row.guest_messages,
+        transcript: row.transcript === 1,
         state: row.revoked !== null ? "revoked" : (row.expires as number) < at ? "expired" : "active",
       })),
     };
@@ -235,10 +258,10 @@ export class Shares {
     const digest = await sha256(secret);
     // Read inside the caller's transaction, after the digest (an await) is ready.
     return () => {
-      const row = this.sql.exec("SELECT hash, node, address, label, expires, revoked, first_used FROM shares WHERE id = ?", ident).toArray()[0];
+      const row = this.sql.exec("SELECT hash, node, address, label, expires, revoked, first_used, transcript FROM shares WHERE id = ?", ident).toArray()[0];
       if (!sameDigest((row?.hash as string) ?? "0".repeat(64), digest) || !row) throw new HttpError(404, INACTIVE);
       if (row.revoked !== null || (row.expires as number) < now()) throw new HttpError(410, INACTIVE);
-      return { node: row.node as string, address: row.address as string, label: row.label as string, expires: row.expires as number, firstUsed: row.first_used as number | null };
+      return { node: row.node as string, address: row.address as string, label: row.label as string, expires: row.expires as number, firstUsed: row.first_used as number | null, transcript: row.transcript === 1 };
     };
   }
 
@@ -255,7 +278,8 @@ export class Shares {
       )
       .toArray();
     return {
-      share: { label: share.label, title: state.title, name: state.name, online: state.online, busy: BUSY.includes(state.status), expires: share.expires },
+      // The title is part of the session's content, shown only to a share that grants the transcript.
+      share: { label: share.label, title: share.transcript ? state.title : "", name: state.name, online: state.online, busy: BUSY.includes(state.status), expires: share.expires, transcript: share.transcript },
       messages: rows.map((row) => ({
         seq: row.seq,
         from: row.side,
@@ -331,6 +355,65 @@ export class Shares {
     return stored;
   }
 
+  /** The rendered turns of the one session the share names, if it grants the transcript. */
+  private async granted(ident: string, secret: string | null, raw: boolean): Promise<{ turns: transcript.RenderedTurns; mtime: number | null }> {
+    const share = (await this.active(ident, secret))();
+    if (!share.transcript) throw new HttpError(403, "this share does not grant the session's transcript");
+    return transcript.load(this.env, share.node, share.address, raw);
+  }
+
+  /** A page of the shared session's turns, as the remote MCP's read_conversation pages them. */
+  async readTranscript(ident: string, secret: string | null, args: { offset: number | null; limit: number; around: string | null; raw: boolean }): Promise<Body> {
+    const { turns, mtime } = await this.granted(ident, secret, args.raw);
+    return { ...transcript.read(turns, args.offset, args.limit, args.around), archived_through: mtime };
+  }
+
+  /** Turns of the shared session holding every word of `query`, newest first; hidden blocks are never searched. */
+  async searchTranscript(ident: string, secret: string | null, query: string, limit: number): Promise<Body> {
+    const { turns, mtime } = await this.granted(ident, secret, false);
+    return { ...transcript.search(turns, query, limit), archived_through: mtime };
+  }
+
+  async archivedThrough(ident: string, secret: string | null): Promise<number | null> {
+    const share = (await this.active(ident, secret))();
+    return share.transcript ? ((await transcript.archived(this.env, share.node, share.address))?.mtime ?? null) : null;
+  }
+
+  /** GET /v1/shares/<id>/transcript and /transcript/search: the share's secret in its header, as for its messages. */
+  async transcriptRoute(request: Request, ident: string, searching: boolean): Promise<Response> {
+    try {
+      const header = request.headers.get(SHARE_HEADER);
+      const secret = header && !header.includes(",") ? header : null;
+      const url = new URL(request.url);
+      const whole = (name: string): number | undefined => {
+        const value = query(url, name);
+        if (value === null) return undefined;
+        if (!/^\d+$/.test(value)) throw new HttpError(400, "offset and limit are whole numbers");
+        return Number(value);
+      };
+      let result: Body;
+      try {
+        if (searching) {
+          const [words, limit] = searchArguments({ query: query(url, "query") ?? "", limit: whole("limit") });
+          result = await this.searchTranscript(ident, secret, words, limit);
+        } else {
+          const raw = ["1", "true"].includes(query(url, "raw") ?? "");
+          result = await this.readTranscript(ident, secret, readArguments({ offset: whole("offset"), limit: whole("limit"), around: query(url, "around") ?? undefined, raw }));
+        }
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        if (error instanceof ToolRefused) throw new HttpError(400, error.message);
+        throw error;
+      }
+      const response = json(result);
+      response.headers.set("cache-control", "no-store");
+      return response;
+    } catch (error) {
+      if (error instanceof HttpError) return errorResponse(error.status, error.message);
+      throw error;
+    }
+  }
+
   /** GET and POST /v1/shares/<id>/messages: no node token, the share's secret in its header is the credential. */
   async guest(request: Request, ident: string): Promise<Response> {
     try {
@@ -375,6 +458,9 @@ export class Shares {
         send: async (text) => (await this.send(ident, secret, text)).seq as number,
         view: async (after) => (await this.view(ident, secret, after)) as unknown as View,
         wait: (after, seconds) => this.waitView(ident, secret, after, seconds),
+        read: (args) => this.readTranscript(ident, secret, args),
+        search: (words, limit) => this.searchTranscript(ident, secret, words, limit),
+        archivedThrough: () => this.archivedThrough(ident, secret),
       };
       // Checked before any message, so a dead link fails at connect rather than at the first tool.
       await access.view(0);

@@ -191,6 +191,9 @@ class Hub:
         self.path, self.lock = path, threading.Lock()
         with self._db() as db:
             db.executescript(SCHEMA)
+            # A relay database from before transcript grants gains the flag, every old share being messaging only.
+            if "transcript" not in {row[1] for row in db.execute("PRAGMA table_info(shares)")}:
+                db.execute("ALTER TABLE shares ADD COLUMN transcript INTEGER NOT NULL DEFAULT 0")
             # A relay database from before `when` existed gains the column, every old post being `now`.
             if "timing" not in {row[1] for row in db.execute("PRAGMA table_info(posts)")}:
                 db.execute("ALTER TABLE posts ADD COLUMN timing TEXT NOT NULL DEFAULT 'now'")
@@ -604,8 +607,11 @@ class Hub:
         return {"name": row[0], "title": row[1] or "", "status": row[2] or "",
                 "online": _online(seen[0] if seen else 0.0, row[3], time.time())}
 
-    def create_share(self, node: str, address, label="guest", ttl=SHARE_TTL) -> dict:
-        """A guest link bound to one session this node published and holds online; the secret is returned once."""
+    def create_share(self, node: str, address, label="guest", ttl=SHARE_TTL, transcript=False) -> dict:
+        """A guest link bound to one session this node published and holds online; the secret is returned once.
+
+        `transcript` also lets the guest read and search that session's archived transcript, and nothing else.
+        """
         if not isinstance(address, str) or not address:
             raise HubError(400, "address is the session to share, harness:id or NODE/harness:id")
         local = address
@@ -620,6 +626,8 @@ class Hub:
             raise HubError(400, f"label is a name of at most {LABEL_LIMIT} printable characters")
         if isinstance(ttl, bool) or not isinstance(ttl, int) or not SHARE_TTL_MIN <= ttl <= SHARE_TTL_MAX:
             raise HubError(400, f"ttl is a whole number of seconds from {SHARE_TTL_MIN} to {SHARE_TTL_MAX}")
+        if not isinstance(transcript, bool):
+            raise HubError(400, "transcript is true or false")
         label = label.strip()
         ident, secret, now = secrets.token_hex(8), secrets.token_urlsafe(32), time.time()
         with self.lock, self._db() as db:
@@ -631,26 +639,28 @@ class Hub:
             stale = [row[0] for row in db.execute("SELECT id FROM shares WHERE expires < ?", (now - SHARE_KEEP,))]
             db.executemany("DELETE FROM share_messages WHERE share = ?", [(s,) for s in stale])
             db.executemany("DELETE FROM shares WHERE id = ?", [(s,) for s in stale])
-            db.execute("INSERT INTO shares VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
-                       (ident, _hash(secret), node, local, label, now, now + ttl))
+            db.execute("INSERT INTO shares (id, hash, node, address, label, created, expires, transcript)"
+                       " VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (ident, _hash(secret), node, local, label, now, now + ttl,
+                                                          int(transcript)))
             until = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(now + ttl))
+            scope = " with transcript" if transcript else ""
             self._file_note(db, node, local, label,
-                            f"Shared {node}/{local} with {label} until {until} (share {ident}). "
+                            f"Shared {node}/{local}{scope} with {label} until {until} (share {ident}). "
                             f"Revoke it with `one-conv live share --revoke {ident} --yes`.")
         return {"id": ident, "secret": secret, "address": f"{node}/{local}", "label": label,
-                "expires": now + ttl, "path": f"/s/{ident}"}
+                "expires": now + ttl, "path": f"/s/{ident}", "transcript": transcript}
 
     def list_shares(self, node: str) -> dict:
         """This node's shares, newest first, with their state and how many messages each guest sent."""
         now = time.time()
         with self._db() as db:
             rows = db.execute("SELECT s.id, s.address, s.label, s.created, s.expires, s.revoked, s.first_used,"
-                              " (SELECT COUNT(*) FROM share_messages m WHERE m.share = s.id AND m.side = 'guest')"
+                              " s.transcript, (SELECT COUNT(*) FROM share_messages m WHERE m.share = s.id AND m.side = 'guest')"
                               " FROM shares s WHERE s.node = ? ORDER BY s.created DESC", (node,)).fetchall()
         return {"shares": [{"id": i, "address": f"{node}/{a}", "label": label, "created": c, "expires": e,
-                            "revoked": r, "first_used": used, "guest_messages": count,
+                            "revoked": r, "first_used": used, "guest_messages": count, "transcript": bool(t),
                             "state": "revoked" if r is not None else ("expired" if e < now else "active")}
-                           for i, a, label, c, e, r, used, count in rows]}
+                           for i, a, label, c, e, r, used, t, count in rows]}
 
     def revoke_share(self, node: str, ident: str) -> dict:
         """End one of this node's shares at once; its page then says the link is no longer active."""
@@ -663,31 +673,42 @@ class Hub:
 
     @staticmethod
     def _active_share(db, ident: str, secret) -> tuple:
-        """(node, address, label, expires, first_used) of a share whose secret matches; 404 or 410 otherwise.
+        """(node, address, label, expires, first_used, transcript) of a share whose secret matches; 404 or 410 otherwise.
 
         An unknown id and a wrong secret answer alike, so a guess learns nothing.
         """
         if not SHARE_ID.fullmatch(ident) or not isinstance(secret, str) or not secret or len(secret) > MAX_SECRET:
             raise HubError(404, INACTIVE)
-        row = db.execute("SELECT hash, node, address, label, expires, revoked, first_used FROM shares WHERE id = ?",
+        row = db.execute("SELECT hash, node, address, label, expires, revoked, first_used, transcript FROM shares"
+                         " WHERE id = ?",
                          (ident,)).fetchone()
         # Compared even without a row, so an unknown id takes as long as a wrong secret.
         if not hmac.compare_digest(row[0] if row else "0" * 64, _hash(secret)) or row is None:
             raise HubError(404, INACTIVE)
         if row[5] is not None or row[4] < time.time():
             raise HubError(410, INACTIVE)
-        return row[1], row[2], row[3], row[4], row[6]
+        return row[1], row[2], row[3], row[4], row[6], bool(row[7])
+
+    def share_grant(self, ident: str, secret) -> tuple[str, str, bool]:
+        """(node, local address, transcript granted) of an active share whose secret matches."""
+        with self._db() as db:
+            node, address, _, _, _, transcript = self._active_share(db, ident, secret)
+        return node, address, transcript
 
     def guest_view(self, ident: str, secret, after: int = 0) -> dict:
-        """The share's label, its session's title and state, and the exchange after `after`, oldest first."""
+        """The share's label, its session's @name and state, and the exchange after `after`, oldest first.
+
+        The session's title is part of its content, so it shows only on a share that grants the transcript.
+        """
         with self._db() as db:
-            node, address, label, expires, _ = self._active_share(db, ident, secret)
+            node, address, label, expires, _, transcript = self._active_share(db, ident, secret)
             state = self._session_state(db, node, address) or {"name": None, "title": "", "status": "", "online": False}
             rows = db.execute("SELECT m.seq, m.side, m.text, m.created, d.outcome FROM share_messages m"
                               " LEFT JOIN deliveries d ON d.post = m.post WHERE m.share = ? AND m.seq > ?"
                               " ORDER BY m.seq LIMIT ?", (ident, max(0, after), GUEST_PAGE)).fetchall()
-        return {"share": {"label": label, "title": state["title"], "name": state["name"], "online": state["online"],
-                          "busy": state["status"] in ("busy", "waiting"), "expires": expires},
+        return {"share": {"label": label, "title": state["title"] if transcript else "", "name": state["name"],
+                          "online": state["online"], "busy": state["status"] in ("busy", "waiting"), "expires": expires,
+                          "transcript": transcript},
                 "messages": [{"seq": seq, "from": side, "text": text, "created": created,
                               **({"status": outcome or "sent"} if side == "guest" else {})}
                              for seq, side, text, created, outcome in rows]}
@@ -701,7 +722,7 @@ class Hub:
         now = time.time()
         with self.lock, self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            node, address, label, _, first_used = self._active_share(db, ident, secret)
+            node, address, label, _, first_used, _ = self._active_share(db, ident, secret)
             state = self._session_state(db, node, address)
             if state is None or not state["online"]:
                 raise HubError(409, "the agent is offline; this message was not sent")
@@ -758,6 +779,8 @@ def application(hub: Hub, archive_db: str | None = None):
 
     With `archive_db`, the conversation archive is served at `one_conv.archive.HUB_ARCHIVE_PATH`
     under the same node tokens: every node reads every capture and uploads only under its own name.
+    It also serves the transcript of a shared session to a share that grants it; without
+    `archive_db` no share can grant a transcript.
     """
     from starlette.applications import Starlette
     from starlette.concurrency import run_in_threadpool
@@ -864,10 +887,20 @@ def application(hub: Hub, archive_db: str | None = None):
                                                                       req.query_params.getlist("tag"),
                                                                       int_param(req, "limit", NOTES_LIMIT)))
 
+    store = None
+    if archive_db is not None:
+        from archive.store import SQLiteStore
+        store = SQLiteStore(f"sqlite:///{archive_db}")
+
+    def create_share(node, body):
+        if body.get("transcript") is True and store is None:
+            raise HubError(409, "this relay keeps no archive, so a share cannot grant a transcript")
+        return hub.create_share(node, body.get("address"), body.get("label", "guest"), body.get("ttl", SHARE_TTL),
+                                body.get("transcript", False))
+
     async def shares(request):
         if request.method == "POST":
-            return await handle(request, lambda node, body, _: hub.create_share(
-                node, body.get("address"), body.get("label", "guest"), body.get("ttl", SHARE_TTL)))
+            return await handle(request, lambda node, body, _: create_share(node, body))
         return await handle(request, lambda node, body, _: hub.list_shares(node))
 
     async def share(request):
@@ -919,6 +952,77 @@ def application(hub: Hub, archive_db: str | None = None):
             return 0.0
         return value if math.isfinite(value) else 0.0
 
+    def granted_turns(ident, secret, raw: bool) -> tuple[list[dict], float]:
+        """(rendered turns, archived mtime) of the one session the share names, if it grants the transcript."""
+        from . import share_transcript
+        node, address, granted = hub.share_grant(ident, secret)
+        if not granted:
+            raise HubError(403, "this share does not grant the session's transcript")
+        if store is None:
+            raise HubError(503, "this relay keeps no archive")
+        try:
+            turns, mtime = share_transcript.load(store, node, address)
+        except share_transcript.TranscriptMissing as error:
+            raise HubError(404, str(error)) from None
+        return share_transcript.render_turns(turns, raw), mtime
+
+    def read_transcript(ident, secret, offset=None, limit=40, around=None, raw=False) -> dict:
+        """A page of the shared session's turns, as the remote MCP's read_conversation pages them."""
+        from . import share_transcript
+        turns, mtime = granted_turns(ident, secret, raw)
+        start = share_transcript.page_start(turns, limit, offset, around)
+        return {**share_transcript.page(turns, start, limit), "archived_through": mtime}
+
+    def search_transcript(ident, secret, query: str, limit=20) -> dict:
+        """Turns of the shared session holding every word of `query`, newest first; hidden blocks are never searched."""
+        from . import share_transcript
+        turns, mtime = granted_turns(ident, secret, False)
+        return {**share_transcript.search(turns, query, limit), "archived_through": mtime}
+
+    def archived_through(ident, secret) -> float | None:
+        from . import share_transcript
+        node, address, granted = hub.share_grant(ident, secret)
+        head = share_transcript.archived(store, node, address) if granted and store is not None else None
+        return head["mtime"] if head else None
+
+    def transcript_params(request) -> dict:
+        """read_transcript's arguments from a guest GET, refused as the MCP tool refuses them."""
+        from . import share_mcp as protocol
+        query = request.query_params
+        args = {"raw": query.get("raw") in ("1", "true")}
+        try:
+            if "offset" in query:
+                args["offset"] = int(query["offset"])
+            if "limit" in query:
+                args["limit"] = int(query["limit"])
+        except ValueError:
+            raise HubError(400, "offset and limit are whole numbers") from None
+        if "around" in query:
+            args["around"] = query["around"]
+        try:
+            return protocol.read_arguments(args)
+        except protocol.ToolRefused as error:
+            raise HubError(400, str(error)) from None
+
+    async def transcript(request):
+        # The share's secret is the credential, as for the guest's messages; the session is the grant's alone.
+        from . import share_mcp as protocol
+        try:
+            ident, secret = request.path_params["share"], share_secret(request)
+            if request.url.path.endswith("/search"):
+                try:
+                    query, limit = protocol.search_arguments({"query": request.query_params.get("query", ""),
+                                                              "limit": int_param(request, "limit", 20)})
+                except protocol.ToolRefused as error:
+                    raise HubError(400, str(error)) from None
+                result = await run_in_threadpool(search_transcript, ident, secret, query, limit)
+            else:
+                args = transcript_params(request)
+                result = await run_in_threadpool(lambda: read_transcript(ident, secret, **args))
+            return JSONResponse(result, headers={"cache-control": "no-store"})
+        except HubError as error:
+            return JSONResponse({"error": str(error)}, status_code=error.status)
+
     class ShareTools:
         """What the share's MCP tools reach: this share alone, through the same checks as the guest page."""
 
@@ -933,6 +1037,15 @@ def application(hub: Hub, archive_db: str | None = None):
 
         async def wait(self, after: int, seconds: float) -> dict:
             return await wait_reply(self.ident, self.secret, after, seconds)
+
+        async def read(self, **args) -> dict:
+            return await run_in_threadpool(lambda: read_transcript(self.ident, self.secret, **args))
+
+        async def search(self, query: str, limit: int) -> dict:
+            return await run_in_threadpool(search_transcript, self.ident, self.secret, query, limit)
+
+        async def archived_through(self) -> float | None:
+            return await run_in_threadpool(archived_through, self.ident, self.secret)
 
     async def share_mcp(request):
         # The share's secret is the bearer token: an agent's MCP client sends it on every request.
@@ -963,6 +1076,8 @@ def application(hub: Hub, archive_db: str | None = None):
         Route("/v1/shares", shares, methods=["GET", "POST"]),
         Route("/v1/shares/{share}", share, methods=["DELETE"]),
         Route("/v1/shares/{share}/messages", guest, methods=["GET", "POST"]),
+        Route("/v1/shares/{share}/transcript", transcript, methods=["GET"]),
+        Route("/v1/shares/{share}/transcript/search", transcript, methods=["GET"]),
         Route("/s/{share}", page, methods=["GET"]),
         Route("/s/{share}/mcp", share_mcp, methods=["POST"]),
         Route("/v1/sessions", sessions, methods=["GET", "PUT"]),

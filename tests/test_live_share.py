@@ -175,8 +175,8 @@ def test_the_guest_reads_the_label(shared):
     assert guest(shared)[1]["share"]["label"] == "Alice"
 
 
-def test_the_guest_reads_the_session_title(shared):
-    assert guest(shared)[1]["share"]["title"] == "Fix the build"
+def test_the_guest_page_hides_the_session_title_without_the_transcript(shared):
+    assert guest(shared)[1]["share"]["title"] == ""
 
 
 def test_a_wrong_secret_is_refused(shared):

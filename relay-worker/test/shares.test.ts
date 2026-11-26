@@ -102,9 +102,9 @@ describe("the guest", () => {
     expect((await body<{ share: { label: string } }>(guest(made))).share.label).toBe("Alice");
   });
 
-  test("reads the session's title", async () => {
+  test("does not see the session's title without the transcript", async () => {
     const { made } = await shared();
-    expect((await body<{ share: { title: string } }>(guest(made))).share.title).toBe("Fix the build");
+    expect((await body<{ share: { title: string } }>(guest(made))).share.title).toBe("");
   });
 
   test("with a wrong secret is a 404", async () => {

@@ -42,6 +42,18 @@ textarea { flex: 1; resize: none; min-height: 42px; max-height: 40vh; padding: 1
            background: var(--bg); color: var(--text); font: inherit; }
 button { padding: 0 18px; border: 0; border-radius: 12px; background: var(--guest); color: var(--guest-text); font: inherit; font-weight: 600; cursor: pointer; }
 button:disabled, textarea:disabled { opacity: .5; cursor: default; }
+nav { display: flex; gap: 4px; padding: 6px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+nav[hidden], section[hidden], main[hidden], form[hidden] { display: none; }
+nav button { padding: 6px 14px; background: transparent; color: var(--muted); }
+nav button[aria-selected="true"] { background: var(--agent); color: var(--text); }
+section { flex: 1; overflow-y: auto; padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
+section form { padding: 0; border: 0; background: none; }
+section input { flex: 1; padding: 9px 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--bg); color: var(--text); font: inherit; }
+.turn { border-left: 3px solid var(--line); padding: 2px 0 2px 10px; }
+.turn .who { font-size: 12px; color: var(--muted); }
+.turn .text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }
+.turn.hit { cursor: pointer; }
+.more { align-self: center; background: var(--agent); color: var(--text); padding: 6px 14px; }
 </style>
 </head>
 <body>
@@ -49,6 +61,14 @@ button:disabled, textarea:disabled { opacity: .5; cursor: default; }
   <h1 id="title">Shared conversation</h1>
   <p id="subtitle"><span class="dot" id="dot"></span><span id="state">connecting…</span></p>
 </header>
+<nav id="tabs" role="tablist" hidden>
+  <button type="button" role="tab" id="tab-chat" aria-selected="true">Chat</button>
+  <button type="button" role="tab" id="tab-transcript" aria-selected="false">Transcript</button>
+</nav>
+<section id="transcript" hidden aria-live="polite">
+  <form id="search"><input id="query" type="search" placeholder="Search this session" aria-label="Search this session"><button type="submit">Search</button></form>
+  <div id="turns"></div>
+</section>
 <main id="log" aria-live="polite"><div class="empty" id="empty">Loading…</div></main>
 <div class="banner" id="banner" role="status"></div>
 <form id="form">
@@ -86,6 +106,67 @@ button:disabled, textarea:disabled { opacity: .5; cursor: default; }
     return { ok: response.ok, status: response.status, data };
   }
 
+  // The Transcript tab: the shared session's archived turns, only on a share that grants them.
+  let earlier = null;
+
+  async function transcriptApi(path) {
+    const response = await fetch(`/v1/shares/${id}/transcript${path}`, { cache: "no-store", credentials: "omit", headers: { "x-share-secret": secret } });
+    const data = await response.json().catch(() => ({}));
+    if (response.status === 410) finish("This link is no longer active.");
+    return { ok: response.ok, data };
+  }
+
+  function turnElement(turn, hit) {
+    const element = document.createElement("div");
+    element.className = hit ? "turn hit" : "turn";
+    element.append(Object.assign(document.createElement("div"), { className: "who", textContent: `${turn.role} · ${turn.ts}` }),
+                   Object.assign(document.createElement("div"), { className: "text", textContent: hit ? turn.snippet : turn.text }));
+    if (hit) element.addEventListener("click", () => readTranscript(turn.index));
+    return element;
+  }
+
+  function note(text) {
+    return Object.assign(document.createElement("div"), { className: "notice", textContent: text });
+  }
+
+  async function readTranscript(offset, prepend) {
+    const { ok, data } = await transcriptApi(offset === undefined ? "" : `?offset=${offset}`);
+    const box = $("turns");
+    if (!ok) return box.replaceChildren(note(data.error || "The transcript is not available."));
+    const turns = data.turns.map((turn) => turnElement(turn, false));
+    earlier = data.previous_offset;
+    const more = Object.assign(document.createElement("button"), { className: "more", type: "button", textContent: "Earlier turns" });
+    more.addEventListener("click", () => readTranscript(earlier, true));
+    if (prepend) {
+      box.querySelector(".more")?.remove();
+      box.prepend(...(earlier === null ? [] : [more]), ...turns);
+    } else {
+      box.replaceChildren(...(earlier === null ? [] : [more]), ...turns);
+      if (!turns.length) box.append(note("No turns archived yet."));
+      if (offset === undefined) $("transcript").scrollTop = $("transcript").scrollHeight;
+    }
+  }
+
+  $("search").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const words = $("query").value.trim();
+    if (!words) return readTranscript();
+    const { ok, data } = await transcriptApi(`/search?query=${encodeURIComponent(words)}`);
+    const box = $("turns");
+    if (!ok) return box.replaceChildren(note(data.error || "The search failed."));
+    box.replaceChildren(...(data.hits.length ? data.hits.map((hit) => turnElement(hit, true)) : [note("No turn matches.")]));
+  });
+
+  function showTab(transcript) {
+    $("tab-chat").setAttribute("aria-selected", String(!transcript));
+    $("tab-transcript").setAttribute("aria-selected", String(transcript));
+    $("transcript").hidden = !transcript;
+    log.hidden = $("form").hidden = transcript;
+    if (transcript && !$("turns").childElementCount) readTranscript();
+  }
+  $("tab-chat").addEventListener("click", () => showTab(false));
+  $("tab-transcript").addEventListener("click", () => showTab(true));
+
   function add(message) {
     $("empty")?.remove();
     const bubble = document.createElement("div");
@@ -112,6 +193,7 @@ button:disabled, textarea:disabled { opacity: .5; cursor: default; }
       const { ok, data } = await api("GET");
       if (!ok || closed) return;
       const share = data.share;
+      $("tabs").hidden = !share.transcript;
       const name = share.title || (share.name ? `@${share.name}` : "an agent");
       $("title").textContent = name;
       document.title = `${name} · shared with ${share.label}`;

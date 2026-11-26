@@ -345,7 +345,9 @@ def build_live_group(launcher: list[str], transcript=None) -> click.Group:
         from . import bridge
         steps = [step for step in installer.plan(launcher) if harness in (None, step.harness)]
         for step in steps:
-            if step.done():
+            if not step.available():
+                click.echo(f"  skipped  [{step.harness}] {step.cli} is not installed")
+            elif step.done():
                 click.echo(f"  ok       [{step.harness}] {step.summary}")
             elif yes:
                 step.apply()

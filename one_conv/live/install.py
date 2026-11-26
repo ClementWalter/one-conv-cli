@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import shutil
+import shutil
 import subprocess
 import sys
 from collections.abc import Callable
@@ -27,6 +28,11 @@ class Step:
     summary: str
     done: Callable[[], bool]
     apply: Callable[[], None]
+    # The harness command the step runs; without it on PATH the step is skipped, not failed.
+    cli: str = ""
+
+    def available(self, which=None) -> bool:
+        return not self.cli or (which or shutil.which)(self.cli) is not None
 
 
 def _json_file(path: Path) -> dict:
@@ -177,14 +183,14 @@ def plan(launcher: list[str]) -> list[Step]:
         Step("claude", "register the one-conv MCP server (user scope)",
              lambda: _registered(["claude", "mcp", "get", "one-conv"], mcp),
              lambda: _replace(["claude", "mcp", "remove", "--scope", "user", "one-conv"],
-                              ["claude", "mcp", "add", "--scope", "user", "one-conv", "--", *mcp])),
+                              ["claude", "mcp", "add", "--scope", "user", "one-conv", "--", *mcp]), cli="claude"),
         Step("claude", f'set "crossSessionInbound": "accept" in {settings}; any local process running as '
              "you can then inject user turns into every Claude Code session, including bypass ones",
              inbound_done, inbound_apply),
         Step("codex", "register the one-conv MCP server",
              lambda: _registered(["codex", "mcp", "get", "one-conv"], mcp),
              lambda: _replace(["codex", "mcp", "remove", "one-conv"],
-                              ["codex", "mcp", "add", "one-conv", "--", *mcp])),
+                              ["codex", "mcp", "add", "one-conv", "--", *mcp]), cli="codex"),
         Step("omp", f"write the relay extension {omp.extension_path()}", extension_done, extension_apply),
         Step("cursor", f"add the one-conv MCP server to {cursor_mcp}", cursor_mcp_done, cursor_mcp_apply),
         Step("cursor", f"add the relay stop hook to {cursor_hooks}", cursor_hook_done, cursor_hook_apply),

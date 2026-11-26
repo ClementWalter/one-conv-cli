@@ -196,7 +196,7 @@ def add_bridge_commands(live: click.Group, launcher: list[str]) -> None:
             raise click.UsageError(str(error)) from None
         hub = _check_hub(hub)
         saved = bridge.settings()
-        missing = [step for step in installer.plan(launcher) if not step.done()]
+        missing = [step for step in installer.plan(launcher) if step.available() and not step.done()]
         if not yes:
             click.echo("DRY-RUN (nothing changed). Re-run with --yes to join.")
             click.echo(f"  redeem   the one-time invite for node {node} at {hub}")

@@ -24,7 +24,8 @@ def examples(*lines: str) -> str:
     return "\b\nExamples:\n" + "\n".join(f"  {line}" for line in lines)
 
 
-def build_live_group(launcher: list[str]) -> click.Group:
+def build_live_group(launcher: list[str], transcript=None) -> click.Group:
+    """The `live` commands; `transcript(address)` reads a local session for `live teleport` (see one_conv_cli)."""
     @click.group("live", context_settings=HELP,
                  epilog="\b\nTargets:\n  claude:<id> codex:<id> omp:<id> cursor:<id> agy:<id>  a session address (or id prefix)\n"
                         "  NODE/claude:<full id>                      a session on another machine (live join, live serve)\n"
@@ -39,6 +40,8 @@ def build_live_group(launcher: list[str]) -> click.Group:
                         "  one-conv live join 'https://<your-relay>.workers.dev#studio.<code>' --yes   # on the new one\n"
                         "  one-conv live serve --hub ssh://me@relay-box --node laptop --token-stdin < token   # self-hosted relay\n"
                         "  one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes\n"
+                        "  one-conv live teleport studio --check     # from an agent: what studio lacks to continue it\n"
+                        "  one-conv live serve --accept-teleport     # on studio: let sessions teleport here\n"
                         "  one-conv live status 9f2c41d07a5e4b1c8d3e6f7a8b9c0d1e")
     def live():
         """Message running agents from any session, on this machine or another: name yourself, send, follow up.
@@ -472,6 +475,78 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 click.echo(f"{'stopped' if was_running else 'already ended'} {row.address or row.tmux} (tmux session {row.tmux})")
         if as_json:
             click.echo(json.dumps(results))
+
+    @live.command("teleport", context_settings=HELP,
+                  epilog=examples("one-conv live teleport studio --check",
+                                  "one-conv live teleport studio --yes",
+                                  "one-conv live teleport studio --push-wip --yes --json",
+                                  "one-conv live teleport ci-runner --cwd '~/code/app' --mode auto --yes"))
+    @click.argument("node")
+    @click.option("--cwd", help="Folder on NODE to work in, instead of the clone found there by its remote URL.")
+    @click.option("--mode", type=click.Choice(spawn.MODES),
+                  help="Approvals on NODE. Default: the session's own mode when its transcript says, else ask.")
+    @click.option("--check", is_flag=True, help="Only show what NODE has and lacks; move nothing.")
+    @click.option("--force", is_flag=True, help="Go ahead although NODE lacks a tool, MCP server, skill or dotfile.")
+    @click.option("--push-wip", is_flag=True,
+                  help="Push committed but unpushed work (HEAD) to a teleport/<id> branch so NODE can fetch it.")
+    @click.option("--from", "sender_address", help="The session to move; detected from the calling agent by default.")
+    @click.option("--json", "as_json", is_flag=True, help="Emit the report as JSON.")
+    @click.option("--yes", is_flag=True, help="Move the session. Without it, only checks.")
+    def teleport_command(node, cwd, mode, check, force, push_wip, sender_address, as_json, yes):
+        """Move the calling agent session to machine NODE on the relay, where it continues its task.
+
+        Takes an inventory of what the session uses (harness and model, git checkout, CLIs,
+        MCP servers, skills, dotfiles it read under ~), asks NODE's bridge which of those it has,
+        and prints ok / missing / unknown for each. With --yes and nothing blocking, it syncs this
+        session to the archive and has NODE start the same harness in tmux, in its clone of the
+        repository at the same commit (a new worktree when that clone is elsewhere), briefed with
+        this conversation. The new session's first act is a message back here confirming; this
+        session must then stop working. Uncommitted changes always refuse; commits only on this
+        machine refuse unless --push-wip. NODE must opt in: `one-conv live serve --accept-teleport`.
+        """
+        from . import inventory as inventories, teleport
+        if transcript is None:
+            raise click.ClickException("teleport needs the history readers of the one-conv CLI")
+        try:
+            sender = router.whoami(sender_address)
+        except router.LiveError as error:
+            raise click.UsageError(str(error)) from None
+        if sender is None or sender.id.startswith("?"):
+            raise click.UsageError("Run this from inside the agent session to move, or pass --from ADDRESS.")
+        try:
+            read = transcript(sender.address)
+        except click.ClickException as error:
+            raise click.ClickException(f"cannot read {sender.address}'s transcript: {error.message}") from None
+        found = inventories.build(sender.harness, sender.cwd or read.get("cwd") or "", read.get("blocks") or [],
+                                  read.get("path"))
+        try:
+            report = teleport.run(node, sender, read, found, cwd=cwd, mode=mode, check_only=check or not yes,
+                                  force=force, wip=push_wip)
+        except (teleport.TeleportError, hubclient.HubRefused) as error:
+            if as_json:
+                click.echo(json.dumps({"status": "failed", "error": str(error),
+                                       **({"screen": error.screen} if getattr(error, "screen", "") else {})}))
+                sys.exit(1)
+            screen = getattr(error, "screen", "")
+            raise click.ClickException(f"{error}" + (f"\nIts screen on {node}:\n{screen}" if screen else "")) from None
+        if as_json:
+            click.echo(json.dumps(report))
+            if report["status"] == "refused":
+                sys.exit(1)
+            return
+        click.echo(f"{report['origin']} -> {node}" + (f" ({report['dir']})" if report.get("dir") else ""))
+        for line in teleport.table(report["rows"]):
+            click.echo(line)
+        if report["status"] == "refused":
+            raise click.ClickException("not teleporting:\n" + "\n".join(f"  - {reason}" for reason in report["blockers"]))
+        if report["status"] == "checked":
+            click.echo("Nothing blocks this teleport." + ("" if check else " Re-run with --yes to move the session."))
+            return
+        click.echo(f"teleported: {report['address']} in {report['dir']} at {report['branch']}@{report['sha'][:12]}"
+                   if report.get("sha") else f"teleported: {report['address']} in {report['dir']}")
+        if report.get("name_error"):
+            click.echo(f"warning: the name did not move: {report['name_error']}", err=True)
+        click.echo(report["next"])
 
     @live.command("cursor-hook", hidden=True, epilog=examples('one-conv live cursor-hook < hook-payload.json'))
     def cursor_hook_command():

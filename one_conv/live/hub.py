@@ -30,6 +30,12 @@ reaches no other address, sees only its own exchange, and is refused while the s
 offline rather than queued. A guest's agent uses the same share through its MCP server,
 `/s/<id>/mcp` (share_mcp.py), with the secret as its bearer token. The person gets a note tagged `share` when a share is made and
 when its guest first writes.
+
+A post with mode `request` is for a node's bridge rather than a session: `to` is a node name,
+the delivery reaches that node as `to: "bridge"`, and `text` is the request (`live teleport`
+asks another machine what it lacks for a session, then to start it there). The bridge answers
+with its final ack, which may carry a JSON `result` the sender reads back with `status`.
+A bridge that does not know requests refuses them like any address that is not a session.
 """
 
 import asyncio
@@ -52,7 +58,12 @@ MESSAGE_ID = re.compile(r"[0-9a-f]{32}")
 # `held` is provisional: the bridge keeps a when=idle message for a busy session and reports
 # one of the others once it leaves; a held delivery is not handed out again.
 OUTCOMES = ("accepted", "refused", "unconfirmed", "held")
-MODES = ("push", "fyi")
+# request: for the receiving node's bridge itself, answered with a result on the ack.
+MODES = ("push", "fyi", "request")
+# The address a request delivery carries: the receiving node's bridge.
+BRIDGE = "bridge"
+# A request's answer is small: a list of checks, or the address of a started session.
+RESULT_LIMIT = 65_536
 # now: delivered at once; idle: the receiving bridge holds it while the session is busy.
 WHEN = ("now", "idle")
 REPLIES = ("expected", "none", "inline")
@@ -125,7 +136,7 @@ CREATE TABLE IF NOT EXISTS posts (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_no
     mode TEXT NOT NULL DEFAULT 'push', text TEXT NOT NULL, created REAL NOT NULL, attachments TEXT,
     timing TEXT NOT NULL DEFAULT 'now', UNIQUE (from_node, id));
 CREATE TABLE IF NOT EXISTS deliveries (delivery TEXT PRIMARY KEY, post INTEGER NOT NULL REFERENCES posts (seq),
-    to_node TEXT NOT NULL, to_address TEXT NOT NULL, taken REAL, outcome TEXT, outcome_at REAL,
+    to_node TEXT NOT NULL, to_address TEXT NOT NULL, taken REAL, outcome TEXT, outcome_at REAL, result TEXT,
     UNIQUE (post, to_node, to_address));
 CREATE INDEX IF NOT EXISTS pending ON deliveries (to_node, outcome, post);
 CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, node TEXT NOT NULL, media_type TEXT NOT NULL,
@@ -183,6 +194,9 @@ class Hub:
             # A relay database from before `when` existed gains the column, every old post being `now`.
             if "timing" not in {row[1] for row in db.execute("PRAGMA table_info(posts)")}:
                 db.execute("ALTER TABLE posts ADD COLUMN timing TEXT NOT NULL DEFAULT 'now'")
+            # A relay database from before requests existed gains the column for their answers.
+            if "result" not in {row[1] for row in db.execute("PRAGMA table_info(deliveries)")}:
+                db.execute("ALTER TABLE deliveries ADD COLUMN result TEXT")
 
     @contextmanager
     def _db(self):
@@ -340,6 +354,15 @@ class Hub:
         return node, address
 
     @staticmethod
+    def _bridge_recipient(db, target: str) -> tuple[str, str]:
+        """Where a request goes: the bridge of a node that holds a token on this relay."""
+        if not NODE.fullmatch(target):
+            raise HubError(400, f"a request goes to a node name, not {target!r}")
+        if db.execute("SELECT 1 FROM tokens WHERE node = ?", (target,)).fetchone() is None:
+            raise HubError(404, f"no node is called {target}")
+        return target, BRIDGE
+
+    @staticmethod
     def _receipt(db, seq: int, msg_id: str, duplicate: bool) -> dict:
         rows = db.execute("SELECT delivery, to_node, to_address, outcome FROM deliveries WHERE post = ? "
                           "ORDER BY rowid", (seq,)).fetchall()
@@ -376,6 +399,8 @@ class Hub:
             return self._note(node, msg_id, sender, text, message, bool(attached))
         if target.startswith(GUEST):
             return self._guest_reply(node, msg_id, sender, text, target, bool(attached))
+        if mode == "request" and attached:
+            raise HubError(400, "a request carries text only")
         # `when` joins the digest only when idle, so a `now` post hashes as it always has.
         fields = [target, sender, reply, mode, text, *attached] + (["when=idle"] if timing == "idle" else [])
         digest = hashlib.sha256(json.dumps(fields).encode()).hexdigest()
@@ -392,7 +417,8 @@ class Hub:
             # A sender is this node's own session or the person at its terminal, never another node's agent.
             if not isinstance(sender, str) or (not self._published(db, node, sender) and sender not in ("user", "unknown")):
                 raise HubError(403, "from must be a session this node published, or user/unknown")
-            to_node, to_address = self._recipient(db, target)
+            to_node, to_address = (self._bridge_recipient(db, target) if mode == "request"
+                                   else self._recipient(db, target))
             seq = db.execute("INSERT INTO posts (from_node, id, digest, target, sender, reply, mode, text, created,"
                              " attachments, timing) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                              (node, msg_id, digest, target, sender, reply, mode, text, time.time(),
@@ -516,21 +542,31 @@ class Hub:
                 "text": x, "created": c, **({"attachments": cls._parsed(attachments)} if attachments else {}),
                 **({"when": timing} if timing == "idle" else {}), **guest}
 
-    def ack(self, node: str, delivery: str, outcome: str) -> dict:
+    def ack(self, node: str, delivery: str, outcome: str, result=None) -> dict:
         """Record the outcome of one of this node's deliveries; the first final outcome reported stands.
 
         `held` is recorded only on a delivery without an outcome, and a final outcome replaces it.
+        `result` is a JSON object answering a request, kept with the outcome it came with.
         """
         if outcome not in OUTCOMES:
             raise HubError(400, f"outcome must be one of {', '.join(OUTCOMES)}")
+        stored = None
+        if result is not None:
+            if not isinstance(result, dict):
+                raise HubError(400, "result is a JSON object")
+            stored = json.dumps(result, separators=(",", ":"), ensure_ascii=False)
+            if len(stored) > RESULT_LIMIT:
+                raise HubError(413, f"a result is at most {RESULT_LIMIT} characters of JSON")
         with self.lock, self._db() as db:
-            row = db.execute("SELECT outcome FROM deliveries WHERE delivery = ? AND to_node = ?",
-                             (delivery, node)).fetchone()
+            row = db.execute("SELECT d.outcome, p.mode FROM deliveries d JOIN posts p ON p.seq = d.post"
+                             " WHERE d.delivery = ? AND d.to_node = ?", (delivery, node)).fetchone()
             if row is None:
                 raise HubError(404, "no such delivery for this node")
-            db.execute("UPDATE deliveries SET outcome = ?, outcome_at = ? WHERE delivery = ?"
-                       " AND (outcome IS NULL OR (outcome = 'held' AND ? != 'held'))",
-                       (outcome, time.time(), delivery, outcome))
+            if stored is not None and row[1] != "request":
+                raise HubError(400, "only a request is answered with a result")
+            db.execute("UPDATE deliveries SET outcome = ?, outcome_at = ?, result = COALESCE(?, result)"
+                       " WHERE delivery = ? AND (outcome IS NULL OR (outcome = 'held' AND ? != 'held'))",
+                       (outcome, time.time(), stored, delivery, outcome))
             current = db.execute("SELECT outcome FROM deliveries WHERE delivery = ?", (delivery,)).fetchone()[0]
         return {"delivery": delivery, "outcome": current}
 
@@ -540,10 +576,11 @@ class Hub:
             post = db.execute("SELECT seq FROM posts WHERE from_node = ? AND id = ?", (node, msg_id)).fetchone()
             if post is None:
                 raise HubError(404, "no such message from this node")
-            rows = db.execute("SELECT delivery, to_node, to_address, outcome, outcome_at FROM deliveries"
+            rows = db.execute("SELECT delivery, to_node, to_address, outcome, outcome_at, result FROM deliveries"
                               " WHERE post = ? ORDER BY rowid", (post[0],)).fetchall()
         return {"id": msg_id, "recipients": [{"to": f"{n}/{a}", "delivery": d, "outcome": o or "stored",
-                                              "outcome_at": at} for d, n, a, o, at in rows]}
+                                              "outcome_at": at, **({"result": json.loads(r)} if r else {})}
+                                             for d, n, a, o, at, r in rows]}
 
     # --- shares: a guest link to one session -------------------------------------------------------
 
@@ -777,7 +814,7 @@ def application(hub: Hub, archive_db: str | None = None):
 
     async def acks(request):
         return await handle(request, lambda node, body, _: hub.ack(node, str(body.get("delivery")),
-                                                                    str(body.get("outcome"))))
+                                                                    str(body.get("outcome")), body.get("result")))
 
     async def upload(request):
         try:

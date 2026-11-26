@@ -405,7 +405,7 @@ def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str
     if images:
         message["attachments"] = _upload(hub, images)
     try:
-        receipt = hubclient.submit(hub, message)
+        receipt = _submit_published(hub, message)
     except (hubclient.HubRefused, hubclient.PendingConflict) as error:
         raise LiveError(str(error)) from error
     if receipt is None:
@@ -417,6 +417,27 @@ def _post_remote(hub, target: str, text: str, sender: str, fyi: bool, reply: str
     if when == "idle" and receipt.get("when") != "idle":
         result["warning"] = "the relay does not carry when=idle yet, so the message is delivered at once"
     return result
+
+
+def _submit_published(hub, message: dict) -> dict | None:
+    """hubclient.submit; a session that started here after the bridge's last publication is published first.
+
+    The relay accepts a sender only once this node published it, and the bridge publishes on a
+    timer, so a freshly started agent (one `live spawn` or `live teleport` started) would otherwise
+    be refused for its first message.
+    """
+    try:
+        return hubclient.submit(hub, message)
+    except hubclient.HubRefused as error:
+        sender = message.get("from", "")
+        if error.status != 403 or not any(s.address == sender for s in list_all(sender.partition(":")[0])):
+            raise
+        from .bridge import publish_sessions
+        try:
+            publish_sessions(hub)
+        except (hubclient.HubRefused, hubclient.HubUnavailable):
+            raise error from None
+        return hubclient.submit(hub, message)
 
 
 def _send_cloud(target: str, text: str, sender: LiveSession | None, origin: str, fyi: bool,

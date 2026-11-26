@@ -8,7 +8,7 @@ import time
 
 import click
 
-from . import bridge, hubclient, invite, service, tunnel
+from . import bridge, hubclient, invite, provision, service, tunnel
 from . import install as installer
 
 HELP = {"help_option_names": ["-h", "--help"]}
@@ -30,6 +30,8 @@ def _status_lines(state: dict) -> list[str]:
         lines.append(f"  last error: {state['last_error']}")
     lines.append(f"  queued for the relay: {state['outbox']}")
     lines.append(f"  starts at login: {'yes' if service.installed() else 'no (one-conv live serve --install --yes)'}")
+    accepts = bridge.settings().get(provision.ACCEPT_KEY) is True
+    lines.append(f"  accepts teleports: {'yes' if accepts else 'no (one-conv live serve --accept-teleport)'}")
     lines.extend(f"  {note}" for note in state.get("notes") or [])
     return lines
 
@@ -64,9 +66,13 @@ def add_bridge_commands(live: click.Group, launcher: list[str]) -> None:
                   help="Run the bridge as a login service (launchd on macOS, systemd on Linux): it starts on its own"
                        " and restarts after a crash.")
     @click.option("--uninstall", "uninstall_it", is_flag=True, help="Remove the login service.")
+    @click.option("--accept-teleport/--no-accept-teleport", "accept_teleport", default=None,
+                  help="Let agent sessions on other nodes of this relay teleport here (`live teleport`): they are"
+                       " checked out and started in tmux on this machine. Saved; a running bridge applies it at once.")
     @click.option("--yes", is_flag=True, help="Apply --install or --uninstall; without it, only show what would change.")
     @click.option("--json", "as_json", is_flag=True, help="Emit --status as JSON.")
-    def serve_command(hub, node, hub_port, token_stdin, show_status, stop_it, install_it, uninstall_it, yes, as_json):
+    def serve_command(hub, node, hub_port, token_stdin, show_status, stop_it, install_it, uninstall_it, accept_teleport,
+                      yes, as_json):
         """Connect this machine to a live relay, so its agents and agents elsewhere reach each other.
 
         The bridge publishes the sessions running here, delivers messages the relay holds for
@@ -105,6 +111,12 @@ def add_bridge_commands(live: click.Group, launcher: list[str]) -> None:
         if stop_it:
             click.echo("stopping the bridge" if bridge.stop() else "no bridge is running")
             return
+        if accept_teleport is not None and (bridge.status()["running"] or not (hub or bridge.settings().get("hub"))):
+            # The running bridge reads the setting for each request, so it needs no restart.
+            bridge.save_accept_teleport(accept_teleport)
+            click.echo(f"teleports to this machine are {'accepted' if accept_teleport else 'refused'}"
+                       + (" (the running bridge applies it to the next request)" if bridge.status()["running"] else ""))
+            return
         saved = bridge.settings()
         hub, node = hub or saved.get("hub"), node or saved.get("node")
         hub_port = hub_port or saved.get("hub_port") or 8789
@@ -116,7 +128,8 @@ def add_bridge_commands(live: click.Group, launcher: list[str]) -> None:
             # A remembered token belongs to the remembered hub; never send it to another one.
             raise click.UsageError("A new --hub needs its own token: pass --token-stdin or ONE_CONV_HUB_TOKEN.")
         hub = _check_hub(hub)
-        bridge.save_settings(hub, node, hub_port, token)
+        bridge.save_settings(hub, node, hub_port, token,
+                             **({provision.ACCEPT_KEY: accept_teleport} if accept_teleport is not None else {}))
         # force: the CLI configured WARNING at import, which would hide the bridge's transport and delivery lines.
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", force=True)
         click.echo(f"bridge for node {node} via {hub}; stop with Ctrl-C or `one-conv live serve --stop`", err=True)
@@ -167,8 +180,10 @@ def add_bridge_commands(live: click.Group, launcher: list[str]) -> None:
     @click.argument("invitation", metavar="INVITE")
     @click.option("--hub-port", type=int, default=invite.DEFAULT_HUB_PORT, show_default=True,
                   help="The relay's port on an ssh host.")
+    @click.option("--accept-teleport", is_flag=True,
+                  help="Also let agent sessions on other nodes teleport here (`live teleport`).")
     @click.option("--yes", is_flag=True, help="Join. Without it, only lists the steps.")
-    def join_command(invitation, hub_port, yes):
+    def join_command(invitation, hub_port, accept_teleport, yes):
         """Connect this machine to the relay with an invite from `live invite`, and start its bridge.
 
         Redeems the one-time code for this node's token, saves the relay, node and token like
@@ -188,6 +203,8 @@ def add_bridge_commands(live: click.Group, launcher: list[str]) -> None:
             if saved.get("hub"):
                 click.echo(f"  replace  the saved bridge settings (node {saved.get('node')} via {saved['hub']})")
             click.echo(f"  save     relay, node and token in {bridge.bridge_dir() / 'serve.json'} (mode 600)")
+            if accept_teleport:
+                click.echo("  accept   sessions teleported here from other nodes (live teleport)")
             for step in missing:
                 click.echo(f"  install  [{step.harness}] {step.summary}")
             click.echo(f"  install  the login service {service.path()} and start the bridge")
@@ -199,7 +216,8 @@ def add_bridge_commands(live: click.Group, launcher: list[str]) -> None:
                 joined = invite.redeem(url, code)
         except (invite.InviteError, tunnel.TunnelError, RuntimeError, ValueError) as error:
             raise click.ClickException(str(error)) from None
-        bridge.save_settings(hub, joined["node"], hub_port, joined["token"])
+        bridge.save_settings(hub, joined["node"], hub_port, joined["token"],
+                             **({provision.ACCEPT_KEY: True} if accept_teleport else {}))
         click.echo(f"  saved    node {joined['node']} via {hub} in {bridge.bridge_dir() / 'serve.json'}")
         for step in missing:
             step.apply()

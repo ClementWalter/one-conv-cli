@@ -4250,11 +4250,25 @@ _register_cloud_accounts(lambda: _claude_accounts())
 
 from one_conv.live.cli import build_live_group  # noqa: E402
 
+
+def _teleport_transcript(address: str) -> dict:
+    """What `live teleport` reads from a session here: its tool calls, transcript file, handoff seed and last request."""
+    handle = _address_handle(address)
+    turns = _handle_iter_turns(handle, include_subagents=False)
+    blocks = [block for turn in turns for block in turn.blocks if block.get("type") == "tool_use"]
+    seed, _ = _port_seed_text(handle, False, False, 0, handoff.DEFAULT_BUDGET)
+    requests = [turn["text"] for turn in _handle_rendered_turns(handle, False, False, 0) if turn["role"] == "user"]
+    # The newest request is often the ask to teleport itself; the task is the one before it.
+    task = next((text for text in reversed(requests) if "teleport" not in text.lower()), requests[-1] if requests else "")
+    return {"blocks": blocks, "path": str(handle.path) if handle.path else None, "cwd": handle.project_cwd,
+            "seed": seed, "summary": " ".join(task.split())[:200]}
+
+
 # Hooks and extensions call back into this checkout through uv, whose script environment
 # survives dependency changes; the running interpreter's cached environment may not.
 _UV = shutil.which("uv")
 cli.add_command(build_live_group([_UV, "run", "--quiet", "--script", str(Path(__file__).resolve())] if _UV
-                                 else [sys.executable, "-O", str(Path(__file__).resolve())]))
+                                 else [sys.executable, "-O", str(Path(__file__).resolve())], _teleport_transcript))
 
 
 @cli.command("mcp", epilog="\b\nExamples:\n  one-conv mcp\n  one-conv mcp --config")

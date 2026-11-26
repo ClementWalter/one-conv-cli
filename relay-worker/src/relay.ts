@@ -146,7 +146,7 @@ export class Relay extends DurableObject<Env> {
     this.sql = ctx.storage.sql;
     this.sql.exec(SCHEMA);
     this.sql.exec(SHARE_SCHEMA);
-    this.shares = new Shares(ctx.storage, (node, delivery) => this.wake(node, delivery));
+    this.shares = new Shares(ctx.storage, (node, delivery) => this.wake(node, delivery), env);
     // A relay stored before `when` existed gains the column, every old post being `now`.
     if (!this.sql.exec("PRAGMA table_info(posts)").toArray().some((column) => column.name === "timing")) {
       this.sql.exec("ALTER TABLE posts ADD COLUMN timing TEXT NOT NULL DEFAULT 'now'");
@@ -181,6 +181,8 @@ export class Relay extends DurableObject<Env> {
       },
       { pattern: path("/v1/shares/{share}"), methods: ["DELETE"], handle: work((node, _, __, params) => this.shares.revoke(node, params.share)) },
       { pattern: path("/v1/shares/{share}/messages"), methods: ["GET", "POST"], handle: (request, params) => this.shares.guest(request, params.share) },
+      { pattern: path("/v1/shares/{share}/transcript"), methods: ["GET"], handle: (request, params) => this.shares.transcriptRoute(request, params.share, false) },
+      { pattern: path("/v1/shares/{share}/transcript/search"), methods: ["GET"], handle: (request, params) => this.shares.transcriptRoute(request, params.share, true) },
       { pattern: path("/s/{share}/mcp"), methods: ["POST"], handle: (request, params) => this.shares.mcp(request, params.share) },
     ];
   }

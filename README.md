@@ -622,7 +622,8 @@ person, talk to one of your agent sessions, and nothing else:
 ```bash
 one-conv live share --label Alice --yes         # inside the session
 one-conv live share --session laptop/claude:<id> --ttl 2h --yes   # from a terminal
-one-conv live share --list                      # this machine's shares
+one-conv live share --label Alice --transcript --yes   # also let them read and search it
+one-conv live share --list                      # this machine's shares, and which grant the transcript
 one-conv live share --revoke <share id> --yes   # everything below stops working at once
 ```
 
@@ -650,14 +651,17 @@ one-conv live send 'https://<your-relay>/s/<id>#<secret>' 'what changed in the A
 And for a person, the chat page `https://<your-relay>/s/<id>#<secret>`.
 
 The share's MCP server (`/s/<id>/mcp`, streamable HTTP, the secret as bearer
-token, no OAuth) has four tools, all bound to that one session:
+token, no OAuth) has four tools, all bound to that one session, and two more
+when the share grants the transcript:
 
 | Tool | Purpose |
 | --- | --- |
 | `ask(text, wait_seconds=120)` | Post and wait for the session's answer (at most 600 s); `status="pending"` with `after` on timeout |
 | `send(text)` | Post without waiting |
 | `read_replies(after=0, wait_seconds=0)` | The session's answers after a cursor |
-| `session_info()` | Label, the session's title and `@name`, online and busy |
+| `session_info()` | Label, the session's `@name`, online and busy, whether the transcript is granted; with it, also the title and `archived_through` |
+| `read_session(offset, limit=40, around, raw=false)` | With `--transcript`: the session's turns, paged like the remote MCP's `read_conversation`, at most 60,000 characters a page |
+| `search_session(query, limit=20)` | With `--transcript`: turns of that session holding every word, newest first, with the index `read_session(offset=...)` takes |
 
 A one-conv agent can also pass the link to `send_message(to=...)`: the answer
 comes back in `reply`, as for a `claude-chat:` target (`wait_for_reply=false`, or
@@ -668,8 +672,23 @@ which browsers never send, and every client passes it in a header. The relay
 keeps only its digest. A share works for 24 hours by default (`--ttl`, at most
 30 days). The MCP tool `share_session` makes one from inside an agent.
 
-The chat page shows the session's title, the label you chose and only the
-guest's own exchange, never the session's transcript. A guest's message, from
+By default a share is messaging only: the chat page shows the label you chose,
+the session's `@name` and only the guest's own exchange, never the session's
+title or transcript. With `--transcript` (`share_session(transcript=true)`) the
+guest can also read and search that one session's transcript: the MCP tools
+above, and a Transcript tab on the chat page. They read the relay's archive copy
+of the session the share names, which its bridge syncs about every minute
+(`archived_through` is the time of the newest change that copy holds); no
+argument can point them at another conversation. Thinking, tool calls and tool
+output stay hidden unless `raw=true`, and even then system reminders are
+stripped and long tool output is cut, as in the remote MCP; search never looks
+at hidden blocks. The relay serves this from its archive: the Worker's, or the
+one `scripts/live-hub.py` keeps beside its database. The inbox note on creation says
+"with transcript", and `live share --list` shows it. `one-conv local thread`
+does not take a share link; a colleague reads a shared transcript through the
+MCP tools or the page.
+
+A guest's message, from
 the page, the MCP server or a one-conv send, reaches that one session as
 `<one-conv-message from="guest:<share id>" kind="guest" from-handle="Alice">`,
 followed by rules the agent reads with it: the guest (a person or their agent)

@@ -99,9 +99,9 @@ describe("the share's MCP server", () => {
     expect(((await tool(made, "read_replies", { after })).replies as { text: string }[]).map((r) => r.text)).toEqual(["the answer"]);
   });
 
-  test("session_info names the session", async () => {
+  test("session_info names the session by its @name", async () => {
     const { made } = await shared();
-    expect((await tool(made, "session_info")).title).toBe("Fix the build");
+    expect((await tool(made, "session_info")).name).toBe("lead");
   });
 
   test("a message over 8 KB is a tool error", async () => {

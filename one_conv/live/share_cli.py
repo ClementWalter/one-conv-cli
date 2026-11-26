@@ -32,8 +32,11 @@ def add_share_command(live: click.Group) -> None:
     @click.option("--list", "show_list", is_flag=True, help="List this machine's shares.")
     @click.option("--revoke", metavar="ID", help="End a share at once.")
     @click.option("--yes", is_flag=True, help="Create (or revoke). Without it, only shows what would happen.")
+    @click.option("--transcript", is_flag=True,
+                  help="Also let them read and search this session's transcript (the relay's archive copy, synced "
+                       "about every minute). Off by default: messaging only.")
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
-    def share_command(label, ttl, address, show_list, revoke, yes, as_json):
+    def share_command(label, ttl, address, show_list, revoke, transcript, yes, as_json):
         """Let a colleague's agent (or a person) talk to ONE agent session: this one, or --session.
 
         Prints, each carrying the share's secret: a `claude mcp add` command and a Codex
@@ -54,19 +57,20 @@ def add_share_command(live: click.Group) -> None:
             elif revoke:
                 _revoke(revoke, yes, as_json)
             else:
-                _create(label, ttl, address, yes, as_json)
+                _create(label, ttl, address, transcript, yes, as_json)
         except (share.ShareError, router.LiveError) as error:
             raise click.ClickException(str(error)) from None
 
-    def _create(label, ttl, address, yes, as_json):
+    def _create(label, ttl, address, transcript, yes, as_json):
         seconds = share.parse_ttl(ttl)
         target = share.session_address(None if address else router.whoami(), address)
         if not yes:
             click.echo("DRY-RUN (nothing shared). Re-run with --yes to make the link.")
             click.echo(f"  session:  {target}")
             click.echo(f"  guest:    {label}, for {ttl}")
+            click.echo(f"  grants:   messages{' and the transcript' if transcript else ' only'}")
             return
-        made = share.create(target, label, seconds)
+        made = share.create(target, label, seconds, transcript)
         if as_json:
             click.echo(json.dumps(made))
             return
@@ -91,7 +95,8 @@ def add_share_command(live: click.Group) -> None:
         for row in rows:
             until = _when(row["expires"])
             click.echo(f"{row['id']}  {row['state']:<8} {row['label'][:20]:<20} {row['address']}  until {until}"
-                       f"  {row['guest_messages']} guest message(s)")
+                       f"  {row['guest_messages']} guest message(s)"
+                       f"{'  with transcript' if row.get('transcript') else ''}")
 
     def _revoke(ident, yes, as_json):
         if not yes:

@@ -141,7 +141,7 @@ async function resolve(env: Env, reference: string): Promise<{ key: string; meta
 }
 
 /** A field of a capture: its chunks from R2, inflated, joined and parsed as the JSON the client encoded. */
-async function field(env: Env, digests: string[]): Promise<unknown> {
+export async function field(env: Env, digests: string[]): Promise<unknown> {
   const parts = await Promise.all(
     digests.map(async (digest) => {
       const object = await env.ARCHIVE.get(`chunks/${digest}`);

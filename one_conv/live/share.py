@@ -97,13 +97,17 @@ def _call(method: str, path: str, body: dict | None = None) -> dict:
         raise ShareError(str(error)) from None
 
 
-def create(address: str, label: str, ttl: int) -> dict:
-    """{id, link, address, label, expires, warning?} of a new share; the link carries the secret once."""
-    made = _call("POST", "/v1/shares", {"address": address, "label": label, "ttl": ttl})
+def create(address: str, label: str, ttl: int, transcript: bool = False) -> dict:
+    """{id, link, address, label, expires, transcript, warning?} of a new share; the link carries the secret once.
+
+    `transcript` also lets the guest read and search that one session's transcript.
+    """
+    body = {"address": address, "label": label, "ttl": ttl, **({"transcript": True} if transcript else {})}
+    made = _call("POST", "/v1/shares", body)
     base, warning = public_base(_hub())
     shared = link(base, made["id"], made["secret"])
     result = {"id": made["id"], "link": shared, "address": made["address"], "label": made["label"],
-              "expires": made["expires"], **setup(shared, made["label"])}
+              "expires": made["expires"], "transcript": bool(made.get("transcript")), **setup(shared, made["label"])}
     return {**result, "warning": warning} if warning else result
 
 

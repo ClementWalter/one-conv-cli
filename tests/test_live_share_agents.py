@@ -103,8 +103,12 @@ def test_read_replies_returns_answers_after_the_cursor(shared):
     assert [r["text"] for r in tool(shared, "read_replies", after=after)["replies"]] == ["answer"]
 
 
-def test_session_info_names_the_session(shared):
-    assert tool(shared, "session_info")["title"] == "Fix the build"
+def test_session_info_names_the_session_by_its_name(shared):
+    assert tool(shared, "session_info")["name"] == "lead"
+
+
+def test_session_info_hides_the_title_without_the_transcript(shared):
+    assert "title" not in tool(shared, "session_info")
 
 
 def test_session_info_says_it_is_online(shared):

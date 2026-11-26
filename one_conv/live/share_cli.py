@@ -34,10 +34,13 @@ def add_share_command(live: click.Group) -> None:
     @click.option("--yes", is_flag=True, help="Create (or revoke). Without it, only shows what would happen.")
     @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
     def share_command(label, ttl, address, show_list, revoke, yes, as_json):
-        """Give someone a link to chat with ONE agent session: this one, or --session.
+        """Let a colleague's agent (or a person) talk to ONE agent session: this one, or --session.
 
-        The guest's page shows only their own exchange with the session, never its transcript.
-        Their messages arrive marked kind="guest": the agent is told they are not you, grant
+        Prints, each carrying the share's secret: a `claude mcp add` command and a Codex
+        config.toml block for the share's MCP server (`ask`, `send`, `read_replies`,
+        `session_info`), a `one-conv live send '<link>'` command, and the link to a chat page
+        for a person. `--json` gives them as separate fields. A guest sees only their own
+        exchange with the session, never its transcript. Their messages arrive marked kind="guest": the agent is told they are not you, grant
         no approval and must not reveal secrets, files or other conversations unless your own
         instructions in the session allow it. It answers with send_message to guest:<id>.
         The session must be reachable through the relay (this machine's bridge running); a
@@ -67,9 +70,14 @@ def add_share_command(live: click.Group) -> None:
         if as_json:
             click.echo(json.dumps(made))
             return
-        click.echo(f"Share {made['id']}: {made['label']} can chat with {made['address']} until {_when(made['expires'])}."
-                   " Send them this link (it works like a password):", err=True)
-        click.echo(made["link"])
+        mark = share.SECRET_MARK
+        click.echo(f"Share {made['id']}: {made['label']} can reach {made['address']} until {_when(made['expires'])}.\n"
+                   f"Lines marked {mark} carry the share's secret: pass them only to {made['label']}, like a password.\n")
+        click.echo(f"For their agent, Claude Code {mark}:\n  {made['claude_command']}\n")
+        click.echo(f"For their agent, Codex, in ~/.codex/config.toml {mark}:")
+        click.echo("".join(f"  {line}\n" for line in made["codex_config"].splitlines()))
+        click.echo(f"For their one-conv {mark} (prints the answer):\n  {made['one_conv_command']}\n")
+        click.echo(f"For a person, the chat page {mark}:\n  {made['link']}")
         if made.get("warning"):
             click.echo(f"warning: {made['warning']}", err=True)
 

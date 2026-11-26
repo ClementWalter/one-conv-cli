@@ -9,11 +9,16 @@
  * the bound session, which answers with a message to `guest:<id>`. A guest reaches no other
  * address, sees only its own exchange, and is refused while the session is offline rather than
  * queued. The person gets a note tagged `share` when a share is made and when its guest first writes.
+ *
+ * A guest's agent uses the same share through its MCP server, `/s/<id>/mcp` (share-mcp.ts), with
+ * the secret as its bearer token. Waiting for an answer holds the request on an in-memory promise
+ * that the session's answer (or a revocation) resolves, so a wait costs no CPU.
  */
 
 import { HttpError, boundedBody, errorResponse, json, pyFloat, query, randomHex, sha256, tokenUrlsafe, utf8 } from "./http";
 import { pyRepr } from "./pyrepr";
 import { USER, online, splitAddress } from "./relay";
+import { type ShareAccess, type View, answer } from "./share-mcp";
 
 export const SHARE_ID = /^[0-9a-f]{16}$/;
 export const GUEST = "guest:";
@@ -29,6 +34,9 @@ const GUEST_BODY = 64 * 1024;
 export const GUEST_RATE = 20;
 const GUEST_WINDOW = 300;
 const GUEST_PAGE = 200;
+// A guest's GET waits at most this long for an answer, like an inbox long-poll.
+const GUEST_WAIT = 30;
+const MCP_BODY = 64 * 1024;
 const MAX_SECRET = 256;
 export const SHARE_HEADER = "x-share-secret";
 export const INACTIVE = "this link is no longer active";
@@ -75,6 +83,9 @@ function printable(label: string): boolean {
 }
 
 export class Shares {
+  // Requests waiting for an answer, per share, woken when the session answers or the share is revoked.
+  private waiting = new Map<string, Set<() => void>>();
+
   constructor(
     private readonly storage: DurableObjectStorage,
     // Wakes the bridge of `node` for a new delivery, as a relayed message does.
@@ -83,6 +94,36 @@ export class Shares {
 
   private get sql(): SqlStorage {
     return this.storage.sql;
+  }
+
+  private notify(ident: string): void {
+    for (const resolve of this.waiting.get(ident) ?? []) resolve();
+  }
+
+  private waitFor(ident: string, ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const waiters = this.waiting.get(ident) ?? new Set();
+      this.waiting.set(ident, waiters);
+      const done = () => {
+        clearTimeout(timer);
+        waiters.delete(done);
+        if (!waiters.size) this.waiting.delete(ident);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      waiters.add(done);
+    });
+  }
+
+  /** The guest view once the session answered after `after`, or when `seconds` ran out; a revoked share ends it with its error. */
+  async waitView(ident: string, secret: string | null, after: number, seconds: number): Promise<View> {
+    const deadline = Date.now() + Math.max(0, seconds) * 1000;
+    for (;;) {
+      const view = (await this.view(ident, secret, after)) as unknown as View;
+      const left = deadline - Date.now();
+      if (view.messages.some((m) => m.from === "agent") || left <= 0) return view;
+      await this.waitFor(ident, left);
+    }
   }
 
   /** A note the relay itself files for the person, tagged `share`. */
@@ -184,6 +225,7 @@ export class Shares {
   revoke(node: string, ident: string): Body {
     const changed = this.sql.exec("UPDATE shares SET revoked = COALESCE(revoked, ?) WHERE id = ? AND node = ?", now(), ident, node).rowsWritten;
     if (!changed) throw new HttpError(404, `no share ${ident} made by this node`);
+    this.notify(ident);
     return { id: ident, revoked: true };
   }
 
@@ -271,7 +313,7 @@ export class Shares {
     if (!SHARE_ID.test(ident)) throw new HttpError(400, `a guest address is guest:<share id>, not ${pyRepr(target)}`);
     const digest = await sha256(JSON.stringify([target, sender ?? null, text]));
     const receipt = { id, recipients: [{ to: target, status: "stored" }] };
-    return this.storage.transactionSync(() => {
+    const stored = this.storage.transactionSync(() => {
       const existing = this.sql.exec("SELECT digest FROM share_messages WHERE from_node = ? AND id = ?", node, id).toArray()[0];
       if (existing) {
         if (existing.digest !== digest) throw new HttpError(409, "this id was already used for a different message; send it under a new id");
@@ -284,6 +326,9 @@ export class Shares {
       this.sql.exec("INSERT INTO share_messages (share, side, from_node, id, digest, text, created, post) VALUES (?, 'agent', ?, ?, ?, ?, ?, NULL)", ident, node, id, digest, text, now());
       return { ...receipt, duplicate: false };
     });
+    // An `ask` or a waiting GET returns as soon as the answer is stored.
+    if (!stored.duplicate) this.notify(ident);
+    return stored;
   }
 
   /** GET and POST /v1/shares/<id>/messages: no node token, the share's secret in its header is the credential. */
@@ -293,8 +338,12 @@ export class Shares {
       const header = request.headers.get(SHARE_HEADER);
       const secret = header && !header.includes(",") ? header : null;
       if (request.method === "GET" || request.method === "HEAD") {
-        const after = Math.trunc(pyFloat(query(new URL(request.url), "after") ?? "0") ?? 0);
-        const response = json(await this.view(ident, secret, Number.isFinite(after) ? after : 0));
+        const url = new URL(request.url);
+        const after = Math.trunc(pyFloat(query(url, "after") ?? "0") ?? 0);
+        const wait = pyFloat(query(url, "wait") ?? "0") ?? 0;
+        // `wait` holds the request until the session answers after `after`, as an inbox long-poll does.
+        const seconds = Number.isFinite(wait) ? Math.min(Math.max(wait, 0), GUEST_WAIT) : 0;
+        const response = json(await this.waitView(ident, secret, Number.isFinite(after) ? after : 0, seconds));
         response.headers.set("cache-control", "no-store");
         return response;
       }
@@ -307,6 +356,43 @@ export class Shares {
       }
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new HttpError(400, "the request body must be a JSON object");
       return json(await this.send(ident, secret, (parsed as Body).text));
+    } catch (error) {
+      if (error instanceof HttpError) return errorResponse(error.status, error.message);
+      throw error;
+    }
+  }
+
+  /** POST /s/<id>/mcp: the share's MCP server, its secret as the bearer token; no OAuth. */
+  async mcp(request: Request, ident: string): Promise<Response> {
+    try {
+      const header = request.headers.get("authorization") ?? "";
+      const space = header.indexOf(" ");
+      const secret = space > 0 && header.slice(0, space).toLowerCase() === "bearer" ? header.slice(space + 1) : "";
+      if (!secret || /[\s,]/.test(secret)) {
+        return Response.json({ error: "this share's MCP server takes its secret as `Authorization: Bearer <secret>`" }, { status: 401, headers: { "www-authenticate": "Bearer" } });
+      }
+      const access: ShareAccess = {
+        send: async (text) => (await this.send(ident, secret, text)).seq as number,
+        view: async (after) => (await this.view(ident, secret, after)) as unknown as View,
+        wait: (after, seconds) => this.waitView(ident, secret, after, seconds),
+      };
+      // Checked before any message, so a dead link fails at connect rather than at the first tool.
+      await access.view(0);
+      let body: unknown;
+      try {
+        body = JSON.parse(utf8(await boundedBody(request, MCP_BODY, new HttpError(413, "request too large"))));
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        return Response.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } }, { status: 400 });
+      }
+      const messages = (Array.isArray(body) ? body : [body]) as Parameters<typeof answer>[0][];
+      const answers: Body[] = [];
+      for (const message of messages) {
+        const reply = await answer(message, access);
+        if (reply !== null) answers.push(reply);
+      }
+      if (!answers.length) return new Response(null, { status: 202 });
+      return Response.json(Array.isArray(body) ? answers : answers[0]);
     } catch (error) {
       if (error instanceof HttpError) return errorResponse(error.status, error.message);
       throw error;

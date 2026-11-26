@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlencode
 
-from . import agy, claude, codex, cursor, held, hubclient, names, omp
+from . import agy, claude, codex, cursor, held, hubclient, names, omp, share
 from .model import GUEST_ADDRESS, LiveSession, envelope, is_session_id, live_home, parse_address
 
 try:
@@ -292,8 +292,12 @@ def _hub():
 
 def send(target: str, text: str, sender: LiveSession | None, origin: str = "unknown",
          fyi: bool = False, reply: str = "expected", message_id: str | None = None, images=(),
-         tags=(), when: str = "now") -> dict:
+         tags=(), when: str = "now", wait_reply: bool = True) -> dict:
     """Deliver to one session: here, in a cloud conversation, or on another machine through the relay.
+
+    A share link (`https://<relay>/s/<id>#<secret>`, from `live share`) reaches the session
+    someone shared with you: the answer comes back in the receipt's `reply` unless `wait_reply`
+    is false.
 
     `message_id` is chosen once and reused on retry, so a receiver can drop a duplicate.
     `when="now"` hands the message over at once, so a busy agent takes it at its next tool
@@ -317,6 +321,10 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
         return _send_user(text, sender, origin, list(tags), message_id)
     if tags:
         raise LiveError("Tags label messages to user only.")
+    if share.is_link(target):
+        if fyi or images or when == "idle":
+            raise LiveError("A share link takes text only, without fyi, images or when=idle.")
+        return _send_share(target, text, sender, origin, wait_reply)
     if target.startswith(GUEST):
         if fyi or images or when == "idle":
             raise LiveError("A guest reads text on its share page: send text only, without fyi, images or when=idle.")
@@ -460,6 +468,34 @@ def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, f
             logger.warning("delivered, but could not record the peer pair: %s", error)
             receipt["warning"] = f"peer pair not recorded: {error}"
     return receipt
+
+
+def _send_share(link: str, text: str, sender: LiveSession | None, origin: str, wait_reply: bool) -> dict:
+    """Post to a session someone shared with you, and read its answer back inline unless told not to.
+
+    The rate slot applies: two agents talking through a share could otherwise relay forever.
+    Receipts name the link without its secret.
+    """
+    if not text.strip():
+        raise LiveError("A message to a share needs text.")
+    try:
+        target, guest = share.redacted(link), share.Guest(link)
+    except share.ShareError as error:
+        raise LiveError(str(error)) from error
+    label = sender.address if sender is not None else origin
+    try:
+        with _rate_slot(label, target):
+            seq = guest.post(text)
+        replies = guest.replies(seq, share.REPLY_WAIT) if wait_reply else []
+    except share.ShareError as error:
+        raise LiveError(str(error)) from error
+    receipt = {"to": target, "from": label, "via": "share", "delivery": "share",
+               "after": replies[-1]["seq"] if replies else seq}
+    if not wait_reply:
+        return {**receipt, "status": "sent"}
+    if not replies:
+        return {**receipt, "status": f"no answer within {share.REPLY_WAIT:g}s; send again later to see it"}
+    return {**receipt, "status": "replied", "reply": "\n\n".join(r["text"] for r in replies)}
 
 
 def _send_guest(target: str, text: str, sender: LiveSession | None, origin: str, message_id: str) -> dict:

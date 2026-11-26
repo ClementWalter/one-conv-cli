@@ -7,6 +7,7 @@
  *   /mcp, /authorize, /oauth/..., /.well-known/oauth-...
  *                    the remote MCP server for the Claude app, behind OAuth (mcp-auth.ts)
  *   /s/<share id>    the guest page of a shared session (shares.ts), the same file the Python relay serves
+ *   /s/<id>/mcp      the share's MCP server for a guest's agent, the secret as bearer token (share-mcp.ts, in the Relay)
  */
 
 import sharePage from "./share-page.html";

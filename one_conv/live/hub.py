@@ -27,13 +27,16 @@ link `/s/<id>#<secret>` chats with that session alone through /v1/shares/<id>/me
 secret in the X-Share-Secret header: a guest message becomes a delivery from `guest:<id>`
 (kind "guest") to the bound session, which answers with a message to `guest:<id>`. A guest
 reaches no other address, sees only its own exchange, and is refused while the session is
-offline rather than queued. The person gets a note tagged `share` when a share is made and
+offline rather than queued. A guest's agent uses the same share through its MCP server,
+`/s/<id>/mcp` (share_mcp.py), with the secret as its bearer token. The person gets a note tagged `share` when a share is made and
 when its guest first writes.
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
+import math
 import re
 import secrets
 import sqlite3
@@ -94,6 +97,9 @@ GUEST_BODY = 64 * 1024
 GUEST_RATE = 20
 GUEST_WINDOW = 300
 GUEST_PAGE = 200
+# A guest's GET waits at most this long for an answer; the share's MCP `ask` waits by checking every GUEST_POLL.
+GUEST_WAIT = 30.0
+GUEST_POLL = 0.25
 MAX_SECRET = 256
 SHARE_HEADER = "x-share-secret"
 INACTIVE = "this link is no longer active"
@@ -835,12 +841,27 @@ def application(hub: Hub, archive_db: str | None = None):
         values = request.headers.getlist(SHARE_HEADER)
         return values[0] if len(values) == 1 else None
 
+    async def wait_reply(ident, secret, after: int, seconds: float) -> dict:
+        """The guest view once the session answered after `after`, or when `seconds` ran out.
+
+        It checks every GUEST_POLL seconds without holding a server thread, and a revoked or
+        expired share ends the wait with its error.
+        """
+        deadline = time.monotonic() + max(0.0, seconds)
+        while True:
+            view = await run_in_threadpool(hub.guest_view, ident, secret, after)
+            if any(m["from"] == "agent" for m in view["messages"]) or time.monotonic() >= deadline:
+                return view
+            await asyncio.sleep(GUEST_POLL)
+
     async def guest(request):
         # No node token: the share's secret is the credential, and it reaches only the bound session.
         try:
             ident, secret = request.path_params["share"], share_secret(request)
             if request.method == "GET":
-                return JSONResponse(await run_in_threadpool(hub.guest_view, ident, secret, int_param(request, "after", 0)),
+                # `wait` holds the request until the session answers after `after`, as an inbox long-poll does.
+                seconds = min(max(float_param(request, "wait"), 0.0), GUEST_WAIT)
+                return JSONResponse(await wait_reply(ident, secret, int_param(request, "after", 0), seconds),
                                     headers={"cache-control": "no-store"})
             body = json.loads(await bounded_body(request, GUEST_BODY) or b"{}")
             if not isinstance(body, dict):
@@ -854,12 +875,59 @@ def application(hub: Hub, archive_db: str | None = None):
     async def page(request):
         return Response(SHARE_PAGE.read_bytes(), media_type="text/html; charset=utf-8", headers=PAGE_HEADERS)
 
+    def float_param(request, name: str) -> float:
+        try:
+            value = float(request.query_params.get(name, "0"))
+        except ValueError:
+            return 0.0
+        return value if math.isfinite(value) else 0.0
+
+    class ShareTools:
+        """What the share's MCP tools reach: this share alone, through the same checks as the guest page."""
+
+        def __init__(self, ident, secret):
+            self.ident, self.secret = ident, secret
+
+        async def send(self, text) -> int:
+            return (await run_in_threadpool(hub.guest_send, self.ident, self.secret, text))["seq"]
+
+        async def view(self, after: int) -> dict:
+            return await run_in_threadpool(hub.guest_view, self.ident, self.secret, after)
+
+        async def wait(self, after: int, seconds: float) -> dict:
+            return await wait_reply(self.ident, self.secret, after, seconds)
+
+    async def share_mcp(request):
+        # The share's secret is the bearer token: an agent's MCP client sends it on every request.
+        from . import share_mcp as protocol
+        try:
+            values = request.headers.getlist("authorization")
+            scheme, _, secret = (values[0] if len(values) == 1 else "").partition(" ")
+            if scheme.lower() != "bearer" or not secret:
+                raise HubError(401, "this share's MCP server takes its secret as `Authorization: Bearer <secret>`")
+            tools = ShareTools(request.path_params["share"], secret)
+            # Checked before any message, so a dead link fails at connect rather than at the first tool.
+            await tools.view(0)
+            body = json.loads(await bounded_body(request, GUEST_BODY) or b"null")
+        except HubError as error:
+            return JSONResponse({"error": str(error)}, status_code=error.status,
+                                headers={"www-authenticate": "Bearer"} if error.status == 401 else None)
+        except ValueError:
+            return JSONResponse({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}},
+                                status_code=400)
+        messages = body if isinstance(body, list) else [body]
+        answers = [reply for reply in [await protocol.answer(m, tools, (HubError,)) for m in messages] if reply is not None]
+        if not answers:
+            return Response(status_code=202)
+        return JSONResponse(answers if isinstance(body, list) else answers[0])
+
     routes = [
         Route("/v1/whoami", whoami, methods=["GET"]),
         Route("/v1/shares", shares, methods=["GET", "POST"]),
         Route("/v1/shares/{share}", share, methods=["DELETE"]),
         Route("/v1/shares/{share}/messages", guest, methods=["GET", "POST"]),
         Route("/s/{share}", page, methods=["GET"]),
+        Route("/s/{share}/mcp", share_mcp, methods=["POST"]),
         Route("/v1/sessions", sessions, methods=["GET", "PUT"]),
         Route("/v1/messages", messages, methods=["POST"]),
         Route("/v1/messages/{msg_id}", status, methods=["GET"]),

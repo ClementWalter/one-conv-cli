@@ -279,18 +279,18 @@ When a spawned agent's work is done and reported, end it with `one-conv live sto
 ADDRESS --yes`; `one-conv live stop` lists the agents you can stop.
 
 When the user asks you to continue on another machine of the relay, teleport
-yourself: the MCP `teleport` tool (`node`, `check_only`, `push_wip`, `force`,
-`cwd`, `mode`), or `one-conv live teleport NODE` from your shell.
+yourself: the MCP `teleport` tool (`node`, `check_only`, `force`, `cwd`, `mode`),
+or `one-conv live teleport NODE` from your shell.
 
-1. Check first (`check_only=true`, or `--check`). Report each `missing` row to
-   the user; don't install tools or copy credentials on the other machine
-   yourself.
-2. Commit your changes: uncommitted or untracked files always refuse, since a
-   teleport carries commits, never a working tree. If commits are not on the
-   remote yet, push your branch, or pass `push_wip=true` (`--push-wip`) to
-   push HEAD to a `teleport/<id>` branch.
+1. Check first (`check_only=true`, or `--check`): the rows say what the other
+   machine has, and `brief` is the provisioning brief for what it lacks. Gaps
+   don't stop the move; your continuation provisions them. Tell the user only
+   about `blockers` (no tmux, or a harness that can't be installed there).
+2. Don't commit or stash for the move: uncommitted work and unpushed commits
+   travel as a snapshot on a `teleport/<id>` branch without touching your
+   checkout. Files that look like secrets stay behind and are listed.
 3. Teleport (`--yes`). The target starts the same harness in tmux at your
-   commit, with your conversation as its brief, and its first act is one
+   commit, with your conversation and the brief, and its first act is one
    message to you: `teleported: now NODE/harness:id in DIR at BRANCH@SHA`.
 4. Once the result says `teleported`, stop working on the task: don't edit
    files, don't run commands for it, don't send more messages about it. Don't
@@ -298,7 +298,10 @@ yourself: the MCP `teleport` tool (`node`, `check_only`, `push_wip`, `force`,
    open; the continuation owns the task.
 
 If you are the continuation, your brief says so: send the confirmation first,
-then pick up the task. Read turns the brief omits with `one-conv local thread
+then step 0: install, clone and configure what the provisioning brief lists,
+and send ONE note to `user` (tag `teleport`) with the exact commands that need
+a person (logins, 2FA, secrets; never ask for secret values in chat). Then pick
+up the task: what isn't blocked now, the rest once provisioned. Read turns the brief omits with `one-conv local thread
 ORIGIN --around ...`. The other machine must have opted in with
 `one-conv live serve --accept-teleport`; if it refuses, tell the user that
 command.

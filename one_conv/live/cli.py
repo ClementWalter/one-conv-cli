@@ -479,30 +479,31 @@ def build_live_group(launcher: list[str], transcript=None) -> click.Group:
     @live.command("teleport", context_settings=HELP,
                   epilog=examples("one-conv live teleport studio --check",
                                   "one-conv live teleport studio --yes",
-                                  "one-conv live teleport studio --push-wip --yes --json",
+                                  "one-conv live teleport studio --yes --json",
                                   "one-conv live teleport ci-runner --cwd '~/code/app' --mode auto --yes"))
     @click.argument("node")
     @click.option("--cwd", help="Folder on NODE to work in, instead of the clone found there by its remote URL.")
     @click.option("--mode", type=click.Choice(spawn.MODES),
                   help="Approvals on NODE. Default: the session's own mode when its transcript says, else ask.")
     @click.option("--check", is_flag=True, help="Only show what NODE has and lacks; move nothing.")
-    @click.option("--force", is_flag=True, help="Go ahead although NODE lacks a tool, MCP server, skill or dotfile.")
-    @click.option("--push-wip", is_flag=True,
-                  help="Push committed but unpushed work (HEAD) to a teleport/<id> branch so NODE can fetch it.")
+    @click.option("--force", is_flag=True, help="Use a --cwd on NODE whose checkout has another remote than this one's.")
     @click.option("--from", "sender_address", help="The session to move; detected from the calling agent by default.")
     @click.option("--json", "as_json", is_flag=True, help="Emit the report as JSON.")
     @click.option("--yes", is_flag=True, help="Move the session. Without it, only checks.")
-    def teleport_command(node, cwd, mode, check, force, push_wip, sender_address, as_json, yes):
+    def teleport_command(node, cwd, mode, check, force, sender_address, as_json, yes):
         """Move the calling agent session to machine NODE on the relay, where it continues its task.
 
         Takes an inventory of what the session uses (harness and model, git checkout, CLIs,
         MCP servers, skills, dotfiles it read under ~), asks NODE's bridge which of those it has,
-        and prints ok / missing / unknown for each. With --yes and nothing blocking, it syncs this
-        session to the archive and has NODE start the same harness in tmux, in its clone of the
-        repository at the same commit (a new worktree when that clone is elsewhere), briefed with
-        this conversation. The new session's first act is a message back here confirming; this
-        session must then stop working. Uncommitted changes always refuse; commits only on this
-        machine refuse unless --push-wip. NODE must opt in: `one-conv live serve --accept-teleport`.
+        and prints ok / missing / unknown for each, plus a provisioning brief for what NODE lacks:
+        why the session needs it, how this machine installed it, MCP config with secrets blanked,
+        how to log in. Gaps never refuse: the brief ships with the move and is the continuation's
+        step 0. Uncommitted files and unpushed commits travel as a `wip(teleport)` snapshot pushed
+        to teleport/<id>, made without touching this checkout; likely secret files stay behind.
+        With --yes it syncs this session to the archive and NODE starts the same harness in tmux at
+        that commit (a new worktree when needed), briefed with this conversation. Its first act is a
+        message back here confirming; this session must then stop working. Only a missing tmux or a
+        harness NODE cannot install refuses. NODE must opt in: `one-conv live serve --accept-teleport`.
         """
         from . import inventory as inventories, teleport
         if transcript is None:
@@ -521,7 +522,7 @@ def build_live_group(launcher: list[str], transcript=None) -> click.Group:
                                   read.get("path"))
         try:
             report = teleport.run(node, sender, read, found, cwd=cwd, mode=mode, check_only=check or not yes,
-                                  force=force, wip=push_wip)
+                                  force=force)
         except (teleport.TeleportError, hubclient.HubRefused) as error:
             if as_json:
                 click.echo(json.dumps({"status": "failed", "error": str(error),
@@ -537,13 +538,24 @@ def build_live_group(launcher: list[str], transcript=None) -> click.Group:
         click.echo(f"{report['origin']} -> {node}" + (f" ({report['dir']})" if report.get("dir") else ""))
         for line in teleport.table(report["rows"]):
             click.echo(line)
+        planned = report.get("snapshot")
+        if planned:
+            verb = "would snapshot" if planned.get("planned") else "snapshotted"
+            click.echo(f"{verb} {planned['files']} uncommitted files and {planned['unpushed']} unpushed commits"
+                       + (f" to {planned['branch']}" if planned.get("branch") else "")
+                       + (f"; left behind: {', '.join(e['path'] for e in planned['skipped'])}" if planned["skipped"] else ""))
+        if report.get("brief") and report["status"] != "teleported":
+            click.echo(f"\nProvisioning brief ({report['brief_path']}):\n\n{report['brief']}")
         if report["status"] == "refused":
             raise click.ClickException("not teleporting:\n" + "\n".join(f"  - {reason}" for reason in report["blockers"]))
         if report["status"] == "checked":
-            click.echo("Nothing blocks this teleport." + ("" if check else " Re-run with --yes to move the session."))
+            click.echo("Nothing blocks this teleport" + (": the brief above ships with it." if report.get("brief") else ".")
+                       + ("" if check else " Re-run with --yes to move the session."))
             return
         click.echo(f"teleported: {report['address']} in {report['dir']} at {report['branch']}@{report['sha'][:12]}"
                    if report.get("sha") else f"teleported: {report['address']} in {report['dir']}")
+        if report.get("brief_path"):
+            click.echo(f"provisioning brief, step 0 on {node}: {report['brief_path']}")
         if report.get("name_error"):
             click.echo(f"warning: the name did not move: {report['name_error']}", err=True)
         click.echo(report["next"])

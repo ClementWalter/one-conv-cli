@@ -1,14 +1,18 @@
 """`live teleport`: the calling agent session moves itself to another machine on the relay.
 
-The origin takes an inventory of what the session needs (inventory.py), asks the target node's
-bridge which of those it has (a relay request answered by provision.py there), and stops at
-that table with --check. Otherwise it refuses while anything is missing (unless --force) or
-while work exists only here: uncommitted changes always, commits no remote has unless
---push-wip pushes HEAD to `teleport/<id>` (never to the session's own branch). It then syncs
-this session to the relay's archive, so the target reads its latest turns, and asks the
-target to start the same harness at the same commit, briefed with a handoff seed and told to
-confirm to this session first. The session's @name moves with it. This session keeps running
-but must stop working: the task continues remotely.
+The origin takes an inventory of what the session needs (inventory.py) and asks the target node's
+bridge which of those it has (a relay request answered by provision.py there). What the target
+lacks never refuses the move: it becomes a provisioning brief (brief.py), saved here and shipped
+with the move, that the continuation works through as step 0. Only a missing tmux, a harness the
+target cannot install without a person, or a --cwd that is another repository (without --force)
+stops it; --check stops after printing the table and the brief.
+
+Work that exists only here travels as a snapshot (snapshot.py): uncommitted files are committed
+on top of HEAD without touching the checkout and pushed with unpushed commits to `teleport/<id>`,
+never to the session's own branch. The session is then synced to the relay's archive, so the
+target reads its latest turns, and the target starts the same harness at that commit, briefed
+with a handoff seed and told to confirm to this session first. The session's @name moves with it.
+This session keeps running but must stop working: the task continues remotely.
 
 Requests go through the relay under one id each, so a retried post never starts a second
 session, and each carries a time to live, so a bridge that comes back late does not act on one.
@@ -22,7 +26,7 @@ import time
 import uuid
 from collections.abc import Callable
 
-from . import bridge, hubclient, names, provision, spawn
+from . import bridge, brief, hubclient, names, provision, snapshot, spawn
 from .inventory import Inventory
 from .model import LiveSession
 
@@ -36,8 +40,6 @@ POST_ATTEMPTS = 3
 # Histories `archive-sync.py --source` names for each harness.
 ARCHIVE_SOURCE = {"claude": "claude", "codex": "codex", "omp": "omp", "cursor": "cursor-cli", "agy": "agy"}
 FINAL = ("accepted", "refused", "unconfirmed")
-# Rows that decide where the session works: nothing can start without them, even with --force.
-PLACEMENT = ("harness", "repo", "folder")
 
 
 class TeleportError(Exception):
@@ -96,39 +98,32 @@ def ask(hub: hubclient.HubClient, node: str, sender: str, request: dict, timeout
     return result
 
 
-def blockers(inventory: Inventory, rows: list[dict], node: str, force: bool, push_wip: bool) -> list[str]:
-    """Why the teleport must not go ahead; empty when it may."""
+def blockers(rows: list[dict], force: bool) -> list[str]:
+    """Why the teleport cannot start at all; empty when it may (whatever else the brief lists)."""
     reasons = []
-    pushing = push_wip and inventory.repo is not None and inventory.repo.unpushed > 0
     for row in rows:
-        if row["status"] != "missing":
-            continue
-        if row["item"] == "commit" and pushing:
-            continue  # --push-wip carries the commit over.
-        if row["item"] in PLACEMENT or not force:
-            reasons.append(f"{row['item']} {row['name']} is missing on {node}" + (f": {row['detail']}" if row["detail"] else ""))
-    repo = inventory.repo
-    if repo is not None:
-        if repo.changed or repo.untracked:
-            reasons.append(f"{repo.changed} changed and {repo.untracked} untracked files in {repo.root}: commit them "
-                           "(or remove them) first; a teleport moves commits, never a working tree")
-        if repo.unpushed and not push_wip:
-            reasons.append(f"{repo.unpushed} commits on HEAD are only on this machine: push them, or pass --push-wip "
-                           "to push HEAD to a teleport/<id> branch")
-        if not repo.remote:
-            reasons.append(f"{repo.root} has no origin remote, so {node} cannot fetch its commits")
+        if row["item"] == "tmux" and row["status"] == "missing":
+            reasons.append("tmux is missing on the target, and the continuation runs in tmux")
+        elif row["item"] == "harness" and row["status"] == "missing" and not row.get("install"):
+            reasons.append(f"{row['name']} is missing on the target and cannot be installed there without a person")
+        elif row["status"] == "dubious" and not force:
+            reasons.append(row["detail"])
     return reasons
 
 
-def push_wip(inventory: Inventory, short: str) -> str:
-    """Push the committed HEAD to `teleport/<short>` on origin; returns the branch name."""
-    branch = f"teleport/{short}"
-    result = subprocess.run(["git", "-C", inventory.repo.root, "push", "origin", f"HEAD:refs/heads/{branch}"],
-                            capture_output=True, text=True, timeout=120, check=False,
-                            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
-    if result.returncode:
-        raise TeleportError(f"git push origin HEAD:{branch} failed: {result.stderr.strip()}")
-    return branch
+def needs_snapshot(inventory: Inventory, rows: list[dict]) -> bool:
+    """Whether work exists only here: changed or untracked files, unpushed commits, or a commit the target cannot fetch."""
+    repo = inventory.repo
+    if repo is None or not repo.remote or not repo.sha:
+        return False
+    unfetchable = any(row["item"] == "commit" and row["status"] == "missing" for row in rows)
+    return bool(repo.changed or repo.untracked or repo.unpushed or unfetchable)
+
+
+def plan_snapshot(inventory: Inventory) -> dict:
+    """What a snapshot would carry and leave out, without committing or pushing anything."""
+    carried, skipped = snapshot.plan(inventory.repo.root)
+    return {"files": len(carried), "unpushed": inventory.repo.unpushed, "skipped": skipped}
 
 
 def sync_archive(hub: hubclient.HubClient, harness: str, cwd: str, timeout: float = ARCHIVE_SYNC_TIMEOUT) -> str:
@@ -163,10 +158,10 @@ def choose_mode(harness: str, explicit: str | None, detected: str) -> str:
 
 
 def run(node: str, sender: LiveSession, transcript: dict, inventory: Inventory, *, cwd: str | None = None,
-        mode: str | None = None, check_only: bool = False, force: bool = False, wip: bool = False,
+        mode: str | None = None, check_only: bool = False, force: bool = False,
         hub: hubclient.HubClient | None = None, probe_timeout: float = PROBE_TIMEOUT,
         spawn_wait: float = SPAWN_WAIT, **waiting) -> dict:
-    """Check `node`, then (unless check_only or blocked) move `sender` there; returns the report.
+    """Check `node`, write the provisioning brief, then (unless check_only or blocked) move `sender` there.
 
     `transcript` carries the session's handoff `seed` and last request `summary`.
     """
@@ -183,18 +178,38 @@ def run(node: str, sender: LiveSession, transcript: dict, inventory: Inventory, 
     probe = ask(hub, node, sender.address, {"kind": "probe", "inventory": inventory.to_json(), "cwd": cwd,
                                             "fetch": fetch, "ttl": REQUEST_TTL}, probe_timeout, **waiting)
     report["rows"], report["dir"] = probe.get("rows") or [], probe.get("dir") or ""
-    report["blockers"] = blockers(inventory, report["rows"], node, force, wip)
+    report["blockers"] = blockers(report["rows"], force)
+    pending = plan_snapshot(inventory) if needs_snapshot(inventory, report["rows"]) else None
     if check_only or report["blockers"]:
+        text = brief.render(inventory.to_json(), report["rows"], node, probe.get("platform") or "", origin, pending)
+        if text:
+            report["brief"], report["brief_path"] = text, str(brief.save(text, short))
+        if pending:
+            report["snapshot"] = {**pending, "planned": True}
         report["status"] = "checked" if check_only and not report["blockers"] else "refused"
         provision.audit("origin", kind="probe", node=node, origin=origin, outcome=report["status"],
-                        blockers=report["blockers"])
+                        blockers=report["blockers"], brief=report.get("brief_path"))
         return report
     chosen = choose_mode(inventory.harness, mode, inventory.mode)
-    wip_branch = push_wip(inventory, short) if wip and repo is not None and repo.unpushed else ""
+    taken = None
+    if pending:
+        try:
+            taken = snapshot.take(repo.root, short).to_json()
+        except snapshot.SnapshotError as error:
+            raise TeleportError(f"the work only this machine has could not travel: {error}") from None
+        report["snapshot"] = taken
+    text = brief.render(inventory.to_json(), report["rows"], node, probe.get("platform") or "", origin, taken)
+    if text:
+        report["brief"], report["brief_path"] = text, str(brief.save(text, short))
     report["archive"] = sync_archive(hub, inventory.harness, inventory.cwd) or "synced"
     name = names.release(sender.address)
-    request = {"kind": "spawn", "inventory": inventory.to_json(), "origin": origin, "cwd": cwd, "mode": chosen,
+    wip_branch = (taken or {}).get("branch") or ""
+    spawned_inventory = inventory.to_json()
+    if taken and taken.get("commit") and spawned_inventory.get("repo"):
+        spawned_inventory["repo"]["sha"] = taken["commit"]
+    request = {"kind": "spawn", "inventory": spawned_inventory, "origin": origin, "cwd": cwd, "mode": chosen,
                "name": name, "short": short, "fetch": wip_branch or fetch, "wip_branch": wip_branch,
+               "snapshot": taken, "provisioning": text, "force": force,
                "seed": transcript.get("seed") or "", "summary": transcript.get("summary") or "",
                "timeout": provision.SPAWN_TIMEOUT, "ttl": REQUEST_TTL}
     try:
@@ -202,18 +217,20 @@ def run(node: str, sender: LiveSession, transcript: dict, inventory: Inventory, 
     except TeleportError:
         if name:
             names.set_name(name, sender.address, lambda address: False)
-        provision.audit("origin", kind="spawn", node=node, origin=origin, outcome="failed")
+        provision.audit("origin", kind="spawn", node=node, origin=origin, outcome="failed", snapshot=taken)
         raise
-    report.update({key: started.get(key) for key in ("address", "tmux", "dir", "branch", "sha", "checkout", "name")
-                   if started.get(key)})
+    report.update({key: started.get(key) for key in ("address", "tmux", "dir", "branch", "sha", "checkout", "name",
+                                                       "installed") if started.get(key)})
     if started.get("name_error"):
         report["name_error"] = started["name_error"]
     report.update(status="teleported", mode=chosen, wip_branch=wip_branch,
                   next=(f"Stop working now: this task continues on {node} as {started.get('address')}, which "
-                        f"confirms here with one message. Do not edit files or send messages for this task from "
-                        f"this session."))
+                        f"confirms here with one message"
+                        + (" and provisions what the brief lists" if text else "")
+                        + ". Do not edit files or send messages for this task from this session."))
     provision.audit("origin", kind="spawn", node=node, origin=origin, outcome="teleported",
-                    address=started.get("address"), dir=started.get("dir"))
+                    address=started.get("address"), dir=started.get("dir"), snapshot=taken,
+                    brief=report.get("brief_path"))
     return report
 
 

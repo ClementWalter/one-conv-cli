@@ -5,6 +5,7 @@ Git runs for real in temporary repositories; tmux and the harness are stubbed as
 
 import json
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -18,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
-from one_conv.live import bridge, hubclient, inventory, names, provision, router, spawn, teleport
+from one_conv.live import bridge, hubclient, inventory, names, provision, router, snapshot, spawn, teleport
 from one_conv.live.cli import build_live_group
 from one_conv.live.model import LiveSession
 
@@ -129,7 +130,7 @@ def test_a_dirty_checkout_keeps_its_changes(code):
 
 
 def test_a_commit_that_cannot_be_fetched_refuses_the_checkout(code):
-    with pytest.raises(provision.ProvisionError, match="push it first"):
+    with pytest.raises(provision.ProvisionError, match="could not be fetched"):
         provision.checkout(str(code.clone), repo_info(code, sha="0" * 40), "feature", "s1", code.settings)
 
 
@@ -150,6 +151,7 @@ def machine(tmp_path, monkeypatch):
     """This machine's PATH holds `claude` and `git` only; its Claude config names the `one-conv` MCP server."""
     bin_dir = tmp_path / "bin"
     executable(bin_dir, "claude", "#!/bin/sh\necho '9.9.9 (Claude Code)'\n")
+    executable(bin_dir, "tmux", "#!/bin/sh\nexit 0\n")
     os.symlink(subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip(), bin_dir / "git")
     monkeypatch.setenv("PATH", str(bin_dir))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
@@ -306,6 +308,87 @@ def test_a_session_that_never_registers_reports_its_screen(tmux, code, monkeypat
     assert raised.value.screen == "waiting for trust prompt"
 
 
+@pytest.fixture
+def provisioned(tmux, code):
+    """A spawn carrying a provisioning brief; returns the first prompt the harness got."""
+    provision.start_session(spawn_request(code, provisioning="# Provisioning box\n## cli `wa` (missing)"), "box",
+                            code.settings, timeout=1)
+    return tmux[0][2].argv[-1]
+
+
+def test_the_brief_is_step_0_of_the_first_prompt(provisioned):
+    assert "STEP 0, right after that message: provision this machine." in provisioned
+
+
+def test_the_first_prompt_carries_the_brief(provisioned):
+    assert "<provisioning-brief>\n# Provisioning box\n## cli `wa` (missing)\n</provisioning-brief>" in provisioned
+
+
+def test_the_first_prompt_asks_for_one_note_to_the_user(provisioned):
+    assert 'send ONE message with send_message, to="user" and tags=["teleport"]' in provisioned
+
+
+def test_the_brief_is_saved_on_the_target(provisioned):
+    assert (Path(os.environ["ONE_CONV_LIVE_DIR"]) / "teleport-briefs" / "s1.md").read_text().startswith("# Provisioning box")
+
+
+def test_without_a_brief_there_is_no_step_0(started, tmux):
+    assert "STEP 0" not in tmux[0][2].argv[-1]
+
+
+def test_a_snapshot_is_checked_out_on_its_teleport_branch(code):
+    (code.work / "c.txt").write_text("c")
+    git(code.work, "add", ".")
+    git(code.work, "commit", "-m", "wip(teleport): s1")
+    git(code.work, "push", "origin", "HEAD:refs/heads/teleport/s1")
+    sha = git(code.work, "rev-parse", "HEAD")
+    place = provision.checkout(str(code.clone), repo_info(code, sha=sha), "teleport/s1", "s1", code.settings, "teleport/s1")
+    assert (place["branch"], git(place["dir"], "rev-parse", "HEAD")) == ("teleport/s1", sha)
+
+
+def test_a_missing_repo_is_cloned_for_the_session(tmux, code, tmp_path):
+    settings = {**code.settings, provision.ROOTS_KEY: [str(tmp_path / "empty-root")]}
+    (tmp_path / "empty-root").mkdir()
+    request = spawn_request(code)
+    request["inventory"]["repo"]["remote"] = str(code.remote)
+    provision.start_session(request, "box", settings, timeout=1)
+    assert git(tmp_path / "empty-root" / "remote", "rev-parse", "HEAD") == git(code.remote, "rev-parse", "main")
+
+
+def test_a_cwd_of_another_repository_is_refused_without_force(tmux, code, tmp_path):
+    other = tmp_path / "other"
+    git(tmp_path, "init", "-q", str(other))
+    with pytest.raises(provision.ProvisionError, match="pass --force"):
+        provision.start_session(spawn_request(code, cwd=str(other)), "box", code.settings, timeout=1)
+
+
+def test_a_missing_tmux_refuses_the_spawn(tmux, code, monkeypatch):
+    real = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **k: None if name == "tmux" else real(name, *a, **k))
+    with pytest.raises(provision.ProvisionError, match="tmux is not installed"):
+        provision.start_session(spawn_request(code), "box", code.settings, timeout=1)
+
+
+@pytest.fixture
+def npm(machine):
+    """An `npm` on PATH whose global install drops a `codex` launcher next to it."""
+    executable(machine / "bin", "npm", f"#!/bin/sh\nprintf '#!/bin/sh\\n' > {machine}/bin/codex && /bin/chmod +x {machine}/bin/codex\n")
+    return machine
+
+
+def test_the_probe_offers_to_install_a_missing_harness(npm):
+    assert provision.probe({"harness": "codex"}, {})["rows"][0]["install"] == "npm install -g @openai/codex"
+
+
+def test_a_missing_harness_is_installed_before_the_spawn(npm):
+    assert provision.ensure_harness("codex", "box") == "installed codex with `npm install -g @openai/codex`"
+
+
+def test_a_harness_without_a_silent_install_refuses(machine):
+    with pytest.raises(provision.ProvisionError, match="cannot be installed without a person"):
+        provision.ensure_harness("omp", "box")
+
+
 # the bridge answers requests through a real relay -------------------------------------------------
 
 def serve_app(app):
@@ -415,25 +498,35 @@ def found(**repo) -> inventory.Inventory:
     return inventory.Inventory(harness="claude", cwd="/work", repo=checkout)
 
 
-def rows(*statuses) -> list[dict]:
-    return [{"item": item, "name": name, "status": status, "detail": ""} for item, name, status in statuses]
+def rows(*statuses, **extra) -> list[dict]:
+    return [{"item": item, "name": name, "status": status, "detail": "", **extra} for item, name, status in statuses]
 
 
-@pytest.mark.parametrize(("checked", "repo", "force", "wip", "blocked"), [
-    (rows(("cli", "git", "ok")), {}, False, False, False),
-    (rows(("cli", "wrangler", "missing")), {}, False, False, True),
-    (rows(("cli", "wrangler", "missing")), {}, True, False, False),
-    (rows(("mcp", "linear", "unknown")), {}, False, False, False),
-    (rows(("repo", "github.com/o/app", "missing")), {}, True, False, True),
-    (rows(("harness", "claude", "missing")), {}, True, False, True),
-    ([], {"changed": 1}, True, True, True),
-    ([], {"untracked": 1}, False, True, True),
-    ([], {"unpushed": 2}, False, False, True),
-    (rows(("commit", "feature@aaa", "missing")), {"unpushed": 2}, False, True, False),
-    (rows(("commit", "feature@aaa", "missing")), {}, False, True, True),
+@pytest.mark.parametrize(("checked", "force", "blocked"), [
+    (rows(("cli", "git", "ok")), False, False),
+    (rows(("cli", "wrangler", "missing")), False, False),
+    (rows(("mcp", "linear", "unknown")), False, False),
+    (rows(("repo", "github.com/o/app", "missing")), False, False),
+    (rows(("hint", "~/.config/gh/hosts.yml", "missing")), False, False),
+    (rows(("tmux", "tmux", "missing")), True, True),
+    (rows(("harness", "omp", "missing")), True, True),
+    (rows(("harness", "claude", "missing"), install="npm install -g @anthropic-ai/claude-code"), False, False),
+    (rows(("folder", "/srv/other", "dubious")), False, True),
+    (rows(("folder", "/srv/other", "dubious")), True, False),
 ])
-def test_blockers_decide_whether_the_teleport_goes_ahead(checked, repo, force, wip, blocked):
-    assert bool(teleport.blockers(found(**repo), checked, "box", force, wip)) == blocked
+def test_only_tmux_an_uninstallable_harness_or_a_dubious_folder_block(checked, force, blocked):
+    assert bool(teleport.blockers(checked, force)) == blocked
+
+
+@pytest.mark.parametrize(("repo", "checked", "needed"), [
+    ({}, [], False),
+    ({"changed": 1}, [], True),
+    ({"untracked": 1}, [], True),
+    ({"unpushed": 2}, [], True),
+    ({}, rows(("commit", "feature@aaa", "missing")), True),
+])
+def test_a_snapshot_is_needed_only_for_work_the_target_cannot_fetch(repo, checked, needed):
+    assert teleport.needs_snapshot(found(**repo), checked) == needed
 
 
 @pytest.mark.parametrize(("harness", "explicit", "detected", "mode"), [
@@ -453,9 +546,9 @@ def test_a_mode_the_harness_lacks_is_refused_when_asked_for():
 
 @pytest.fixture
 def origin(monkeypatch):
-    """teleport.run with the target's answers stubbed: probe rows, then a started session or a failure."""
-    asked = []
-    answers = {"probe": {"rows": rows(("cli", "git", "ok")), "dir": "/srv/app"},
+    """teleport.run with the target's answers and the snapshot stubbed: probe rows, then a started session."""
+    asked, snapshots = [], []
+    answers = {"probe": {"rows": rows(("cli", "git", "ok")), "dir": "/srv/app", "platform": "linux"},
                "spawn": {"address": "box/claude:new1", "dir": "/srv/app", "branch": "feature", "sha": "a" * 40}}
 
     def ask(hub, node, sender, request, timeout, **_):
@@ -464,15 +557,37 @@ def origin(monkeypatch):
         if isinstance(answer, Exception):
             raise answer
         return answer
+
+    def take(root, short, push=True):
+        snapshots.append(root)
+        return snapshot.Snapshot(branch=f"teleport/{short}", commit="b" * 40, files=2, skipped=[])
     monkeypatch.setattr(teleport, "ask", ask)
     monkeypatch.setattr(teleport, "sync_archive", lambda *a, **k: "")
+    monkeypatch.setattr(snapshot, "take", take)
+    monkeypatch.setattr(snapshot, "plan", lambda root: (["a.txt", "b.txt"], [{"path": ".env", "reason": "looks like a secret"}]))
     hub = SimpleNamespace(node="mac", url="http://127.0.0.1:1", token="t")
-    return SimpleNamespace(asked=asked, answers=answers, hub=hub)
+    return SimpleNamespace(asked=asked, answers=answers, hub=hub, snapshots=snapshots)
 
 
 def test_a_check_stops_after_the_probe(origin):
     teleport.run("box", ORIGIN, {}, found(), check_only=True, hub=origin.hub)
     assert [request["kind"] for request in origin.asked] == ["probe"]
+
+
+def test_a_check_returns_the_brief_for_what_the_target_lacks(origin):
+    origin.answers["probe"]["rows"] = rows(("cli", "git", "missing"))
+    assert "## cli `git` (missing)" in teleport.run("box", ORIGIN, {}, found(), check_only=True, hub=origin.hub)["brief"]
+
+
+def test_a_check_saves_the_brief_under_the_live_folder(origin):
+    origin.answers["probe"]["rows"] = rows(("cli", "git", "missing"))
+    report = teleport.run("box", ORIGIN, {}, found(), check_only=True, hub=origin.hub)
+    assert Path(report["brief_path"]).read_text() == report["brief"]
+
+
+def test_a_check_plans_the_snapshot_without_taking_it(origin):
+    teleport.run("box", ORIGIN, {}, found(changed=1), check_only=True, hub=origin.hub)
+    assert origin.snapshots == []
 
 
 def test_a_teleport_reports_the_new_address(origin):
@@ -488,10 +603,51 @@ def test_a_teleport_tells_the_agent_to_stop(origin):
     assert "Stop working now" in teleport.run("box", ORIGIN, {}, found(), hub=origin.hub)["next"]
 
 
-def test_a_blocked_teleport_never_spawns(origin):
-    origin.answers["probe"] = {"rows": rows(("cli", "wrangler", "missing"))}
+def test_missing_tools_still_teleport(origin):
+    origin.answers["probe"]["rows"] = rows(("cli", "wrangler", "missing"))
+    assert teleport.run("box", ORIGIN, {}, found(), hub=origin.hub)["status"] == "teleported"
+
+
+def test_the_brief_ships_with_the_spawn(origin):
+    origin.answers["probe"]["rows"] = rows(("cli", "wrangler", "missing"))
+    teleport.run("box", ORIGIN, {}, found(), hub=origin.hub)
+    assert "## cli `wrangler` (missing)" in origin.asked[1]["provisioning"]
+
+
+def test_a_missing_tmux_never_spawns(origin):
+    origin.answers["probe"]["rows"] = rows(("tmux", "tmux", "missing"))
     teleport.run("box", ORIGIN, {}, found(), hub=origin.hub)
     assert [request["kind"] for request in origin.asked] == ["probe"]
+
+
+def test_a_blocked_teleport_still_returns_the_brief(origin):
+    origin.answers["probe"]["rows"] = rows(("tmux", "tmux", "missing"))
+    assert "sudo apt-get install tmux" in teleport.run("box", ORIGIN, {}, found(), hub=origin.hub)["brief"]
+
+
+def test_uncommitted_work_is_snapshotted(origin):
+    assert teleport.run("box", ORIGIN, {}, found(changed=1), hub=origin.hub)["snapshot"]["branch"].startswith("teleport/")
+
+
+def test_the_target_fetches_the_snapshot_branch(origin):
+    teleport.run("box", ORIGIN, {}, found(changed=1), hub=origin.hub)
+    assert origin.asked[1]["fetch"] == origin.asked[1]["wip_branch"]
+
+
+def test_the_target_checks_out_the_snapshot_commit(origin):
+    teleport.run("box", ORIGIN, {}, found(changed=1), hub=origin.hub)
+    assert origin.asked[1]["inventory"]["repo"]["sha"] == "b" * 40
+
+
+def test_a_clean_pushed_tree_takes_no_snapshot(origin):
+    teleport.run("box", ORIGIN, {}, found(), hub=origin.hub)
+    assert origin.snapshots == []
+
+
+def test_the_snapshot_is_logged(origin):
+    teleport.run("box", ORIGIN, {}, found(changed=1), hub=origin.hub)
+    rows_logged = [json.loads(line) for line in (Path(os.environ["ONE_CONV_LIVE_DIR"]) / "teleports.jsonl").read_text().splitlines()]
+    assert rows_logged[-1]["snapshot"]["files"] == 2
 
 
 def test_the_name_travels_with_the_spawn_request(origin):
@@ -519,22 +675,6 @@ def test_teleporting_to_this_machine_is_refused(origin):
         teleport.run("mac", ORIGIN, {}, found(), hub=origin.hub)
 
 
-def test_push_wip_pushes_head_to_a_teleport_branch(code):
-    (code.work / "c.txt").write_text("c")
-    git(code.work, "add", ".")
-    git(code.work, "commit", "-m", "wip")
-    teleport.push_wip(inventory.Inventory(harness="claude", cwd=str(code.work), repo=inventory.repo(str(code.work))), "s1")
-    assert git(code.remote, "rev-parse", "refs/heads/teleport/s1") == git(code.work, "rev-parse", "HEAD")
-
-
-def test_push_wip_leaves_the_session_branch_alone(code):
-    (code.work / "c.txt").write_text("c")
-    git(code.work, "add", ".")
-    git(code.work, "commit", "-m", "wip")
-    teleport.push_wip(inventory.Inventory(harness="claude", cwd=str(code.work), repo=inventory.repo(str(code.work))), "s1")
-    assert git(code.remote, "rev-parse", "refs/heads/feature") == code.sha
-
-
 # the command ---------------------------------------------------------------------------------------
 
 @pytest.fixture
@@ -554,8 +694,13 @@ def test_the_check_prints_the_table(command):
     assert "ok       cli      git" in command("box", "--check").output
 
 
+def test_the_check_prints_the_brief(command, origin):
+    origin.answers["probe"]["rows"] = rows(("cli", "git", "missing"))
+    assert "## cli `git` (missing)" in command("box", "--check").output
+
+
 def test_a_refused_teleport_exits_non_zero(command, origin):
-    origin.answers["probe"] = {"rows": rows(("cli", "wrangler", "missing"))}
+    origin.answers["probe"]["rows"] = rows(("tmux", "tmux", "missing"))
     assert command("box", "--yes").exit_code == 1
 
 

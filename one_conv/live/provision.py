@@ -6,18 +6,23 @@ serve.json); otherwise every request is refused with how to opt in. Requests com
 the relay, from nodes holding a token on it, and the bridge's ingress log runs each at most once.
 
 `probe` answers ok / missing / unknown for each item of the origin's inventory: the harness and
-its version, every command-line tool, MCP server, skill and home dotfile, the repository (found
-among the project roots by its normalized remote URL) and whether its commit can be fetched.
-`spawn` checks the commit out without disturbing an existing checkout (a new worktree whenever
-the checkout is on another branch, behind, or dirty), then starts the same harness in tmux the
-way `live spawn` does, briefed to confirm to the origin and continue its task.
+its version, tmux, every command-line tool, MCP server, skill and home dotfile, the repository
+(found among the project roots by its normalized remote URL) and whether its commit can be fetched.
+`spawn` installs a missing harness when npm can without a prompt, clones a missing repository,
+checks the commit out without disturbing an existing checkout (a new worktree whenever the checkout
+is elsewhere, dirty, or the work came as a snapshot), saves the origin's provisioning brief, then
+starts the same harness in tmux the way `live spawn` does, briefed to confirm to the origin,
+provision what this machine lacks (step 0) and continue its task. It refuses only without tmux,
+without a harness it can install, or with a --cwd that is another repository (unless forced).
 """
 
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -40,6 +45,8 @@ DEFAULT_WORKTREES = "~/worktrees"
 ROOT_DEPTH = 2
 SKIPPED_DIRS = frozenset({"node_modules", "Library", "target", "build", "dist", "venv", ".venv"})
 HARNESS_BINARY = {"claude": "claude", "codex": "codex", "cursor": "agent", "omp": "omp", "agy": "agy"}
+# Harnesses the bridge installs itself when missing: npm needs no prompt for them.
+NPM_HARNESS = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex"}
 # A request older than this when the bridge sees it is refused: its sender has stopped waiting.
 REQUEST_TTL = 60.0
 SPAWN_TIMEOUT = 150.0
@@ -223,7 +230,7 @@ def commit_status(folder: str, repo: dict, fetch_ref: str = "") -> tuple[str, st
     remote_sha = listed.split()[0] if listed else ""
     if remote_sha == sha:
         return "ok", f"fetchable from origin/{ref}"
-    return "missing", f"{sha[:12]} is not on origin/{ref}: push it (or teleport with --push-wip)"
+    return "missing", f"{sha[:12]} is not on origin/{ref}: it travels as a teleport snapshot"
 
 
 def row(item: str, name: str, status: str, detail: str = "") -> dict:
@@ -231,30 +238,56 @@ def row(item: str, name: str, status: str, detail: str = "") -> dict:
 
 
 def locate(inventory: dict, settings: dict, cwd: str | None) -> tuple[str, list[dict]]:
-    """The folder the session would work in here, and the rows saying how it was found."""
+    """The folder the session would work in here, and the rows saying how it was found.
+
+    A `--cwd` whose checkout has another remote than the session's is `dubious`: only --force uses it.
+    """
     repo = inventory.get("repo")
     if cwd:
         folder = os.path.expanduser(cwd)
-        return (folder, [row("folder", folder, "ok", "given with --cwd")]) if os.path.isdir(folder) else \
-            ("", [row("folder", folder, "missing", "given with --cwd, but it does not exist here")])
+        if not os.path.isdir(folder):
+            return "", [row("folder", folder, "missing", "given with --cwd, but it does not exist here")]
+        if repo and repo.get("key"):
+            remote = _out(folder, "remote", "get-url", "origin")
+            if remote is None or remote_key(remote) != repo["key"]:
+                found = remote_key(remote) if remote else "not a clone of it"
+                return folder, [row("folder", folder, "dubious", f"given with --cwd, but it is {found}, "
+                                                                f"not {repo['key']}: pass --force to use it anyway")]
+        return folder, [row("folder", folder, "ok", "given with --cwd")]
     if repo and repo.get("key"):
         found = find_repo(repo["key"], roots(settings))
         if found is None:
-            searched = ", ".join(str(root) for root in roots(settings))
             return "", [row("repo", repo["key"], "missing",
-                            f"no clone under {searched}: clone it, set project roots, or pass --cwd")]
+                            f"no clone here yet: the teleport clones it into {clone_target(repo, settings)}")]
         return str(found), [row("repo", repo["key"], "ok", str(found))]
     folder = inventory.get("cwd") or ""
     if folder and os.path.isdir(folder):
         return folder, [row("folder", folder, "ok", "same path as on the origin")]
-    return "", [row("folder", folder or "?", "missing", "not a git checkout, and no such folder here: pass --cwd")]
+    return "", [row("folder", folder or "?", "missing", f"not a git checkout, and no such folder here: the session "
+                                                         f"starts in {Path.home()}")]
+
+
+def clone_target(repo: dict, settings: dict) -> Path:
+    """Where a missing repository is cloned: under the first project root that exists, else ~/code."""
+    root = next((path for path in roots(settings) if path.is_dir()), Path.home() / "code")
+    return root / (Path(repo.get("key") or repo.get("root") or "repo").name or "repo")
+
+
+def harness_install(harness: str) -> str:
+    """The command that installs `harness` here without a prompt, or '' when there is none."""
+    package = NPM_HARNESS.get(harness)
+    return f"npm install -g {package}" if package and shutil.which("npm") else ""
 
 
 def probe(inventory: dict, settings: dict, cwd: str | None = None, fetch_ref: str = "") -> dict:
-    """Each item of the origin's inventory as ok / missing / unknown on this machine."""
+    """Each item of the origin's inventory as ok / missing / unknown on this machine, with this machine's platform."""
     harness = str(inventory.get("harness") or "")
     status, version = harness_version(harness)
-    rows = [row("harness", harness, status, version)]
+    harness_row = row("harness", harness, status, version)
+    if status == "missing" and harness_install(harness):
+        harness_row.update(install=harness_install(harness),
+                           detail=f"{version}; the teleport installs it with `{harness_install(harness)}`")
+    rows = [harness_row, row("tmux", "tmux", "ok" if shutil.which("tmux") else "missing")]
     folder, located = locate(inventory, settings, cwd)
     rows += located
     repo = inventory.get("repo")
@@ -266,15 +299,16 @@ def probe(inventory: dict, settings: dict, cwd: str | None = None, fetch_ref: st
     rows += [row("skill", name, skill_status(name, folder)) for name in inventory.get("skills") or []]
     rows += [row("hint", name, "ok" if Path(os.path.expanduser(name)).exists() else "missing")
              for name in inventory.get("hints") or []]
-    return {"rows": rows, "dir": folder}
+    return {"rows": rows, "dir": folder, "platform": sys.platform}
 
 
-def checkout(folder: str, repo: dict, fetch_ref: str, short: str, settings: dict) -> dict:
+def checkout(folder: str, repo: dict, fetch_ref: str, short: str, settings: dict, wip: str = "") -> dict:
     """The working folder at the origin's commit: the checkout itself when it already is exactly there, else a new worktree.
 
-    An existing checkout is never switched, reset or pulled. The worktree takes the origin's
-    branch when no checkout here has it and it can only move forward to the commit; otherwise
-    it gets its own `teleport/<short>` branch.
+    An existing checkout is never switched, reset or pulled. A snapshot (`wip`) is checked out in a
+    new worktree on its own `teleport/<short>` branch. Otherwise the worktree takes the origin's
+    branch when no checkout here has it and it can only move forward to the commit, else it gets
+    `teleport/<short>`.
     """
     sha, branch = repo.get("sha") or "", repo.get("branch") or ""
     if fetch_ref:
@@ -283,10 +317,10 @@ def checkout(folder: str, repo: dict, fetch_ref: str, short: str, settings: dict
             logger.info("teleport: fetching %s in %s failed: %s", fetch_ref, folder, fetched.stderr.strip())
     if _out(folder, "cat-file", "-e", f"{sha}^{{commit}}") is None:
         raise ProvisionError(f"commit {sha[:12]} is not in {folder} and could not be fetched from origin "
-                             f"{fetch_ref or branch}: push it first (or teleport with --push-wip)")
+                             f"{fetch_ref or branch}")
     current = _out(folder, "symbolic-ref", "--short", "-q", "HEAD") or ""
     clean = _out(folder, "status", "--porcelain") == ""
-    if branch and current == branch and clean and _out(folder, "rev-parse", "HEAD") == sha:
+    if not wip and branch and current == branch and clean and _out(folder, "rev-parse", "HEAD") == sha:
         return {"dir": folder, "branch": branch, "sha": sha, "checkout": "the existing checkout"}
     name = Path(repo.get("key") or folder).name or "repo"
     path = worktree_root(settings) / name / f"teleport-{short}"
@@ -295,33 +329,56 @@ def checkout(folder: str, repo: dict, fetch_ref: str, short: str, settings: dict
     taken = {line.split(" ", 1)[1] for line in listed.splitlines() if line.startswith("branch ")}
     local = _out(folder, "rev-parse", "--verify", "-q", f"refs/heads/{branch}") if branch else None
     forward = local is None or _git(folder, "merge-base", "--is-ancestor", local, sha).returncode == 0
-    if branch and f"refs/heads/{branch}" not in taken and forward:
+    if not wip and branch and f"refs/heads/{branch}" not in taken and forward:
         target, args = branch, ["worktree", "add", "-B", branch, str(path), sha]
     else:
-        target, args = f"teleport/{short}", ["worktree", "add", "-b", f"teleport/{short}", str(path), sha]
+        target, args = f"teleport/{short}", ["worktree", "add", "-B", f"teleport/{short}", str(path), sha]
     added = _git(folder, *args)
     if added.returncode:
         raise ProvisionError(f"git {' '.join(args[:2])} failed in {folder}: {added.stderr.strip()}")
-    if target == branch and _out(folder, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{branch}"):
-        _git(str(path), "branch", f"--set-upstream-to=origin/{branch}")
+    upstream = wip or branch
+    if target in (branch, wip) and _out(folder, "rev-parse", "--verify", "-q", f"refs/remotes/origin/{upstream}"):
+        _git(str(path), "branch", f"--set-upstream-to=origin/{upstream}")
     return {"dir": str(path), "branch": target, "sha": sha, "checkout": f"a new worktree from {folder}"}
 
 
+def clone(repo: dict, settings: dict) -> tuple[str, str]:
+    """(folder, '') once the missing repository is cloned here, or ('', why it could not be)."""
+    target = clone_target(repo, settings)
+    if target.exists():
+        return "", f"{target} already exists and is not a clone of {repo.get('key')}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        result = subprocess.run(["git", "clone", repo["remote"], str(target)], capture_output=True, text=True,
+                                timeout=600, check=False, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.SubprocessError) as error:
+        return "", str(error)
+    return (str(target), "") if result.returncode == 0 else ("", result.stderr.strip()[-500:])
+
+
 def brief(request: dict, node: str, place: dict) -> str:
-    """The new session's first prompt: who it continues, the confirmation to send first, then the origin's seed."""
+    """The new session's first prompt: who it continues, the confirmation, step 0 (provisioning), then the seed."""
     origin, summary = request["origin"], request.get("summary") or "its last request"
     where = f"{place['branch']}@{place['sha'][:12]}" if place.get("sha") else "no git commit"
     worked_on = ((request.get("inventory") or {}).get("repo") or {}).get("branch") or ""
     wip = request.get("wip_branch")
+    snapshot = request.get("snapshot") or {}
     lines = [
         f"You are the continuation of the agent session {origin}, teleported to this machine ({node}) with "
         "`one-conv live teleport`. That session stops working once you confirm: from now on you own its task.",
         f"You work in {place['dir']} ({place['checkout']}), on {where}.",
     ]
+    if place.get("note"):
+        lines.append(place["note"])
+    if snapshot.get("files"):
+        lines.append(f"The last commit, `wip(teleport): {request.get('short')}`, snapshots the origin's "
+                     f"{snapshot['files']} uncommitted files; `git reset --soft HEAD~1` turns them back into "
+                     "uncommitted changes if you prefer.")
     if wip:
-        lines.append(f"Its commits not yet on the remote travelled on the branch origin/{wip}; once your branch is "
-                     f"pushed, delete that branch (`git push origin --delete {wip}`).")
-    if place.get("branch") and worked_on and place["branch"] != worked_on:
+        lines.append(f"This work travelled on the branch origin/{wip}. When you push, push to "
+                     f"{worked_on or 'the branch you choose'} (`git push origin HEAD:{worked_on or '<branch>'}`), "
+                     f"then delete the travel branch (`git push origin --delete {wip}`).")
+    elif place.get("branch") and worked_on and place["branch"] != worked_on:
         lines.append(f"The origin worked on {worked_on}, which another checkout here holds or has moved past: "
                      f"push your commits to it with `git push origin HEAD:{worked_on}`.")
     lines += [
@@ -330,6 +387,22 @@ def brief(request: dict, node: str, place: dict) -> str:
         f'to="{origin}" and expect_reply=false, with this text (your address is what `one-conv live whoami` prints):',
         f"teleported: now {node}/<your address> in {place['dir']} at {where}; continuing from: {summary}",
         "",
+    ]
+    if place.get("brief_path"):
+        lines += [
+            f"STEP 0, right after that message: provision this machine. The check found what {node} lacks for "
+            f"this task; the provisioning brief is saved at {place['brief_path']} and copied below. Install, clone "
+            "and configure what you can yourself, without prompts. For everything that needs a person (logins, "
+            'two-factor codes, secret values), send ONE message with send_message, to="user" and tags=["teleport"], '
+            f"listing the exact commands to run on {node}; never ask for secret values in a chat. Then continue the "
+            "task: the parts that are not blocked right away, the blocked parts once provisioned.",
+            "",
+            "<provisioning-brief>",
+            request.get("provisioning") or "",
+            "</provisioning-brief>",
+            "",
+        ]
+    lines += [
         f"Then continue the last task of {origin} from where it stopped. Its conversation follows.",
         "",
         request.get("seed") or "",
@@ -344,25 +417,62 @@ def _harness_args(harness: str, model: str) -> list[str]:
     return {"claude": ["--model", model], "codex": ["--model", model]}.get(harness, [])
 
 
-def start_session(request: dict, node: str, settings: dict, timeout: float = SPAWN_TIMEOUT) -> dict:
-    """Check the code out and start the harness in tmux, briefed; returns the new session's address and place."""
+def ensure_harness(harness: str, node: str) -> str:
+    """Install the harness when it is missing and installs without a prompt; returns what was done ('' if nothing)."""
+    if shutil.which(HARNESS_BINARY[harness]):
+        return ""
+    command = harness_install(harness)
+    if not command:
+        raise ProvisionError(f"`{HARNESS_BINARY[harness]}` is not installed on {node} and cannot be installed without "
+                             "a person: see the provisioning brief")
+    try:
+        result = subprocess.run(shlex.split(command), capture_output=True, text=True, timeout=600, check=False)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ProvisionError(f"`{command}` failed on {node}: {error}") from None
+    if result.returncode or not shutil.which(HARNESS_BINARY[harness]):
+        raise ProvisionError(f"`{command}` failed on {node}: {(result.stderr or result.stdout).strip()[-500:]}")
+    return f"installed {harness} with `{command}`"
+
+
+def place_session(request: dict, settings: dict, short: str) -> dict:
+    """Where the continuation works: the checked-out commit, a fresh clone, or a plain folder, with how it got there."""
     inventory = request.get("inventory") or {}
-    harness = inventory.get("harness")
-    if harness not in spawn.SPAWNABLE:
-        raise ProvisionError(f"cannot start {harness!r} sessions")
-    if not shutil.which(HARNESS_BINARY[harness]):
-        raise ProvisionError(f"`{HARNESS_BINARY[harness]}` is not installed on {node}")
-    folder, located = locate(inventory, settings, request.get("cwd"))
-    if not folder:
-        raise ProvisionError("; ".join(f"{r['name']}: {r['detail']}" for r in located))
     repo = inventory.get("repo")
-    short = str(request.get("short") or "x")
+    folder, located = locate(inventory, settings, request.get("cwd"))
+    if located[0]["status"] == "dubious" and not request.get("force"):
+        raise ProvisionError(located[0]["detail"])
+    note = ""
+    if not folder and repo and repo.get("remote") and not request.get("cwd"):
+        folder, error = clone(repo, settings)
+        note = f"The repository was cloned to {folder} for this teleport." if folder else \
+            f"Cloning {repo['remote']} failed here ({error}): clone it as the provisioning brief says."
+    if not folder:
+        return {"dir": str(Path.home()), "branch": "", "sha": "", "checkout": "the home folder",
+                "note": note or "No working folder was found here: see the provisioning brief."}
     if repo and repo.get("sha") and _out(folder, "rev-parse", "--git-dir") is not None:
-        place = checkout(folder, repo, request.get("fetch") or repo.get("branch") or "", short, settings)
+        wip = request.get("wip_branch") or ""
+        place = checkout(folder, repo, request.get("fetch") or repo.get("branch") or "", short, settings, wip)
         if repo.get("subdir") and (Path(place["dir"]) / repo["subdir"]).is_dir():
             place["dir"] = str(Path(place["dir"]) / repo["subdir"])
     else:
         place = {"dir": folder, "branch": "", "sha": "", "checkout": "the given folder"}
+    return {**place, **({"note": note} if note else {})}
+
+
+def start_session(request: dict, node: str, settings: dict, timeout: float = SPAWN_TIMEOUT) -> dict:
+    """Install the harness if needed, place the code, and start the harness in tmux, briefed with step 0."""
+    inventory = request.get("inventory") or {}
+    harness = inventory.get("harness")
+    if harness not in spawn.SPAWNABLE:
+        raise ProvisionError(f"cannot start {harness!r} sessions")
+    if not shutil.which("tmux"):
+        raise ProvisionError(f"tmux is not installed on {node}: see the provisioning brief")
+    installed = ensure_harness(harness, node)
+    short = str(request.get("short") or "x")
+    place = place_session(request, settings, short)
+    if request.get("provisioning"):
+        from . import brief as briefs
+        place["brief_path"] = str(briefs.save(request["provisioning"], short))
     mode = request.get("mode") or "ask"
     try:
         command = spawn.launch(harness, brief(request, node, place), place["dir"],
@@ -385,7 +495,8 @@ def start_session(request: dict, node: str, settings: dict, timeout: float = SPA
                              f"(attach there with: tmux attach -t {tmux})", spawn.screen(tmux))
     entry.address = session.address
     spawn.record(entry)
-    result = {"address": f"{node}/{session.address}", "local": session.address, "tmux": tmux, **place}
+    result = {"address": f"{node}/{session.address}", "local": session.address, "tmux": tmux, **place,
+              **({"installed": installed} if installed else {})}
     if request.get("name"):
         try:
             result["name"] = "@" + names.set_name(request["name"], session.address, lambda address: any(
@@ -430,5 +541,6 @@ def handle(item: dict, node: str, settings: dict, now=time.time) -> tuple[str, d
         audit("target", kind=kind, sender=sender, origin=request.get("origin"), outcome="refused", reason=str(error)[:500])
         return "refused", {"error": f"{type(error).__name__}: {error}"[:1000]}
     audit("target", kind=kind, sender=sender, origin=request.get("origin"), outcome="accepted",
-          address=answer["address"], dir=answer["dir"])
+          address=answer["address"], dir=answer["dir"], snapshot=request.get("snapshot"),
+          installed=answer.get("installed"), brief=answer.get("brief_path"))
     return "accepted", answer

@@ -83,6 +83,8 @@ class Inventory:
     mcp: list[str] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
     hints: list[str] = field(default_factory=list)
+    # "cli:gh" -> {"count": 12, "example": "gh pr"}: why the session needs each item.
+    usage: dict[str, dict] = field(default_factory=dict)
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -139,10 +141,11 @@ def tokens(command: str) -> list[str]:
     return kept
 
 
-def first_words(command: str) -> list[str]:
-    """The program each simple command in `command` starts, skipping assignments and shell words."""
-    words, starting = [], True
-    for token in tokens(command):
+def program_calls(command: str) -> list[tuple[str, str]]:
+    """(program, `program subcommand`) for each simple command in `command`, skipping assignments and shell words."""
+    calls, starting = [], True
+    found = tokens(command)
+    for index, token in enumerate(found):
         if all(char in PUNCTUATION for char in token):
             starting = True
             continue
@@ -154,8 +157,23 @@ def first_words(command: str) -> list[str]:
         # A path is a script in this checkout or this machine's layout, not a tool to install by name.
         if "/" in token or token.startswith(("$", "-", "~")) or not PROGRAM.fullmatch(token):
             continue
-        words.append(token)
-    return words
+        following = found[index + 1] if index + 1 < len(found) else ""
+        # A subcommand is a plain word, not a flag, path or separator.
+        sub = following if PROGRAM.fullmatch(following) and not following.startswith("-") else ""
+        calls.append((token, f"{token} {sub}" if sub else token))
+    return calls
+
+
+def first_words(command: str) -> list[str]:
+    """The program each simple command in `command` starts."""
+    return [program for program, _ in program_calls(command)]
+
+
+def _count(usage: dict, key: str, example: str) -> None:
+    """One more use of `key`; the example kept is the most frequent invocation."""
+    row = usage.setdefault(key, {"count": 0, "examples": {}})
+    row["count"] += 1
+    row["examples"][example] = row["examples"].get(example, 0) + 1
 
 
 def mcp_server(tool: str) -> str | None:
@@ -197,39 +215,43 @@ def scan(blocks: list[dict], home: str, repo_root: str = "", exists=os.path.exis
 
     Programs are kept whatever this machine has; `available` filters them.
     """
-    programs, servers, skills, hints = {}, {}, {}, {}
+    programs, servers, skills, hints, usage = {}, {}, {}, {}, {}
     for block in blocks:
         name = block.get("name")
         if not isinstance(name, str):
             continue
         data = block.get("input")
-        server = mcp_server(name)
-        if server:
-            servers[server] = None
+        tools = [name] if mcp_server(name) else []
         if name in CODE_TOOLS and isinstance(data, str):
-            for tool in CODE_MCP.findall(data):
-                if mcp_server(tool):
-                    servers[mcp_server(tool)] = None
+            tools += CODE_MCP.findall(data)
+        for tool in tools:
+            server = mcp_server(tool)
+            if server:
+                servers[server] = None
+                _count(usage, f"mcp:{server}", tool.split("__", 2)[2])
         if name == "Skill" and isinstance(data, dict) and isinstance(data.get("skill"), str):
             skills[data["skill"]] = None
+            _count(usage, f"skill:{data['skill']}", "invoked")
         paths = []
         if name in READ_TOOLS and isinstance(data, dict):
             paths += [data[key] for key in PATH_KEYS if isinstance(data.get(key), str)]
         for command in shell_commands(block):
-            for word in first_words(command):
-                programs[word] = None
-            try:
-                paths += [token for token in tokens(command) if "/" in token]
-            except ValueError:
-                pass
+            for program, example in program_calls(command):
+                programs[program] = None
+                _count(usage, f"cli:{program}", example)
+            paths += [token for token in tokens(command) if "/" in token]
         for path in paths:
             skill = skill_of(path)
             if skill:
                 skills[skill] = None
+                _count(usage, f"skill:{skill}", "read its SKILL.md")
             hint = home_hint(path, home, repo_root)
             if hint and not skill and exists(home.rstrip("/") + hint[1:]):
                 hints[hint] = None
-    return {"programs": list(programs), "mcp": list(servers), "skills": list(skills), "hints": list(hints)}
+                _count(usage, f"hint:{hint}", "read")
+    return {"programs": list(programs), "mcp": list(servers), "skills": list(skills), "hints": list(hints),
+            "usage": {key: {"count": row["count"], "example": max(row["examples"], key=row["examples"].get)}
+                      for key, row in usage.items()}}
 
 
 def available(programs: list[str], which=shutil.which) -> list[str]:
@@ -320,4 +342,4 @@ def build(harness: str, cwd: str, blocks: list[dict], transcript_path: str | Non
     model, mode = settings_from(transcript_path, harness)
     return Inventory(harness=harness, cwd=cwd, model=model, mode=mode, repo=checkout,
                      clis=available(found["programs"], which), mcp=found["mcp"], skills=found["skills"],
-                     hints=found["hints"])
+                     hints=found["hints"], usage=found["usage"])

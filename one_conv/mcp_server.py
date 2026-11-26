@@ -253,16 +253,18 @@ def create_server(update_notice: str = "") -> MCPServer:
 
     @server.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=True), structured_output=True)
     def teleport(node: str, ctx: Context, cwd: str | None = None, mode: str | None = None, check_only: bool = False,
-                 force: bool = False, push_wip: bool = False) -> dict[str, Any]:
+                 force: bool = False) -> dict[str, Any]:
         """Move yourself (this session) to machine `node` on the live relay, where you continue your task.
 
-        Use it when the user asks you to continue on another machine. Call with check_only=true
-        first: the result's `rows` say ok / missing / unknown on `node` for your harness, git
-        checkout and commit, the CLIs, MCP servers and skills you used, and dotfiles you read;
-        `blockers` say what stops a move. Commit your changes before moving (a teleport carries
-        commits, never a working tree); push_wip=true pushes unpushed commits to a teleport/<id>
-        branch; force=true moves despite missing tools. `cwd` is a folder on `node` to use instead
-        of its clone found by remote URL; `mode` (ask, auto, yolo) overrides your own approvals mode.
+        Use it when the user asks you to continue on another machine. check_only=true returns
+        `rows` (ok / missing / unknown on `node` for your harness, tmux, git checkout and commit,
+        the CLIs, MCP servers and skills you used, dotfiles you read) and `brief`, the provisioning
+        brief for what `node` lacks. Gaps do not stop a move: the brief ships with it and your
+        continuation provisions `node` first. Uncommitted work and unpushed commits travel as a
+        snapshot on a teleport/<id> branch, without touching your checkout; likely secret files stay
+        behind and are listed. Only `blockers` stop it (no tmux, or a harness `node` cannot install).
+        `cwd` is a folder on `node` to use instead of its clone found by remote URL (force=true when
+        that folder is another repository); `mode` (ask, auto, yolo) overrides your approvals mode.
         After status "teleported", stop working: the new session confirms to you with a message
         and owns the task from then on.
         """
@@ -270,7 +272,7 @@ def create_server(update_notice: str = "") -> MCPServer:
         args = [sys.executable, "-O", str(LAUNCHER), "live", "teleport", node, "--from", me.address, "--json"]
         args += ["--check"] if check_only else ["--yes"]
         args += (["--cwd", cwd] if cwd else []) + (["--mode", mode] if mode else [])
-        args += (["--force"] if force else []) + (["--push-wip"] if push_wip else [])
+        args += ["--force"] if force else []
         try:
             result = subprocess.run(args, capture_output=True, text=True, timeout=900, check=False,
                                     env={**os.environ, update_check.DISABLE_ENV: "1"})

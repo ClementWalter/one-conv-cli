@@ -1,10 +1,11 @@
 """`live teleport` end to end: two real bridges on a local relay move a session from `mac` to `box`.
 
-mac runs a stand-in omp session (a registry file naming a `sleep` process, and an omp transcript)
-working in a clone of a local bare repository. box has another clone under its project root and
-opted in with `live serve --accept-teleport`. tmux on box is a stand-in that registers a new omp
-session where it was started and, like the briefed agent, sends the brief's confirmation back to
-the origin with `live send`. Every path is under the test's own directory.
+mac runs a stand-in omp session (a registry file naming a `sleep` process, and an omp transcript
+that ran `wacli send`, a CLI only mac has) working in a clone of a local bare repository with
+uncommitted work and a `.env`. box has another clone under its project root and opted in with
+`live serve --accept-teleport`. tmux on box is a stand-in that records the first prompt, registers
+a new omp session where it was started and, like the briefed agent, sends the brief's confirmation
+back to the origin with `live send`. Every path is under the test's own directory.
 """
 
 import json
@@ -55,6 +56,7 @@ name, cwd, brief = args[args.index("-s") + 1], args[args.index("-c") + 1], args[
 ident = "teleported-" + uuid.uuid4().hex[:8]
 sleeper = subprocess.Popen(["sleep", "600"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 (state / name).write_text(str(sleeper.pid))
+(state / f"{{name}}.prompt").write_text(brief)
 registry = Path(os.environ["ONE_CONV_LIVE_DIR"]) / "omp"
 registry.mkdir(parents=True, exist_ok=True)
 (registry / f"{{ident}}.json").write_text(json.dumps({{"sessionId": ident, "pid": sleeper.pid, "cwd": cwd}}))
@@ -102,6 +104,9 @@ def write_origin(env: dict, cwd: Path) -> subprocess.Popen:
             {"type": "message", "timestamp": "2026-01-01T10:00:02Z",
              "message": {"role": "assistant", "content": [{"type": "toolCall", "name": "bash",
                                                            "arguments": {"command": "git status"}}]}},
+            {"type": "message", "timestamp": "2026-01-01T10:00:02Z",
+             "message": {"role": "assistant", "content": [{"type": "toolCall", "name": "bash",
+                                                           "arguments": {"command": "wacli send parser-team"}}]}},
             {"type": "message", "timestamp": "2026-01-01T10:00:03Z",
              "message": {"role": "assistant", "content": [{"type": "text", "text": "The parser test is flaky."}]}}]
     (sessions / f"2026_{ORIGIN_ID}.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n")
@@ -149,11 +154,16 @@ def teleported(relay, tmp_path_factory):
     git(mac_clone, "commit", "-m", "parser")
     git(mac_clone, "push", "origin", "main")
     git(root, "clone", str(remote), str(box_clone))
-    fake_bin = root / "bin"
+    (mac_clone / "parser.py").write_text("print('parse, fixed')\n")
+    (mac_clone / "notes.md").write_text("flaky because of the clock\n")
+    (mac_clone / ".env").write_text("TOKEN=never-travels\n")
+    mac_status = git(mac_clone, "status", "--porcelain")
+    fake_bin, mac_bin = root / "bin", root / "mac-bin"
+    executable(mac_bin / "wacli", "#!/bin/sh\n")
     executable(fake_bin / "tmux", FAKE_TMUX.replace("{python}", sys.executable).replace("{{", "{").replace("}}", "}"))
     executable(fake_bin / "omp", "#!/bin/sh\necho 'omp 0.0-test'\n")
     path = f"{fake_bin}{os.pathsep}{os.environ['PATH']}"
-    mac = node_env(root / "mac", {"PATH": path})
+    mac = node_env(root / "mac", {"PATH": f"{mac_bin}{os.pathsep}{path}"})
     box = node_env(root / "box", {"PATH": path, "FAKE_TMUX_DIR": str(root / "tmux"),
                                   "ONE_CONV_CLI": str(ROOT / "one_conv_cli.py"),
                                   "ONE_CONV_PROJECT_ROOTS": str(root / "box-code"),
@@ -177,8 +187,12 @@ def teleported(relay, tmp_path_factory):
         assert result.stdout, result.stderr
         inbox = Path(mac["ONE_CONV_LIVE_DIR"]) / "inbox" / "omp" / ORIGIN_ID
         confirmation = until(lambda: sorted(inbox.glob("*.json")), "the confirmation on mac")[0]
-        yield SimpleNamespace(report=json.loads(result.stdout), confirmation=json.loads(confirmation.read_text())["text"],
-                              box_clone=box_clone, sha=git(mac_clone, "rev-parse", "HEAD"), box=box)
+        report = json.loads(result.stdout)
+        yield SimpleNamespace(report=report, confirmation=json.loads(confirmation.read_text())["text"],
+                              box_clone=box_clone, head=git(mac_clone, "rev-parse", "HEAD"), box=box,
+                              prompt=next((root / "tmux").glob("*.prompt")).read_text(),
+                              mac_status=(mac_status, git(mac_clone, "status", "--porcelain")),
+                              worktree=Path(report["dir"]))
     finally:
         for process in bridges:
             process.send_signal(signal.SIGTERM)
@@ -200,16 +214,56 @@ def test_the_new_session_lives_on_box(teleported):
     assert teleported.report["address"].startswith("box/omp:teleported-")
 
 
-def test_the_new_session_works_in_boxs_clone(teleported):
-    assert teleported.report["dir"] == str(teleported.box_clone)
+def test_the_snapshot_is_checked_out_in_a_new_worktree(teleported):
+    assert teleported.worktree.parent.parent.name == "box-worktrees"
 
 
-def test_the_new_session_is_at_the_origin_commit(teleported):
-    assert teleported.report["sha"] == teleported.sha
+def test_the_new_session_is_on_the_snapshot_branch(teleported):
+    assert teleported.report["branch"] == teleported.report["snapshot"]["branch"]
+
+
+def test_the_snapshot_sits_on_the_origin_head(teleported):
+    assert git(teleported.worktree, "rev-parse", "HEAD^") == teleported.head
+
+
+def test_the_uncommitted_work_reaches_box(teleported):
+    assert (teleported.worktree / "notes.md").read_text() == "flaky because of the clock\n"
+
+
+def test_the_secret_file_stays_behind(teleported):
+    assert not (teleported.worktree / ".env").exists()
+
+
+def test_the_report_lists_what_stayed_behind(teleported):
+    assert teleported.report["snapshot"]["skipped"] == [{"path": ".env", "reason": "looks like a secret"}]
+
+
+def test_the_origin_checkout_is_untouched(teleported):
+    assert teleported.mac_status[0] == teleported.mac_status[1]
+
+
+def test_the_brief_names_the_cli_box_lacks(teleported):
+    assert "## cli `wacli` (missing)" in teleported.report["brief"]
+
+
+def test_the_brief_says_why_the_session_needs_it(teleported):
+    assert "- Why: ran `wacli send`." in teleported.report["brief"]
+
+
+def test_the_continuation_prompt_has_step_0(teleported):
+    assert "STEP 0, right after that message: provision this machine." in teleported.prompt
+
+
+def test_the_continuation_prompt_carries_the_brief(teleported):
+    assert "## cli `wacli` (missing)" in teleported.prompt
+
+
+def test_the_brief_is_saved_on_box(teleported):
+    assert list((Path(teleported.box["ONE_CONV_LIVE_DIR"]) / "teleport-briefs").glob("*.md"))
 
 
 def test_the_origin_receives_the_confirmation(teleported):
-    assert f"teleported: now {teleported.report['address']} in {teleported.box_clone}" in teleported.confirmation
+    assert f"teleported: now {teleported.report['address']} in {teleported.worktree}" in teleported.confirmation
 
 
 def test_the_confirmation_names_the_task(teleported):

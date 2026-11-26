@@ -110,6 +110,26 @@ def test_scan_collects_each_kind_once_in_first_use_order(scanned, kind, expected
     assert scanned[kind] == expected
 
 
+@pytest.mark.parametrize(("key", "usage"), [
+    ("cli:git", {"count": 2, "example": "git status"}),
+    ("mcp:one-conv", {"count": 1, "example": "send_message"}),
+    ("mcp:linear", {"count": 1, "example": "list_issues"}),
+    ("skill:codex:rescue", {"count": 1, "example": "invoked"}),
+    ("hint:~/.config/gh/hosts.yml", {"count": 1, "example": "read"}),
+])
+def test_scan_counts_how_the_session_used_each_item(scanned, key, usage):
+    assert scanned["usage"][key] == usage
+
+
+@pytest.mark.parametrize(("command", "calls"), [
+    ("wa send group hi", [("wa", "wa send")]),
+    ("gh --repo x pr view", [("gh", "gh")]),
+    ("make", [("make", "make")]),
+])
+def test_program_calls_keep_the_subcommand_as_the_example(command, calls):
+    assert inventory.program_calls(command) == calls
+
+
 def test_available_keeps_programs_found_on_path():
     assert inventory.available(["git", "nope"], lambda name: f"/usr/bin/{name}" if name == "git" else None) == ["git"]
 

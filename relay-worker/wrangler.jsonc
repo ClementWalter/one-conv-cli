@@ -1,11 +1,9 @@
 // one-conv relay + conversation archive: the wire API of scripts/live-hub.py on Cloudflare.
+// Deploying to your own account from scratch: see README.md in this folder.
 //
 // Local:   npm ci && npx wrangler dev --local --var RELAY_ADMIN_TOKEN:<secret>
-// Deploy:  npx wrangler r2 bucket create one-conv-archive
-//          npx wrangler deploy
-//          npx wrangler secret put RELAY_ADMIN_TOKEN
-//          npx wrangler secret put MCP_OWNER_PASSPHRASE   (typed on /authorize to connect the Claude app)
-// Tokens:  RELAY_ADMIN_TOKEN=<secret> uv run scripts/relay_admin.py --url https://<worker-url> token add <node>
+// Deploy:  npx wrangler deploy   (secrets: RELAY_ADMIN_TOKEN, MCP_OWNER_PASSPHRASE via wrangler secret put)
+// Invite:  RELAY_ADMIN_TOKEN=<secret> uv run scripts/relay_admin.py --url https://<worker-url> invite <node>
 // Import:  RELAY_ADMIN_TOKEN=<secret> uv run scripts/import_archive.py --url https://<worker-url> --db archive.db
 {
   "$schema": "node_modules/wrangler/config-schema.json",
@@ -19,6 +17,8 @@
     ]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Relay", "ArchiveIndex"] }],
+  // This deployment's bucket and KV namespace. Another Cloudflare account creates its own
+  // (README.md) and puts their names and id here.
   "r2_buckets": [{ "binding": "ARCHIVE", "bucket_name": "one-conv-archive" }],
   // OAuth grants for the remote MCP connector; a new namespace would sign every connected app out.
   "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "718a87ea9b324606bac5e217a25b5d29" }],

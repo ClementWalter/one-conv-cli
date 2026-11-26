@@ -8,8 +8,9 @@ Use [SKILL.md](SKILL.md) for the canonical cloud/local interface and current aut
 Experimental cloud adapters are available through `one-conv cloud providers`
 and `one-conv cloud sync --help`. Read [PROVIDERS.md](PROVIDERS.md) before using
 them: Claude Chat and Codex task graphs are verified against browser responses,
-Cowork needs a populated sample, and cloud login is not implemented. Sessions come from
-the caller; never present manual token copying as customer onboarding.
+Cowork needs a populated sample. Sign in with `one-conv cloud PRODUCT connect`
+(`--login` for an account outside your everyday browser); never present manual
+token copying as customer onboarding.
 
 Terminal access to your **own** conversation history across four coding
 agents by reading each one's local storage directly, read-only:

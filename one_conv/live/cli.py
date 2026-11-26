@@ -27,13 +27,15 @@ def examples(*lines: str) -> str:
 def build_live_group(launcher: list[str]) -> click.Group:
     @click.group("live", context_settings=HELP,
                  epilog="\b\nTargets:\n  claude:<id> codex:<id> omp:<id> cursor:<id> agy:<id>  a session address (or id prefix)\n"
-                        "  NODE/claude:<full id>                      a session on another machine (live serve)\n"
+                        "  NODE/claude:<full id>                      a session on another machine (live join, live serve)\n"
                         "  @name                                      the agent that chose the name, here or elsewhere\n"
                         "  claude-chat:<id> cowork:<id>               a saved Claude chat or Cowork session\n"
                         "  user                                       you: a note in your inbox (`live inbox`), never a new turn\n"
                         "\b\nExamples:\n  one-conv live name reviewer\n"
                         "  one-conv live send @builder 'can you take the migration?' --yes\n"
-                        "  one-conv live serve --hub ssh://me@relay-box --node laptop --token-stdin < token\n"
+                        "  one-conv live invite studio      # on a connected machine: prints the join command\n"
+                        "  one-conv live join 'https://<your-relay>.workers.dev#studio.<code>' --yes   # on the new one\n"
+                        "  one-conv live serve --hub ssh://me@relay-box --node laptop --token-stdin < token   # self-hosted relay\n"
                         "  one-conv live send ci-runner/codex:019a0c5e-7b1d-7f30-9c4e-2d8a5b6f1e03 'rerun the flaky test' --yes\n"
                         "  one-conv live status 9f2c41d07a5e4b1c8d3e6f7a8b9c0d1e")
     def live():
@@ -307,7 +309,12 @@ def build_live_group(launcher: list[str]) -> click.Group:
     @click.option("--harness", type=click.Choice(HARNESSES), help="Only this harness.")
     @click.option("--yes", is_flag=True, help="Apply the missing steps. Without it, only lists them.")
     def install_command(harness, yes):
-        """Register the MCP server, omp extension, Cursor hook and agy hooks that live relaying needs."""
+        """Register the MCP server, omp extension, Cursor hook and agy hooks that live relaying needs.
+
+        These reach sessions on this machine. Reaching other machines also needs the bridge:
+        `live join` with an invite from a connected machine, or `live serve --hub ...`.
+        """
+        from . import bridge
         steps = [step for step in installer.plan(launcher) if harness in (None, step.harness)]
         for step in steps:
             if step.done():
@@ -319,6 +326,9 @@ def build_live_group(launcher: list[str]) -> click.Group:
                 click.echo(f"  missing  [{step.harness}] {step.summary}")
         if not yes:
             click.echo("Re-run with --yes to apply the missing steps. Running sessions pick them up on restart.")
+        if not bridge.settings().get("hub"):
+            click.echo("No relay yet: to reach other machines, run the `one-conv live join ...` command that"
+                       " `one-conv live invite NODE` prints on a connected machine.")
 
     @live.command("spawn", context_settings={**HELP, "ignore_unknown_options": True},
                   epilog=examples("one-conv live spawn codex --cwd ../review --brief-file brief.md --yes",
@@ -478,6 +488,6 @@ def build_live_group(launcher: list[str]) -> click.Group:
                                            os.environ.get(agy.TOKEN_ENV))))
 
     from .bridge_cli import add_bridge_commands
-    add_bridge_commands(live)
+    add_bridge_commands(live, launcher)
 
     return live

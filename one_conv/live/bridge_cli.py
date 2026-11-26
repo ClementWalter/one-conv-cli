@@ -1,15 +1,19 @@
-"""`one-conv live serve`: run, inspect or stop this machine's bridge to a live relay."""
+"""`one-conv live serve`, `live invite` and `live join`: connect this machine to a live relay and run its bridge."""
 
 import json
 import logging
 import os
 import sys
+import time
 
 import click
 
-from . import bridge, hubclient, service, tunnel
+from . import bridge, hubclient, invite, service, tunnel
+from . import install as installer
 
 HELP = {"help_option_names": ["-h", "--help"]}
+# How long `live join` waits for the freshly installed bridge to take its lock.
+JOIN_WAIT_SECONDS = 10.0
 
 
 def _check_hub(hub: str) -> str:
@@ -19,16 +23,38 @@ def _check_hub(hub: str) -> str:
         raise click.UsageError(f"--hub: {error}") from None
 
 
-def add_bridge_commands(live: click.Group) -> None:
+def _status_lines(state: dict) -> list[str]:
+    """What `live serve --status` prints for a bridge state."""
+    lines = [f"{'running' if state['running'] else 'not running'}: node {state.get('node', '?')} via {state.get('hub', '?')}"]
+    if state.get("last_error"):
+        lines.append(f"  last error: {state['last_error']}")
+    lines.append(f"  queued for the relay: {state['outbox']}")
+    lines.append(f"  starts at login: {'yes' if service.installed() else 'no (one-conv live serve --install --yes)'}")
+    lines.extend(f"  {note}" for note in state.get("notes") or [])
+    return lines
+
+
+def _wait_until_running(seconds: float) -> dict:
+    deadline = time.monotonic() + seconds
+    state = bridge.status()
+    while not state["running"] and time.monotonic() < deadline:
+        time.sleep(0.5)
+        state = bridge.status()
+    return state
+
+
+def add_bridge_commands(live: click.Group, launcher: list[str]) -> None:
     @live.command("serve", context_settings=HELP,
                   epilog="\b\nExamples:\n"
-                         "  one-conv live serve --hub ssh://me@hub-box --node laptop --token-stdin < token\n"
-                         "  one-conv live serve --hub https://hub.example.com --node ci-runner --token-stdin < ci-runner.token\n"
+                         "  one-conv live join https://<your-relay>.workers.dev#laptop.<code> --yes   # simplest: an invite\n"
+                         "  one-conv live serve --hub https://<your-relay>.workers.dev --node laptop --token-stdin < token\n"
+                         "  one-conv live serve --hub ssh://me@relay-box --node laptop --token-stdin < token\n"
                          "  one-conv live serve            # again, with the last settings\n"
                          "  one-conv live serve --status\n"
                          "  one-conv live serve --stop\n"
                          "  one-conv live serve --install --yes   # start at login, restart after a crash")
-    @click.option("--hub", help="The relay: https://HOST, http://127.0.0.1:PORT (loopback only), or ssh://[user@]HOST to tunnel to it.")
+    @click.option("--hub", help="The relay: https://HOST (the Cloudflare Worker or a self-hosted relay behind TLS),"
+                                " http://127.0.0.1:PORT (loopback only), or ssh://[user@]HOST to tunnel to it.")
     @click.option("--node", help="This machine's name on the relay, as its token was issued (a-z, 0-9, -).")
     @click.option("--hub-port", type=int, help="The relay's port on an ssh host.  [default: 8789]")
     @click.option("--token-stdin", is_flag=True, help="Read this node's token from stdin and remember it (mode 600).")
@@ -48,7 +74,12 @@ def add_bridge_commands(live: click.Group) -> None:
         unreachable, and syncs this machine's agent histories to the relay's archive so any
         machine can read and continue them as NODE/harness:id. No inbound network access is
         required. Run one per machine, in the foreground, under tmux, or as a login service
-        (--install); its token comes from `scripts/live-hub.py token add`.
+        (--install). Settings, including the token, are saved in <live dir>/bridge/serve.json.
+
+        The simplest way to connect a machine is `live join` with an invite from a machine
+        already connected (`live invite NODE`). A token can also come from the relay's
+        operator: `relay-worker/scripts/relay_admin.py token add NODE` for the Cloudflare
+        Worker, `scripts/live-hub.py token add NODE` for the self-hosted Python relay.
         """
         if install_it or uninstall_it:
             if not yes:
@@ -68,14 +99,8 @@ def add_bridge_commands(live: click.Group) -> None:
             if as_json:
                 click.echo(json.dumps(state))
                 return
-            click.echo(f"{'running' if state['running'] else 'not running'}: node {state.get('node', '?')} "
-                       f"via {state.get('hub', '?')}")
-            if state.get("last_error"):
-                click.echo(f"  last error: {state['last_error']}")
-            click.echo(f"  queued for the relay: {state['outbox']}")
-            click.echo(f"  starts at login: {'yes' if service.installed() else 'no (one-conv live serve --install --yes)'}")
-            for note in state.get("notes") or []:
-                click.echo(f"  {note}")
+            for line in _status_lines(state):
+                click.echo(line)
             return
         if stop_it:
             click.echo("stopping the bridge" if bridge.stop() else "no bridge is running")
@@ -85,7 +110,8 @@ def add_bridge_commands(live: click.Group) -> None:
         hub_port = hub_port or saved.get("hub_port") or 8789
         token = sys.stdin.read().strip() if token_stdin else os.environ.get("ONE_CONV_HUB_TOKEN") or saved.get("token")
         if not (hub and node and token):
-            raise click.UsageError("Give --hub, --node and a token (--token-stdin or ONE_CONV_HUB_TOKEN) the first time.")
+            raise click.UsageError("Give --hub, --node and a token (--token-stdin or ONE_CONV_HUB_TOKEN) the first time,"
+                                   " or run `one-conv live join` with an invite from a connected machine.")
         if hub != saved.get("hub") and not (token_stdin or os.environ.get("ONE_CONV_HUB_TOKEN")):
             # A remembered token belongs to the remembered hub; never send it to another one.
             raise click.UsageError("A new --hub needs its own token: pass --token-stdin or ONE_CONV_HUB_TOKEN.")
@@ -95,3 +121,96 @@ def add_bridge_commands(live: click.Group) -> None:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", force=True)
         click.echo(f"bridge for node {node} via {hub}; stop with Ctrl-C or `one-conv live serve --stop`", err=True)
         sys.exit(bridge.serve(hub, node, token, hub_port))
+
+    @live.command("invite", context_settings=HELP,
+                  epilog="\b\nExamples:\n"
+                         "  one-conv live invite studio\n"
+                         "  one-conv live invite ci-runner --ttl 2h\n"
+                         "  one-conv live invite laptop --replace     # the old laptop token stops working once it is used\n"
+                         "  one-conv live invite studio --json")
+    @click.argument("node")
+    @click.option("--ttl", default=invite.DEFAULT_TTL, show_default=True,
+                  help="How long the invite stays valid: 90s, 15m, 2h, 1d (at most 24h).")
+    @click.option("--replace", is_flag=True,
+                  help="Allow NODE to exist already: joining gives it a new token and the old one stops working.")
+    @click.option("--json", "as_json", is_flag=True, help="Emit {node, expires, command} as JSON.")
+    def invite_command(node, ttl, replace, as_json):
+        """Let a new machine join the relay as NODE: prints the one command to run there.
+
+        The relay makes a one-time code bound to NODE with this machine's node token, so no
+        admin secret is copied around. The code expires after --ttl and works once; anyone
+        holding it until then can join as NODE, so pass it like a password.
+        """
+        saved = bridge.settings()
+        if not (saved.get("hub") and saved.get("token")):
+            raise click.ClickException("This machine is not connected to a relay: run `one-conv live join` with an"
+                                       " invite from a connected machine, or `one-conv live serve --hub ... --token-stdin`.")
+        try:
+            seconds = invite.parse_ttl(ttl)
+            with invite.reach(saved["hub"], saved.get("hub_port") or invite.DEFAULT_HUB_PORT) as url:
+                made = invite.create(url, saved["token"], node, seconds, replace)
+        except (invite.InviteError, tunnel.TunnelError, ValueError) as error:
+            raise click.ClickException(str(error)) from None
+        command = invite.join_command(saved["hub"], made["node"], made["code"],
+                                      saved.get("hub_port") or invite.DEFAULT_HUB_PORT)
+        if as_json:
+            click.echo(json.dumps({"node": made["node"], "expires": made["expires"], "command": command}))
+            return
+        until = time.strftime("%Y-%m-%d %H:%M", time.localtime(made["expires"]))
+        click.echo(f"Run this on the new machine before {until} (works once):", err=True)
+        click.echo(command)
+
+    @live.command("join", context_settings=HELP,
+                  epilog="\b\nExamples:\n"
+                         "  one-conv live join 'https://<your-relay>.workers.dev#studio.<code>'          # show the steps\n"
+                         "  one-conv live join 'https://<your-relay>.workers.dev#studio.<code>' --yes")
+    @click.argument("invitation", metavar="INVITE")
+    @click.option("--hub-port", type=int, default=invite.DEFAULT_HUB_PORT, show_default=True,
+                  help="The relay's port on an ssh host.")
+    @click.option("--yes", is_flag=True, help="Join. Without it, only lists the steps.")
+    def join_command(invitation, hub_port, yes):
+        """Connect this machine to the relay with an invite from `live invite`, and start its bridge.
+
+        Redeems the one-time code for this node's token, saves the relay, node and token like
+        `live serve --token-stdin` (mode 600), applies the `live install` steps, installs the
+        bridge as a login service (`live serve --install`) and starts it.
+        """
+        try:
+            hub, node, code = invite.parse_invite(invitation)
+        except invite.InviteError as error:
+            raise click.UsageError(str(error)) from None
+        hub = _check_hub(hub)
+        saved = bridge.settings()
+        missing = [step for step in installer.plan(launcher) if not step.done()]
+        if not yes:
+            click.echo("DRY-RUN (nothing changed). Re-run with --yes to join.")
+            click.echo(f"  redeem   the one-time invite for node {node} at {hub}")
+            if saved.get("hub"):
+                click.echo(f"  replace  the saved bridge settings (node {saved.get('node')} via {saved['hub']})")
+            click.echo(f"  save     relay, node and token in {bridge.bridge_dir() / 'serve.json'} (mode 600)")
+            for step in missing:
+                click.echo(f"  install  [{step.harness}] {step.summary}")
+            click.echo(f"  install  the login service {service.path()} and start the bridge")
+            return
+        try:
+            # Checked first: the code is spent once redeemed.
+            service.require_supported()
+            with invite.reach(hub, hub_port) as url:
+                joined = invite.redeem(url, code)
+        except (invite.InviteError, tunnel.TunnelError, RuntimeError, ValueError) as error:
+            raise click.ClickException(str(error)) from None
+        bridge.save_settings(hub, joined["node"], hub_port, joined["token"])
+        click.echo(f"  saved    node {joined['node']} via {hub} in {bridge.bridge_dir() / 'serve.json'}")
+        for step in missing:
+            step.apply()
+            click.echo(f"  applied  [{step.harness}] {step.summary}")
+        try:
+            notes = service.install()
+        except RuntimeError as error:
+            raise click.ClickException(f"{error}; the token is saved, so retry with "
+                                       "`one-conv live serve --install --yes`") from None
+        for note in notes:
+            click.echo(f"  {note}")
+        # The bridge reports its node and relay once it runs; until then they come from the settings.
+        for line in _status_lines({"node": joined["node"], "hub": hub, **_wait_until_running(JOIN_WAIT_SECONDS)}):
+            click.echo(line)

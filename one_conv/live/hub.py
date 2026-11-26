@@ -16,6 +16,10 @@ ingress log is what keeps a retried delivery from prompting an agent twice.
 
 A message to `user` is for the person, not an agent: it is filed as a note with optional tags
 that any of the person's nodes reads back in order through GET /v1/user, and no bridge is woken.
+
+A connected node (or the relay's operator) can invite a new machine: POST /v1/invites returns
+a one-time code bound to a node name, kept only as a digest, that expires within a day.
+POST /v1/join, unauthenticated, trades the code for that node's token exactly once.
 """
 
 import hashlib
@@ -58,6 +62,13 @@ TAG = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 TAGS_PER_NOTE = 8
 NAME_LIMIT = 200
 NOTES_LIMIT = 200
+# An invite is short-lived: long enough to walk to the other machine, never a standing credential.
+INVITE_TTL = 15 * 60
+INVITE_TTL_MIN = 60
+INVITE_TTL_MAX = 24 * 3600
+# Used and expired invites are kept this long for the operator to see, then pruned.
+INVITE_KEEP = 7 * 24 * 3600
+MAX_CODE = 256
 # CREATE IF NOT EXISTS only: a database holding other tables or extra nullable columns opens unchanged.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tokens (node TEXT PRIMARY KEY, hash TEXT NOT NULL, created REAL NOT NULL);
@@ -77,6 +88,8 @@ CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, node TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS notes (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_node TEXT NOT NULL, id TEXT NOT NULL,
     digest TEXT NOT NULL, sender TEXT NOT NULL, name TEXT NOT NULL, text TEXT NOT NULL, tags TEXT NOT NULL,
     created REAL NOT NULL, UNIQUE (from_node, id));
+CREATE TABLE IF NOT EXISTS invites (hash TEXT PRIMARY KEY, node TEXT NOT NULL, inviter TEXT NOT NULL,
+    takes_over INTEGER NOT NULL, created REAL NOT NULL, expires REAL NOT NULL, used REAL);
 """
 
 
@@ -140,6 +153,51 @@ class Hub:
             db.execute("DELETE FROM sessions WHERE node = ?", (node,))
             db.execute("DELETE FROM nodes WHERE node = ?", (node,))
         return bool(removed)
+
+    def create_invite(self, by: str, node, ttl=INVITE_TTL, replace=False) -> dict:
+        """A one-time code that `redeem_invite` trades for NODE's token; `by` is the inviting node ("" for the operator).
+
+        A node that already has a token is refused unless `replace`, so an invite never
+        silently takes over a running machine's identity.
+        """
+        if not isinstance(node, str) or not NODE.fullmatch(node):
+            raise HubError(400, f"node names are lowercase letters, digits and dashes: {node!r}")
+        if isinstance(ttl, bool) or not isinstance(ttl, int) or not INVITE_TTL_MIN <= ttl <= INVITE_TTL_MAX:
+            raise HubError(400, f"ttl is a whole number of seconds from {INVITE_TTL_MIN} to {INVITE_TTL_MAX}")
+        if not isinstance(replace, bool):
+            raise HubError(400, "replace is true or false")
+        code, now = secrets.token_urlsafe(24), time.time()
+        with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not replace and db.execute("SELECT 1 FROM tokens WHERE node = ?", (node,)).fetchone():
+                raise HubError(409, f"node {node} already has a token; invite with replace to take it over")
+            db.execute("DELETE FROM invites WHERE expires < ?", (now - INVITE_KEEP,))
+            db.execute("INSERT INTO invites VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                       (_hash(code), node, by, int(replace), now, now + ttl))
+        return {"node": node, "code": code, "expires": now + ttl}
+
+    def redeem_invite(self, code) -> dict:
+        """NODE's new token for an unused, unexpired invite code; the code is spent in the same transaction."""
+        if not isinstance(code, str) or not code or len(code) > MAX_CODE:
+            raise HubError(400, "code is the invite code `one-conv live invite` printed")
+        digest = _hash(code)
+        with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT hash, node, takes_over, expires, used FROM invites").fetchall()
+            found = next((row for row in rows if hmac.compare_digest(row[0], digest)), None)
+            if found is None:
+                raise HubError(404, "unknown invite code")
+            stored, node, replace, expires, used = found
+            if used is not None:
+                raise HubError(410, "this invite was already used; ask for a new one with `one-conv live invite`")
+            if expires < time.time():
+                raise HubError(410, "this invite expired; ask for a new one with `one-conv live invite`")
+            if not replace and db.execute("SELECT 1 FROM tokens WHERE node = ?", (node,)).fetchone():
+                raise HubError(409, f"node {node} got a token after this invite was made; ask for one with --replace")
+            token = secrets.token_urlsafe(32)
+            db.execute("UPDATE invites SET used = ? WHERE hash = ?", (time.time(), stored))
+            db.execute("INSERT OR REPLACE INTO tokens VALUES (?, ?, ?)", (node, _hash(token), time.time()))
+        return {"node": node, "token": token}
 
     def node_for(self, token: str | None) -> str:
         """The node a bearer token belongs to; the request's identity comes only from here."""
@@ -512,6 +570,22 @@ def application(hub: Hub, archive_db: str | None = None):
             return JSONResponse({"error": str(error)}, status_code=error.status)
         return Response(body, media_type=media_type)
 
+    async def invites(request):
+        return await handle(request, lambda node, body, _: hub.create_invite(
+            node, body.get("node"), body.get("ttl", INVITE_TTL), body.get("replace", False)))
+
+    async def join(request):
+        # No token: the invite code in the body is the credential, and it is spent on success.
+        try:
+            body = json.loads(await bounded_body(request, 4096) or b"{}")
+            if not isinstance(body, dict):
+                raise HubError(400, "the request body must be a JSON object")
+            return JSONResponse(await run_in_threadpool(hub.redeem_invite, body.get("code")))
+        except HubError as error:
+            return JSONResponse({"error": str(error)}, status_code=error.status)
+        except ValueError:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
     async def whoami(request):
         return await handle(request, lambda node, body, _: {"node": node})
 
@@ -536,6 +610,8 @@ def application(hub: Hub, archive_db: str | None = None):
         Route("/v1/attachments", upload, methods=["POST"]),
         Route("/v1/attachments/{ident}", attachment, methods=["GET"]),
         Route("/v1/user", user_notes, methods=["GET"]),
+        Route("/v1/invites", invites, methods=["POST"]),
+        Route("/v1/join", join, methods=["POST"]),
     ]
     if archive_db is not None:
         routes.append(Mount(_archive_path(), app=archive_application(hub, archive_db)))

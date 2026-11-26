@@ -11,9 +11,13 @@ this script reads it from the environment only, so it never shows up in argv or 
     RELAY_ADMIN_TOKEN=... relay_admin.py --url https://relay.example.workers.dev token add NODE
     RELAY_ADMIN_TOKEN=... relay_admin.py --url ... token revoke NODE
     RELAY_ADMIN_TOKEN=... relay_admin.py --url ... token list
+    RELAY_ADMIN_TOKEN=... relay_admin.py --url ... invite NODE [--ttl 15m] [--replace]
 
 `token add` writes the new token to stdout once; hand it to that node's bridge
 (`one-conv live serve --hub URL --node NODE --token-stdin`). Adding a node again replaces its token.
+`invite` writes the one `one-conv live join ...` command to run on the new machine instead: a
+one-time code, so no token is copied by hand. A connected machine makes the same invite with
+`one-conv live invite NODE`, without the admin secret.
 """
 
 import argparse
@@ -23,7 +27,11 @@ import os
 import sys
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
+from pathlib import Path
 from urllib.request import Request, urlopen
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from one_conv.live import invite  # noqa: E402  (stdlib only: the checkout is the dependency)
 
 log = logging.getLogger("relay-admin")
 
@@ -51,17 +59,32 @@ def main() -> int:
     token = commands.add_parser("token", help="Add, revoke or list node tokens.")
     token.add_argument("action", choices=("add", "revoke", "list"))
     token.add_argument("node", nargs="?")
+    invitation = commands.add_parser("invite", help="Print a one-time `one-conv live join` command for a node.")
+    invitation.add_argument("node")
+    invitation.add_argument("--ttl", default=invite.DEFAULT_TTL, help="How long the code stays valid [default: 15m].")
+    invitation.add_argument("--replace", action="store_true", help="Allow a node that already has a token.")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     admin = os.environ.get("RELAY_ADMIN_TOKEN")
     if not args.url or not admin:
         log.error("set --url (or ONE_CONV_RELAY_URL) and RELAY_ADMIN_TOKEN")
         return 2
-    if args.action != "list" and not args.node:
+    if args.command == "token" and args.action != "list" and not args.node:
         log.error("token %s needs a NODE", args.action)
         return 2
     try:
-        if args.action == "add":
+        if args.command == "invite":
+            try:
+                ttl = invite.parse_ttl(args.ttl)
+            except invite.InviteError as error:
+                log.error("%s", error)
+                return 2
+            status, body = call(args.url, admin, "POST", "/admin/invites", {"node": args.node, "ttl": ttl, "replace": args.replace})
+            if status == 200:
+                # The only time the code exists in clear: it goes to stdout for the operator to hand over.
+                sys.stdout.write(invite.join_command(args.url.rstrip("/"), body["node"], body["code"]) + "\n")
+                return 0
+        elif args.action == "add":
             status, body = call(args.url, admin, "POST", "/admin/tokens", {"node": args.node})
             if status == 200:
                 # The only time the token exists in clear: it goes to stdout for the operator to hand over.

@@ -456,3 +456,98 @@ def test_last_is_the_newest_note_even_when_the_tag_skips_it(two_nodes):
 def test_a_malformed_note_is_refused(two_nodes, extra, status):
     _, url, mac, _ = two_nodes
     assert call(url, "/v1/messages", mac, "POST", message("user", **extra))[0] == status
+
+
+# --- invites: a connected node lets a new machine join without copying a token ------------------
+
+@pytest.fixture
+def inviter(hub):
+    """(state, url, token of the connected node `mac`)."""
+    state, url = hub
+    return state, url, state.add_token("mac")
+
+
+def invite(url, token, node="studio", **extra):
+    return call(url, "/v1/invites", token, "POST", {"node": node, **extra})
+
+
+def join(url, code):
+    return call(url, "/v1/join", None, "POST", {"code": code})
+
+
+def test_an_invite_needs_a_node_token(hub):
+    _, url = hub
+    assert invite(url, None)[0] == 401
+
+
+def test_an_invite_is_bound_to_its_node(inviter):
+    _, url, mac = inviter
+    assert invite(url, mac)[1]["node"] == "studio"
+
+
+def test_a_redeemed_invite_gives_the_node_its_token(inviter):
+    _, url, mac = inviter
+    token = join(url, invite(url, mac)[1]["code"])[1]["token"]
+    assert call(url, "/v1/whoami", token)[1] == {"node": "studio"}
+
+
+def test_an_invite_works_once(inviter):
+    _, url, mac = inviter
+    code = invite(url, mac)[1]["code"]
+    join(url, code)
+    assert join(url, code)[0] == 410
+
+
+def test_an_unknown_code_is_refused(inviter):
+    _, url, _ = inviter
+    assert join(url, "not-a-code-anyone-was-given")[0] == 404
+
+
+def test_a_join_without_a_code_is_refused(inviter):
+    _, url, _ = inviter
+    assert call(url, "/v1/join", None, "POST", {})[0] == 400
+
+
+def test_an_invite_for_a_node_with_a_token_is_refused(inviter):
+    _, url, mac = inviter
+    assert invite(url, mac, node="mac")[0] == 409
+
+
+def test_an_invite_with_replace_takes_over_the_node(inviter):
+    _, url, mac = inviter
+    join(url, invite(url, mac, node="mac", replace=True)[1]["code"])
+    assert call(url, "/v1/whoami", mac)[0] == 401
+
+
+def test_an_invite_without_replace_is_refused_once_the_node_got_a_token(inviter):
+    state, url, mac = inviter
+    code = invite(url, mac)[1]["code"]
+    state.add_token("studio")
+    assert join(url, code)[0] == 409
+
+
+@pytest.mark.parametrize("ttl", [59, 86401, "15m", True, 900.5])
+def test_an_invite_ttl_outside_a_minute_to_a_day_is_refused(inviter, ttl):
+    _, url, mac = inviter
+    assert invite(url, mac, ttl=ttl)[0] == 400
+
+
+def test_an_invite_for_a_malformed_node_is_refused(inviter):
+    _, url, mac = inviter
+    assert invite(url, mac, node="Studio Mac")[0] == 400
+
+
+def test_an_invite_expires_after_its_ttl(inviter):
+    state, url, mac = inviter
+    code = invite(url, mac)[1]["code"]
+    with sqlite3.connect(local_database(state)) as db:
+        db.execute("UPDATE invites SET expires = 0")
+    assert join(url, code)[0] == 410
+
+
+def test_the_relay_keeps_only_a_digest_of_the_code(inviter):
+    state, url, mac = inviter
+    code = invite(url, mac)[1]["code"]
+    with sqlite3.connect(local_database(state)) as db:
+        rows = db.execute("SELECT * FROM invites").fetchall()
+    assert code not in json.dumps(rows)

@@ -126,6 +126,21 @@ describe("deletes", () => {
     expect((await body<{ posts: unknown[] }>(call("/v1/board/release", { token: mac }))).posts).toEqual([]);
   });
 
+  test("deleting the last post drops the topic from the listing", async () => {
+    const { mac } = await twoNodes();
+    const made = await body<{ id: string }>(post(mac, "release"));
+    await (await call(`/v1/board/release/posts/${made.id}`, { method: "DELETE", token: mac })).text();
+    expect((await body<{ topics: unknown[] }>(call("/v1/board", { token: mac }))).topics).toEqual([]);
+  });
+
+  test("posting to an emptied topic lists it again", async () => {
+    const { mac } = await twoNodes();
+    const made = await body<{ id: string }>(post(mac, "release"));
+    await (await call(`/v1/board/release/posts/${made.id}`, { method: "DELETE", token: mac })).text();
+    await (await post(mac, "release", { text: "back" })).text();
+    expect((await body<{ topics: { topic: string }[] }>(call("/v1/board", { token: mac }))).topics.map((t) => t.topic)).toEqual(["release"]);
+  });
+
   test("an admin delete of an unknown post is not found", async () => {
     await twoNodes();
     expect((await call(`/v1/board/release/posts/${"0".repeat(32)}`, { method: "DELETE", token: ADMIN })).status).toBe(404);

@@ -853,7 +853,8 @@ one-conv board rm pr-42 <post id> --yes                   # hide your own post (
   topics the reader has read or posted in. The line moves no position.
 - **Deleting.** Only the machine that posted, or the relay's admin, can delete
   a post. On the Worker, the admin token works with `board rm`; on the Python
-  relay, use `scripts/live-hub.py board-rm`.
+  relay, use `scripts/live-hub.py board-rm`. A topic whose posts are all deleted
+  leaves `board topics` until someone posts to it again.
 - **No relay.** Without a relay the board refuses, since it is shared across
   machines.
 

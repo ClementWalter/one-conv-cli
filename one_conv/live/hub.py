@@ -20,6 +20,15 @@ that any of the person's nodes reads back in order through GET /v1/user, and no 
 A connected node (or the relay's operator) can invite a new machine: POST /v1/invites returns
 a one-time code bound to a node name, kept only as a digest, that expires within a day.
 POST /v1/join, unauthenticated, trades the code for that node's token exactly once.
+
+A node can share one of its published sessions with a guest (POST /v1/shares): the grant is
+bound to that session's address, and only a digest of its secret is kept. Whoever holds the
+link `/s/<id>#<secret>` chats with that session alone through /v1/shares/<id>/messages, the
+secret in the X-Share-Secret header: a guest message becomes a delivery from `guest:<id>`
+(kind "guest") to the bound session, which answers with a message to `guest:<id>`. A guest
+reaches no other address, sees only its own exchange, and is refused while the session is
+offline rather than queued. The person gets a note tagged `share` when a share is made and
+when its guest first writes.
 """
 
 import hashlib
@@ -31,6 +40,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 NODE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 MESSAGE_ID = re.compile(r"[0-9a-f]{32}")
@@ -69,6 +79,35 @@ INVITE_TTL_MAX = 24 * 3600
 # Used and expired invites are kept this long for the operator to see, then pruned.
 INVITE_KEEP = 7 * 24 * 3600
 MAX_CODE = 256
+# Shares: a guest link to one session, valid a day by default and a month at most.
+SHARE_ID = re.compile(r"[0-9a-f]{16}")
+GUEST = "guest:"
+SHARE_TTL = 24 * 3600
+SHARE_TTL_MIN = 60
+SHARE_TTL_MAX = 30 * 24 * 3600
+# Expired and revoked shares, with their exchange, are kept this long for the owner to list.
+SHARE_KEEP = 7 * 24 * 3600
+LABEL_LIMIT = 64
+# A guest sends text only, at most GUEST_TEXT bytes, GUEST_RATE messages per GUEST_WINDOW seconds.
+GUEST_TEXT = 8192
+GUEST_BODY = 64 * 1024
+GUEST_RATE = 20
+GUEST_WINDOW = 300
+GUEST_PAGE = 200
+MAX_SECRET = 256
+SHARE_HEADER = "x-share-secret"
+INACTIVE = "this link is no longer active"
+SHARE_TAG = "share"
+# The guest page: one static file this relay and the Worker both serve.
+SHARE_PAGE = Path(__file__).resolve().parents[2] / "relay-worker" / "src" / "share-page.html"
+# The page runs only its own inline code and talks only to this origin.
+PAGE_HEADERS = {
+    "content-security-policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                               "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    "referrer-policy": "no-referrer",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+}
 # CREATE IF NOT EXISTS only: a database holding other tables or extra nullable columns opens unchanged.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tokens (node TEXT PRIMARY KEY, hash TEXT NOT NULL, created REAL NOT NULL);
@@ -90,7 +129,17 @@ CREATE TABLE IF NOT EXISTS notes (seq INTEGER PRIMARY KEY AUTOINCREMENT, from_no
     created REAL NOT NULL, UNIQUE (from_node, id));
 CREATE TABLE IF NOT EXISTS invites (hash TEXT PRIMARY KEY, node TEXT NOT NULL, inviter TEXT NOT NULL,
     takes_over INTEGER NOT NULL, created REAL NOT NULL, expires REAL NOT NULL, used REAL);
+CREATE TABLE IF NOT EXISTS shares (id TEXT PRIMARY KEY, hash TEXT NOT NULL, node TEXT NOT NULL, address TEXT NOT NULL,
+    label TEXT NOT NULL, created REAL NOT NULL, expires REAL NOT NULL, revoked REAL, first_used REAL);
+CREATE TABLE IF NOT EXISTS share_messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, share TEXT NOT NULL,
+    side TEXT NOT NULL, from_node TEXT NOT NULL, id TEXT NOT NULL, digest TEXT NOT NULL, text TEXT NOT NULL,
+    created REAL NOT NULL, post INTEGER, UNIQUE (from_node, id));
+CREATE INDEX IF NOT EXISTS share_exchange ON share_messages (share, seq);
 """
+# A guest's post has no sending node; its sender is guest:<share id>, whose share gives the label.
+PENDING = ("SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.reply, p.mode, p.text, p.created,"
+           " p.attachments, p.timing, s.label FROM deliveries d JOIN posts p ON p.seq = d.post"
+           " LEFT JOIN shares s ON p.from_node = '' AND p.sender = 'guest:' || s.id")
 
 
 class HubError(Exception):
@@ -319,6 +368,8 @@ class Hub:
             raise HubError(400, "to must be NODE/harness:id, @name or user")
         if target == USER:
             return self._note(node, msg_id, sender, text, message, bool(attached))
+        if target.startswith(GUEST):
+            return self._guest_reply(node, msg_id, sender, text, target, bool(attached))
         # `when` joins the digest only when idle, so a `now` post hashes as it always has.
         fields = [target, sender, reply, mode, text, *attached] + (["when=idle"] if timing == "idle" else [])
         digest = hashlib.sha256(json.dumps(fields).encode()).hexdigest()
@@ -441,10 +492,8 @@ class Hub:
         while True:
             with self.lock, self._db() as db:
                 self._seen(db, node)
-                rows = db.execute(
-                    "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.reply, p.mode, p.text,"
-                    " p.created, p.attachments, p.timing FROM deliveries d JOIN posts p ON p.seq = d.post"
-                    " WHERE d.to_node = ? AND d.outcome IS NULL ORDER BY d.post LIMIT 50", (node,)).fetchall()
+                rows = db.execute(f"{PENDING} WHERE d.to_node = ? AND d.outcome IS NULL ORDER BY d.post LIMIT 50",
+                                  (node,)).fetchall()
                 if rows:
                     db.executemany("UPDATE deliveries SET taken = ? WHERE delivery = ?",
                                    [(time.time(), r[0]) for r in rows])
@@ -454,10 +503,12 @@ class Hub:
 
     @classmethod
     def _handed(cls, row) -> dict:
-        d, i, a, fn, s, r, m, x, c, attachments, timing = row
-        return {"delivery": d, "id": i, "to": a, "from": f"{fn}/{s}", "reply": r, "mode": m, "text": x,
-                "created": c, **({"attachments": cls._parsed(attachments)} if attachments else {}),
-                **({"when": timing} if timing == "idle" else {})}
+        d, i, a, fn, s, r, m, x, c, attachments, timing, label = row
+        # A guest is named by its share alone: it has no node and no session of its own.
+        guest = {"kind": "guest", "label": label or ""} if fn == "" else {}
+        return {"delivery": d, "id": i, "to": a, "from": s if fn == "" else f"{fn}/{s}", "reply": r, "mode": m,
+                "text": x, "created": c, **({"attachments": cls._parsed(attachments)} if attachments else {}),
+                **({"when": timing} if timing == "idle" else {}), **guest}
 
     def ack(self, node: str, delivery: str, outcome: str) -> dict:
         """Record the outcome of one of this node's deliveries; the first final outcome reported stands.
@@ -487,6 +538,176 @@ class Hub:
                               " WHERE post = ? ORDER BY rowid", (post[0],)).fetchall()
         return {"id": msg_id, "recipients": [{"to": f"{n}/{a}", "delivery": d, "outcome": o or "stored",
                                               "outcome_at": at} for d, n, a, o, at in rows]}
+
+    # --- shares: a guest link to one session -------------------------------------------------------
+
+    @staticmethod
+    def _file_note(db, node: str, sender: str, name: str, text: str) -> None:
+        """A note the relay itself files for the person, tagged `share`."""
+        ident = secrets.token_hex(16)
+        digest = hashlib.sha256(json.dumps([USER, sender, name, text, SHARE_TAG]).encode()).hexdigest()
+        db.execute("INSERT INTO notes (from_node, id, digest, sender, name, text, tags, created)"
+                   " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                   (node, ident, digest, sender, name, text, json.dumps([SHARE_TAG]), time.time()))
+
+    @staticmethod
+    def _session_state(db, node: str, address: str) -> dict | None:
+        """The published session's title, name, status and whether its bridge holds it online; None if unpublished."""
+        row = db.execute("SELECT name, title, status, updated FROM sessions WHERE node = ? AND address = ?",
+                         (node, address)).fetchone()
+        if row is None:
+            return None
+        seen = db.execute("SELECT seen FROM nodes WHERE node = ?", (node,)).fetchone()
+        return {"name": row[0], "title": row[1] or "", "status": row[2] or "",
+                "online": _online(seen[0] if seen else 0.0, row[3], time.time())}
+
+    def create_share(self, node: str, address, label="guest", ttl=SHARE_TTL) -> dict:
+        """A guest link bound to one session this node published and holds online; the secret is returned once."""
+        if not isinstance(address, str) or not address:
+            raise HubError(400, "address is the session to share, harness:id or NODE/harness:id")
+        local = address
+        if "/" in address:
+            owner, local = split_address(address)
+            if owner != node:
+                raise HubError(403, f"{address} is another node's session; share it from that machine")
+        if ":" not in local:
+            raise HubError(400, f"a session address is harness:id, not {address!r}")
+        if not isinstance(label, str) or not label.strip() or len(label) > LABEL_LIMIT \
+                or any(ord(char) < 32 or ord(char) == 127 for char in label):
+            raise HubError(400, f"label is a name of at most {LABEL_LIMIT} printable characters")
+        if isinstance(ttl, bool) or not isinstance(ttl, int) or not SHARE_TTL_MIN <= ttl <= SHARE_TTL_MAX:
+            raise HubError(400, f"ttl is a whole number of seconds from {SHARE_TTL_MIN} to {SHARE_TTL_MAX}")
+        label = label.strip()
+        ident, secret, now = secrets.token_hex(8), secrets.token_urlsafe(32), time.time()
+        with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            state = self._session_state(db, node, local)
+            if state is None or not state["online"]:
+                raise HubError(409, f"{node}/{local} is not reachable through the relay: its machine's bridge must"
+                                    " be running (`one-conv live serve`)")
+            stale = [row[0] for row in db.execute("SELECT id FROM shares WHERE expires < ?", (now - SHARE_KEEP,))]
+            db.executemany("DELETE FROM share_messages WHERE share = ?", [(s,) for s in stale])
+            db.executemany("DELETE FROM shares WHERE id = ?", [(s,) for s in stale])
+            db.execute("INSERT INTO shares VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+                       (ident, _hash(secret), node, local, label, now, now + ttl))
+            until = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(now + ttl))
+            self._file_note(db, node, local, label,
+                            f"Shared {node}/{local} with {label} until {until} (share {ident}). "
+                            f"Revoke it with `one-conv live share --revoke {ident} --yes`.")
+        return {"id": ident, "secret": secret, "address": f"{node}/{local}", "label": label,
+                "expires": now + ttl, "path": f"/s/{ident}"}
+
+    def list_shares(self, node: str) -> dict:
+        """This node's shares, newest first, with their state and how many messages each guest sent."""
+        now = time.time()
+        with self._db() as db:
+            rows = db.execute("SELECT s.id, s.address, s.label, s.created, s.expires, s.revoked, s.first_used,"
+                              " (SELECT COUNT(*) FROM share_messages m WHERE m.share = s.id AND m.side = 'guest')"
+                              " FROM shares s WHERE s.node = ? ORDER BY s.created DESC", (node,)).fetchall()
+        return {"shares": [{"id": i, "address": f"{node}/{a}", "label": label, "created": c, "expires": e,
+                            "revoked": r, "first_used": used, "guest_messages": count,
+                            "state": "revoked" if r is not None else ("expired" if e < now else "active")}
+                           for i, a, label, c, e, r, used, count in rows]}
+
+    def revoke_share(self, node: str, ident: str) -> dict:
+        """End one of this node's shares at once; its page then says the link is no longer active."""
+        with self.lock, self._db() as db:
+            changed = db.execute("UPDATE shares SET revoked = COALESCE(revoked, ?) WHERE id = ? AND node = ?",
+                                 (time.time(), ident, node)).rowcount
+        if not changed:
+            raise HubError(404, f"no share {ident} made by this node")
+        return {"id": ident, "revoked": True}
+
+    @staticmethod
+    def _active_share(db, ident: str, secret) -> tuple:
+        """(node, address, label, expires, first_used) of a share whose secret matches; 404 or 410 otherwise.
+
+        An unknown id and a wrong secret answer alike, so a guess learns nothing.
+        """
+        if not SHARE_ID.fullmatch(ident) or not isinstance(secret, str) or not secret or len(secret) > MAX_SECRET:
+            raise HubError(404, INACTIVE)
+        row = db.execute("SELECT hash, node, address, label, expires, revoked, first_used FROM shares WHERE id = ?",
+                         (ident,)).fetchone()
+        # Compared even without a row, so an unknown id takes as long as a wrong secret.
+        if not hmac.compare_digest(row[0] if row else "0" * 64, _hash(secret)) or row is None:
+            raise HubError(404, INACTIVE)
+        if row[5] is not None or row[4] < time.time():
+            raise HubError(410, INACTIVE)
+        return row[1], row[2], row[3], row[4], row[6]
+
+    def guest_view(self, ident: str, secret, after: int = 0) -> dict:
+        """The share's label, its session's title and state, and the exchange after `after`, oldest first."""
+        with self._db() as db:
+            node, address, label, expires, _ = self._active_share(db, ident, secret)
+            state = self._session_state(db, node, address) or {"name": None, "title": "", "status": "", "online": False}
+            rows = db.execute("SELECT m.seq, m.side, m.text, m.created, d.outcome FROM share_messages m"
+                              " LEFT JOIN deliveries d ON d.post = m.post WHERE m.share = ? AND m.seq > ?"
+                              " ORDER BY m.seq LIMIT ?", (ident, max(0, after), GUEST_PAGE)).fetchall()
+        return {"share": {"label": label, "title": state["title"], "name": state["name"], "online": state["online"],
+                          "busy": state["status"] in ("busy", "waiting"), "expires": expires},
+                "messages": [{"seq": seq, "from": side, "text": text, "created": created,
+                              **({"status": outcome or "sent"} if side == "guest" else {})}
+                             for seq, side, text, created, outcome in rows]}
+
+    def guest_send(self, ident: str, secret, text) -> dict:
+        """Route a guest's text to the share's session as a delivery from guest:<id>; refused while it is offline."""
+        if not isinstance(text, str) or not text.strip():
+            raise HubError(400, "text is the message to send")
+        if len(text.encode("utf-8", "surrogatepass")) > GUEST_TEXT:
+            raise HubError(413, f"a message is at most {GUEST_TEXT // 1024} KB")
+        now = time.time()
+        with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            node, address, label, _, first_used = self._active_share(db, ident, secret)
+            state = self._session_state(db, node, address)
+            if state is None or not state["online"]:
+                raise HubError(409, "the agent is offline; this message was not sent")
+            recent = db.execute("SELECT COUNT(*) FROM share_messages WHERE share = ? AND side = 'guest' AND created > ?",
+                                (ident, now - GUEST_WINDOW)).fetchone()[0]
+            if recent >= GUEST_RATE:
+                raise HubError(429, f"at most {GUEST_RATE} messages per {GUEST_WINDOW // 60} minutes; wait a little")
+            msg_id, sender = secrets.token_hex(16), f"{GUEST}{ident}"
+            digest = hashlib.sha256(json.dumps([f"{node}/{address}", sender, text]).encode()).hexdigest()
+            seq = db.execute("INSERT INTO posts (from_node, id, digest, target, sender, reply, mode, text, created,"
+                             " attachments, timing) VALUES ('', ?, ?, ?, ?, 'expected', 'push', ?, ?, NULL, 'now')",
+                             (msg_id, digest, f"{node}/{address}", sender, text, now)).lastrowid
+            db.execute("INSERT INTO deliveries (delivery, post, to_node, to_address) VALUES (?, ?, ?, ?)",
+                       (secrets.token_hex(16), seq, node, address))
+            row = db.execute("INSERT INTO share_messages (share, side, from_node, id, digest, text, created, post)"
+                             " VALUES (?, 'guest', '', ?, ?, ?, ?, ?)", (ident, msg_id, digest, text, now, seq)).lastrowid
+            if first_used is None:
+                db.execute("UPDATE shares SET first_used = ? WHERE id = ?", (now, ident))
+                self._file_note(db, node, sender, label,
+                                f"{label} sent a first message through share {ident} to {node}/{address}.")
+        return {"seq": row, "status": "sent"}
+
+    def _guest_reply(self, node: str, msg_id: str, sender, text: str, target: str, attached: bool) -> dict:
+        """File the shared session's answer for its guest's page; only that session (or its owner) may answer."""
+        if attached:
+            raise HubError(400, "a message to a guest carries text only")
+        ident = target[len(GUEST):]
+        if not SHARE_ID.fullmatch(ident):
+            raise HubError(400, f"a guest address is guest:<share id>, not {target!r}")
+        digest = hashlib.sha256(json.dumps([target, sender, text]).encode()).hexdigest()
+        receipt = {"id": msg_id, "recipients": [{"to": target, "status": "stored"}]}
+        with self.lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute("SELECT digest FROM share_messages WHERE from_node = ? AND id = ?",
+                                  (node, msg_id)).fetchone()
+            if existing:
+                if existing[0] != digest:
+                    raise HubError(409, "this id was already used for a different message; send it under a new id")
+                return {**receipt, "duplicate": True}
+            row = db.execute("SELECT node, address, expires, revoked FROM shares WHERE id = ?", (ident,)).fetchone()
+            if row is None:
+                raise HubError(404, f"no share {ident}")
+            if row[0] != node or sender not in (row[1], USER):
+                raise HubError(403, f"only the shared session {row[0]}/{row[1]} answers {target}")
+            if row[3] is not None or row[2] < time.time():
+                raise HubError(410, f"share {ident} is no longer active; the guest cannot read new messages")
+            db.execute("INSERT INTO share_messages (share, side, from_node, id, digest, text, created, post)"
+                       " VALUES (?, 'agent', ?, ?, ?, ?, ?, NULL)", (ident, node, msg_id, digest, text, time.time()))
+        return {**receipt, "duplicate": False}
 
 
 def application(hub: Hub, archive_db: str | None = None):
@@ -600,8 +821,45 @@ def application(hub: Hub, archive_db: str | None = None):
                                                                       req.query_params.getlist("tag"),
                                                                       int_param(req, "limit", NOTES_LIMIT)))
 
+    async def shares(request):
+        if request.method == "POST":
+            return await handle(request, lambda node, body, _: hub.create_share(
+                node, body.get("address"), body.get("label", "guest"), body.get("ttl", SHARE_TTL)))
+        return await handle(request, lambda node, body, _: hub.list_shares(node))
+
+    async def share(request):
+        return await handle(request, lambda node, body, req: hub.revoke_share(node, req.path_params["share"]))
+
+    def share_secret(request):
+        # Exactly one header: the secret never travels in a URL, where logs and history would keep it.
+        values = request.headers.getlist(SHARE_HEADER)
+        return values[0] if len(values) == 1 else None
+
+    async def guest(request):
+        # No node token: the share's secret is the credential, and it reaches only the bound session.
+        try:
+            ident, secret = request.path_params["share"], share_secret(request)
+            if request.method == "GET":
+                return JSONResponse(await run_in_threadpool(hub.guest_view, ident, secret, int_param(request, "after", 0)),
+                                    headers={"cache-control": "no-store"})
+            body = json.loads(await bounded_body(request, GUEST_BODY) or b"{}")
+            if not isinstance(body, dict):
+                raise HubError(400, "the request body must be a JSON object")
+            return JSONResponse(await run_in_threadpool(hub.guest_send, ident, secret, body.get("text")))
+        except HubError as error:
+            return JSONResponse({"error": str(error)}, status_code=error.status)
+        except ValueError:
+            return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    async def page(request):
+        return Response(SHARE_PAGE.read_bytes(), media_type="text/html; charset=utf-8", headers=PAGE_HEADERS)
+
     routes = [
         Route("/v1/whoami", whoami, methods=["GET"]),
+        Route("/v1/shares", shares, methods=["GET", "POST"]),
+        Route("/v1/shares/{share}", share, methods=["DELETE"]),
+        Route("/v1/shares/{share}/messages", guest, methods=["GET", "POST"]),
+        Route("/s/{share}", page, methods=["GET"]),
         Route("/v1/sessions", sessions, methods=["GET", "PUT"]),
         Route("/v1/messages", messages, methods=["POST"]),
         Route("/v1/messages/{msg_id}", status, methods=["GET"]),

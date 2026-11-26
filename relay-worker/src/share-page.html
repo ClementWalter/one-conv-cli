@@ -1,0 +1,187 @@
+<!doctype html>
+<!-- The guest page of a shared session (/s/<id>#<secret>), served as is by the Worker and the Python relay.
+     The secret stays in the URL fragment, which browsers never send; the page passes it in the
+     X-Share-Secret header. Text is always inserted as text, never as HTML. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>Shared conversation</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1b; --muted: #6b6b66; --line: #e4e4df;
+  --guest: #1f5fd1; --guest-text: #ffffff; --agent: #ecece7; --danger: #b3261e; --ok: #2e7d32;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151514; --panel: #1e1e1c; --text: #ececec; --muted: #9a9a93; --line: #2f2f2c;
+          --guest: #3b78e7; --guest-text: #ffffff; --agent: #2a2a27; --danger: #f2827a; --ok: #7bc67e; }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+       display: flex; flex-direction: column; }
+header { padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 17px; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+header p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; vertical-align: 1px; }
+.dot.on { background: var(--ok); }
+main { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.msg { max-width: min(80ch, 85%); padding: 9px 13px; border-radius: 16px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.guest { align-self: flex-end; background: var(--guest); color: var(--guest-text); border-bottom-right-radius: 4px; }
+.msg.agent { align-self: flex-start; background: var(--agent); border-bottom-left-radius: 4px; }
+.meta { font-size: 12px; color: var(--muted); align-self: flex-end; margin-top: -6px; }
+.empty, .notice { color: var(--muted); text-align: center; margin: auto 0; padding: 24px 8px; }
+.typing { align-self: flex-start; color: var(--muted); font-size: 14px; }
+.banner { padding: 8px 16px; font-size: 14px; background: var(--panel); border-top: 1px solid var(--line); color: var(--danger); }
+.banner:empty { display: none; }
+form { display: flex; gap: 8px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: var(--panel); }
+textarea { flex: 1; resize: none; min-height: 42px; max-height: 40vh; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--line);
+           background: var(--bg); color: var(--text); font: inherit; }
+button { padding: 0 18px; border: 0; border-radius: 12px; background: var(--guest); color: var(--guest-text); font: inherit; font-weight: 600; cursor: pointer; }
+button:disabled, textarea:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Shared conversation</h1>
+  <p id="subtitle"><span class="dot" id="dot"></span><span id="state">connecting…</span></p>
+</header>
+<main id="log" aria-live="polite"><div class="empty" id="empty">Loading…</div></main>
+<div class="banner" id="banner" role="status"></div>
+<form id="form">
+  <textarea id="input" rows="1" maxlength="8192" placeholder="Write a message" aria-label="Message" disabled></textarea>
+  <button id="send" type="submit" disabled>Send</button>
+</form>
+<script>
+"use strict";
+(() => {
+  const POLL_MS = 2500;
+  const LIMIT = 8192;
+  const id = (location.pathname.match(/^\/s\/([0-9a-f]{16})\/?$/) || [])[1] || "";
+  const secret = location.hash.slice(1);
+  const $ = (name) => document.getElementById(name);
+  const log = $("log"), input = $("input"), send = $("send"), banner = $("banner");
+  let after = 0, closed = false, sending = false, waiting = false, last = null;
+
+  function finish(text) {
+    // A dead link: nothing more is fetched or sent.
+    closed = true;
+    input.disabled = send.disabled = true;
+    log.replaceChildren(Object.assign(document.createElement("div"), { className: "notice", textContent: text }));
+    $("state").textContent = "inactive";
+    $("dot").className = "dot";
+  }
+
+  async function api(method, body) {
+    const response = await fetch(`/v1/shares/${id}/messages${method === "GET" ? `?after=${after}` : ""}`, {
+      method, cache: "no-store", credentials: "omit",
+      headers: { "x-share-secret": secret, ...(body ? { "content-type": "application/json" } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (response.status === 404 || response.status === 410) finish("This link is no longer active.");
+    return { ok: response.ok, status: response.status, data };
+  }
+
+  function add(message) {
+    $("empty")?.remove();
+    const bubble = document.createElement("div");
+    bubble.className = `msg ${message.from === "guest" ? "guest" : "agent"}`;
+    bubble.textContent = message.text;
+    log.append(bubble);
+    if (message.from === "guest" && message.status === "refused") {
+      log.append(Object.assign(document.createElement("div"), { className: "meta", textContent: "not delivered" }));
+    }
+    last = message.from;
+  }
+
+  function indicator(share) {
+    document.querySelector(".typing")?.remove();
+    // Working: the session is mid-turn, or the guest's last message has no answer yet.
+    if (share.online && (share.busy || last === "guest")) {
+      log.append(Object.assign(document.createElement("div"), { className: "typing", textContent: share.busy ? "working…" : "waiting for a reply…" }));
+    }
+  }
+
+  async function poll() {
+    if (closed) return;
+    try {
+      const { ok, data } = await api("GET");
+      if (!ok || closed) return;
+      const share = data.share;
+      const name = share.title || (share.name ? `@${share.name}` : "an agent");
+      $("title").textContent = name;
+      document.title = `${name} · shared with ${share.label}`;
+      $("state").textContent = share.online ? `online · shared with ${share.label}` : "offline: messages are not delivered";
+      $("dot").className = share.online ? "dot on" : "dot";
+      input.disabled = !share.online;
+      send.disabled = !share.online || sending;
+      // Two polls can overlap (one after a send): a message is shown once, by its seq.
+      const messages = data.messages.filter((message) => message.seq > after);
+      const fresh = messages.length > 0;
+      for (const message of messages) {
+        add(message);
+        after = Math.max(after, message.seq);
+      }
+      if (!after && $("empty")) $("empty").textContent = "Say hello: your messages go to this agent only.";
+      indicator(share);
+      if (fresh) log.scrollTop = log.scrollHeight;
+    } catch {
+      $("state").textContent = "reconnecting…";
+    } finally {
+      if (!closed && !waiting) {
+        waiting = true;
+        setTimeout(() => { waiting = false; poll(); }, POLL_MS);
+      }
+    }
+  }
+
+  $("form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text || sending || closed) return;
+    if (new TextEncoder().encode(text).length > LIMIT) {
+      banner.textContent = "This message is too long (8 KB at most).";
+      return;
+    }
+    sending = true;
+    send.disabled = true;
+    banner.textContent = "";
+    try {
+      const { ok, data } = await api("POST", { text });
+      if (ok) {
+        input.value = "";
+        input.style.height = "";
+      } else if (!closed) {
+        banner.textContent = data.error || "The message was not sent.";
+      }
+    } catch {
+      banner.textContent = "The relay is unreachable; try again.";
+    } finally {
+      sending = false;
+      send.disabled = closed || input.disabled;
+    }
+    poll();
+  });
+
+  input.addEventListener("keydown", (event) => {
+    // Enter sends, Shift+Enter starts a new line.
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      $("form").requestSubmit();
+    }
+  });
+  input.addEventListener("input", () => {
+    input.style.height = "";
+    input.style.height = `${input.scrollHeight}px`;
+  });
+
+  if (!id || !secret) finish("This link is incomplete: open the full link you were given.");
+  else poll();
+})();
+</script>
+</body>
+</html>

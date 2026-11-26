@@ -7,7 +7,8 @@ as the self-hosted Python relay (`scripts/live-hub.py`).
 
 | Piece | Cloudflare resource |
 | --- | --- |
-| Live relay: node tokens, sessions, messages, invites | Durable Object `Relay` (SQLite) |
+| Live relay: node tokens, sessions, messages, invites, session shares | Durable Object `Relay` (SQLite) |
+| Guest page of a shared session (`/s/<id>`, `live share`) | `src/share-page.html`, bundled as text |
 | Archive index | Durable Object `ArchiveIndex` (SQLite) |
 | Archive chunks and message images | R2 bucket, binding `ARCHIVE` |
 | OAuth grants of the remote MCP connector | KV namespace, binding `OAUTH_KV` |

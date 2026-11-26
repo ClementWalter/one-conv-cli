@@ -31,7 +31,9 @@ def build_live_group(launcher: list[str]) -> click.Group:
                         "  @name                                      the agent that chose the name, here or elsewhere\n"
                         "  claude-chat:<id> cowork:<id>               a saved Claude chat or Cowork session\n"
                         "  user                                       you: a note in your inbox (`live inbox`), never a new turn\n"
+                        "  guest:<share id>                           the guest of a share link (`live share`), answered on its page\n"
                         "\b\nExamples:\n  one-conv live name reviewer\n"
+                        "  one-conv live share --label Alice --yes   # inside a session: a link to chat with it alone\n"
                         "  one-conv live send @builder 'can you take the migration?' --yes\n"
                         "  one-conv live invite studio      # on a connected machine: prints the join command\n"
                         "  one-conv live join 'https://<your-relay>.workers.dev#studio.<code>' --yes   # on the new one\n"
@@ -102,6 +104,12 @@ def build_live_group(launcher: list[str]) -> click.Group:
                            f"{' tagged ' + ', '.join(router.check_tags(list(tags))) if tags else ''}")
                 click.echo(f"  from:     {me.address if me else origin}")
                 return
+            if not yes and target.startswith(router.GUEST):
+                click.echo("DRY-RUN (nothing sent). Re-run with --yes to send.")
+                click.echo(f"  to:       {target}, the guest of a share (`live share --list`)")
+                click.echo("  delivery: stored on the relay; the guest reads it on the share's page")
+                click.echo(f"  from:     {me.address if me else origin}")
+                return
             if not yes and cloud_send.is_cloud_target(target):
                 product, query = cloud_send.split_target(target)
                 row = cloud_send.saved_conversation(query, product)
@@ -140,8 +148,9 @@ def build_live_group(launcher: list[str]) -> click.Group:
             click.echo(f"{receipt['status']}: {receipt['to']}")
             if receipt.get("via") == "claude.ai":
                 click.echo(receipt["reply"])
-        # A note to user has no delivery to follow; the relay tracks deliveries to agents only.
-        if ((receipt.get("via") == "hub" and receipt["to"] != router.USER) or receipt.get("delivery") == "held") \
+        # Notes to user and answers to a guest have no delivery to follow; the relay tracks deliveries to agents only.
+        if ((receipt.get("via") == "hub" and receipt["to"] != router.USER and receipt.get("delivery") != "guest")
+                or receipt.get("delivery") == "held") \
                 and not as_json:
             click.echo(f"  follow it with: one-conv live status {receipt['id']}")
         if receipt.get("warning") and not as_json:
@@ -489,5 +498,7 @@ def build_live_group(launcher: list[str]) -> click.Group:
 
     from .bridge_cli import add_bridge_commands
     add_bridge_commands(live, launcher)
+    from .share_cli import add_share_command
+    add_share_command(live)
 
     return live

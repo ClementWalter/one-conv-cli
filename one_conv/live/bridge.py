@@ -15,6 +15,8 @@ reported `unconfirmed` and not retried, since the agent may already have it. Out
 what the adapter did: `accepted` is not `read`. A delivery sent with when=idle to a busy
 session is acked `held` and kept in held.py's store; a background thread hands held messages
 to their sessions once idle, and the bridge then acks the relay with the final outcome.
+A delivery of kind "guest" comes from a share link (`live share`): it is wrapped with the
+guest trust rules, which tell the session the guest is not the user.
 
 Beside delivery, the bridge syncs this machine's agent histories to the relay's archive, so
 any machine can read a session here as `NODE/harness:id` and continue it.
@@ -37,7 +39,7 @@ from pathlib import Path
 
 from . import held, hubclient, names, router, tunnel
 from .stream import InboxStream, StreamUnsupported
-from .model import envelope, live_home, parse_address
+from .model import envelope, guest_envelope, live_home, parse_address
 
 try:
     import fcntl
@@ -220,6 +222,8 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, fetch=
     session = next((s for s in router.list_all(harness) if s.address == target), None)
     if session is None:
         return "refused", f"{target} is not live on this machine"
+    if item.get("kind") == "guest":
+        return _deliver_guest(item, session)
     remote = (directory or {}).get(sender_route, {})
     local = sender_route.partition("/")[2]
     # A sender that is not a session (the person at that node's terminal) has no return address.
@@ -247,6 +251,24 @@ def deliver_inbound(item: dict, directory: dict[str, dict] | None = None, fetch=
         return "unconfirmed", f"{type(failure.__cause__).__name__}: {failure.__cause__}"
     except router.LiveError as error:
         return "refused", str(error)
+
+
+def _deliver_guest(item: dict, session) -> tuple[str, str]:
+    """Hand a guest's message to the shared session, wrapped with the guest trust rules.
+
+    The relay rate-limits guests per share, so the agent-to-agent rate slot does not apply.
+    """
+    try:
+        wrapped = guest_envelope(str(item.get("text", "")), str(item.get("from", "")),
+                                 str(item.get("label") or ""), item.get("id"))
+    except ValueError as error:
+        return "refused", str(error)
+    try:
+        detail = router.ADAPTERS[session.harness].deliver(session, wrapped)
+    except Exception as error:
+        # The adapter may have acted before failing, so the message is not known to be undelivered.
+        return "unconfirmed", f"{type(error).__name__}: {error}"
+    return ("unconfirmed" if detail.startswith(UNKNOWN_RESULTS) else "accepted"), detail
 
 
 class Bridge:

@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from . import agy, claude, codex, cursor, held, hubclient, names, omp
-from .model import LiveSession, envelope, is_session_id, live_home, parse_address
+from .model import GUEST_ADDRESS, LiveSession, envelope, is_session_id, live_home, parse_address
 
 try:
     import fcntl
@@ -32,6 +32,8 @@ FYI_KEEP_SECONDS = 7 * 24 * 3600
 FYI_MAX_SKEW_SECONDS = 3600
 # The person every agent works for: a message to it is a note in their inbox, never a new turn.
 USER = "user"
+# The prefix of a share's guest address (`live share`): answers go to its page on the relay.
+GUEST = "guest:"
 TAG = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 TAGS_PER_NOTE = 8
 NOTES_LIMIT = 200
@@ -315,6 +317,10 @@ def send(target: str, text: str, sender: LiveSession | None, origin: str = "unkn
         return _send_user(text, sender, origin, list(tags), message_id)
     if tags:
         raise LiveError("Tags label messages to user only.")
+    if target.startswith(GUEST):
+        if fyi or images or when == "idle":
+            raise LiveError("A guest reads text on its share page: send text only, without fyi, images or when=idle.")
+        return _send_guest(target, text, sender, origin, message_id)
     try:
         loaded = attached.load(images)
     except attached.ImageError as error:
@@ -454,6 +460,29 @@ def _send_one(target: str, text: str, sender: LiveSession | None, origin: str, f
             logger.warning("delivered, but could not record the peer pair: %s", error)
             receipt["warning"] = f"peer pair not recorded: {error}"
     return receipt
+
+
+def _send_guest(target: str, text: str, sender: LiveSession | None, origin: str, message_id: str) -> dict:
+    """Answer the guest of a share (`live share`): the relay files it for that guest's page.
+
+    Only the shared session itself, or the person at its machine, may answer; the relay checks it.
+    The relay rate-limits guests, so the agent-to-agent rate slot does not apply to answering one.
+    """
+    if not GUEST_ADDRESS.fullmatch(target):
+        raise LiveError(f"A guest address is guest:<share id>, as the guest's message names it, not {target!r}.")
+    if not text.strip():
+        raise LiveError("A message to a guest needs text.")
+    hub = _hub()
+    if hub is None:
+        raise LiveError(f"{target} reads its messages on the relay; this machine has none (`one-conv live serve`).")
+    label = sender.address if sender is not None and not sender.id.startswith("?") else origin
+    try:
+        receipt = hubclient.submit(hub, {"id": message_id, "to": target, "from": label, "text": text})
+    except (hubclient.HubRefused, hubclient.PendingConflict) as error:
+        raise LiveError(str(error)) from error
+    status = ("queued for the relay: no receipt yet, the bridge will resend it under the same id" if receipt is None
+              else "stored on the relay for the guest's page")
+    return {"to": target, "id": message_id, "from": label, "via": "hub", "delivery": "guest", "status": status}
 
 
 def _user_store() -> Path:

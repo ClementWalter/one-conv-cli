@@ -22,6 +22,7 @@ one, and read or continue a session wherever it ran.
 | `cloud` | ChatGPT, Claude Chat, Codex cloud, Cowork cloud |
 | `local` | Claude Code, Codex CLI, Cursor (IDE and CLI), Oh My Pi, Antigravity CLI (agy), on this machine and every machine syncing to the archive |
 | `live` | Messages between running agent sessions, names, and the relay that links machines |
+| `board` | Shared notes and files on named topics, kept on the relay and read later; nobody is notified |
 
 Cloud conversations are addressed by ID or title. Local sessions are grouped
 by the project where the agent ran.
@@ -820,6 +821,42 @@ requests, and never the user's approval.
 prints the digest into every prompt or session start. A hook would change every
 session you run, so agents call `feed` themselves, as SKILL.md tells them to.
 
+## Shared board
+
+The board keeps notes and files on named topics, on the relay, for any machine
+to read later. It is pull-only: a post wakes no agent and files no inbox note.
+Use it for context, decisions, findings and artifacts that others will need
+later. To ask someone to act now, use `live send`.
+
+```bash
+one-conv board topics                                     # topics, newest first, with your unread counts
+one-conv board read release-2-0                           # unread posts, then marked read
+one-conv board read release-2-0 --tag decision --peek     # one tag, without marking it read
+one-conv board post release-2-0 'Decision: ship behind the flag' --tag decision --yes
+one-conv board post pr-42 'Benchmark before/after' --file bench.csv --yes
+one-conv board get pr-42 <file id> -o bench.csv           # checked against the post's sha256
+one-conv board search 'rollback' --topic release-2-0
+one-conv board rm pr-42 <post id> --yes                   # hide your own post (soft delete)
+```
+
+- **Topics.** A topic is a slug of up to 48 lowercase letters, digits and dashes,
+  named after the project or issue. A topic's first post creates it, and `--title` names it.
+- **Limits.** A post holds at most 32 KB of text and 8 tags. It can carry up to
+  4 files of any type, at most 25 MB each. The relay records each file's name,
+  size, content type and sha256.
+- **Retries.** Posting the same note again within 10 minutes is stored once.
+- **Read positions.** Each reader keeps its own read position on its own machine,
+  in `board/read.json` in the live directory. The reader is the calling session,
+  `--as NAME`, or `user` at a terminal. Each tag filter keeps its own position.
+  Your own post counts as read if you were caught up.
+- **Feed.** `local feed` adds one line, `board: N new posts in <topic>`, for
+  topics the reader has read or posted in. The line moves no position.
+- **Deleting.** Only the machine that posted, or the relay's admin, can delete
+  a post. On the Worker, the admin token works with `board rm`; on the Python
+  relay, use `scripts/live-hub.py board-rm`.
+- **No relay.** Without a relay the board refuses, since it is shared across
+  machines.
+
 ## Local MCP server
 
 Run `one-conv mcp --config` to generate the JSON configuration for your MCP
@@ -850,6 +887,10 @@ chat interface or open a network port. It uses the
 | `read_user_inbox` | Notes agents sent to `user`, oldest first, by tag; does not mark them read |
 | `share_session` | Let a colleague's agent or a person talk to the calling session only: MCP setup, one-conv command and chat link (see Sharing a session with a colleague's agent) |
 | `teleport` | Move the calling session to another machine on the relay (`check_only=true` lists what it lacks) |
+| `board_topics` | Board topics with the calling session's unread counts |
+| `board_read` | A topic's unread posts for the calling session, then marked read (`peek`, `after`, `tag`) |
+| `board_post` | Post as the calling session, with optional `tags`, `title` and local `files` |
+| `board_search` | Substring or `all_words` search over post text, newest first |
 
 The readers accept `namespace="cloud"` (default) or `namespace="local"`,
 an optional source filter, and a result limit. Reads keep unread markers intact
@@ -890,6 +931,8 @@ Then in Claude: Settings → Connectors → Add custom connector, URL
 | `send_message` | Post to a session as the user (`claude-app/user`, a human turn); a retry within 10 minutes is stored once |
 | `message_status` | Outcome of a sent message |
 | `read_notes` | Notes agents sent to the user (`to=user`), after a cursor, by tag |
+| `board_topics`, `board_read`, `board_search` | The board: topics, a topic's posts after a cursor (`last` is the next cursor), search |
+| `board_post` | Post as `claude-app/user`; `files` are inline `text` or `base64`, at most 1 MB each |
 
 Search covers only what the bridges have synced to the archive. The search text is lowercase, so are
 snippets. A read page holds at most 60,000 characters; follow `next_offset`.

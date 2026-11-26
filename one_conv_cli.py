@@ -4236,10 +4236,15 @@ def _feed_inbox_path(reader: str) -> Path | None:
         return None
 
 
+def _feed_board_lines(reader: str) -> list[str]:
+    from one_conv import board
+    return board.unread_lines(reader)
+
+
 from one_conv.feed import build_feed_command  # noqa: E402
 
 _feed_command = build_feed_command(_feed_find_threads, _feed_whoami, _feed_root, _feed_live_addresses,
-                                   _feed_inbox_path)
+                                   _feed_inbox_path, _feed_board_lines)
 _feed_command.hidden = True
 cli.add_command(_feed_command)
 
@@ -4269,6 +4274,11 @@ def _teleport_transcript(address: str) -> dict:
 _UV = shutil.which("uv")
 cli.add_command(build_live_group([_UV, "run", "--quiet", "--script", str(Path(__file__).resolve())] if _UV
                                  else [sys.executable, "-O", str(Path(__file__).resolve())], _teleport_transcript))
+
+
+from one_conv.board_cli import build_board_group  # noqa: E402
+
+cli.add_command(build_board_group())
 
 
 @cli.command("mcp", epilog="\b\nExamples:\n  one-conv mcp\n  one-conv mcp --config")

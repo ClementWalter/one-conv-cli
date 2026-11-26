@@ -31,6 +31,9 @@ offline rather than queued. A guest's agent uses the same share through its MCP 
 `/s/<id>/mcp` (share_mcp.py), with the secret as its bearer token. The person gets a note tagged `share` when a share is made and
 when its guest first writes.
 
+The board (hub_board.py) keeps notes on shared topics under /v1/board: posted once, read by
+whoever pulls them, never delivered to anyone.
+
 A post with mode `request` is for a node's bridge rather than a session: `to` is a node name,
 the delivery reaches that node as `to: "bridge"`, and `text` is the request (`live teleport`
 asks another machine what it lacks for a session, then to start it there). The bridge answers
@@ -200,6 +203,10 @@ class Hub:
             # A relay database from before requests existed gains the column for their answers.
             if "result" not in {row[1] for row in db.execute("PRAGMA table_info(deliveries)")}:
                 db.execute("ALTER TABLE deliveries ADD COLUMN result TEXT")
+        from .hub_board import SCHEMA as BOARD_SCHEMA, Board
+        with self._db() as db:
+            db.executescript(BOARD_SCHEMA)
+        self.board = Board(self)
 
     @contextmanager
     def _db(self):
@@ -787,6 +794,9 @@ def application(hub: Hub, archive_db: str | None = None):
     from starlette.requests import Request
     from starlette.responses import JSONResponse, Response
     from starlette.routing import Mount, Route
+    from urllib.parse import quote
+
+    from .hub_board import FILE_LIMIT, file_name, parse_reads
 
     async def handle(request: Request, work):
         try:
@@ -886,6 +896,47 @@ def application(hub: Hub, archive_db: str | None = None):
         return await handle(request, lambda node, body, req: hub.notes(int_param(req, "after", 0),
                                                                       req.query_params.getlist("tag"),
                                                                       int_param(req, "limit", NOTES_LIMIT)))
+
+    async def board_topics(request):
+        return await handle(request, lambda node, body, req: hub.board.topics(parse_reads(req.query_params.getlist("read"))))
+
+    async def board_topic(request):
+        topic = request.path_params["topic"]
+        if request.method == "POST":
+            return await handle(request, lambda node, body, _: hub.board.post(node, topic, body))
+        return await handle(request, lambda node, body, req: hub.board.read(
+            topic, int_param(req, "after", 0), req.query_params.getlist("tag"), int_param(req, "limit", 50)))
+
+    async def board_search(request):
+        return await handle(request, lambda node, body, req: hub.board.search(
+            req.query_params.get("q", ""), req.query_params.get("topic") or None,
+            req.query_params.get("words", "") in ("1", "true"), int_param(req, "limit", 20)))
+
+    async def board_delete(request):
+        params = request.path_params
+        return await handle(request, lambda node, body, _: hub.board.delete(node, params["topic"], params["ident"]))
+
+    async def board_upload(request):
+        try:
+            node = await run_in_threadpool(hub.authenticated_node, request)
+            # A file is sent as itself, not inside JSON, so its limit is the file limit.
+            body = await bounded_body(request, FILE_LIMIT)
+            name = file_name(request.headers.get("x-file-name", ""))
+            return JSONResponse(await run_in_threadpool(hub.board.upload, node, request.path_params["topic"], name,
+                                                        request.headers.get("content-type", ""), body))
+        except HubError as error:
+            return JSONResponse({"error": str(error)}, status_code=error.status)
+
+    async def board_file(request):
+        try:
+            await run_in_threadpool(hub.authenticated_node, request)
+            meta, body = await run_in_threadpool(hub.board.file, request.path_params["topic"], request.path_params["ident"])
+        except HubError as error:
+            return JSONResponse({"error": str(error)}, status_code=error.status)
+        # Served as a download, never rendered: a file is whatever a node uploaded.
+        return Response(body, media_type=meta["content_type"], headers={
+            "content-disposition": f"attachment; filename*=UTF-8''{quote(meta['name'], safe='')}",
+            "x-content-type-options": "nosniff", "x-content-sha256": meta["sha256"]})
 
     store = None
     if archive_db is not None:
@@ -1088,6 +1139,12 @@ def application(hub: Hub, archive_db: str | None = None):
         Route("/v1/attachments", upload, methods=["POST"]),
         Route("/v1/attachments/{ident}", attachment, methods=["GET"]),
         Route("/v1/user", user_notes, methods=["GET"]),
+        Route("/v1/board", board_topics, methods=["GET"]),
+        Route("/v1/board/search", board_search, methods=["GET"]),
+        Route("/v1/board/{topic}", board_topic, methods=["GET", "POST"]),
+        Route("/v1/board/{topic}/files", board_upload, methods=["POST"]),
+        Route("/v1/board/{topic}/files/{ident}", board_file, methods=["GET"]),
+        Route("/v1/board/{topic}/posts/{ident}", board_delete, methods=["DELETE"]),
         Route("/v1/invites", invites, methods=["POST"]),
         Route("/v1/join", join, methods=["POST"]),
     ]

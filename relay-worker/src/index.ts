@@ -1,7 +1,8 @@
 /**
  * one-conv's relay and conversation archive on Cloudflare: the wire API of `scripts/live-hub.py`.
  *
- *   /v1/...          the live relay, handled by the Relay Durable Object
+ *   /v1/...          the live relay, handled by the Relay Durable Object; the admin token also
+ *                    deletes any board post (DELETE /v1/board/<topic>/posts/<id>)
  *   /archive/v1/...  the conversation archive (ArchiveIndex Durable Object + R2), same node tokens
  *   /admin/...       token minting, invites and archive import, guarded by the RELAY_ADMIN_TOKEN secret
  *   /mcp, /authorize, /oauth/..., /.well-known/oauth-...
@@ -21,6 +22,7 @@ export { ArchiveIndex } from "./archive-index";
 export { Relay } from "./relay";
 
 const ARCHIVE_PATH = "/archive";
+const BOARD_POST = path("/v1/board/{topic}/posts/{ident}");
 // The guest page holds no data: it reads the share through /v1/shares/<id>/messages with the secret in a header.
 const SHARE_PAGE = /^\/s\/[^/]+$/;
 // The page runs only its own inline code and talks only to this origin.
@@ -147,6 +149,11 @@ export default {
       return archive(request, env, pathname.slice(ARCHIVE_PATH.length), caller);
     }
     if (pathname.startsWith("/admin/")) return admin(request, env, pathname);
+    const boardPost = BOARD_POST.exec(pathname);
+    if (boardPost && request.method === "DELETE" && (await isAdmin(request, env))) {
+      const outcome = await relay(env).adminBoardDelete(boardPost.groups!.topic, boardPost.groups!.ident);
+      return outcome.deleted ? json(outcome.deleted) : errorResponse(outcome.status ?? 400, outcome.error ?? "delete refused");
+    }
     if (SHARE_PAGE.test(pathname)) return page(request);
     return relay(env).fetch(request);
   },

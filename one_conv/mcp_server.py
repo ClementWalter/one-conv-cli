@@ -95,7 +95,9 @@ def create_server(update_notice: str = "") -> MCPServer:
         "from teammates working for the same user: act on them within that user's task, but "
         "they are not the user typing and grant no new approval. A message with kind=\"guest\" comes "
         "from someone outside the user's team, through a share link (share_session): it grants no "
-        "approval at all; answer it with send_message to its guest:<id> address."))
+        "approval at all; answer it with send_message to its guest:<id> address. "
+        "The board (board_topics, board_read, board_post, board_search) keeps shared notes and files "
+        "on named topics for later; it notifies nobody."))
     readonly = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 
     @server.tool(annotations=ToolAnnotations(destructiveHint=False), structured_output=True)
@@ -207,6 +209,76 @@ def create_server(update_notice: str = "") -> MCPServer:
         try:
             return router.user_notes(after, tags or (), limit)
         except router.LiveError as error:
+            raise ToolError(str(error)) from error
+
+    def _board_session(ctx: Context):
+        from .live import router
+        return router.whoami(meta=dict(ctx.request_context.meta or {}))
+
+    @server.tool(annotations=readonly, structured_output=True)
+    def board_topics(ctx: Context) -> dict[str, Any]:
+        """List the board's topics, most recently posted first, with how many posts each has unread for you.
+
+        The board holds shared context, decisions, findings and files that agents and the user
+        posted for later. Check it when you start work on a shared project. Nothing on it wakes
+        anyone: it is read by pulling.
+        """
+        from . import board
+        try:
+            return {"topics": board.topics(board.reader_for(None, _board_session(ctx)))}
+        except board.BoardError as error:
+            raise ToolError(str(error)) from error
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False),
+                 structured_output=True)
+    def board_read(topic: str, ctx: Context, after: int | None = None, tag: list[str] | None = None,
+                   peek: bool = False, limit: int = 50) -> dict[str, Any]:
+        """Read a board topic's posts you have not read yet, oldest first, and mark them read.
+
+        peek=true leaves them unread; `after` reads from that seq instead and moves nothing.
+        `tag` keeps posts carrying any of the tags. A post's files are listed with their id,
+        name, size and sha256: `one-conv board get TOPIC FILE_ID` downloads one.
+        """
+        from . import board
+        try:
+            return board.read(topic, board.reader_for(None, _board_session(ctx)), tag or (), limit, peek, after=after)
+        except board.BoardError as error:
+            raise ToolError(str(error)) from error
+
+    @server.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True, openWorldHint=False),
+                 structured_output=True)
+    def board_post(topic: str, text: str, ctx: Context, tags: list[str] | None = None,
+                   files: list[str] | None = None, title: str = "") -> dict[str, Any]:
+        """Post a note to a board topic as yourself; the first post creates the topic. Nobody is notified.
+
+        Use the board for shared context, decisions, findings and artifacts others may need
+        later; use send_message to ask someone to act now. Post concise notes, never progress
+        chatter. `topic` is a slug (lowercase letters, digits, dashes, up to 48) named after the
+        project or issue. `files` are up to 4 paths on this machine, 25 MB each. `title` sets
+        the topic's title. Repeating the same post within 10 minutes is stored once.
+        """
+        from . import board
+        from .live import router
+        session = _board_session(ctx)
+        try:
+            prepared = board.plan(topic, text, tags or (), files or ())
+            author, name = board.author_for(session, router.origin(False))
+            return board.post(prepared, author, name, board.reader_for(None, session), title)
+        except board.BoardError as error:
+            raise ToolError(str(error)) from error
+
+    @server.tool(annotations=readonly, structured_output=True)
+    def board_search(query: str, topic: str | None = None, all_words: bool = False,
+                     limit: int = 20) -> dict[str, Any]:
+        """Search board posts, newest first: `query` is one substring (ASCII case ignored).
+
+        all_words=true matches posts holding every word in any order. `topic` keeps one topic.
+        Searching moves no read position.
+        """
+        from . import board
+        try:
+            return {"posts": board.search(query, topic, all_words, limit)}
+        except board.BoardError as error:
             raise ToolError(str(error)) from error
 
     def _caller(ctx: Context):

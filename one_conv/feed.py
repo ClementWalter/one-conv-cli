@@ -395,12 +395,15 @@ def inbox_full(state: FeedState, path: Path | None, peek: bool) -> list[dict]:
 def build_feed_command(find_threads: Callable[[list[str]], tuple[dict[str, Thread], list[str]]],
                        whoami: Callable[[], str | None], root: Callable[[], Path],
                        live_addresses: Callable[[], list[str]],
-                       inbox_path: Callable[[str], Path | None]):
+                       inbox_path: Callable[[str], Path | None],
+                       board_lines: Callable[[str], list[str]] = lambda reader: []):
     """`find_threads(addresses)` returns ({address: Thread}, [addresses not found]).
 
     `live_addresses()` lists running sessions, which may be followed before their
     transcript reaches disk (a fresh omp session writes its file only on first flush).
     `inbox_path(reader)` is the reader's FYI inbox, written by `live send --fyi`.
+    `board_lines(reader)` names the board topics the reader read or posted in that have new
+    posts; the digest only mentions them and moves no board position.
     """
     import click
 
@@ -503,16 +506,19 @@ def build_feed_command(find_threads: Callable[[list[str]], tuple[dict[str, Threa
             else:
                 # FYI messages filled the cap; threads keep their positions for the next run.
                 result = {"lines": [], "threads": [], "omitted": list(found), "unavailable": []}
+            board = board_lines(reader)
             if as_json:
                 click.echo(json.dumps({"reader": reader, "following": addresses, "missing": missing,
                                        "inbox": {k: v for k, v in inbox.items() if k != "used"},
-                                       "positions": {a: state.positions(a) for a in found}, **result},
-                                      ensure_ascii=False))
+                                       "positions": {a: state.positions(a) for a in found}, **result,
+                                       "board": board}, ensure_ascii=False))
                 return
             if inbox["lines"] or result["lines"]:
                 click.echo(PEER_TEXT_NOTE)
                 for line in [*inbox["lines"], *result["lines"]]:
                     click.echo(line)
+            for line in board:
+                click.echo(line)
             if inbox["omitted"]:
                 click.echo(f"+{inbox['omitted']} more FYI message(s); run feed again or --full inbox.")
             if inbox["unavailable"]:

@@ -116,6 +116,18 @@ def test_revoking_an_unknown_node_fails(tmp_path):
     assert run("token", "revoke", "ghost", "--db", str(tmp_path / "relay.db")).returncode == 1
 
 
+def test_the_operator_hides_any_board_post(tmp_path):
+    from one_conv.live.hub import Hub
+    hub = Hub(str(tmp_path / "relay.db"))
+    receipt = hub.board.post("mac", "release", {"id": "a" * 32, "from": "user", "text": "oops"})
+    run("board-rm", "release", receipt["id"], "--db", str(tmp_path / "relay.db"))
+    assert hub.board.read("release", 0, [], 50)["posts"] == []
+
+
+def test_the_operator_removing_an_unknown_post_fails(tmp_path):
+    assert run("board-rm", "release", "a" * 32, "--db", str(tmp_path / "relay.db")).returncode == 1
+
+
 def test_revoking_an_unknown_node_on_the_worker_fails(relay_worker):
     assert run_admin(relay_worker, "token", "revoke", "ghost").returncode == 1
 

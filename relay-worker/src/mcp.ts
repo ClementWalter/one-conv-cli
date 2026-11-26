@@ -1,7 +1,9 @@
 /**
  * one-conv as a remote MCP server (streamable HTTP, stateless JSON responses) at /mcp, for the
  * Claude app's custom connectors and Claude cloud sessions. It reads the archive every node
- * uploads and the relay's live directory, and posts messages as the person using the app.
+ * uploads and the relay's live directory, posts messages as the person using the app, and reads
+ * and posts to the board as that person (`claude-app/user`). A board file from the app is small
+ * text or base64 content (REMOTE_FILE_LIMIT each), since a tool call carries it inline.
  *
  * Every request is self-contained: no session id, no server-to-client stream, so GET answers
  * 405 as the transport allows. Authentication happens before this handler (see mcp-auth.ts).
@@ -25,6 +27,8 @@ const MAX_QUERY = 1000;
 // Retries of one send within this window reuse its message id, so the relay stores it once.
 const IDEMPOTENCY_WINDOW_SECONDS = 600;
 const KEY = /^[0-9a-f]{64}$/;
+// A board file posted from the app travels inside the tool call, so it stays small.
+export const REMOTE_FILE_LIMIT = 1_000_000;
 // A live address NODE/harness:id, or a bare session id, names an archived agent session.
 const SESSION = /^(?:(?<node>[a-z0-9][a-z0-9-]{0,31})\/)?(?:(?:claude|codex|omp|cursor|agy):)?(?<session>[A-Za-z0-9][A-Za-z0-9._-]{0,127})$/;
 
@@ -250,6 +254,95 @@ async function readNotes(args: Args, env: Env): Promise<unknown> {
   }
 }
 
+// --- board -------------------------------------------------------------------------------------------
+
+/** A relay refusal, which crosses the RPC boundary as a plain Error, in the relay's own words. */
+async function relayed<T>(work: () => Promise<T>): Promise<T> {
+  try {
+    return await work();
+  } catch (error) {
+    throw new ToolError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function tagList(args: Args, name: string): string[] {
+  const value = args[name] ?? [];
+  if (!Array.isArray(value) || !value.every((tag) => typeof tag === "string")) throw new ToolError(`${name} must be a list of strings`);
+  return value as string[];
+}
+
+async function boardTopics(_: Args, env: Env): Promise<unknown> {
+  return relayed(async () => relay(env).boardTopics());
+}
+
+async function boardRead(args: Args, env: Env): Promise<unknown> {
+  const topic = str(args, "topic", true)!;
+  const url = new URL("https://relay/v1/board");
+  url.searchParams.set("after", String(int(args, "after", 0, 0, Number.MAX_SAFE_INTEGER)));
+  url.searchParams.set("limit", String(int(args, "limit", 50, 1, 200)));
+  for (const tag of tagList(args, "tags")) url.searchParams.append("tag", tag);
+  return relayed(async () => relay(env).boardRead(topic, url.href));
+}
+
+async function boardSearch(args: Args, env: Env): Promise<unknown> {
+  const url = new URL("https://relay/v1/board/search");
+  url.searchParams.set("q", str(args, "query", true)!);
+  url.searchParams.set("limit", String(int(args, "limit", 20, 1, 200)));
+  if (bool(args, "all_words", false)) url.searchParams.set("words", "1");
+  const topic = str(args, "topic");
+  if (topic) url.searchParams.set("topic", topic);
+  return relayed(async () => relay(env).boardSearch(url.href));
+}
+
+interface InlineFile {
+  name: string;
+  contentType: string;
+  bytes: Uint8Array;
+}
+
+/** The files of an app post: each a name with `text` or `base64` content, small enough to travel inline. */
+export function inlineFiles(args: Args): InlineFile[] {
+  const files = args.files ?? [];
+  if (!Array.isArray(files) || files.length > 4) throw new ToolError("files is a list of at most 4 {name, text | base64} objects");
+  return files.map((file: unknown) => {
+    if (typeof file !== "object" || file === null) throw new ToolError("each file is {name, text | base64, content_type?}");
+    const entry = file as Args;
+    const name = str(entry, "name", true)!;
+    const text = str(entry, "text");
+    const encoded = str(entry, "base64");
+    if ((text === null) === (encoded === null)) throw new ToolError(`file ${name} needs exactly one of text or base64`);
+    let bytes: Uint8Array;
+    if (text !== null) {
+      bytes = new TextEncoder().encode(text);
+    } else {
+      try {
+        bytes = Uint8Array.from(atob(encoded!), (char) => char.charCodeAt(0));
+      } catch {
+        throw new ToolError(`file ${name} has invalid base64`);
+      }
+    }
+    if (!bytes.length || bytes.length > REMOTE_FILE_LIMIT) throw new ToolError(`a file posted from the app is 1 byte to ${REMOTE_FILE_LIMIT / 1_000_000} MB`);
+    const contentType = str(entry, "content_type") ?? (text !== null ? "text/plain; charset=utf-8" : "application/octet-stream");
+    return { name, contentType, bytes };
+  });
+}
+
+async function boardPost(args: Args, env: Env): Promise<unknown> {
+  const topic = str(args, "topic", true)!;
+  const text = str(args, "text") ?? "";
+  const title = str(args, "title") ?? "";
+  const tags = tagList(args, "tags");
+  const files = inlineFiles(args);
+  // Retries of the same post within the window reuse its id; file content (not ids) makes it the same post.
+  const id = (await sha256(JSON.stringify(["board", topic, title, text, tags, Math.floor(Date.now() / 1000 / IDEMPOTENCY_WINDOW_SECONDS)]))).slice(0, 32);
+  return relayed(async () => {
+    const stub = relay(env);
+    const uploaded: string[] = [];
+    for (const file of files) uploaded.push((await stub.boardUpload(APP_NODE, topic, file.name, file.contentType, file.bytes)).id);
+    return stub.boardPost(APP_NODE, topic, { id, from: "user", text, title, tags, files: uploaded });
+  });
+}
+
 // --- tools -------------------------------------------------------------------------------------------
 
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
@@ -346,6 +439,79 @@ export const TOOLS: Tool[] = [
     },
     annotations: { title: "Read agents' notes to you", ...READ_ONLY },
     run: readNotes,
+  },
+  {
+    name: "board_topics",
+    description:
+      "List the board's topics, most recently posted first, with their post counts and newest `last` seq. " +
+      "The board holds shared context, decisions, findings and files that agents and the user posted for later; nothing on it wakes anyone.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { title: "List board topics", ...READ_ONLY },
+    run: boardTopics,
+  },
+  {
+    name: "board_read",
+    description:
+      "Read a board topic's posts, oldest first after seq `after`; `tags` keeps posts carrying any of them. " +
+      "Pass the result's `last` as `after` next time to see only newer posts. Files are listed with their name, size and sha256.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: { type: "string" },
+        after: { type: "integer", minimum: 0, default: 0 },
+        limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+        tags: { type: "array", items: { type: "string" } },
+      },
+      required: ["topic"],
+    },
+    annotations: { title: "Read a board topic", ...READ_ONLY },
+    run: boardRead,
+  },
+  {
+    name: "board_post",
+    description:
+      "Post a note to a board topic as the user (claude-app/user); the first post creates the topic. " +
+      "`topic` is a slug (lowercase letters, digits, dashes, up to 48) named after the project or issue. " +
+      "Post decisions, findings and artifacts others need later, concisely; never progress chatter. Nobody is woken: readers pull. " +
+      `\`files\` are up to 4 {name, text | base64, content_type?}, each at most ${REMOTE_FILE_LIMIT / 1_000_000} MB. ` +
+      "Retrying the same post within 10 minutes is stored once.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        topic: { type: "string" },
+        text: { type: "string" },
+        title: { type: "string", description: "Optional: sets the topic's title." },
+        tags: { type: "array", items: { type: "string" } },
+        files: {
+          type: "array",
+          maxItems: 4,
+          items: {
+            type: "object",
+            properties: { name: { type: "string" }, text: { type: "string" }, base64: { type: "string" }, content_type: { type: "string" } },
+            required: ["name"],
+          },
+        },
+      },
+      required: ["topic", "text"],
+    },
+    annotations: { title: "Post to the board", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    run: boardPost,
+  },
+  {
+    name: "board_search",
+    description: "Search board posts, newest first: `query` is one substring (ASCII case ignored); all_words=true matches posts holding every word. `topic` keeps one topic.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        topic: { type: "string" },
+        all_words: { type: "boolean", default: false },
+        limit: { type: "integer", minimum: 1, maximum: 200, default: 20 },
+      },
+      required: ["query"],
+    },
+    annotations: { title: "Search the board", ...READ_ONLY },
+    run: boardSearch,
   },
 ];
 

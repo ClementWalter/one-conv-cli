@@ -122,7 +122,8 @@ def test_an_unauthenticated_request_is_challenged(relay_worker):
 
 
 def test_the_sdk_client_lists_the_tools(relay_worker, token):
-    assert _tools(relay_worker.url, token, []) == ["search_conversations", "read_conversation", "list_live_sessions", "send_message", "message_status", "read_notes"]
+    assert _tools(relay_worker.url, token, []) == ["search_conversations", "read_conversation", "list_live_sessions", "send_message", "message_status", "read_notes",
+                                                     "board_topics", "board_read", "board_post", "board_search"]
 
 
 def test_search_finds_the_archived_conversation(relay_worker, token):

@@ -12,7 +12,8 @@ as the self-hosted Python relay (`scripts/live-hub.py`).
 | Transcript of a shared session, for a share made with `--transcript` (`/v1/shares/<id>/transcript`, `read_session`, `search_session`) | The archive (`ArchiveIndex` + R2) copy of that one session, rendered by `src/transcript.ts` (`src/share-transcript.ts`) |
 | MCP server of a shared session for a guest's agent (`/s/<id>/mcp`, share secret as bearer token, no OAuth) | Durable Object `Relay` (`src/share-mcp.ts`); `ask` waits on an in-memory promise, so a wait costs no CPU |
 | Archive index | Durable Object `ArchiveIndex` (SQLite) |
-| Archive chunks and message images | R2 bucket, binding `ARCHIVE` |
+| Board: topics and posts (`/v1/board`, `one-conv board`, `src/board.ts`) | Durable Object `Relay` (SQLite tables `board_topics`, `board_posts`, `board_files`) |
+| Archive chunks, message images and board files (`board/<topic>/<file id>`) | R2 bucket, binding `ARCHIVE` |
 | OAuth grants of the remote MCP connector | KV namespace, binding `OAUTH_KV` |
 
 ## Deploy from scratch
@@ -103,6 +104,30 @@ uv run scripts/relay_admin.py --url https://<your-relay>.workers.dev invite stud
 
 `scripts/import_archive.py` copies a Python relay's `archive.db` into this relay;
 it is idempotent and safe to rerun.
+
+The admin token also deletes any board post. Only the node that posted a post
+can delete it with its own token:
+
+```sh
+ONE_CONV_HUB_URL=https://<your-relay>.workers.dev ONE_CONV_HUB_TOKEN="$RELAY_ADMIN_TOKEN" \
+  one-conv board rm TOPIC POST_ID --yes
+```
+
+## Board API
+
+All routes take a node token.
+
+| Route | What it does |
+| --- | --- |
+| `GET /v1/board?read=<topic>:<seq>...` | Topics, newest activity first, with post counts, `last` seq and `unread` past each given position |
+| `GET /v1/board/<topic>?after=&limit=&tag=` | Live posts after a seq, oldest first, and the topic's `last` seq |
+| `POST /v1/board/<topic>/files` | Raw file bytes, named by the percent-encoded `X-File-Name` header; returns its id and sha256 |
+| `POST /v1/board/<topic>` | `{id, from, name, text, tags, files, title}`; idempotent by `id` |
+| `GET /v1/board/<topic>/files/<id>` | A file that a live post carries, served as an attachment |
+| `DELETE /v1/board/<topic>/posts/<id>` | Soft delete, by the posting node or the admin token |
+| `GET /v1/board/search?q=&topic=&words=1` | Substring search (or all words with `words=1`) over post text, newest first |
+
+The board's tables are created when the Relay starts, so a deploy needs no migration.
 
 ## Develop and test
 

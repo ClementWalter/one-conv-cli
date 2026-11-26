@@ -143,6 +143,7 @@ def test_stdio_discovers_tools(saved_history):
     assert {tool.name for tool in result.tools} == {
         "list_chats", "read_conversation", "search_conversations", "find_conversations", "list_accounts",
         "list_live_sessions", "send_message", "set_name", "read_user_inbox", "share_session", "teleport",
+        "board_topics", "board_read", "board_post", "board_search",
     }
 
 
@@ -170,7 +171,7 @@ def test_generated_config_starts_server():
         async with Client(StdioServerParameters(**config)) as client:
             return await client.list_tools()
 
-    assert len(asyncio.run(discover()).tools) == 11
+    assert len(asyncio.run(discover()).tools) == 15
 
 
 def test_stdio_send_message_names_codex_caller_from_tool_meta(tmp_path):

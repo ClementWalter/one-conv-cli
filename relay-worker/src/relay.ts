@@ -26,6 +26,9 @@
  *
  * A node can share one of its sessions with a guest through a link: see shares.ts.
  *
+ * The board keeps notes on shared topics under /v1/board, posted once and read by whoever pulls
+ * them, never delivered to anyone: see board.ts.
+ *
  * A post with mode `request` is for a node's bridge rather than a session: `to` is a node name,
  * the delivery reaches that node as `to: "bridge"`, and `text` is the request (`live teleport`
  * asks another machine what it lacks for a session, then to start it there). The bridge answers
@@ -36,6 +39,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 import { HttpError, type Route, bearer, boundedBody, decodedPath, dispatch, errorResponse, json, path, pyFloat, query, randomHex, sha256, tokenUrlsafe, utf8 } from "./http";
 import { pyLen, pyRepr, pyStr, truthy } from "./pyrepr";
+import { BOARD_PREFIX, BOARD_SCHEMA, BOARD_TABLES, Board, type BoardFile, parseReads } from "./board";
 import { GUEST, SHARE_SCHEMA, SHARE_TABLES, Shares } from "./shares";
 
 export const NODE = /^[a-z0-9][a-z0-9-]{0,31}$/;
@@ -110,7 +114,7 @@ CREATE TABLE IF NOT EXISTS invites (hash TEXT PRIMARY KEY, node TEXT NOT NULL, i
 // has no sending node; its sender is guest:<share id>, whose share gives the label.
 const PENDING =
   "SELECT d.delivery, p.id, d.to_address, p.from_node, p.sender, p.reply, p.mode, p.text, p.created, p.attachments, p.timing, s.label FROM deliveries d JOIN posts p ON p.seq = d.post LEFT JOIN shares s ON p.from_node = '' AND p.sender = 'guest:' || s.id";
-const TABLES = ["tokens", "nodes", "sessions", "deliveries", "posts", "attachments", "notes", "invites", ...SHARE_TABLES];
+const TABLES = ["tokens", "nodes", "sessions", "deliveries", "posts", "attachments", "notes", "invites", ...SHARE_TABLES, ...BOARD_TABLES];
 
 type Row = Record<string, SqlStorageValue>;
 type Body = Record<string, unknown>;
@@ -140,6 +144,7 @@ export class Relay extends DurableObject<Env> {
   private waiting = new Map<string, Set<() => void>>();
   private routes: Route<null>[];
   private shares: Shares;
+  private board: Board;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -147,6 +152,8 @@ export class Relay extends DurableObject<Env> {
     this.sql.exec(SCHEMA);
     this.sql.exec(SHARE_SCHEMA);
     this.shares = new Shares(ctx.storage, (node, delivery) => this.wake(node, delivery), env);
+    this.sql.exec(BOARD_SCHEMA);
+    this.board = new Board(ctx.storage, env, (node, sender) => this.published(node, sender));
     // A relay stored before `when` existed gains the column, every old post being `now`.
     if (!this.sql.exec("PRAGMA table_info(posts)").toArray().some((column) => column.name === "timing")) {
       this.sql.exec("ALTER TABLE posts ADD COLUMN timing TEXT NOT NULL DEFAULT 'now'");
@@ -172,6 +179,16 @@ export class Relay extends DurableObject<Env> {
       { pattern: path("/v1/attachments"), methods: ["POST"], handle: (request) => this.upload(request) },
       { pattern: path("/v1/attachments/{ident}"), methods: ["GET"], handle: (request, params) => this.download(request, params.ident) },
       { pattern: path("/v1/user"), methods: ["GET"], handle: work((_, __, request) => this.notes(new URL(request.url))) },
+      { pattern: path("/v1/board"), methods: ["GET"], handle: work((_, __, request) => this.board.topics(parseReads(new URL(request.url).searchParams.getAll("read")))) },
+      { pattern: path("/v1/board/search"), methods: ["GET"], handle: work((_, __, request) => this.board.search(new URL(request.url))) },
+      {
+        pattern: path("/v1/board/{topic}"),
+        methods: ["GET", "POST"],
+        handle: work((node, body, request, params) => (request.method === "POST" ? this.board.post(node, params.topic, body) : this.board.read(params.topic, new URL(request.url)))),
+      },
+      { pattern: path("/v1/board/{topic}/files"), methods: ["POST"], handle: (request, params) => this.raw(request, async (node) => json(await this.board.uploadRequest(node, params.topic, request))) },
+      { pattern: path("/v1/board/{topic}/files/{ident}"), methods: ["GET"], handle: (request, params) => this.raw(request, () => this.board.fileResponse(params.topic, params.ident)) },
+      { pattern: path("/v1/board/{topic}/posts/{ident}"), methods: ["DELETE"], handle: work((node, _, __, params) => this.board.delete(node, params.topic, params.ident)) },
       { pattern: path("/v1/invites"), methods: ["POST"], handle: work((node, body) => this.invite(node, body)) },
       { pattern: path("/v1/join"), methods: ["POST"], handle: (request) => this.join(request) },
       {
@@ -313,11 +330,46 @@ export class Relay extends DurableObject<Env> {
   /** Empties every table and attachment; only reachable when the deployment enables resets (tests). */
   async reset(): Promise<void> {
     for (const table of TABLES) this.sql.exec(`DELETE FROM ${table}`);
-    this.sql.exec("DELETE FROM sqlite_sequence WHERE name IN ('posts', 'notes', 'share_messages')");
-    for (;;) {
-      const listed = await this.env.ARCHIVE.list({ prefix: "attachments/" });
-      if (!listed.objects.length) break;
-      await this.env.ARCHIVE.delete(listed.objects.map((object) => object.key));
+    this.sql.exec("DELETE FROM sqlite_sequence WHERE name IN ('posts', 'notes', 'share_messages', 'board_posts')");
+    for (const prefix of ["attachments/", BOARD_PREFIX]) {
+      for (;;) {
+        const listed = await this.env.ARCHIVE.list({ prefix });
+        if (!listed.objects.length) break;
+        await this.env.ARCHIVE.delete(listed.objects.map((object) => object.key));
+      }
+    }
+  }
+
+  // --- board over RPC: the remote MCP posts as claude-app, the admin API deletes any post ----------
+
+  boardTopics(reads: Record<string, number> = {}): Body {
+    return this.board.topics(new Map(Object.entries(reads)));
+  }
+
+  /** A caller over RPC passes the URL as text, since a URL object does not cross that boundary. */
+  boardRead(topic: string, url: string): Body {
+    return this.board.read(topic, new URL(url));
+  }
+
+  boardSearch(url: string): Body {
+    return this.board.search(new URL(url));
+  }
+
+  boardUpload(node: string, topic: string, name: string, mediaType: string, body: Uint8Array): Promise<BoardFile> {
+    return this.board.upload(node, topic, name, mediaType, body);
+  }
+
+  boardPost(node: string, topic: string, body: Body): Promise<Body> {
+    return this.board.post(node, topic, body);
+  }
+
+  /** An admin delete, whose errors cross the RPC boundary as values. */
+  adminBoardDelete(topic: string, ident: string): { deleted?: { id: string; topic: string; deleted: boolean }; status?: number; error?: string } {
+    try {
+      return { deleted: this.board.delete("", topic, ident, true) };
+    } catch (error) {
+      if (error instanceof HttpError) return { status: error.status, error: error.message };
+      throw error;
     }
   }
 
@@ -349,6 +401,16 @@ export class Relay extends DurableObject<Env> {
         body = parsed as Body;
       }
       return json(await work(node, body, request, params));
+    } catch (error) {
+      if (error instanceof HttpError) return errorResponse(error.status, error.message);
+      throw error;
+    }
+  }
+
+  /** A route whose body or answer is not JSON: authenticated like the rest, its errors still JSON. */
+  private async raw(request: Request, work: (node: string) => Promise<Response>): Promise<Response> {
+    try {
+      return await work(await this.authenticated(request));
     } catch (error) {
       if (error instanceof HttpError) return errorResponse(error.status, error.message);
       throw error;

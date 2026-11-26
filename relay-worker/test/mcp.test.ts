@@ -167,6 +167,10 @@ describe("the MCP protocol", () => {
       "send_message",
       "message_status",
       "read_notes",
+      "board_topics",
+      "board_read",
+      "board_post",
+      "board_search",
     ]);
   });
 
@@ -316,6 +320,66 @@ describe("read_notes", () => {
     await (await publish(mac, [{ address: "claude:aaa" }])).text();
     await call("/v1/messages", { method: "POST", token: mac, body: { id: "a".repeat(32), to: "user", from: "claude:aaa", text: "PR merged", tags: ["done"] } });
     expect((await tool(await connect(), "read_notes", { tags: ["blocked"] })).messages).toEqual([]);
+  });
+});
+
+describe("board", () => {
+  test("board_post posts as the app's user", async () => {
+    const token = await connect();
+    await tool(token, "board_post", { topic: "release", text: "ship monday" });
+    expect((await tool(token, "board_read", { topic: "release" })).posts[0].from).toBe("claude-app/user");
+  });
+
+  test("a node reads what the app posted", async () => {
+    await tool(await connect(), "board_post", { topic: "release", text: "ship monday" });
+    expect((await body<{ posts: { text: string }[] }>(call("/v1/board/release", { token: await mint("mac") }))).posts.map((p) => p.text)).toEqual(["ship monday"]);
+  });
+
+  test("board_post retried with the same text is stored once", async () => {
+    const token = await connect();
+    await tool(token, "board_post", { topic: "release", text: "ship monday" });
+    expect((await tool(token, "board_post", { topic: "release", text: "ship monday" })).duplicate).toBe(true);
+  });
+
+  test("board_post uploads an inline text file", async () => {
+    const token = await connect();
+    await tool(token, "board_post", { topic: "release", text: "notes attached", files: [{ name: "notes.md", text: "# Notes" }] });
+    const file = (await tool(token, "board_read", { topic: "release" })).posts[0].files[0];
+    expect(await (await call(`/v1/board/release/files/${file.id}`, { token: await mint("mac") })).text()).toBe("# Notes");
+  });
+
+  test("board_post decodes a base64 file", async () => {
+    const token = await connect();
+    await tool(token, "board_post", { topic: "release", text: "bytes", files: [{ name: "b.bin", base64: btoa("\x00\x01") }] });
+    expect((await tool(token, "board_read", { topic: "release" })).posts[0].files[0].size).toBe(2);
+  });
+
+  test("board_post refuses a file over the app's limit", async () => {
+    const result = await tool(await connect(), "board_post", { topic: "release", text: "big", files: [{ name: "big.txt", text: "x".repeat(1_000_001) }] });
+    expect(result.error).toContain("1 MB");
+  });
+
+  test("a relay refusal is a tool error", async () => {
+    expect((await tool(await connect(), "board_post", { topic: "Bad Topic", text: "x" })).error).toContain("a topic is");
+  });
+
+  test("board_topics lists the topic", async () => {
+    const token = await connect();
+    await tool(token, "board_post", { topic: "release", text: "ship monday" });
+    expect((await tool(token, "board_topics")).topics.map((t: { topic: string }) => t.topic)).toEqual(["release"]);
+  });
+
+  test("board_read after the last seq is empty", async () => {
+    const token = await connect();
+    await tool(token, "board_post", { topic: "release", text: "ship monday" });
+    const { last } = await tool(token, "board_read", { topic: "release" });
+    expect((await tool(token, "board_read", { topic: "release", after: last })).posts).toEqual([]);
+  });
+
+  test("board_search finds the post", async () => {
+    const token = await connect();
+    await tool(token, "board_post", { topic: "release", text: "ship monday" });
+    expect((await tool(token, "board_search", { query: "monday" })).posts.length).toBe(1);
   });
 });
 

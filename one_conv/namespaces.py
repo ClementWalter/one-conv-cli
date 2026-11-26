@@ -27,7 +27,7 @@ class NamespaceRoot(click.Group):
     """Keep legacy names callable without mixing them into the primary help."""
 
     def list_commands(self, context):
-        return [name for name in ("cloud", "local", "live", "mcp", "update") if name in self.commands]
+        return [name for name in ("cloud", "local", "live", "board", "mcp", "update") if name in self.commands]
 
 
 def selected_sources(source, defaults):

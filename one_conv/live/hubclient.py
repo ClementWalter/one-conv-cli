@@ -97,13 +97,13 @@ class HubClient:
         except (urllib.error.URLError, OSError, ValueError) as error:
             raise HubUnavailable(f"hub at {self.url} is unreachable: {error}") from None
 
-    def download(self, path: str) -> tuple[str, bytes]:
+    def download(self, path: str, timeout: float | None = None) -> tuple[str, bytes]:
         """(media_type, body) of a binary resource, such as an attachment a message carries."""
         if self.listener_pid is not None and not tunnel.listening(self.listener_pid, urlsplit(self.url).port or 0):
             raise HubUnavailable("the bridge's ssh forward is not running")
         request = urllib.request.Request(self.url + path, headers={"Authorization": f"Bearer {self.token}"})
         try:
-            with self._opener.open(request, timeout=self.timeout) as response:
+            with self._opener.open(request, timeout=timeout or self.timeout) as response:
                 return response.headers.get("Content-Type", "application/octet-stream").partition(";")[0], response.read()
         except urllib.error.HTTPError as error:
             try:
@@ -114,14 +114,16 @@ class HubClient:
         except (urllib.error.URLError, OSError) as error:
             raise HubUnavailable(f"hub at {self.url} is unreachable: {error}") from None
 
-    def upload(self, media_type: str, data: bytes) -> dict:
-        """Store one image on the relay; returns its {id, media_type, size}."""
+    def upload(self, media_type: str, data: bytes, path: str = "/v1/attachments", headers: dict | None = None,
+               timeout: float | None = None) -> dict:
+        """Store raw bytes on the relay (an image by default, or a board file at `path`); returns the relay's JSON."""
         if self.listener_pid is not None and not tunnel.listening(self.listener_pid, urlsplit(self.url).port or 0):
             raise HubUnavailable("the bridge's ssh forward is not running")
-        request = urllib.request.Request(self.url + "/v1/attachments", data=data, method="POST",
-                                         headers={"Authorization": f"Bearer {self.token}", "Content-Type": media_type})
+        request = urllib.request.Request(self.url + path, data=data, method="POST",
+                                         headers={"Authorization": f"Bearer {self.token}", "Content-Type": media_type,
+                                                  **(headers or {})})
         try:
-            with self._opener.open(request, timeout=self.timeout) as response:
+            with self._opener.open(request, timeout=timeout or self.timeout) as response:
                 return json.loads(response.read() or b"{}")
         except urllib.error.HTTPError as error:
             try:

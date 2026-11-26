@@ -20,6 +20,7 @@ conversation archive every bridge syncs to, both authenticated by the same node 
     live-hub.py token add NODE --db relay.db      # prints the token once; give it to that node's bridge
     live-hub.py token revoke NODE --db relay.db
     live-hub.py invite NODE --db relay.db --url https://relay.example.com [--ttl 15m] [--replace]
+    live-hub.py board-rm TOPIC POST_ID --db relay.db   # hide any board post, as the relay's operator
 
 `invite` prints the one `one-conv live join ...` command to run on the new machine: a one-time
 code, so no token is copied by hand. Machines already connected can make invites themselves
@@ -60,10 +61,22 @@ def main() -> int:
                             help="The relay as the new machine reaches it: https://HOST or ssh://[user@]HOST.")
     invitation.add_argument("--ttl", default=invite.DEFAULT_TTL, help="How long the code stays valid [default: 15m].")
     invitation.add_argument("--replace", action="store_true", help="Allow a node that already has a token.")
+    removal = commands.add_parser("board-rm", help="Hide any board post, as the relay's operator.")
+    removal.add_argument("topic")
+    removal.add_argument("post")
+    removal.add_argument("--db", required=True)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     os.umask(0o077)  # The databases hold token hashes, message text and conversation history.
     hub = Hub(args.db)
+    if args.command == "board-rm":
+        try:
+            hub.board.delete("", args.topic, args.post, admin=True)
+        except HubError as error:
+            log.error("%s", error)
+            return 1
+        log.info("deleted %s from %s", args.post, args.topic)
+        return 0
     if args.command == "invite":
         try:
             made = hub.create_invite("", args.node, invite.parse_ttl(args.ttl), args.replace)
